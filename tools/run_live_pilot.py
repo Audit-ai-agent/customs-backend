@@ -11,9 +11,6 @@ from datetime import UTC, datetime
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
-from integration.review_service import ReviewCommand, execute_review
-
-
 DEFAULT_EVIDENCE_URL = "http://127.0.0.1:8010"
 DEFAULT_REVIEW_AS_OF = "2026-07-10"
 DEFAULT_OPS_DSN = "postgresql://trade:change_me@127.0.0.1:5432/trade_doc"
@@ -74,6 +71,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.preflight_only:
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
         return 0
+
+    # Delay the Agent distribution guard until after dependency readiness is
+    # established, so preflight can diagnose Data without an Agent install.
+    from integration.review_service import ReviewCommand, execute_review
 
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     run_id = f"pilot-{stamp}-{uuid.uuid4().hex[:8]}"
