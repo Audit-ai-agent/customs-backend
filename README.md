@@ -22,8 +22,10 @@ Backend 시스템 테스트는 지정된 API 버전을 소비한다.
 ## Python 3.11 설치와 단위 검증
 
 ```powershell
-uv sync --locked --extra unit --python 3.11
-uv run --locked --extra unit pytest packages/operational_db/tests
+uv sync --locked --group dev --extra unit --python 3.11
+uv run --locked ruff check .
+uv run --locked mypy
+uv run --locked --extra unit pytest packages/operational_db/tests tests/unit
 ```
 
 Operational DB migration:
@@ -41,15 +43,26 @@ AI Agent는 형제 폴더가 아닌 exact-commit wheel로 설치한다. 이 저�
 `f81d3376962b3c9551aea59748af8b6f3352f4f3784bfef735bc5431589a63ea`다.
 
 ```powershell
-uv sync --locked --extra unit --extra system --python 3.11
-if ((Get-FileHash ..\_artifacts\packages\customs_ai_agent-0.1.0-py3-none-any.whl -Algorithm SHA256).Hash.ToLower() -ne "f81d3376962b3c9551aea59748af8b6f3352f4f3784bfef735bc5431589a63ea") { throw "AI wheel hash mismatch" }
-uv pip install ..\_artifacts\packages\customs_ai_agent-0.1.0-py3-none-any.whl
+uv sync --locked --group dev --extra unit --extra system --python 3.11
+uv run --no-sync python tools/install_pinned_agent.py ..\_artifacts\packages\customs_ai_agent-0.1.0-py3-none-any.whl --verify-only
+uv run --no-sync python tools/install_pinned_agent.py ..\_artifacts\packages\customs_ai_agent-0.1.0-py3-none-any.whl
 uv run --no-sync pytest tests/system
+uv sync --check --locked --inexact --group dev --extra unit --extra system
 ```
 
-현재 개발 환경에 정확한 Agent 배포판이 이미 설치되어 있다면 마지막
-명령만 실행할 수 있다. 이 방식은 wheel 배포 계약이지 `sys.path`, editable
-설치, 형제 상대경로 의존이 아니다.
+현재 개발 환경에 정확한 Agent 배포판과 lock된 system 의존성이 이미
+설치되어 있다면 `pytest tests/system`부터 실행할 수 있다. 이 방식은 wheel
+배포 계약이지 `sys.path`, editable 설치, 형제 상대경로 의존이 아니다.
+
+실제 Evidence API와 Operational PostgreSQL까지 확인하는 release pilot은
+Data readiness가 200인 상태에서 다음처럼 실행한다. Data corpus가 불완전하면
+기본 모드는 실패하며, `--allow-incomplete-corpus`는 특정 Structured 경로만
+진단할 때 사용하는 비-release 옵션이다.
+
+```powershell
+uv run --no-sync python packages/operational_db/scripts/migrate.py
+uv run --no-sync python tools/run_live_pilot.py
+```
 
 CLI 및 로컬 UI:
 

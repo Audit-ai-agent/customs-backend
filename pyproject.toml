@@ -21,7 +21,19 @@ unit = [
 system = [
   "fastapi>=0.115,<1",
   "httpx>=0.27,<1",
+  # Exact provider runtime set. The Agent wheel itself is installed --no-deps
+  # only after its identity and SHA-256 have been verified.
+  "langgraph==1.2.9",
+  "pydantic==2.13.4",
+  "python-dotenv==1.2.2",
+  "rapidfuzz==3.14.5",
   "uvicorn[standard]>=0.30,<1",
+]
+
+[dependency-groups]
+dev = [
+  "mypy>=1.11,<2",
+  "ruff>=0.8,<1",
 ]
 
 [project.scripts]
@@ -36,21 +48,29 @@ where = ["src", "packages/operational_db/src"]
 include = ["integration*", "operational_db*"]
 
 [tool.setuptools.package-data]
-integration = ["agent_webui.html"]
+integration = ["agent_webui.html", "agent_contract.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["packages/operational_db/tests", "tests"]
+pythonpath = ["."]
 addopts = "-ra --strict-markers"
 markers = [
   "system: requires the exact AI Agent distribution and optional local services",
 ]
 
-# The AI wheel is a separately versioned provider artifact and is intentionally
-# not resolved through a sibling path. The harness enforces this exact version
-# before importing Agent APIs; see integration.ai_distribution.
-[tool.customs-backend.system-contract]
-ai-distribution = "customs-ai-agent"
-ai-version = "0.1.0"
-ai-commit = "3cff42f2da4c7debce0c51fea4e05f3eb62b48f6"
-ai-wheel-sha256 = "f81d3376962b3c9551aea59748af8b6f3352f4f3784bfef735bc5431589a63ea"
-evidence-api = "v1"
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "packages/operational_db/src", "tests", "packages/operational_db/tests"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src", "packages/operational_db/src"]
+check_untyped_defs = true
+ignore_missing_imports = true
+no_implicit_optional = true
+show_error_codes = true
+warn_unused_configs = true

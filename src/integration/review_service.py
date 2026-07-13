@@ -18,11 +18,20 @@ from integration.ai_distribution import require_compatible_ai_agent
 
 require_compatible_ai_agent()
 
-from customs_ai_agent.adapters.retrieval import HttpRegulationRetriever, RegulationRetriever
-from customs_ai_agent.runner import run_review
-from customs_ai_agent.schemas.models import ReviewRunRequest
-from operational_db import PostgresOperationalRepository, ReviewRunSnapshot, snapshot_from_agent_state
-from operational_db.repository import OperationalRepository
+# These imports intentionally follow the distribution guard: importing sibling
+# source or an unpinned Agent build must fail before application code is loaded.
+from customs_ai_agent.adapters.retrieval import (  # noqa: E402
+    HttpRegulationRetriever,
+    RegulationRetriever,
+)
+from customs_ai_agent.runner import run_review  # noqa: E402
+from customs_ai_agent.schemas.models import ReviewRunRequest  # noqa: E402
+from operational_db import (  # noqa: E402
+    PostgresOperationalRepository,
+    ReviewRunSnapshot,
+    snapshot_from_agent_state,
+)
+from operational_db.repository import OperationalRepository  # noqa: E402
 
 
 DEFAULT_RAG_URL = "http://127.0.0.1:8010"

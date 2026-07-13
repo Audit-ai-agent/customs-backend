@@ -1,0 +1,15 @@
+{
+  "schema_version": "1.0",
+  "distribution": "customs-ai-agent",
+  "version": "0.1.0",
+  "source_commit": "3cff42f2da4c7debce0c51fea4e05f3eb62b48f6",
+  "wheel_sha256": "f81d3376962b3c9551aea59748af8b6f3352f4f3784bfef735bc5431589a63ea",
+  "provider_uv_lock_sha256": "3ede9a56881781f4606f86ca2859e4a0ff78a2f9cc0f7d80d035891fa0887c1f",
+  "evidence_api": "v1",
+  "runtime_direct": {
+    "langgraph": "1.2.9",
+    "pydantic": "2.13.4",
+    "python-dotenv": "1.2.2",
+    "rapidfuzz": "3.14.5"
+  }
+}

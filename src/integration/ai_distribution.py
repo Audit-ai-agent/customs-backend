@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import json
 from importlib.metadata import PackageNotFoundError, version
+from importlib.resources import files
 
 
-AI_DISTRIBUTION = "customs-ai-agent"
-AI_VERSION = "0.1.0"
+AGENT_CONTRACT = json.loads(
+    files("integration").joinpath("agent_contract.json").read_text(encoding="utf-8")
+)
+AI_DISTRIBUTION = str(AGENT_CONTRACT["distribution"])
+AI_VERSION = str(AGENT_CONTRACT["version"])
 
 
 def require_compatible_ai_agent() -> None:
@@ -16,7 +21,7 @@ def require_compatible_ai_agent() -> None:
         installed = version(AI_DISTRIBUTION)
     except PackageNotFoundError as exc:
         raise RuntimeError(
-            "customs-ai-agent==0.1.0 is required for system/demo commands; "
+            f"{AI_DISTRIBUTION}=={AI_VERSION} is required for system/demo commands; "
             "install the wheel built from the pinned Agent commit"
         ) from exc
     if installed != AI_VERSION:

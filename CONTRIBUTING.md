@@ -11,14 +11,21 @@
 ## 필수 검증
 
 ```powershell
-uv sync --locked --extra unit --python 3.11
-uv run --locked --extra unit pytest packages/operational_db/tests
+uv sync --locked --group dev --extra unit --python 3.11
+uv run --locked --group dev --extra unit ruff check .
+uv run --locked --group dev --extra unit mypy
+uv run --locked --group dev --extra unit pytest packages/operational_db/tests tests/unit
 ```
 
-Agent 연동을 변경했다면 exact Agent wheel과 `system` extra를 설치한 후:
+Agent 연동을 변경했다면 `system` extra를 lock대로 설치하고, exact Agent
+wheel을 hash 검증 후 `--no-deps` 방식으로 설치한다. 테스트 후 lock 환경이
+변하지 않았음도 확인한다.
 
 ```powershell
+uv sync --locked --group dev --extra unit --extra system --python 3.11
+uv run --no-sync python tools/install_pinned_agent.py ..\_artifacts\packages\customs_ai_agent-0.1.0-py3-none-any.whl
 uv run --no-sync pytest tests/system
+uv sync --check --locked --inexact --group dev --extra unit --extra system
 ```
 
 PR에는 문제, 선택 기준, 변경 계약, 실행 명령과 결과, rollback

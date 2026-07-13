@@ -18,8 +18,12 @@ jobs:
           version: "0.11.28"
           enable-cache: true
       - name: Install locked Python 3.11 environment
-        run: uv sync --locked --extra unit --python 3.11
+        run: uv sync --locked --group dev --extra unit --python 3.11
+      - name: Lint
+        run: uv run --locked ruff check .
+      - name: Typecheck
+        run: uv run --locked mypy
       - name: Run Operational DB unit tests
-        run: uv run --locked --extra unit pytest packages/operational_db/tests
+        run: uv run --locked --extra unit pytest packages/operational_db/tests tests/unit
       - name: Build clean wheel
         run: uv build

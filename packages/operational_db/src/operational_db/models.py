@@ -80,16 +80,17 @@ class ReviewRunSnapshot(BaseModel):
             evidence_keys.add((item_id, str(evidence["evidence_id"])))
 
         for finding in self.regulatory_findings:
-            item_id = finding.get("item_id")
-            if not item_id:
+            finding_item_id = finding.get("item_id")
+            if not finding_item_id:
                 raise ValueError("regulatory finding must include item_id")
             evidence_ids = finding.get("evidence_ids") or []
             if not evidence_ids:
                 raise ValueError("regulatory finding must include evidence_ids")
             for evidence_id in evidence_ids:
-                if (str(item_id), str(evidence_id)) not in evidence_keys:
+                if (str(finding_item_id), str(evidence_id)) not in evidence_keys:
                     raise ValueError(
-                        f"finding references evidence outside the same item/run: {item_id}/{evidence_id}"
+                        "finding references evidence outside the same item/run: "
+                        f"{finding_item_id}/{evidence_id}"
                     )
         return self
 
