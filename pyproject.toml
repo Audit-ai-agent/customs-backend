@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=78", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "customs-backend"
+version = "0.1.0"
+description = "Backend-owned operational persistence and local Agent integration harness"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "pydantic>=2.7,<3",
+  "psycopg[binary]>=3.2,<4",
+]
+
+[project.optional-dependencies]
+unit = [
+  "pytest>=8,<10",
+  "pytest-cov>=5,<8",
+]
+system = [
+  "fastapi>=0.115,<1",
+  "httpx>=0.27,<1",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[project.scripts]
+customs-review = "integration.headless_review:main"
+customs-agent-demo = "integration.agent_webapp:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src", "packages/operational_db/src"]
+include = ["integration*", "operational_db*"]
+
+[tool.setuptools.package-data]
+integration = ["agent_webui.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["packages/operational_db/tests", "tests"]
+addopts = "-ra --strict-markers"
+markers = [
+  "system: requires the exact AI Agent distribution and optional local services",
+]
+
+# The AI wheel is a separately versioned provider artifact and is intentionally
+# not resolved through a sibling path. The harness enforces this exact version
+# before importing Agent APIs; see integration.ai_distribution.
+[tool.customs-backend.system-contract]
+ai-distribution = "customs-ai-agent"
+ai-version = "0.1.0"
+ai-commit = "3cff42f2da4c7debce0c51fea4e05f3eb62b48f6"
+ai-wheel-sha256 = "f81d3376962b3c9551aea59748af8b6f3352f4f3784bfef735bc5431589a63ea"
+evidence-api = "v1"

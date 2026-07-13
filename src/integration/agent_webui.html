@@ -1,0 +1,866 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>AI Agent 통합 검증</title>
+<style>
+  :root {
+    --bg: #f4f6f9;
+    --surface: #ffffff;
+    --surface-soft: #f8fafc;
+    --ink: #172033;
+    --muted: #64748b;
+    --line: #dbe2ea;
+    --accent: #2457d6;
+    --accent-soft: #e9efff;
+    --pass: #087f5b;
+    --pass-soft: #e4f7f0;
+    --warn: #a85b00;
+    --warn-soft: #fff2da;
+    --fail: #c32f36;
+    --fail-soft: #fdebed;
+    --support: #4169a1;
+    --support-soft: #eaf1fb;
+    --shadow: 0 8px 28px rgba(31, 45, 68, .07);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    color: var(--ink);
+    background: var(--bg);
+    font-family: "Pretendard", "Noto Sans KR", "Malgun Gothic", system-ui, sans-serif;
+    font-size: 14px;
+    line-height: 1.55;
+  }
+  button, input, select { font: inherit; }
+  button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible {
+    outline: 3px solid rgba(36, 87, 214, .25);
+    outline-offset: 2px;
+  }
+  header {
+    padding: 18px 24px 16px;
+    border-bottom: 1px solid var(--line);
+    background: var(--surface);
+  }
+  .header-inner, main { width: min(1240px, 100%); margin: 0 auto; }
+  .title-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+  h1 { margin: 0; font-size: 20px; letter-spacing: -.02em; }
+  h1 small { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; font-weight: 500; }
+  .header-link { color: var(--accent); font-size: 12px; text-decoration: none; white-space: nowrap; }
+  .mode-row { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 14px; }
+  .mode-badge, .badge, .tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    border-radius: 999px;
+    font-weight: 700;
+    line-height: 1;
+  }
+  .mode-badge { padding: 7px 10px; border: 1px solid var(--line); font-size: 11px; background: var(--surface-soft); }
+  .mode-badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+  .mode-badge.mock::before { background: var(--warn); }
+  .mode-badge.live::before { background: var(--pass); }
+  .mode-badge.down::before { background: var(--fail); }
+  main { padding: 20px 22px 64px; }
+  .notice {
+    margin-bottom: 14px;
+    padding: 11px 13px;
+    border: 1px solid #f1d3a4;
+    border-radius: 10px;
+    color: #74410a;
+    background: #fffaf1;
+    font-size: 12.5px;
+  }
+  .card { border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
+  .card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 13px 15px;
+    border-bottom: 1px solid var(--line);
+  }
+  .card-head h2, .card-head h3 { margin: 0; font-size: 14px; }
+  .card-body { padding: 15px; }
+  .muted { color: var(--muted); }
+  .small { font-size: 12px; }
+  .health-grid, .summary-grid, .count-grid {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 9px;
+  }
+  .health-box, .summary-box, .count-box {
+    min-width: 0;
+    padding: 10px 11px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    background: var(--surface-soft);
+  }
+  .health-box .label, .summary-box .label, .count-box .label {
+    display: block;
+    margin-bottom: 3px;
+    overflow: hidden;
+    color: var(--muted);
+    font-size: 10.5px;
+    font-weight: 700;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-transform: uppercase;
+    letter-spacing: .035em;
+  }
+  .health-box .value, .summary-box .value, .count-box .value {
+    display: block;
+    overflow-wrap: anywhere;
+    font-size: 13px;
+    font-weight: 750;
+  }
+  .health-box.pass, .summary-box.pass { border-color: #b5decf; background: var(--pass-soft); }
+  .health-box.warn, .summary-box.warn { border-color: #efd2a5; background: var(--warn-soft); }
+  .health-box.fail, .summary-box.fail { border-color: #efbbc0; background: var(--fail-soft); }
+  .section-gap { margin-top: 14px; }
+  .form-grid {
+    display: grid;
+    grid-template-columns: minmax(200px, 1.2fr) 160px 130px minmax(240px, 1.4fr);
+    gap: 11px;
+  }
+  label.field { display: block; }
+  label.field > span { display: block; margin-bottom: 5px; color: var(--muted); font-size: 11.5px; font-weight: 700; }
+  input, select {
+    width: 100%;
+    min-height: 39px;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    padding: 8px 10px;
+    color: var(--ink);
+    background: #fff;
+  }
+  input:disabled, select:disabled { background: #eef2f7; cursor: not-allowed; }
+  .run-row { display: grid; grid-template-columns: 1fr auto; gap: 11px; align-items: end; margin-top: 11px; }
+  .run-id-wrap { display: grid; grid-template-columns: minmax(220px, 1fr) auto auto; gap: 7px; }
+  .check-wrap { display: flex; align-items: center; gap: 8px; min-height: 39px; color: var(--muted); font-size: 12px; }
+  .check-wrap input { width: 16px; min-height: 16px; margin: 0; }
+  button {
+    min-height: 37px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 13px;
+    color: var(--ink);
+    background: #fff;
+    cursor: pointer;
+    font-weight: 700;
+  }
+  button:hover:not(:disabled) { border-color: #9aa9bb; background: #f8fafc; }
+  button:disabled { opacity: .55; cursor: wait; }
+  button.primary { border-color: var(--accent); color: #fff; background: var(--accent); }
+  button.primary:hover:not(:disabled) { background: #1948bf; }
+  button.ghost { padding-inline: 11px; font-size: 12px; }
+  .run-button { min-width: 160px; min-height: 42px; }
+  .error-box { display: none; margin-top: 11px; padding: 10px 12px; border-radius: 8px; color: #8d2027; background: var(--fail-soft); white-space: pre-wrap; }
+  .error-box.on { display: block; }
+  .loading {
+    display: none;
+    align-items: center;
+    gap: 10px;
+    margin-top: 11px;
+    padding: 11px 12px;
+    border-radius: 8px;
+    color: #234ba7;
+    background: var(--accent-soft);
+  }
+  .loading.on { display: flex; }
+  .spinner { width: 17px; height: 17px; border: 2px solid #adbeed; border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .results { display: none; }
+  .results.on { display: block; }
+  .summary-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 11px; }
+  .summary-header h2 { margin: 0; font-size: 15px; }
+  .summary-header .ids { min-width: 0; color: var(--muted); font-size: 11px; text-align: right; overflow-wrap: anywhere; }
+  .badge { padding: 5px 8px; font-size: 10.5px; }
+  .badge.pass { color: var(--pass); background: var(--pass-soft); }
+  .badge.warn { color: var(--warn); background: var(--warn-soft); }
+  .badge.fail { color: var(--fail); background: var(--fail-soft); }
+  .badge.info { color: var(--accent); background: var(--accent-soft); }
+  .badge.support { color: var(--support); background: var(--support-soft); }
+  .timeline { display: flex; align-items: flex-start; gap: 0; overflow-x: auto; padding: 7px 2px 2px; }
+  .step { position: relative; min-width: 112px; flex: 1; padding: 0 7px; text-align: center; }
+  .step:not(:last-child)::after { content: ""; position: absolute; left: calc(50% + 15px); right: calc(-50% + 15px); top: 12px; height: 2px; background: var(--line); }
+  .step.done:not(:last-child)::after { background: #9ed0bf; }
+  .step-dot { position: relative; z-index: 1; display: grid; place-items: center; width: 25px; height: 25px; margin: 0 auto 5px; border: 2px solid #c9d2de; border-radius: 50%; color: var(--muted); background: #fff; font-size: 11px; font-weight: 800; }
+  .step.done .step-dot { border-color: var(--pass); color: #fff; background: var(--pass); }
+  .step.problem .step-dot { border-color: var(--warn); color: #fff; background: var(--warn); }
+  .step-name { display: block; font-size: 10.5px; font-weight: 700; word-break: break-word; }
+  .step-msg { display: block; margin-top: 2px; color: var(--muted); font-size: 9.5px; }
+  .tabs { display: flex; gap: 5px; overflow-x: auto; margin-top: 14px; padding-bottom: 1px; }
+  .tab { flex: 0 0 auto; min-height: 35px; padding: 7px 12px; color: var(--muted); font-size: 12px; }
+  .tab.on { border-color: var(--accent); color: #fff; background: var(--accent); }
+  .panel { display: none; margin-top: 8px; }
+  .panel.on { display: block; }
+  .empty { padding: 28px 12px; color: var(--muted); text-align: center; }
+  .stack { display: grid; gap: 10px; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .three-col { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .inner-card { border: 1px solid var(--line); border-radius: 9px; padding: 11px 12px; background: #fff; }
+  .inner-card h3, .inner-card h4 { margin: 0 0 7px; font-size: 12.5px; }
+  .inner-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 9px; }
+  .kv { display: grid; grid-template-columns: minmax(105px, .32fr) 1fr; border-top: 1px solid #eef1f5; font-size: 12px; }
+  .kv:first-child { border-top: 0; }
+  .kv > div { padding: 6px 5px; overflow-wrap: anywhere; }
+  .kv .key { color: var(--muted); font-weight: 650; }
+  pre {
+    margin: 7px 0 0;
+    padding: 10px;
+    max-height: 420px;
+    overflow: auto;
+    border: 1px solid #e5eaf0;
+    border-radius: 7px;
+    color: #25344a;
+    background: #f7f9fc;
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 11.5px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { padding: 8px 7px; border-bottom: 1px solid #e9edf2; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+  th { color: var(--muted); background: var(--surface-soft); font-size: 10.5px; text-transform: uppercase; }
+  .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+  .tag { margin: 2px 4px 2px 0; padding: 4px 7px; color: var(--accent); background: var(--accent-soft); font-size: 10px; }
+  .tag.finding { color: #6d28a7; background: #f1e8fb; }
+  .tag.supporting { color: var(--support); background: var(--support-soft); }
+  .tag.blocked { color: var(--fail); background: var(--fail-soft); }
+  .evidence-card.finding { border-left: 4px solid #8e44ad; }
+  .evidence-card.supporting { border-left: 4px solid var(--support); }
+  .evidence-card.blocked { border-left: 4px solid var(--fail); }
+  .evidence-text { margin: 8px 0; color: #344154; font-size: 12px; white-space: pre-wrap; }
+  .trace { display: flex; flex-wrap: wrap; align-items: stretch; gap: 5px; margin-top: 9px; }
+  .trace-node { min-width: 135px; flex: 1; padding: 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-soft); }
+  .trace-node .key { display: block; color: var(--muted); font-size: 9.5px; font-weight: 700; text-transform: uppercase; }
+  .trace-node .value { display: block; margin-top: 2px; overflow-wrap: anywhere; font-size: 10.5px; }
+  .trace-arrow { align-self: center; color: #9aa6b6; font-weight: 800; }
+  a.source { color: var(--accent); text-decoration: none; overflow-wrap: anywhere; }
+  a.source:hover { text-decoration: underline; }
+  .evaluation-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+  .metric-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin-top: 11px; }
+  .metric { padding: 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-soft); }
+  .metric .name { color: var(--muted); font-size: 10px; }
+  .metric .number { margin-top: 2px; overflow-wrap: anywhere; font-size: 15px; font-weight: 800; }
+  @media (max-width: 960px) {
+    .health-grid, .summary-grid, .count-grid, .metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .form-grid { grid-template-columns: 1fr 1fr; }
+    .three-col { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 680px) {
+    header { padding-inline: 16px; }
+    main { padding-inline: 12px; }
+    .title-row { align-items: flex-start; }
+    .health-grid, .summary-grid, .count-grid, .metric-grid { grid-template-columns: 1fr 1fr; }
+    .form-grid, .two-col, .run-row { grid-template-columns: 1fr; }
+    .run-id-wrap { grid-template-columns: 1fr auto; }
+    .run-id-wrap .load-button { grid-column: 1 / -1; }
+    .run-button { width: 100%; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="header-inner">
+    <div class="title-row">
+      <h1>AI Agent 통합 검증<small>Mock 통관문서 → Agent → 실제 Data/RAG/DB → Finding → 불변 저장</small></h1>
+      <a class="header-link" href="http://127.0.0.1:8010" target="_blank" rel="noopener noreferrer">Data/RAG 화면 열기 ↗</a>
+    </div>
+    <div class="mode-row" aria-label="실행 모드">
+      <span class="mode-badge mock">문서 입력 · 추출 MOCK</span>
+      <span class="mode-badge live" id="mode-agent">Agent Workflow LIVE</span>
+      <span class="mode-badge" id="mode-rag">Regulation RAG 확인 중</span>
+      <span class="mode-badge" id="mode-kb">Knowledge DB 확인 중</span>
+      <span class="mode-badge" id="mode-ops">Operational DB 확인 중</span>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="notice">
+    <b>로컬 전용·무인증 개발 도구</b>입니다. 외부 네트워크에 노출하거나 제품 Backend로 사용하지 마십시오. 현재 데모는 <b>Mock 텍스트 문서 입력·추출</b>을 사용하고, Agent workflow·localhost Evidence Service·Operational DB 연동 경로를 확인합니다. 최종 법적 판단은 책임 있는 사람이 해야 합니다.
+  </div>
+
+  <section class="card" aria-labelledby="health-title">
+    <div class="card-head">
+      <h2 id="health-title">System Readiness</h2>
+      <button class="ghost" id="refresh-health" type="button">새로고침</button>
+    </div>
+    <div class="card-body">
+      <div class="health-grid" id="health-grid"><div class="health-box warn"><span class="label">상태</span><span class="value">확인 중…</span></div></div>
+      <div class="small muted" id="health-detail" style="margin-top:8px"></div>
+    </div>
+  </section>
+
+  <section class="card section-gap" aria-labelledby="run-title">
+    <div class="card-head">
+      <h2 id="run-title">Agent 전체 심사 실행</h2>
+      <span class="small muted">UI는 항상 HTTP Retriever를 사용합니다.</span>
+    </div>
+    <div class="card-body">
+      <form id="review-form">
+        <div class="form-grid">
+          <label class="field"><span>검증 시나리오</span><select id="scenario" required><option value="">불러오는 중…</option></select></label>
+          <label class="field"><span>기준일</span><input id="review-as-of" type="date" required></label>
+          <label class="field"><span>거래 유형</span><select id="trade-type"><option value="import">수입</option><option value="export">수출</option></select></label>
+          <label class="field"><span>제출한 요건서류 코드 (쉼표 구분)</span><input id="document-codes" type="text" placeholder="예: CCCT_DOC_46E819BB87B27371"></label>
+        </div>
+        <details style="margin:12px 0">
+          <summary class="small muted">고급 장애 검증: Evidence Service URL 변경</summary>
+          <label class="field" style="margin-top:8px"><span>RAG URL</span><input id="rag-url" type="url" value="http://127.0.0.1:8010" placeholder="http://127.0.0.1:8010"></label>
+          <div class="notice" style="margin-top:7px">정상 검증은 8010을 사용합니다. fail-closed 확인 시에만 존재하지 않는 localhost 포트로 변경하세요.</div>
+        </details>
+        <div class="run-row">
+          <div>
+            <label class="field"><span>Review Run ID</span></label>
+            <div class="run-id-wrap">
+              <input id="run-id" type="text" required autocomplete="off" aria-label="Review Run ID">
+              <button class="ghost" id="new-run-id" type="button">새 ID</button>
+              <button class="ghost load-button" id="load-run" type="button">DB에서 조회</button>
+            </div>
+            <label class="check-wrap"><input id="store" type="checkbox" checked> Operational DB에 저장하고 readback hash를 검증</label>
+          </div>
+          <button class="primary run-button" id="run-review" type="submit">전체 심사 실행</button>
+        </div>
+      </form>
+      <div class="loading" id="run-loading" role="status"><span class="spinner" aria-hidden="true"></span><span>Mock 문서부터 Agent·RAG·DB 저장까지 실행 중입니다. 완료 후 audit timeline을 표시합니다.</span></div>
+      <div class="error-box" id="run-error" role="alert"></div>
+    </div>
+  </section>
+
+  <section class="results section-gap" id="results" aria-live="polite">
+    <div class="summary-header">
+      <h2>실행 결과</h2>
+      <div class="ids" id="result-ids"></div>
+    </div>
+    <div class="summary-grid" id="summary-grid"></div>
+
+    <section class="card section-gap">
+      <div class="card-head"><h3>Agent Workflow Timeline</h3><span class="small muted">실행 완료 후 audit event 기반</span></div>
+      <div class="card-body"><div class="timeline" id="timeline"></div></div>
+    </section>
+
+    <nav class="tabs" aria-label="실행 결과 탭">
+      <button class="tab on" type="button" data-panel="documents">문서·추출</button>
+      <button class="tab" type="button" data-panel="validation">검증</button>
+      <button class="tab" type="button" data-panel="rag">RAG·Evidence</button>
+      <button class="tab" type="button" data-panel="findings">Finding 추적</button>
+      <button class="tab" type="button" data-panel="report">XAI Report</button>
+      <button class="tab" type="button" data-panel="database">DB 저장 검증</button>
+      <button class="tab" type="button" data-panel="raw">Raw JSON</button>
+    </nav>
+    <div class="panel on" id="panel-documents"></div>
+    <div class="panel" id="panel-validation"></div>
+    <div class="panel" id="panel-rag"></div>
+    <div class="panel" id="panel-findings"></div>
+    <div class="panel" id="panel-report"></div>
+    <div class="panel" id="panel-database"></div>
+    <div class="panel" id="panel-raw"></div>
+  </section>
+
+</main>
+
+<script>
+"use strict";
+
+const $ = id => document.getElementById(id);
+const esc = value => String(value ?? "").replace(/[&<>"']/g, char => ({
+  "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
+})[char]);
+const text = value => value === null || value === undefined || value === "" ? "—" : String(value);
+const pretty = value => JSON.stringify(value ?? null, null, 2);
+const list = value => Array.isArray(value) ? value : [];
+const object = value => value && typeof value === "object" && !Array.isArray(value) ? value : {};
+const human = value => text(value).replaceAll("_", " ");
+
+let currentResponse = null;
+let currentSnapshot = null;
+let currentMeta = {};
+let healthData = null;
+
+async function api(url, options = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs || 180000);
+  try {
+    const response = await fetch(url, {
+      method: options.method || "GET",
+      headers: { "Accept": "application/json", ...(options.body ? { "Content-Type": "application/json" } : {}) },
+      body: options.body ? JSON.stringify(options.body) : undefined,
+      signal: controller.signal
+    });
+    const raw = await response.text();
+    let data = {};
+    if (raw) {
+      try { data = JSON.parse(raw); } catch (_) { data = { detail: raw }; }
+    }
+    if (!response.ok) {
+      const detail = data.detail || data.error || data.message || `${response.status} ${response.statusText}`;
+      throw new Error(typeof detail === "string" ? detail : pretty(detail));
+    }
+    return data;
+  } catch (error) {
+    if (error.name === "AbortError") throw new Error("API 응답 대기 시간을 초과했습니다.");
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function setMode(id, label, state) {
+  const element = $(id);
+  element.textContent = label;
+  element.classList.remove("live", "down");
+  element.classList.add(state === "live" ? "live" : "down");
+}
+
+function healthValue(data, paths, fallback = null) {
+  for (const path of paths) {
+    let value = data;
+    for (const key of path.split(".")) value = value && value[key];
+    if (value !== undefined && value !== null) return value;
+  }
+  return fallback;
+}
+
+function healthBox(label, value, state = "") {
+  return `<div class="health-box ${esc(state)}"><span class="label">${esc(label)}</span><span class="value">${esc(text(value))}</span></div>`;
+}
+
+async function loadHealth() {
+  $("refresh-health").disabled = true;
+  try {
+    healthData = await api("/api/health", { timeoutMs: 20000 });
+    const status = healthValue(healthData, ["status", "agent_demo.status"], "unknown");
+    const evidenceStatus = healthValue(healthData, ["evidence.status", "evidence.readiness.status", "evidence_service.status", "rag.status", "readiness.status"], status);
+    const opsStatus = healthValue(healthData, ["operational_db.status", "ops_db.status", "operational_db"], "unknown");
+    const snapshotId = healthValue(healthData, ["knowledge_snapshot_id", "evidence.knowledge_snapshot_id", "evidence.readiness.knowledge_snapshot_id", "evidence_service.knowledge_snapshot_id", "readiness.knowledge_snapshot_id", "ccct.knowledge_snapshot_id"]);
+    const asOf = healthValue(healthData, ["supported_review_as_of", "evidence.supported_review_as_of", "evidence.readiness.supported_review_as_of", "evidence_service.supported_review_as_of", "readiness.supported_review_as_of"]);
+    const pgCount = healthValue(healthData, ["law_index.postgres_indexed", "evidence.law_index.postgres_indexed", "evidence.readiness.law_index.postgres_indexed", "evidence_service.law_index.postgres_indexed", "readiness.law_index.postgres_indexed", "postgres_indexed"]);
+    const qdrantCount = healthValue(healthData, ["law_index.qdrant", "evidence.law_index.qdrant", "evidence.readiness.law_index.qdrant", "evidence_service.law_index.qdrant", "readiness.law_index.qdrant", "qdrant_points"]);
+    const expected = healthValue(healthData, ["law_index.expected", "evidence.law_index.expected", "evidence.readiness.law_index.expected", "evidence_service.law_index.expected", "readiness.law_index.expected", "expected_points"]);
+    const ready = String(status).toLowerCase() === "ready" || String(status).toLowerCase() === "ok";
+    const evidenceReady = ["ready", "ok", "live", "true"].includes(String(evidenceStatus).toLowerCase());
+    const opsReady = ["ready", "ok", "live", "connected", "true"].includes(String(opsStatus).toLowerCase()) || opsStatus === true;
+    const indexMatch = pgCount !== null && qdrantCount !== null && Number(pgCount) === Number(qdrantCount) && (expected === null || Number(pgCount) === Number(expected));
+    $("health-grid").innerHTML = [
+      healthBox("Agent Demo", status, ready ? "pass" : "warn"),
+      healthBox("Evidence Service", evidenceStatus, evidenceReady ? "pass" : "fail"),
+      healthBox("CCCT Snapshot", snapshotId, snapshotId ? "pass" : "fail"),
+      healthBox("Supported As-Of", asOf, asOf ? "pass" : "warn"),
+      healthBox("Law Index PG / Qdrant", pgCount !== null || qdrantCount !== null ? `${text(pgCount)} / ${text(qdrantCount)}${expected !== null ? ` (expected ${expected})` : ""}` : "—", indexMatch ? "pass" : "warn"),
+      healthBox("Operational DB", typeof opsStatus === "object" ? (opsStatus.status || "connected") : opsStatus, opsReady ? "pass" : "fail")
+    ].join("");
+    $("health-detail").textContent = snapshotId ? `실행 결과의 knowledge snapshot이 ${snapshotId}와 일치하는지 추가로 검증합니다.` : "CCCT snapshot을 확인할 수 없어 실행 시 fail-closed 결과가 나올 수 있습니다.";
+    setMode("mode-rag", `Regulation RAG ${evidenceReady ? "LIVE" : "NOT READY"}`, evidenceReady ? "live" : "down");
+    setMode("mode-kb", `Knowledge DB ${snapshotId && indexMatch ? "LIVE" : "CHECK"}`, snapshotId && indexMatch ? "live" : "down");
+    setMode("mode-ops", `Operational DB ${opsReady ? "LIVE" : "NOT READY"}`, opsReady ? "live" : "down");
+    if (asOf && !$("review-as-of").value) $("review-as-of").value = String(asOf).slice(0, 10);
+    if (healthData.rag_url) $("rag-url").value = String(healthData.rag_url);
+  } catch (error) {
+    healthData = null;
+    $("health-grid").innerHTML = healthBox("Readiness", `FAIL · ${error.message}`, "fail");
+    $("health-detail").textContent = "Agent UI는 열렸지만 실제 RAG/DB 준비 상태를 확인하지 못했습니다.";
+    setMode("mode-rag", "Regulation RAG NOT READY", "down");
+    setMode("mode-kb", "Knowledge DB UNKNOWN", "down");
+    setMode("mode-ops", "Operational DB UNKNOWN", "down");
+  } finally {
+    $("refresh-health").disabled = false;
+  }
+}
+
+function scenarioOption(item) {
+  const scenario = typeof item === "string" ? { scenario_id: item } : object(item);
+  const id = scenario.scenario_id || scenario.id || scenario.name || "";
+  const label = scenario.label || scenario.title || id;
+  const description = scenario.description ? ` — ${scenario.description}` : "";
+  return `<option value="${esc(id)}">${esc(label + description)}</option>`;
+}
+
+async function loadScenarios() {
+  try {
+    const data = await api("/api/scenarios", { timeoutMs: 20000 });
+    const scenarios = Array.isArray(data) ? data : list(data.scenarios || data.items);
+    if (!scenarios.length) throw new Error("사용 가능한 시나리오가 없습니다.");
+    $("scenario").innerHTML = scenarios.map(scenarioOption).join("");
+    const preferred = scenarios.find(item => (typeof item === "string" ? item : item.scenario_id || item.id) === "low_evidence_needs_review");
+    if (preferred) $("scenario").value = "low_evidence_needs_review";
+  } catch (error) {
+    $("scenario").innerHTML = `<option value="">${esc(error.message)}</option>`;
+  }
+}
+
+function newRunId() {
+  const random = globalThis.crypto && crypto.randomUUID ? crypto.randomUUID().replaceAll("-", "") : `${Date.now()}${Math.random().toString(16).slice(2)}`;
+  $("run-id").value = `visual_run_${random.slice(0, 16)}`;
+}
+
+function setBusy(busy) {
+  $("run-loading").classList.toggle("on", busy);
+  $("run-review").disabled = busy;
+  $("load-run").disabled = busy;
+  $("new-run-id").disabled = busy;
+  $("scenario").disabled = busy;
+  $("review-as-of").disabled = busy;
+  $("trade-type").disabled = busy;
+  $("document-codes").disabled = busy;
+  $("store").disabled = busy;
+}
+
+function showRunError(error) {
+  $("run-error").textContent = error ? error.message || String(error) : "";
+  $("run-error").classList.toggle("on", Boolean(error));
+}
+
+function unpackResponse(data) {
+  const candidates = [data.snapshot, data.review, data.run, data.result && data.result.snapshot, data.data && data.data.snapshot, data];
+  const snapshot = candidates.find(candidate => candidate && typeof candidate === "object" && candidate.review_run_id && candidate.report) || null;
+  const meta = object(data.execution || data.meta || data);
+  return { snapshot, meta };
+}
+
+function classification(value, kind) {
+  const normalized = String(value || "").toLowerCase();
+  if (kind === "system") return normalized === "pass" ? "pass" : normalized === "warn" ? "warn" : "fail";
+  if (["ok", "complete", "completed", "ready", "true"].includes(normalized)) return "pass";
+  if (["partial", "unknown", "needs_review", "blocked", "false"].includes(normalized)) return "warn";
+  return "fail";
+}
+
+function metaValue(meta, paths, fallback = null) {
+  return healthValue(meta, paths, fallback);
+}
+
+function extractSnapshotIdFromHealth() {
+  return healthData ? healthValue(healthData, ["knowledge_snapshot_id", "evidence.knowledge_snapshot_id", "evidence.readiness.knowledge_snapshot_id", "evidence_service.knowledge_snapshot_id", "readiness.knowledge_snapshot_id", "ccct.knowledge_snapshot_id"]) : null;
+}
+
+function calculateIntegrity(snapshot) {
+  const evidence = list(snapshot.evidence);
+  const evidenceByKey = new Map(evidence.map(item => [`${item.item_id}\u001f${item.evidence_id}`, item]));
+  const broken = [];
+  for (const finding of list(snapshot.regulatory_findings)) {
+    for (const evidenceId of list(finding.evidence_ids)) {
+      if (!evidenceByKey.has(`${finding.item_id}\u001f${evidenceId}`)) broken.push(`${finding.item_id}/${evidenceId}`);
+    }
+  }
+  return { pass: broken.length === 0, broken };
+}
+
+function summaryBox(label, value, state, detail = "") {
+  return `<div class="summary-box ${esc(state)}"><span class="label">${esc(label)}</span><span class="value">${esc(text(value))}</span>${detail ? `<span class="small muted">${esc(detail)}</span>` : ""}</div>`;
+}
+
+function renderExecution(data) {
+  const unpacked = unpackResponse(data);
+  if (!unpacked.snapshot) throw new Error("API 응답에 ReviewRunSnapshot이 없습니다.");
+  currentResponse = data;
+  currentSnapshot = unpacked.snapshot;
+  currentMeta = unpacked.meta;
+  const snapshot = currentSnapshot;
+  const meta = currentMeta;
+  const integrity = calculateIntegrity(snapshot);
+  const stored = Boolean(metaValue(meta, ["stored"], false));
+  const reused = Boolean(metaValue(meta, ["reused"], false));
+  const persistenceVerified = metaValue(meta, ["persistence_verified", "persistence.verified", "hash_match"], stored ? null : false);
+  const beforeHash = metaValue(meta, ["hashes.before", "snapshot_hash_before_save", "hash_before", "persistence.hash_before"]);
+  const afterHash = metaValue(meta, ["hashes.after", "snapshot_hash_after_readback", "hash_after", "persistence.hash_after"]);
+  const hashMatches = persistenceVerified === true || (beforeHash && afterHash && beforeHash === afterHash);
+  const readinessSnapshot = extractSnapshotIdFromHealth();
+  const snapshotMatches = !readinessSnapshot || readinessSnapshot === snapshot.knowledge_snapshot_id;
+  const fatal = !integrity.pass || (stored && persistenceVerified === false) || !snapshotMatches;
+  const warning = snapshot.retrieval_status !== "ok" || snapshot.retrieval_coverage !== "complete" || (stored && !hashMatches);
+  const serviceSystemState = String(metaValue(meta, ["system_status"], "")).toUpperCase();
+  const systemState = fatal ? "FAIL" : ["PASS", "WARN", "FAIL"].includes(serviceSystemState) ? serviceSystemState : warning ? "WARN" : "PASS";
+
+  $("results").classList.add("on");
+  $("result-ids").innerHTML = `case <b>${esc(snapshot.case_id)}</b><br>run <b>${esc(snapshot.review_run_id)}</b>`;
+  $("summary-grid").innerHTML = [
+    summaryBox("System Execution", systemState, classification(systemState, "system"), fatal ? "참조·저장 무결성 오류" : warning ? "fail-closed 또는 저장 미검증" : "전체 경로 정상"),
+    summaryBox("RAG", `${text(snapshot.retrieval_status)} / ${text(snapshot.retrieval_coverage)}`, classification(snapshot.retrieval_status === "ok" && snapshot.retrieval_coverage === "complete" ? "ok" : "partial")),
+    summaryBox("Business Decision", snapshot.final_status, classification(snapshot.final_status), snapshot.requires_human_review ? "사람 검토 필요" : "자동 완료"),
+    summaryBox("Finding ↔ Evidence", integrity.pass ? "PASS" : "FAIL", integrity.pass ? "pass" : "fail", integrity.pass ? "모든 참조 해소" : `${integrity.broken.length}건 누락`),
+    summaryBox("Persistence", !stored ? "NOT STORED" : hashMatches ? "PASS" : "UNVERIFIED", !stored ? "warn" : hashMatches ? "pass" : "fail", reused ? "기존 run 재사용" : "신규 실행"),
+    summaryBox("Knowledge Snapshot", snapshot.knowledge_snapshot_id || "MISSING", snapshot.knowledge_snapshot_id && snapshotMatches ? "pass" : "fail", snapshotMatches ? "readiness와 일치" : "readiness와 불일치")
+  ].join("");
+  renderTimeline(snapshot);
+  renderDocuments(snapshot);
+  renderValidation(snapshot);
+  renderRag(snapshot);
+  renderFindings(snapshot, integrity);
+  renderReport(snapshot);
+  renderDatabase(snapshot, meta, { stored, reused, persistenceVerified, beforeHash, afterHash, hashMatches, snapshotMatches });
+  $("panel-raw").innerHTML = `<section class="card"><div class="card-head"><h3>API 전체 응답</h3><button class="ghost" id="copy-raw" type="button">JSON 복사</button></div><div class="card-body"><pre>${esc(pretty(data))}</pre></div></section>`;
+  $("copy-raw").addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(pretty(currentResponse)); $("copy-raw").textContent = "복사됨"; } catch (_) { $("copy-raw").textContent = "복사 실패"; }
+  });
+  $("results").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+const STAGES = [
+  "load_case", "classify_documents", "extract_documents", "normalize_documents", "pair_documents",
+  "validate_cross_documents", "retrieve_regulations", "compliance_review", "generate_xai_report", "route_to_human_or_complete"
+];
+
+function renderTimeline(snapshot) {
+  const events = list(snapshot.audit_events);
+  const byStage = new Map();
+  for (const event of events) byStage.set(event.stage, event);
+  $("timeline").innerHTML = STAGES.map((stage, index) => {
+    const event = byStage.get(stage);
+    const problem = event && /fail|error|partial|block/i.test(`${event.event || ""} ${event.message || ""}`);
+    const state = event ? (problem ? "problem" : "done") : "";
+    const message = event ? event.event || "done" : "not recorded";
+    const title = event ? `${event.message || ""}${event.timestamp ? ` · ${event.timestamp}` : ""}` : "audit event 없음";
+    return `<div class="step ${state}" title="${esc(title)}"><span class="step-dot">${event ? (problem ? "!" : "✓") : index + 1}</span><span class="step-name">${esc(stage)}</span><span class="step-msg">${esc(message)}</span></div>`;
+  }).join("");
+}
+
+function renderPairs(value) {
+  const entries = Object.entries(object(value));
+  if (!entries.length) return `<div class="empty">표시할 데이터가 없습니다.</div>`;
+  return entries.map(([key, val]) => `<div class="kv"><div class="key">${esc(key)}</div><div>${typeof val === "object" && val !== null ? `<pre>${esc(pretty(val))}</pre>` : esc(text(val))}</div></div>`).join("");
+}
+
+function renderDocuments(snapshot) {
+  const classified = object(snapshot.classified_documents);
+  const extracted = object(snapshot.extracted_documents);
+  const normalized = object(snapshot.normalized_documents);
+  const documents = list(snapshot.documents);
+  if (!documents.length) {
+    $("panel-documents").innerHTML = `<section class="card"><div class="empty">문서 snapshot이 없습니다.</div></section>`;
+    return;
+  }
+  const cards = documents.map(document => {
+    const id = document.document_id;
+    const cls = classified[id] || {};
+    const ext = extracted[id] || {};
+    const norm = normalized[id] || {};
+    const fieldSource = ext.fields || ext.extracted_fields || {};
+    const extractedFields = Array.isArray(fieldSource) ? fieldSource : Object.values(object(fieldSource));
+    const fieldRows = extractedFields.length ? extractedFields.map(field => `<tr><td>${esc(field.name || field.field_name)}</td><td>${esc(text(field.value))}</td><td>${esc(text(field.normalized_value))}</td><td>${esc(text(field.confidence))}</td><td>${esc(text(field.evidence && field.evidence.raw_text))}</td></tr>`).join("") : `<tr><td colspan="5" class="muted">필드 목록이 없어 JSON으로 표시합니다.</td></tr>`;
+    return `<article class="inner-card">
+      <div class="inner-head"><h3>${esc(document.filename || id)}</h3><div><span class="tag">${esc(id)}</span><span class="tag">${esc(cls.document_type || norm.document_type || document.declared_type || "unknown")}</span></div></div>
+      <div class="two-col">
+        <div><div class="small muted">Mock 원문</div><pre>${esc(document.content_text || "")}</pre></div>
+        <div><div class="small muted">분류 · 정규화 요약</div>${renderPairs({ classification: cls, document_type: norm.document_type, line_items: norm.line_items })}</div>
+      </div>
+      <div class="table-wrap" style="margin-top:9px"><table><thead><tr><th>Field</th><th>Value</th><th>Normalized</th><th>Confidence</th><th>Field Evidence</th></tr></thead><tbody>${fieldRows}</tbody></table></div>
+      <details style="margin-top:8px"><summary class="small muted">추출·정규화 Raw JSON</summary><div class="two-col"><pre>${esc(pretty(ext))}</pre><pre>${esc(pretty(norm))}</pre></div></details>
+    </article>`;
+  }).join("");
+  $("panel-documents").innerHTML = `<div class="notice">bbox와 field evidence는 현재 실제 PDF OCR 좌표가 아니라 Mock fixture에서 생성된 값입니다.</div><div class="stack">${cards}</div>`;
+}
+
+function renderValidation(snapshot) {
+  const issues = list(snapshot.validation_issues);
+  const rows = issues.map(issue => `<tr><td><span class="badge ${classification(issue.severity === "critical" || issue.severity === "high" ? "failed" : "partial")}">${esc(issue.severity)}</span></td><td><b>${esc(issue.issue_code)}</b><br>${esc(issue.message)}</td><td>${esc(text(issue.expected_value))}</td><td>${esc(text(issue.observed_value))}</td><td>${esc(text(issue.source_document_id))} → ${esc(text(issue.target_document_id))}</td><td>${issue.needs_regulatory_review ? "YES" : "NO"}</td></tr>`).join("");
+  $("panel-validation").innerHTML = `<div class="two-col">
+    <section class="card"><div class="card-head"><h3>Cross-document Validation Issues (${issues.length})</h3></div><div class="card-body">${issues.length ? `<div class="table-wrap"><table><thead><tr><th>Severity</th><th>Issue</th><th>Expected</th><th>Observed</th><th>Documents</th><th>Review</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<div class="empty">검출된 validation issue가 없습니다.</div>`}</div></section>
+    <section class="card"><div class="card-head"><h3>Document Pairing</h3></div><div class="card-body">${renderPairs(snapshot.pairing_result)}</div></section>
+  </div>`;
+}
+
+function sourceLink(uri) {
+  if (!uri) return "—";
+  try {
+    const parsed = new URL(uri, location.href);
+    if (!["http:", "https:"].includes(parsed.protocol)) return esc(uri);
+    return `<a class="source" href="${esc(parsed.href)}" target="_blank" rel="noopener noreferrer">${esc(uri)} ↗</a>`;
+  } catch (_) { return esc(uri); }
+}
+
+function evidenceCard(evidence) {
+  const eligibility = evidence.eligibility || "supporting";
+  const klass = ["finding", "supporting", "blocked"].includes(eligibility) ? eligibility : "supporting";
+  const methods = list(evidence.retrieval_methods).map(method => `<span class="tag">${esc(method)}</span>`).join("");
+  const agencies = list(evidence.agencies).map(agency => `<span class="tag">${esc(agency)}</span>`).join("");
+  return `<article class="inner-card evidence-card ${klass}">
+    <div class="inner-head"><h4>${esc(evidence.title || evidence.law_name || evidence.source_type)}</h4><div><span class="tag ${klass}">${esc(eligibility)}</span><span class="tag">${esc(evidence.source_type)}</span></div></div>
+    <div class="evidence-text">${esc(evidence.text || "")}</div>
+    ${evidence.required_document_name ? `<div class="notice" style="margin:7px 0"><b>필요 서류:</b> ${esc(evidence.required_document_name)} <span class="muted">(${esc(evidence.required_document_code)})</span><br><b>승인 기관:</b> ${agencies || "—"}</div>` : ""}
+    <div class="kv"><div class="key">item / matched HS</div><div>${esc(text(evidence.item_id))} / ${esc(text(evidence.matched_hs_code))}</div></div>
+    <div class="kv"><div class="key">법령 · 조문</div><div>${esc(text(evidence.law_name))} ${esc(text(evidence.article_no))}</div></div>
+    <div class="kv"><div class="key">검색 · score</div><div>${methods || "—"} ${esc(text(evidence.score))} ${Object.keys(object(evidence.raw_scores)).length ? `<span class="muted">raw ${esc(pretty(evidence.raw_scores))}</span>` : ""}</div></div>
+    <div class="kv"><div class="key">적용 기간</div><div>${esc(text(evidence.valid_from))} ~ ${esc(text(evidence.valid_to || "현재"))}</div></div>
+    <div class="kv"><div class="key">Evidence ID</div><div>${esc(text(evidence.evidence_id))}</div></div>
+    <div class="kv"><div class="key">Source Record</div><div>${esc(text(evidence.source_record_id))}</div></div>
+    <div class="kv"><div class="key">Version Hash</div><div>${esc(text(evidence.version_hash))}</div></div>
+    <div class="kv"><div class="key">Source URI</div><div>${sourceLink(evidence.source_uri)}</div></div>
+  </article>`;
+}
+
+function renderRag(snapshot) {
+  const results = list(snapshot.retrieval_results);
+  const errors = [...list(snapshot.retrieval_errors), ...results.flatMap(result => list(result.errors))];
+  const resultCards = results.map(result => `<article class="inner-card">
+    <div class="inner-head"><h3>Item ${esc(result.item_id)}</h3><div><span class="badge ${classification(result.coverage)}">${esc(result.hs_resolution)}</span><span class="badge ${classification(result.coverage)}">coverage ${esc(result.coverage)}</span></div></div>
+    <div class="count-grid">
+      <div class="count-box"><span class="label">입력 HS</span><span class="value">${esc(text((list(snapshot.items).find(item => item.item_id === result.item_id) || {}).hs_code))}</span></div>
+      <div class="count-box"><span class="label">확정 HSK10</span><span class="value">${esc(text(result.resolved_hsk10))}</span></div>
+      <div class="count-box"><span class="label">후보 HSK10</span><span class="value">${esc(list(result.candidate_hsk10s).join(", ") || "—")}</span></div>
+      <div class="count-box"><span class="label">공식 요건</span><span class="value">${result.requirements_found ? "FOUND" : result.coverage === "complete" ? "NOT FOUND" : "UNKNOWN"}</span></div>
+      <div class="count-box"><span class="label">Evidence</span><span class="value">${list(result.evidence).length || list(snapshot.evidence).filter(item => item.item_id === result.item_id).length}</span></div>
+    </div>
+  </article>`).join("");
+  const evidence = list(snapshot.evidence);
+  const findingEvidence = evidence.filter(item => item.eligibility === "finding");
+  const supportingEvidence = evidence.filter(item => item.eligibility === "supporting");
+  const blockedEvidence = evidence.filter(item => item.eligibility === "blocked");
+  const errorHtml = errors.length ? `<section class="card"><div class="card-head"><h3>Retrieval Errors (${errors.length})</h3></div><div class="card-body">${errors.map(error => `<div class="notice" style="border-color:#efbbc0;background:var(--fail-soft);color:#8d2027"><b>${esc(error.code || "RETRIEVAL_ERROR")}</b> · ${esc(error.message || pretty(error))} · retryable=${esc(text(error.retryable))}</div>`).join("")}</div></section>` : "";
+  $("panel-rag").innerHTML = `<div class="stack">
+    <section class="card"><div class="card-head"><h3>Retrieval 요약</h3><span class="badge ${classification(snapshot.retrieval_status)}">${esc(text(snapshot.retrieval_status))} / ${esc(text(snapshot.retrieval_coverage))}</span></div><div class="card-body"><div class="stack">${resultCards || `<div class="empty">retrieval result가 없습니다.</div>`}</div><details style="margin-top:9px"><summary class="small muted">실제 Retrieval Request</summary><pre>${esc(pretty(snapshot.retrieval_request))}</pre></details></div></section>
+    ${errorHtml}
+    <section class="card"><div class="card-head"><h3>Finding-eligible CCCT Evidence (${findingEvidence.length})</h3><span class="small muted">이 유형만 요건 Finding 생성 가능</span></div><div class="card-body"><div class="stack">${findingEvidence.map(evidenceCard).join("") || `<div class="empty">해당 Evidence가 없습니다.</div>`}</div></div></section>
+    <section class="card"><div class="card-head"><h3>Supporting Law Evidence (${supportingEvidence.length})</h3><span class="small muted">단독으로 의무 Finding 생성 금지</span></div><div class="card-body"><div class="stack">${supportingEvidence.map(evidenceCard).join("") || `<div class="empty">해당 Evidence가 없습니다.</div>`}</div></div></section>
+    ${blockedEvidence.length ? `<section class="card"><div class="card-head"><h3>Blocked Evidence (${blockedEvidence.length})</h3></div><div class="card-body"><div class="stack">${blockedEvidence.map(evidenceCard).join("")}</div></div></section>` : ""}
+  </div>`;
+}
+
+function renderFindings(snapshot, integrity) {
+  const evidenceByKey = new Map(list(snapshot.evidence).map(item => [`${item.item_id}\u001f${item.evidence_id}`, item]));
+  const findings = list(snapshot.regulatory_findings);
+  const cards = findings.map((finding, index) => {
+    const traces = list(finding.evidence_ids).map(evidenceId => {
+      const evidence = evidenceByKey.get(`${finding.item_id}\u001f${evidenceId}`);
+      if (!evidence) return `<div class="notice" style="border-color:#efbbc0;background:var(--fail-soft);color:#8d2027"><b>FAIL</b> · ${esc(finding.item_id)}/${esc(evidenceId)} Evidence 참조를 같은 run·item에서 해소할 수 없습니다.</div>`;
+      return `<div class="trace">
+        <div class="trace-node"><span class="key">Finding</span><span class="value">${esc(finding.finding_code)}</span></div><span class="trace-arrow">→</span>
+        <div class="trace-node"><span class="key">Item ID</span><span class="value">${esc(finding.item_id)}</span></div><span class="trace-arrow">→</span>
+        <div class="trace-node"><span class="key">Evidence ID</span><span class="value">${esc(evidence.evidence_id)}</span></div><span class="trace-arrow">→</span>
+        <div class="trace-node"><span class="key">Source Record</span><span class="value">${esc(evidence.source_record_id)}</span></div><span class="trace-arrow">→</span>
+        <div class="trace-node"><span class="key">Version Hash</span><span class="value">${esc(evidence.version_hash)}</span></div><span class="trace-arrow">→</span>
+        <div class="trace-node"><span class="key">Source URI</span><span class="value">${sourceLink(evidence.source_uri)}</span></div>
+      </div>`;
+    }).join("");
+    return `<article class="inner-card">
+      <div class="inner-head"><h3>${index + 1}. ${esc(finding.finding_code)}</h3><div><span class="badge ${classification(finding.severity === "high" || finding.severity === "critical" ? "failed" : "partial")}">${esc(finding.severity)}</span></div></div>
+      <p>${esc(finding.message)}</p>
+      <div class="kv"><div class="key">필요 서류</div><div>${esc(text(finding.required_document_name))} (${esc(text(finding.required_document_code))})</div></div>
+      <div class="kv"><div class="key">정책 신뢰값</div><div>${esc(text(finding.confidence))} · 기준 ${esc(text(finding.confidence_basis))} <span class="muted">(확률이 아님)</span></div></div>
+      ${traces}
+    </article>`;
+  }).join("");
+  $("panel-findings").innerHTML = `<section class="card">
+    <div class="card-head"><h3>Finding ↔ Evidence Integrity</h3><span class="badge ${integrity.pass ? "pass" : "fail"}">${integrity.pass ? "PASS" : "FAIL"}</span></div>
+    <div class="card-body"><div class="notice" style="margin-bottom:10px">Finding이 참조한 모든 Evidence ID를 <b>같은 run의 같은 item</b>에서 해소해야 PASS입니다.</div><div class="stack">${cards || `<div class="empty">Regulatory finding이 없습니다. RAG가 complete인지 별도로 확인하세요.</div>`}</div></div>
+  </section>`;
+}
+
+function renderReport(snapshot) {
+  const report = object(snapshot.report);
+  const summary = object(report.summary);
+  $("panel-report").innerHTML = `<div class="two-col">
+    <section class="card"><div class="card-head"><h3>XAI Report</h3><span class="badge ${classification(report.overall_status)}">${esc(text(report.overall_status))}</span></div><div class="card-body">
+      <div class="count-grid">
+        <div class="count-box"><span class="label">Overall Status</span><span class="value">${esc(text(report.overall_status))}</span></div>
+        <div class="count-box"><span class="label">Issues</span><span class="value">${list(report.issues).length}</span></div>
+        <div class="count-box"><span class="label">Findings</span><span class="value">${list(report.regulatory_findings).length}</span></div>
+        <div class="count-box"><span class="label">Evidence</span><span class="value">${list(report.rag_evidence).length}</span></div>
+        <div class="count-box"><span class="label">Human Review</span><span class="value">${snapshot.requires_human_review ? "YES" : "NO"}</span></div>
+      </div>
+      <h4 style="margin:14px 0 5px">요약</h4>${renderPairs(summary)}
+      <div class="notice" style="margin:12px 0 0">${esc(report.disclaimer || "This result is a pre-clearance review aid. Final legal decisions must be made by a responsible human reviewer.")}</div>
+    </div></section>
+    <section class="card"><div class="card-head"><h3>Report Raw JSON</h3></div><div class="card-body"><pre>${esc(pretty(report))}</pre></div></section>
+  </div>`;
+}
+
+function inferredCounts(snapshot) {
+  const extractedFieldCount = Object.values(object(snapshot.extracted_documents)).reduce((total, doc) => {
+    const fields = doc.fields || doc.extracted_fields || {};
+    return total + (Array.isArray(fields) ? fields.length : Object.keys(object(fields)).length);
+  }, 0);
+  return {
+    documents: list(snapshot.documents).length,
+    extracted_fields: extractedFieldCount,
+    items: list(snapshot.items).length,
+    evidence: list(snapshot.evidence).length,
+    findings: list(snapshot.regulatory_findings).length,
+    finding_evidence_links: list(snapshot.regulatory_findings).reduce((total, finding) => total + list(finding.evidence_ids).length, 0),
+    audit_events: list(snapshot.audit_events).length
+  };
+}
+
+function renderDatabase(snapshot, meta, status) {
+  const counts = { ...inferredCounts(snapshot), ...object(meta.counts) };
+  const countBoxes = Object.entries(counts).map(([name, value]) => `<div class="count-box"><span class="label">${esc(human(name))}</span><span class="value">${esc(text(value))}</span></div>`).join("");
+  $("panel-database").innerHTML = `<div class="stack">
+    <section class="card"><div class="card-head"><h3>Operational DB Readback 검증</h3><span class="badge ${status.stored && status.hashMatches ? "pass" : "warn"}">${status.stored && status.hashMatches ? "PERSISTENCE PASS" : status.stored ? "UNVERIFIED" : "NOT STORED"}</span></div><div class="card-body">
+      <div class="count-grid">
+        <div class="count-box"><span class="label">Stored</span><span class="value">${status.stored ? "true" : "false"}</span></div>
+        <div class="count-box"><span class="label">Reused</span><span class="value">${status.reused ? "true" : "false"}</span></div>
+        <div class="count-box"><span class="label">Readback Verified</span><span class="value">${status.persistenceVerified === true ? "true" : status.persistenceVerified === false ? "false" : "unknown"}</span></div>
+        <div class="count-box"><span class="label">Hash Match</span><span class="value">${status.hashMatches ? "PASS" : "NOT VERIFIED"}</span></div>
+        <div class="count-box"><span class="label">Snapshot Match</span><span class="value">${status.snapshotMatches ? "PASS" : "FAIL"}</span></div>
+      </div>
+      <div class="kv" style="margin-top:10px"><div class="key">저장 전 canonical hash</div><div>${esc(text(status.beforeHash))}</div></div>
+      <div class="kv"><div class="key">DB readback hash</div><div>${esc(text(status.afterHash))}</div></div>
+      <div class="kv"><div class="key">Knowledge snapshot</div><div>${esc(text(snapshot.knowledge_snapshot_id))}</div></div>
+      <div class="notice" style="margin:11px 0 0">stored=true만으로는 PASS가 아닙니다. 저장 전 snapshot을 DB에서 다시 읽은 결과와 canonical hash로 비교해야 합니다.</div>
+    </div></section>
+    <section class="card"><div class="card-head"><h3>저장 레코드 수</h3></div><div class="card-body"><div class="count-grid">${countBoxes}</div></div></section>
+  </div>`;
+}
+
+async function submitReview(event) {
+  event.preventDefault();
+  showRunError(null);
+  const codes = $("document-codes").value.split(",").map(code => code.trim()).filter(Boolean);
+  const body = {
+    scenario_id: $("scenario").value,
+    review_run_id: $("run-id").value.trim(),
+    review_as_of: $("review-as-of").value,
+    trade_type: $("trade-type").value,
+    submitted_document_codes: [...new Set(codes)],
+    store: $("store").checked,
+    rag_url: $("rag-url").value.trim()
+  };
+  if (!body.scenario_id || !body.review_run_id || !body.review_as_of) {
+    showRunError(new Error("시나리오, 기준일, run ID를 모두 입력하세요."));
+    return;
+  }
+  setBusy(true);
+  try {
+    const data = await api("/api/reviews", { method: "POST", body, timeoutMs: 300000 });
+    renderExecution(data);
+  } catch (error) {
+    showRunError(error);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function loadRun() {
+  showRunError(null);
+  const runId = $("run-id").value.trim();
+  if (!runId) { showRunError(new Error("조회할 review run ID를 입력하세요.")); return; }
+  setBusy(true);
+  try {
+    const data = await api(`/api/reviews/${encodeURIComponent(runId)}`, { timeoutMs: 30000 });
+    renderExecution(data);
+  } catch (error) {
+    showRunError(error);
+  } finally {
+    setBusy(false);
+  }
+}
+
+document.querySelectorAll(".tab").forEach(button => button.addEventListener("click", () => {
+  document.querySelectorAll(".tab").forEach(tab => tab.classList.toggle("on", tab === button));
+  document.querySelectorAll(".panel").forEach(panel => panel.classList.toggle("on", panel.id === `panel-${button.dataset.panel}`));
+}));
+$("review-form").addEventListener("submit", submitReview);
+$("new-run-id").addEventListener("click", newRunId);
+$("load-run").addEventListener("click", loadRun);
+$("refresh-health").addEventListener("click", loadHealth);
+
+newRunId();
+Promise.allSettled([loadHealth(), loadScenarios()]);
+</script>
+</body>
+</html>
