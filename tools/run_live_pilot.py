@@ -8,15 +8,53 @@ import os
 import sys
 import uuid
 from datetime import UTC, datetime
+from ipaddress import ip_address
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import urlopen
-
-from integration.review_service import ReviewCommand, execute_review
-
 
 DEFAULT_EVIDENCE_URL = "http://127.0.0.1:8010"
 DEFAULT_REVIEW_AS_OF = "2026-07-10"
 DEFAULT_OPS_DSN = "postgresql://trade:change_me@127.0.0.1:5432/trade_doc"
+ALLOWED_INCOMPLETE_REASONS = ("law corpus incomplete", "law index incomplete")
+
+
+def validate_loopback_base_url(value: str) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme != "http" or not parsed.hostname:
+        raise ValueError("Evidence URL must be an HTTP loopback URL")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("Evidence URL must not contain credentials, query, or fragment")
+    if parsed.path not in {"", "/"}:
+        raise ValueError("Evidence URL must not contain an application path")
+    try:
+        loopback = ip_address(parsed.hostname).is_loopback
+    except ValueError:
+        loopback = parsed.hostname.lower() == "localhost"
+    if not loopback:
+        raise ValueError("Evidence URL must resolve syntactically to loopback")
+    return value.rstrip("/")
+
+
+def readiness_is_complete(payload: dict) -> bool:
+    corpus = payload.get("law_corpus")
+    index = payload.get("law_index")
+    return bool(
+        payload.get("status") == "ready"
+        and payload.get("knowledge_snapshot_id")
+        and payload.get("supported_review_as_of")
+        and isinstance(corpus, dict)
+        and corpus.get("expected")
+        and corpus.get("expected") == corpus.get("loaded")
+        and isinstance(index, dict)
+        and index.get("expected")
+        and index.get("expected") == index.get("postgres_indexed") == index.get("qdrant")
+    )
+
+
+def is_allowed_incomplete_readiness(code: int, payload: dict) -> bool:
+    detail = str(payload.get("detail") or "").lower()
+    return code == 503 and any(reason in detail for reason in ALLOWED_INCOMPLETE_REASONS)
 
 
 def health(base_url: str, kind: str) -> tuple[int, dict]:
@@ -55,6 +93,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    try:
+        args.rag_url = validate_loopback_base_url(args.rag_url)
+    except ValueError as exc:
+        print(json.dumps({"status": "FAIL", "reason": str(exc)}, ensure_ascii=False))
+        return 4
+
     live_code, live = health(args.rag_url, "live")
     ready_code, ready = health(args.rag_url, "ready")
     report = {
@@ -65,15 +109,23 @@ def main(argv: list[str] | None = None) -> int:
         "ready": ready,
         "mode": "TARGETED_DIAGNOSTIC" if args.allow_incomplete_corpus else "RELEASE_GATE",
     }
-    if live_code != 200:
+    if live_code != 200 or live.get("status") != "alive":
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
         return 2
-    if ready_code != 200 and not args.allow_incomplete_corpus:
+    ready_complete = ready_code == 200 and readiness_is_complete(ready)
+    diagnostic_incomplete = args.allow_incomplete_corpus and is_allowed_incomplete_readiness(
+        ready_code, ready
+    )
+    if not ready_complete and not diagnostic_incomplete:
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
         return 3
     if args.preflight_only:
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
         return 0
+
+    # Delay the Agent distribution guard until after dependency readiness is
+    # established, so preflight can diagnose Data without an Agent install.
+    from integration.review_service import ReviewCommand, execute_review
 
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     run_id = f"pilot-{stamp}-{uuid.uuid4().hex[:8]}"
