@@ -39,13 +39,17 @@ uv run python packages/operational_db/scripts/migrate.py --dsn $env:POSTGRES_DSN
 AI Agent는 형제 폴더가 아닌 exact-commit wheel로 설치한다. 이 저장소의
 고정 계약은 `customs-ai-agent==0.1.0`이며, 다른 버전은 실행 전에
 거부된다. 현재 기준 artifact는 Agent commit
-`3cff42f2da4c7debce0c51fea4e05f3eb62b48f6`, wheel SHA-256
-`f81d3376962b3c9551aea59748af8b6f3352f4f3784bfef735bc5431589a63ea`다.
+`587c675a2111d84b8c8349dca08a9beebbe96a57`, wheel SHA-256
+`50ce90395b98cad2102954fa963f3f1a364848595ff3b042aa8722b8d30186ba`다.
 
 ```powershell
 uv sync --locked --group dev --extra unit --extra system --python 3.11
-uv run --no-sync python tools/install_pinned_agent.py ..\_artifacts\packages\customs_ai_agent-0.1.0-py3-none-any.whl --verify-only
-uv run --no-sync python tools/install_pinned_agent.py ..\_artifacts\packages\customs_ai_agent-0.1.0-py3-none-any.whl
+$AgentWheel = $env:CUSTOMS_AI_AGENT_WHEEL
+if ([string]::IsNullOrWhiteSpace($AgentWheel)) {
+    throw "CUSTOMS_AI_AGENT_WHEEL must point to the pinned Agent wheel"
+}
+uv run --no-sync python tools/install_pinned_agent.py "$AgentWheel" --verify-only
+uv run --no-sync python tools/install_pinned_agent.py "$AgentWheel"
 uv run --no-sync pytest tests/system
 uv sync --check --locked --inexact --group dev --extra unit --extra system
 ```

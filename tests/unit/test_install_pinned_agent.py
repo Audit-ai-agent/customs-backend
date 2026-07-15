@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import tomllib
 import zipfile
 from pathlib import Path
@@ -81,6 +82,24 @@ def test_uv_environment_fallback(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(installer.shutil, "which", lambda _: None)
     monkeypatch.setenv("UV", str(executable))
     assert installer.resolve_uv() == str(executable)
+
+
+def test_main_verify_only_accepts_external_wheel_path(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    external_store = tmp_path / "external artifact store"
+    external_store.mkdir()
+    wheel = make_wheel(external_store)
+    contract = config_for(wheel, source_commit="a" * 40)
+    contract_path = tmp_path / "agent_contract.json"
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+    monkeypatch.setattr(installer, "CONTRACT_PATH", contract_path)
+    monkeypatch.setattr(
+        sys, "argv", ["install_pinned_agent.py", str(wheel), "--verify-only"]
+    )
+
+    assert installer.main() == 0
+    assert "verified AI Agent wheel" in capsys.readouterr().out
 
 
 def test_agent_contract_is_single_runtime_source_and_matches_system_extra() -> None:

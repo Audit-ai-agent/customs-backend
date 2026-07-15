@@ -23,7 +23,11 @@ wheel을 hash 검증 후 `--no-deps` 방식으로 설치한다. 테스트 후 lo
 
 ```powershell
 uv sync --locked --group dev --extra unit --extra system --python 3.11
-uv run --no-sync python tools/install_pinned_agent.py ..\_artifacts\packages\customs_ai_agent-0.1.0-py3-none-any.whl
+$AgentWheel = $env:CUSTOMS_AI_AGENT_WHEEL
+if ([string]::IsNullOrWhiteSpace($AgentWheel)) {
+    throw "CUSTOMS_AI_AGENT_WHEEL must point to the pinned Agent wheel"
+}
+uv run --no-sync python tools/install_pinned_agent.py "$AgentWheel"
 uv run --no-sync pytest tests/system
 uv sync --check --locked --inexact --group dev --extra unit --extra system
 ```
