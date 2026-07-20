@@ -7,7 +7,7 @@ from customs_ai_agent.schemas.models import (
     EvidenceRetrievalResponse,
     RetrievalItemResult,
 )
-from integration.agent_webapp import create_app
+from integration.agent_webapp import _readiness_fetcher, create_app
 from integration.review_service import ReadinessError, execute_review
 from operational_db import InMemoryOperationalRepository
 
@@ -102,7 +102,17 @@ def test_health_is_degraded_without_hiding_dependency_failure(web_context):
     assert response.status_code == 200
     assert response.json()["status"] == "degraded"
     assert response.json()["evidence"]["status"] == "failed"
-    assert "unavailable" in response.json()["evidence"]["error"]
+    assert response.json()["evidence"]["error"] == (
+        "Evidence Service readiness check failed"
+    )
+
+
+def test_bound_readiness_fetcher_repr_never_exposes_token() -> None:
+    token = "redaction-test-marker"
+
+    fetcher = _readiness_fetcher(token)
+
+    assert token not in repr(fetcher)
 
 
 def test_scenarios_endpoint_exposes_real_agent_fixtures(web_context):
@@ -155,6 +165,7 @@ def test_create_review_returns_full_snapshot_and_persistence_proof(web_context):
     assert payload["counts"]["documents"] == 4
     assert payload["counts"]["audit_events"] >= 10
     assert payload["system_status"] == "PASS"
+    assert payload["snapshot"]["request"]["llm_mode"] == "mock"
     assert repository.get_run("visual-api-run-1") is not None
 
 
@@ -202,7 +213,7 @@ def test_post_is_idempotent_and_rejects_same_run_with_different_request(web_cont
     assert reused.json()["reused"] is True
     assert reused.json()["hashes"] == first.json()["hashes"]
     assert conflict.status_code == 409
-    assert "different request" in conflict.json()["detail"]
+    assert conflict.json()["detail"] == "Review conflict or invalid state"
 
 
 def test_create_review_can_run_without_claiming_database_persistence(web_context):
@@ -230,7 +241,7 @@ def test_create_review_can_run_without_claiming_database_persistence(web_context
     [
         (KeyError("unknown scenario"), 400),
         (ValueError("different request"), 409),
-        (ReadinessError("not ready"), 503),
+        (ReadinessError("INTERNAL_READINESS_SENTINEL"), 503),
         (RuntimeError("unexpected"), 500),
     ],
 )
@@ -254,7 +265,14 @@ def test_create_review_maps_domain_and_dependency_errors(
     )
 
     assert response.status_code == expected_status
-    assert response.json()["detail"]
+    expected_detail = {
+        400: "Unknown Agent scenario",
+        409: "Review conflict or invalid state",
+        503: "Evidence Service is not ready",
+        500: "Review execution failed",
+    }[expected_status]
+    assert response.json()["detail"] == expected_detail
+    assert str(error) not in response.text
 
 
 def test_request_validation_and_missing_readback_have_explicit_http_statuses(web_context):

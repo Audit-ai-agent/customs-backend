@@ -2,8 +2,8 @@
   "schema_version": "1.0",
   "distribution": "customs-ai-agent",
   "version": "0.1.0",
-  "source_commit": "587c675a2111d84b8c8349dca08a9beebbe96a57",
-  "wheel_sha256": "50ce90395b98cad2102954fa963f3f1a364848595ff3b042aa8722b8d30186ba",
+  "source_commit": "1bd9f6d493d4eb60a0d602e5ba0230f704e94e2a",
+  "wheel_sha256": "88a485cde9e1b26a85a4856b7af6aa89b74620187ff59fb4e3b9c1fc360cdf0a",
   "provider_uv_lock_sha256": "3ede9a56881781f4606f86ca2859e4a0ff78a2f9cc0f7d80d035891fa0887c1f",
   "evidence_api": "v1",
   "runtime_direct": {

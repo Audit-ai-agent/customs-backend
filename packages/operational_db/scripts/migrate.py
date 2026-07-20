@@ -46,7 +46,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--dsn",
-        default="postgresql://trade:change_me@localhost:5432/trade_doc",
+        default="postgresql://trade:change_me@localhost:55432/trade_doc",
     )
     args = parser.parse_args()
     migrate(args.dsn)

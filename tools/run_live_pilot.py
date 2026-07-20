@@ -10,12 +10,11 @@ import uuid
 from datetime import UTC, datetime
 from ipaddress import ip_address
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
-from urllib.request import urlopen
+from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
 
 DEFAULT_EVIDENCE_URL = "http://127.0.0.1:8010"
-DEFAULT_REVIEW_AS_OF = "2026-07-10"
-DEFAULT_OPS_DSN = "postgresql://trade:change_me@127.0.0.1:5432/trade_doc"
+DEFAULT_OPS_HOST_PORT = 55432
 ALLOWED_INCOMPLETE_REASONS = ("law corpus incomplete", "law index incomplete")
 
 
@@ -57,33 +56,113 @@ def is_allowed_incomplete_readiness(code: int, payload: dict) -> bool:
     return code == 503 and any(reason in detail for reason in ALLOWED_INCOMPLETE_REASONS)
 
 
-def health(base_url: str, kind: str) -> tuple[int, dict]:
+def health(
+    base_url: str,
+    kind: str,
+    *,
+    service_token: str | None = None,
+) -> tuple[int, dict]:
     url = f"{base_url.rstrip('/')}/internal/rag/v1/health/{kind}"
+    headers = {"Accept": "application/json"}
+    if service_token:
+        headers["X-Demo-Token"] = service_token
+    request = Request(url, headers=headers, method="GET")
     try:
-        with urlopen(url, timeout=10) as response:
-            return response.status, json.loads(response.read())
+        with urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read())
+            if not isinstance(payload, dict):
+                return 0, {"detail": "Evidence health returned a non-object response"}
+            if service_token and service_token in json.dumps(payload, ensure_ascii=False):
+                return 0, {"detail": "Evidence health response rejected"}
+            return response.status, payload
     except HTTPError as exc:
         body = exc.read()
         try:
             parsed = json.loads(body)
         except (UnicodeDecodeError, json.JSONDecodeError):
-            parsed = {"detail": "non-JSON health response"}
-        return exc.code, parsed
+            parsed = {}
+        detail = str(parsed.get("detail") or "").casefold()
+        classified = next(
+            (reason for reason in ALLOWED_INCOMPLETE_REASONS if reason in detail),
+            None,
+        )
+        return exc.code, {
+            "detail": classified or f"Evidence health HTTP {exc.code}"
+        }
     except (URLError, TimeoutError) as exc:
         return 0, {"detail": f"Evidence Service unavailable: {type(exc).__name__}"}
 
 
-def main(argv: list[str] | None = None) -> int:
+def host_port(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("port must be an integer") from exc
+    if not 1 <= parsed <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return parsed
+
+
+def local_ops_dsn(host_port_value: int) -> str:
+    """Build a local-only DSN from the same env names used by Data compose."""
+
+    user = quote(os.environ.get("POSTGRES_USER", "trade"), safe="")
+    encoded_passphrase = quote(os.environ.get("POSTGRES_PASSWORD", "change_me"), safe="")
+    database = quote(os.environ.get("POSTGRES_DB", "trade_doc"), safe="")
+    return (
+        f"postgresql://{user}:{encoded_passphrase}"
+        f"@127.0.0.1:{host_port_value}/{database}"
+    )
+
+
+def resolve_review_as_of(configured: str | None, readiness: dict) -> str:
+    value = configured or readiness.get("supported_review_as_of")
+    if not value:
+        raise ValueError(
+            "review_as_of is required when Evidence readiness does not publish "
+            "supported_review_as_of"
+        )
+    return str(value)
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--rag-url", default=os.environ.get("CUSTOMS_EVIDENCE_URL", DEFAULT_EVIDENCE_URL)
+        "--rag-url",
+        default=os.environ.get(
+            "EVIDENCE_SERVICE_BASE_URL",
+            os.environ.get("CUSTOMS_EVIDENCE_URL", DEFAULT_EVIDENCE_URL),
+        ),
     )
     parser.add_argument(
         "--review-as-of",
-        default=os.environ.get("CUSTOMS_REVIEW_AS_OF", DEFAULT_REVIEW_AS_OF),
+        default=os.environ.get("CUSTOMS_REVIEW_AS_OF"),
+        help=(
+            "Review date (YYYY-MM-DD). If omitted, a release run uses the exact "
+            "supported_review_as_of returned by Evidence readiness."
+        ),
     )
     parser.add_argument(
-        "--ops-dsn", default=os.environ.get("CUSTOMS_OPS_DSN", DEFAULT_OPS_DSN)
+        "--ops-dsn",
+        default=os.environ.get("CUSTOMS_OPS_DSN"),
+        help=(
+            "Operational PostgreSQL DSN. Prefer CUSTOMS_OPS_DSN because a CLI "
+            "value can be exposed by the operating-system process list."
+        ),
+    )
+    parser.add_argument(
+        "--ops-host-port",
+        type=host_port,
+        default=host_port(
+            os.environ.get(
+                "CUSTOMS_OPS_HOST_PORT",
+                os.environ.get("POSTGRES_PORT", str(DEFAULT_OPS_HOST_PORT)),
+            )
+        ),
+        help=(
+            "Host port for the generated local Operational PostgreSQL DSN when "
+            "--ops-dsn/CUSTOMS_OPS_DSN is absent (for example 55432)."
+        ),
     )
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument(
@@ -91,7 +170,14 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Targeted diagnostic only: continue when global Data readiness is 503.",
     )
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    ops_dsn_source = "configured_dsn" if args.ops_dsn else "generated_local_dsn"
+    args.ops_dsn = args.ops_dsn or local_ops_dsn(args.ops_host_port)
+    service_token = os.environ.get("EVIDENCE_SERVICE_TOKEN") or None
 
     try:
         args.rag_url = validate_loopback_base_url(args.rag_url)
@@ -99,14 +185,20 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"status": "FAIL", "reason": str(exc)}, ensure_ascii=False))
         return 4
 
-    live_code, live = health(args.rag_url, "live")
-    ready_code, ready = health(args.rag_url, "ready")
+    live_code, live = health(args.rag_url, "live", service_token=service_token)
+    ready_code, ready = health(args.rag_url, "ready", service_token=service_token)
     report = {
         "evidence_url": args.rag_url,
+        "evidence_auth_configured": service_token is not None,
         "live_http": live_code,
         "ready_http": ready_code,
         "live": live,
         "ready": ready,
+        "llm_mode": "mock",
+        "ops_dsn_source": ops_dsn_source,
+        "ops_host_port": (
+            args.ops_host_port if ops_dsn_source == "generated_local_dsn" else None
+        ),
         "mode": "TARGETED_DIAGNOSTIC" if args.allow_incomplete_corpus else "RELEASE_GATE",
     }
     if live_code != 200 or live.get("status") != "alive":
@@ -123,6 +215,13 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
         return 0
 
+    try:
+        review_as_of = resolve_review_as_of(args.review_as_of, ready)
+    except ValueError as exc:
+        report["configuration_error"] = str(exc)
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+        return 4
+
     # Delay the Agent distribution guard until after dependency readiness is
     # established, so preflight can diagnose Data without an Agent install.
     from integration.review_service import ReviewCommand, execute_review
@@ -138,8 +237,10 @@ def main(argv: list[str] | None = None) -> int:
         {
             "scenario_id": scenario,
             "review_run_id": run_id,
-            "review_as_of": args.review_as_of,
+            "review_as_of": review_as_of,
+            "llm_mode": "mock",
             "rag_url": args.rag_url,
+            "evidence_service_token": service_token,
             "ops_dsn": args.ops_dsn,
             "store": True,
         }
@@ -184,7 +285,7 @@ def main(argv: list[str] | None = None) -> int:
         {
             "review_run_id": run_id,
             "scenario": scenario,
-            "review_as_of": args.review_as_of,
+            "review_as_of": review_as_of,
             "knowledge_snapshot_id": snapshot.knowledge_snapshot_id,
             "evidence_count": len(snapshot.evidence),
             "finding_count": len(snapshot.regulatory_findings),

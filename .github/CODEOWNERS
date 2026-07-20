@@ -1,3 +1,5 @@
-* @ORG_SLUG/backend-team
-/packages/operational_db/ @ORG_SLUG/backend-team
-/src/integration/ @ORG_SLUG/backend-team @ORG_SLUG/ai-agent-team
+# 조직 팀이 실제로 생성되기 전까지 유효한 저장소 관리자를 명시한다.
+# 팀 생성 후에는 검증된 @Audit-ai-agent/<team> 소유자로 교체한다.
+* @gdh0730
+/packages/operational_db/ @gdh0730
+/src/integration/ @gdh0730

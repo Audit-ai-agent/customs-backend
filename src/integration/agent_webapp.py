@@ -32,8 +32,20 @@ from operational_db import OperationalIntegrityError, PostgresOperationalReposit
 
 ROOT = Path(__file__).resolve().parent
 HTML_PATH = ROOT / "agent_webui.html"
-OPS_DSN = os.environ.get("POSTGRES_DSN", DEFAULT_OPS_DSN)
-RAG_URL = os.environ.get("RAG_URL", DEFAULT_RAG_URL).rstrip("/")
+OPS_DSN = os.environ.get("CUSTOMS_OPS_DSN", os.environ.get("POSTGRES_DSN", DEFAULT_OPS_DSN))
+RAG_URL = os.environ.get(
+    "EVIDENCE_SERVICE_BASE_URL", os.environ.get("RAG_URL", DEFAULT_RAG_URL)
+).rstrip("/")
+EVIDENCE_SERVICE_TOKEN = os.environ.get("EVIDENCE_SERVICE_TOKEN") or None
+
+
+def _readiness_fetcher(service_token: str | None):
+    """Bind a token without exposing it through ``functools.partial`` repr."""
+
+    def fetch(rag_url: str) -> dict[str, Any]:
+        return fetch_readiness(rag_url, service_token=service_token)
+
+    return fetch
 
 
 class AgentReviewPayload(BaseModel):
@@ -67,8 +79,8 @@ def _ops_health() -> dict[str, Any]:
             cur.execute("SELECT 1")
             ok = cur.fetchone() == (1,)
         return {"status": "ready" if ok else "failed"}
-    except Exception as exc:  # pragma: no cover - exercised by live health
-        return {"status": "failed", "error": str(exc)}
+    except Exception:  # pragma: no cover - exercised by live health
+        return {"status": "failed", "error": "Operational DB health check failed"}
 
 
 def _execution_for_stored(snapshot) -> ReviewExecution:
@@ -93,7 +105,7 @@ def create_app() -> FastAPI:
     )
     application.state.review_executor = execute_review
     application.state.repository_factory = lambda: PostgresOperationalRepository(OPS_DSN)
-    application.state.readiness_fetcher = fetch_readiness
+    application.state.readiness_fetcher = _readiness_fetcher(EVIDENCE_SERVICE_TOKEN)
     application.state.ops_health_checker = _ops_health
     application.state.run_lock = Lock()
 
@@ -123,8 +135,11 @@ def create_app() -> FastAPI:
     def health() -> dict[str, Any]:
         try:
             evidence = application.state.readiness_fetcher(RAG_URL)
-        except Exception as exc:
-            evidence = {"status": "failed", "error": str(exc)}
+        except Exception:
+            evidence = {
+                "status": "failed",
+                "error": "Evidence Service readiness check failed",
+            }
         operations = application.state.ops_health_checker()
         ready = evidence.get("status") == "ready" and operations.get("status") == "ready"
         return {
@@ -150,10 +165,12 @@ def create_app() -> FastAPI:
     def create_review(payload: AgentReviewPayload) -> dict[str, Any]:
         command_data = {
             "scenario_id": payload.scenario_id,
+            "llm_mode": "mock",
             "review_as_of": payload.review_as_of,
             "trade_type": payload.trade_type,
             "submitted_document_codes": payload.submitted_document_codes,
             "rag_url": (payload.rag_url or RAG_URL),
+            "evidence_service_token": EVIDENCE_SERVICE_TOKEN,
             "store": payload.store,
             "ops_dsn": OPS_DSN,
         }
@@ -168,21 +185,21 @@ def create_app() -> FastAPI:
                     repository=repository,
                 )
             return execution.to_api_dict()
-        except KeyError as exc:
-            raise HTTPException(400, str(exc)) from exc
-        except ReadinessError as exc:
-            raise HTTPException(503, str(exc)) from exc
-        except (OperationalIntegrityError, ValueError) as exc:
-            raise HTTPException(409, str(exc)) from exc
-        except Exception as exc:
-            raise HTTPException(500, str(exc)) from exc
+        except KeyError:
+            raise HTTPException(400, "Unknown Agent scenario") from None
+        except ReadinessError:
+            raise HTTPException(503, "Evidence Service is not ready") from None
+        except (OperationalIntegrityError, ValueError):
+            raise HTTPException(409, "Review conflict or invalid state") from None
+        except Exception:
+            raise HTTPException(500, "Review execution failed") from None
 
     @application.get("/api/reviews/{review_run_id}")
     def get_review(review_run_id: str) -> dict[str, Any]:
         try:
             snapshot = application.state.repository_factory().get_run(review_run_id)
-        except Exception as exc:
-            raise HTTPException(503, str(exc)) from exc
+        except Exception:
+            raise HTTPException(503, "Operational DB read failed") from None
         if snapshot is None:
             raise HTTPException(404, f"review run not found: {review_run_id}")
         return _execution_for_stored(snapshot).to_api_dict()

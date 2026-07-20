@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from datetime import date
+from io import BytesIO
+from urllib.error import HTTPError
 
 import pytest
 
+import integration.review_service as service
 from customs_ai_agent.adapters.retrieval import FailingRegulationRetriever
 from customs_ai_agent.schemas.models import (
     EvidenceRetrievalResponse,
@@ -90,6 +93,7 @@ def test_execute_review_runs_agent_persists_and_verifies_readback():
     assert payload["counts"]["documents"] == 4
     assert payload["counts"]["items"] == 1
     assert payload["counts"]["audit_events"] >= 10
+    assert execution.snapshot.request["llm_mode"] == "mock"
 
 
 def test_same_run_and_request_is_reused_without_calling_retriever_again():
@@ -142,7 +146,7 @@ def test_missing_review_date_uses_evidence_readiness_supported_date(monkeypatch)
     retriever = CompleteNoRequirementRetriever()
     monkeypatch.setattr(
         "integration.review_service.fetch_readiness",
-        lambda _rag_url: {
+        lambda _rag_url, **_kwargs: {
             "status": "ready",
             "supported_review_as_of": "2026-07-10",
         },
@@ -176,6 +180,133 @@ def test_retriever_failure_is_saved_as_warn_fail_closed_result():
 def test_non_loopback_evidence_url_is_rejected():
     with pytest.raises(ValueError, match="must target localhost"):
         _command(rag_url="https://example.com")
+
+
+@pytest.mark.parametrize(
+    "rag_url",
+    [
+        "http://user:password@127.0.0.1:8010",
+        "http://127.0.0.1:8010?token=secret",
+        "http://127.0.0.1:8010/internal/rag/v1",
+    ],
+)
+def test_evidence_url_rejects_credentials_query_and_application_path(rag_url):
+    with pytest.raises(ValueError, match="rag_url must not contain"):
+        _command(rag_url=rag_url)
+
+
+def test_service_token_is_excluded_from_command_dump_and_repr():
+    token = "do-not-serialize-this-token"
+    command = _command(evidence_service_token=token)
+
+    assert command.evidence_service_token is not None
+    assert command.evidence_service_token.get_secret_value() == token
+    assert "evidence_service_token" not in command.model_dump()
+    assert token not in repr(command)
+
+
+def test_operational_dsn_is_excluded_from_command_dump_and_repr():
+    dsn = "postgresql://user:do-not-print@127.0.0.1:55432/operations"
+    command = _command(ops_dsn=dsn)
+
+    assert command.ops_dsn == dsn
+    assert "ops_dsn" not in command.model_dump()
+    assert dsn not in repr(command)
+
+
+def test_readiness_sends_service_token_in_header_only(monkeypatch):
+    captured = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"status":"ready","supported_review_as_of":"2026-07-10"}'
+
+    def fake_urlopen(request, timeout):
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr(service, "urlopen", fake_urlopen)
+
+    payload = service.fetch_readiness(
+        "http://127.0.0.1:8010", service_token="header-only-token"
+    )
+
+    request = captured["request"]
+    assert payload["status"] == "ready"
+    assert request.get_header("X-demo-token") == "header-only-token"
+    assert request.full_url.endswith("/internal/rag/v1/health/ready")
+    assert "header-only-token" not in request.full_url
+
+
+def test_readiness_error_never_echoes_response_body_or_token(monkeypatch):
+    token = "never-echo-this-token"
+
+    def failed_urlopen(request, timeout):
+        del request, timeout
+        raise HTTPError(
+            "http://127.0.0.1:8010/internal/rag/v1/health/ready",
+            401,
+            "Unauthorized",
+            {},
+            BytesIO(f'{{"detail":"{token}"}}'.encode()),
+        )
+
+    monkeypatch.setattr(service, "urlopen", failed_urlopen)
+
+    with pytest.raises(service.ReadinessError) as exc_info:
+        service.fetch_readiness(
+            "http://127.0.0.1:8010",
+            service_token=token,
+        )
+
+    assert str(exc_info.value) == "Evidence readiness HTTP 401"
+    assert token not in str(exc_info.value)
+
+
+def test_token_requires_compatible_agent_retriever_and_does_not_leak(monkeypatch):
+    token = "not-in-error"
+
+    class LegacyRetriever:
+        def __init__(self, base_url):
+            self.base_url = base_url
+
+    monkeypatch.setattr(service, "HttpRegulationRetriever", LegacyRetriever)
+
+    with pytest.raises(RuntimeError, match="compatible Agent wheel") as exc_info:
+        service._http_retriever("http://127.0.0.1:8010", token)
+
+    assert token not in str(exc_info.value)
+
+
+def test_future_additive_agent_token_api_is_used_without_source_coupling(monkeypatch):
+    class TokenAwareRetriever:
+        def __init__(self, base_url, *, service_token=None):
+            self.base_url = base_url
+            self.service_token = service_token
+
+    monkeypatch.setattr(service, "HttpRegulationRetriever", TokenAwareRetriever)
+
+    retriever = service._http_retriever("http://127.0.0.1:8010", "future-token")
+
+    assert retriever.base_url == "http://127.0.0.1:8010"
+    assert retriever.service_token == "future-token"
+
+
+def test_llm_mode_remains_fail_fast_before_provider_implementation(monkeypatch):
+    monkeypatch.delenv("CUSTOMS_AGENT_ENABLE_LLM", raising=False)
+
+    with pytest.raises(RuntimeError, match="CUSTOMS_AGENT_ENABLE_LLM is not set"):
+        execute_review(
+            _command(review_run_id="visual-llm-not-implemented", llm_mode="llm", store=False),
+            retriever=CompleteNoRequirementRetriever(),
+        )
 
 
 def test_persistence_readback_mismatch_fails_instead_of_claiming_success():

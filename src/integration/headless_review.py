@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 from integration.review_service import (
@@ -18,7 +19,13 @@ def build_parser() -> argparse.ArgumentParser:
         description="Headless Agent -> Evidence Service -> Operational DB review"
     )
     parser.add_argument("--scenario", required=True)
-    parser.add_argument("--rag-url", default="http://127.0.0.1:8010")
+    parser.add_argument(
+        "--rag-url",
+        default=os.environ.get(
+            "EVIDENCE_SERVICE_BASE_URL",
+            os.environ.get("CUSTOMS_EVIDENCE_URL", "http://127.0.0.1:8010"),
+        ),
+    )
     parser.add_argument("--review-run-id")
     parser.add_argument("--review-as-of")
     parser.add_argument("--trade-type", choices=("import", "export"), default="import")
@@ -28,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Canonical requirement document code; may be supplied repeatedly",
     )
-    parser.add_argument("--ops-dsn", default=DEFAULT_OPS_DSN)
+    parser.add_argument("--ops-dsn", default=os.environ.get("CUSTOMS_OPS_DSN", DEFAULT_OPS_DSN))
     parser.add_argument("--no-store", action="store_true")
     parser.add_argument(
         "--require-retrieval-ok",
@@ -45,9 +52,11 @@ def build_parser() -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> dict:
     payload = {
         "scenario_id": args.scenario,
+        "llm_mode": "mock",
         "trade_type": args.trade_type,
         "submitted_document_codes": args.submitted_document_code,
         "rag_url": args.rag_url,
+        "evidence_service_token": os.environ.get("EVIDENCE_SERVICE_TOKEN") or None,
         "store": not args.no_store,
         "ops_dsn": args.ops_dsn,
     }
