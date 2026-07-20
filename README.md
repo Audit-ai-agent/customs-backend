@@ -42,6 +42,14 @@ AI Agent는 형제 폴더가 아닌 exact-commit wheel로 설치한다. 이 저�
 `1bd9f6d493d4eb60a0d602e5ba0230f704e94e2a`, wheel SHA-256
 `88a485cde9e1b26a85a4856b7af6aa89b74620187ff59fb4e3b9c1fc360cdf0a`다.
 
+> **호환성 경고:** 이 pin과 아래 pilot은 분리 전 통합 경로를 재현하기 위한
+> 역사적·전환기 자산이다. Agent 0.1.0은 현재 Data Platform
+> `evidence-api-v1.1.0`이 요구하는 네 개의 provider build-binding header를
+> 보내지 않으므로 해당 API와 호환되지 않으며 retrieval 전에 HTTP 412로
+> fail-closed하는 것이 정상이다. 이 도구를 현재 Agent–Data 통합 완료 증거나
+> 제품 Backend로 사용하지 않는다. 현재 계약의 통합은 Data 최종 병합 SHA에
+> Agent 0.3.0 candidate를 다시 고정한 뒤 별도 cross-repository Gate로 검증한다.
+
 ```powershell
 uv sync --locked --group dev --extra unit --extra system --python 3.11
 $AgentWheel = $env:CUSTOMS_AI_AGENT_WHEEL
@@ -58,8 +66,9 @@ uv sync --check --locked --inexact --group dev --extra unit --extra system
 설치되어 있다면 `pytest tests/system`부터 실행할 수 있다. 이 방식은 wheel
 배포 계약이지 `sys.path`, editable 설치, 형제 상대경로 의존이 아니다.
 
-실제 Evidence API와 Operational PostgreSQL까지 확인하는 release pilot은
-Data readiness가 200인 상태에서 다음처럼 실행한다. Data corpus가 불완전하면
+역사적 Data v1.0 Evidence API와 Operational PostgreSQL 경계를 확인하는
+전환기 pilot은 호환되는 legacy Data readiness가 200인 상태에서 다음처럼
+실행한다. 현재 Data v1.1에는 사용하지 않는다. Data corpus가 불완전하면
 기본 모드는 실패하며, `--allow-incomplete-corpus`는 특정 Structured 경로만
 진단할 때 사용하는 비-release 옵션이다.
 
