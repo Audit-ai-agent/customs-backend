@@ -4,13 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "customs-backend"
-version = "0.1.0"
+version = "0.2.0"
 description = "Backend-owned operational persistence and local Agent integration harness"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
+  "alembic>=1.14,<2",
+  "cryptography>=44,<50",
+  "fastapi>=0.115,<1",
+  "httpx>=0.27,<1",
+  "jsonschema>=4.23,<5",
+  "pyjwt[crypto]>=2.10,<3",
   "pydantic>=2.7,<3",
+  "pydantic-settings>=2.7,<3",
   "psycopg[binary]>=3.2,<4",
+  "sqlalchemy>=2.0,<3",
 ]
 
 [project.optional-dependencies]
@@ -19,8 +27,6 @@ unit = [
   "pytest-cov>=5,<8",
 ]
 system = [
-  "fastapi>=0.115,<1",
-  "httpx>=0.27,<1",
   # Exact provider runtime set. The Agent wheel itself is installed --no-deps
   # only after its identity and SHA-256 have been verified.
   "langgraph==1.2.9",
@@ -29,32 +35,48 @@ system = [
   "rapidfuzz==3.14.5",
   "uvicorn[standard]>=0.30,<1",
 ]
+production = [
+  "dramatiq[redis]>=1.17,<3",
+  "minio>=7.2,<8",
+  "uvicorn[standard]>=0.30,<1",
+]
 
 [dependency-groups]
 dev = [
+  "bandit>=1.9,<2",
+  "defusedxml>=0.7,<1",
   "mypy>=1.11,<2",
+  "pip-audit>=2.9,<3",
   "ruff>=0.8,<1",
 ]
 
 [project.scripts]
 customs-review = "integration.headless_review:main"
 customs-agent-demo = "integration.agent_webapp:main"
+customs-backend-api = "customs_backend.main:main"
+customs-outbox-dispatcher = "customs_backend.outbox_dispatcher:main"
 
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src", "packages/operational_db/src"]
-include = ["integration*", "operational_db*"]
+include = ["customs_backend*", "integration*", "operational_db*"]
 
 [tool.setuptools.package-data]
 integration = ["agent_webui.html", "agent_contract.json"]
+customs_backend = [
+  "agent_contract.lock.json",
+  "domain_reviewer_trust_store.json",
+  "contracts/agent/v3/*.schema.json",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["packages/operational_db/tests", "tests"]
 pythonpath = ["."]
 addopts = "-ra --strict-markers"
 markers = [
+  "postgres_integration: requires an explicitly ephemeral migrated PostgreSQL DSN",
   "system: requires the exact AI Agent distribution and optional local services",
 ]
 

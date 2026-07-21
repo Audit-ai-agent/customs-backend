@@ -8,7 +8,9 @@ import json
 import os
 import re
 import shutil
-import subprocess
+
+# Fixed argument vectors only; shell execution is never used.
+import subprocess  # nosec B404
 import sys
 import zipfile
 from email.parser import Parser
@@ -33,7 +35,9 @@ def normalize_distribution(value: str) -> str:
 
 def wheel_identity(path: Path) -> tuple[str, str]:
     with zipfile.ZipFile(path) as archive:
-        metadata_names = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+        metadata_names = [
+            name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+        ]
         if len(metadata_names) != 1:
             raise ValueError("wheel must contain exactly one .dist-info/METADATA file")
         metadata = Parser().parsestr(archive.read(metadata_names[0]).decode("utf-8"))
@@ -81,12 +85,16 @@ def main() -> int:
     uv = resolve_uv()
     if not uv:
         parser.error("uv executable is required to install the verified wheel")
-    subprocess.run(
+    # The wheel bytes and identity were verified above; argv is fixed and shell=False.
+    subprocess.run(  # nosec B603
         [uv, "pip", "install", "--no-deps", "--python", sys.executable, str(wheel)],
         cwd=ROOT,
         check=True,
     )
-    subprocess.run([uv, "pip", "check", "--python", sys.executable], cwd=ROOT, check=True)
+    # The executable was resolved explicitly and the argv has no caller-controlled option.
+    subprocess.run(  # nosec B603
+        [uv, "pip", "check", "--python", sys.executable], cwd=ROOT, check=True
+    )
     print(
         "installed verified AI Agent wheel "
         f"version={config['version']} declared_source_commit={config['source_commit']} "

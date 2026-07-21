@@ -43,6 +43,22 @@ class ReadinessError(RuntimeError):
     """The Evidence Service cannot provide a usable readiness document."""
 
 
+def _validated_loopback_rag_url(value: str) -> str:
+    value = value.strip().rstrip("/")
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("rag_url must be an http(s) URL")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("rag_url must not contain credentials, query, or fragment")
+    if parsed.path not in {"", "/"}:
+        raise ValueError("rag_url must not contain an application path")
+    if not _is_loopback_host(parsed.hostname):
+        raise ValueError(
+            "rag_url must target localhost; this transitional tool does not proxy arbitrary hosts"
+        )
+    return value
+
+
 class ReviewCommand(BaseModel):
     scenario_id: str = Field(min_length=1)
     review_run_id: str = Field(
@@ -69,19 +85,7 @@ class ReviewCommand(BaseModel):
     @field_validator("rag_url")
     @classmethod
     def _http_url(cls, value: str) -> str:
-        value = value.strip().rstrip("/")
-        parsed = urlparse(value)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise ValueError("rag_url must be an http(s) URL")
-        if parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise ValueError("rag_url must not contain credentials, query, or fragment")
-        if parsed.path not in {"", "/"}:
-            raise ValueError("rag_url must not contain an application path")
-        if not _is_loopback_host(parsed.hostname):
-            raise ValueError(
-                "rag_url must target localhost; this transitional tool does not proxy arbitrary hosts"
-            )
-        return value
+        return _validated_loopback_rag_url(value)
 
     @field_validator("evidence_service_token", mode="before")
     @classmethod
@@ -123,8 +127,7 @@ class ReviewExecution:
             "evidence": len(snapshot.evidence),
             "findings": len(snapshot.regulatory_findings),
             "finding_evidence_links": sum(
-                len(finding.get("evidence_ids") or [])
-                for finding in snapshot.regulatory_findings
+                len(finding.get("evidence_ids") or []) for finding in snapshot.regulatory_findings
             ),
             "audit_events": len(snapshot.audit_events),
         }
@@ -165,7 +168,8 @@ def fetch_readiness(
     *,
     service_token: str | None = None,
 ) -> dict[str, Any]:
-    url = f"{rag_url.rstrip('/')}/internal/rag/v1/health/ready"
+    normalized_rag_url = _validated_loopback_rag_url(rag_url)
+    url = f"{normalized_rag_url}/internal/rag/v1/health/ready"
     headers = {"Accept": "application/json"}
     if service_token:
         # The local Data service accepts this header. Never put the token in a URL,
@@ -173,14 +177,14 @@ def fetch_readiness(
         headers["X-Demo-Token"] = service_token
     request = Request(url, headers=headers, method="GET")
     try:
-        with urlopen(request, timeout=timeout) as response:
+        # The helper revalidates the complete base URL as loopback-only HTTP(S)
+        # immediately above; it cannot open file/custom schemes or remote hosts.
+        with urlopen(request, timeout=timeout) as response:  # nosec B310
             payload = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         raise ReadinessError(f"Evidence readiness HTTP {exc.code}") from None
     except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise ReadinessError(
-            f"Evidence readiness failed: {type(exc).__name__}"
-        ) from None
+        raise ReadinessError(f"Evidence readiness failed: {type(exc).__name__}") from None
     if not isinstance(payload, dict) or payload.get("status") != "ready":
         raise ReadinessError("Evidence Service did not return status=ready")
     if not payload.get("supported_review_as_of"):

@@ -7,4 +7,6 @@
 *.json text eol=lf
 *.sql text eol=lf
 *.html text eol=lf
+Dockerfile text eol=lf
+*.sh text eol=lf
 *.ps1 text eol=crlf

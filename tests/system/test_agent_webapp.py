@@ -102,9 +102,7 @@ def test_health_is_degraded_without_hiding_dependency_failure(web_context):
     assert response.status_code == 200
     assert response.json()["status"] == "degraded"
     assert response.json()["evidence"]["status"] == "failed"
-    assert response.json()["evidence"]["error"] == (
-        "Evidence Service readiness check failed"
-    )
+    assert response.json()["evidence"]["error"] == ("Evidence Service readiness check failed")
 
 
 def test_bound_readiness_fetcher_repr_never_exposes_token() -> None:
@@ -245,9 +243,7 @@ def test_create_review_can_run_without_claiming_database_persistence(web_context
         (RuntimeError("unexpected"), 500),
     ],
 )
-def test_create_review_maps_domain_and_dependency_errors(
-    web_context, error, expected_status
-):
+def test_create_review_maps_domain_and_dependency_errors(web_context, error, expected_status):
     client, application, _repository = web_context
 
     def fail(*_args, **_kwargs):

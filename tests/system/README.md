@@ -3,7 +3,10 @@
 이 폴더는 Backend Application Service가 AI Agent 결과를 Operational DB 스냅샷으로
 저장하고 readback hash를 검증하는 경계를 테스트한다.
 
-- `customs-ai-agent==0.1.0` wheel이 필수다.
+- 이 폴더는 legacy/historical integration 경계를 보존하며
+  `customs-ai-agent==0.1.0` wheel을 의도적으로 고정한다.
+- 제품 Backend의 현재 pin은 `customs-ai-agent==0.3.0`이며
+  `tests/product` 및 private Agent HTTP V2/V3 계약으로 검증한다.
 - 현재 자동 테스트는 주입된 deterministic Retriever와 in-memory repository를
   사용하여 Backend 경계를 격리 검증한다.
 - 실제 Evidence Service·PostgreSQL 연동은 `customs-review` 또는 로컬 UI로

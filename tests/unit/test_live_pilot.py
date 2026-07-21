@@ -210,9 +210,7 @@ def test_health_sends_token_in_header_not_url(monkeypatch) -> None:
 
     monkeypatch.setattr(pilot, "urlopen", fake_urlopen)
 
-    code, payload = pilot.health(
-        "http://127.0.0.1:8010", "live", service_token="header-only-token"
-    )
+    code, payload = pilot.health("http://127.0.0.1:8010", "live", service_token="header-only-token")
 
     request = captured["request"]
     assert code == 200

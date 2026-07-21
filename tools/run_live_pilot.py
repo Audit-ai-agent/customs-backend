@@ -62,13 +62,16 @@ def health(
     *,
     service_token: str | None = None,
 ) -> tuple[int, dict]:
+    # Revalidate at the network boundary even when this helper is called directly.
+    base_url = validate_loopback_base_url(base_url)
     url = f"{base_url.rstrip('/')}/internal/rag/v1/health/{kind}"
     headers = {"Accept": "application/json"}
     if service_token:
         headers["X-Demo-Token"] = service_token
     request = Request(url, headers=headers, method="GET")
     try:
-        with urlopen(request, timeout=10) as response:
+        # validate_loopback_base_url above limits this request to loopback HTTP.
+        with urlopen(request, timeout=10) as response:  # nosec B310
             payload = json.loads(response.read())
             if not isinstance(payload, dict):
                 return 0, {"detail": "Evidence health returned a non-object response"}
@@ -86,9 +89,7 @@ def health(
             (reason for reason in ALLOWED_INCOMPLETE_REASONS if reason in detail),
             None,
         )
-        return exc.code, {
-            "detail": classified or f"Evidence health HTTP {exc.code}"
-        }
+        return exc.code, {"detail": classified or f"Evidence health HTTP {exc.code}"}
     except (URLError, TimeoutError) as exc:
         return 0, {"detail": f"Evidence Service unavailable: {type(exc).__name__}"}
 
@@ -109,10 +110,7 @@ def local_ops_dsn(host_port_value: int) -> str:
     user = quote(os.environ.get("POSTGRES_USER", "trade"), safe="")
     encoded_passphrase = quote(os.environ.get("POSTGRES_PASSWORD", "change_me"), safe="")
     database = quote(os.environ.get("POSTGRES_DB", "trade_doc"), safe="")
-    return (
-        f"postgresql://{user}:{encoded_passphrase}"
-        f"@127.0.0.1:{host_port_value}/{database}"
-    )
+    return f"postgresql://{user}:{encoded_passphrase}@127.0.0.1:{host_port_value}/{database}"
 
 
 def resolve_review_as_of(configured: str | None, readiness: dict) -> str:
@@ -196,9 +194,7 @@ def main(argv: list[str] | None = None) -> int:
         "ready": ready,
         "llm_mode": "mock",
         "ops_dsn_source": ops_dsn_source,
-        "ops_host_port": (
-            args.ops_host_port if ops_dsn_source == "generated_local_dsn" else None
-        ),
+        "ops_host_port": (args.ops_host_port if ops_dsn_source == "generated_local_dsn" else None),
         "mode": "TARGETED_DIAGNOSTIC" if args.allow_incomplete_corpus else "RELEASE_GATE",
     }
     if live_code != 200 or live.get("status") != "alive":
@@ -229,9 +225,7 @@ def main(argv: list[str] | None = None) -> int:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     run_id = f"pilot-{stamp}-{uuid.uuid4().hex[:8]}"
     scenario = (
-        "low_evidence_needs_review"
-        if args.allow_incomplete_corpus
-        else "exact_hsk_no_requirements"
+        "low_evidence_needs_review" if args.allow_incomplete_corpus else "exact_hsk_no_requirements"
     )
     command = ReviewCommand.model_validate(
         {

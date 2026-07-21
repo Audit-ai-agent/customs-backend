@@ -84,9 +84,7 @@ def test_uv_environment_fallback(monkeypatch, tmp_path) -> None:
     assert installer.resolve_uv() == str(executable)
 
 
-def test_main_verify_only_accepts_external_wheel_path(
-    monkeypatch, tmp_path, capsys
-) -> None:
+def test_main_verify_only_accepts_external_wheel_path(monkeypatch, tmp_path, capsys) -> None:
     external_store = tmp_path / "external artifact store"
     external_store.mkdir()
     wheel = make_wheel(external_store)
@@ -94,9 +92,7 @@ def test_main_verify_only_accepts_external_wheel_path(
     contract_path = tmp_path / "agent_contract.json"
     contract_path.write_text(json.dumps(contract), encoding="utf-8")
     monkeypatch.setattr(installer, "CONTRACT_PATH", contract_path)
-    monkeypatch.setattr(
-        sys, "argv", ["install_pinned_agent.py", str(wheel), "--verify-only"]
-    )
+    monkeypatch.setattr(sys, "argv", ["install_pinned_agent.py", str(wheel), "--verify-only"])
 
     assert installer.main() == 0
     assert "verified AI Agent wheel" in capsys.readouterr().out

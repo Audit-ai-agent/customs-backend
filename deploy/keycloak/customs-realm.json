@@ -1,0 +1,45 @@
+{
+  "realm": "customs",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "roles": {
+    "realm": [
+      {"name": "reviewer"},
+      {"name": "approver"},
+      {"name": "auditor"},
+      {"name": "admin"}
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "customs-workbench-spa",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["${CUSTOMS_PUBLIC_ORIGIN}/auth/callback"],
+      "webOrigins": ["${CUSTOMS_PUBLIC_ORIGIN}"],
+      "attributes": {"pkce.code.challenge.method": "S256"},
+      "protocolMappers": [
+        {
+          "name": "api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {"included.custom.audience": "customs-workbench-api", "access.token.claim": "true"}
+        },
+        {
+          "name": "realm-roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {"claim.name": "roles", "jsonType.label": "String", "multivalued": "true", "access.token.claim": "true"}
+        },
+        {
+          "name": "organization",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": {"user.attribute": "org_id", "claim.name": "org_id", "jsonType.label": "String", "access.token.claim": "true"}
+        }
+      ]
+    }
+  ]
+}
