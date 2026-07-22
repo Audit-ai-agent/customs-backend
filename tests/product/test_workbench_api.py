@@ -54,6 +54,35 @@ def _rehash_agent_result(result: dict) -> dict:
     return result
 
 
+def _agent_result_with_audited_claude_calls(request: AgentReviewRequest) -> dict:
+    result = build_agent_v3_result(request)
+    runtime = result["runtime_release"]
+    result["model_calls"] = [
+        {
+            "document_id": document.document_id,
+            "provider": "anthropic",
+            "model_id": runtime["model_id"],
+            "prompt_id": "customs_document_analysis",
+            "prompt_version": "1.2.0",
+            "request_id": f"provider-request-sensitive-{index}",
+            "message_id": f"provider-message-sensitive-{index}",
+            "stop_reason": "end_turn",
+            "input_tokens": 100 + index,
+            "output_tokens": 50 + index,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "latency_ms": 10,
+            "prompt_sha256": runtime["extraction_prompt_sha256"],
+            "output_schema_id": "document-analysis",
+            "output_schema_version": "1.0",
+            "output_schema_sha256": runtime["extraction_schema_sha256"],
+            "input_modality": "text",
+        }
+        for index, document in enumerate(request.documents)
+    ]
+    return _rehash_agent_result(result)
+
+
 def _agent_result_with_bound_issue_and_finding(
     request: AgentReviewRequest, *, duplicate_issue_fact: bool = False
 ) -> dict:
@@ -544,6 +573,19 @@ def test_worker_restart_preserves_job_and_forces_auto_completion_gate(workbench)
     }.issubset(run.completion_eligibility.unmet_reason_codes)
     assert "model_calls" not in run.result_detail
     assert "runtime_release" not in run.result_detail
+    assert run.result_detail["model_execution_summary"] == {
+        "provider": None,
+        "model_id": None,
+        "text_only": False,
+        "call_count": 0,
+        "input_tokens_total": 0,
+        "output_tokens_total": 0,
+        "prompt_hashes_complete": False,
+        "schema_hashes_complete": False,
+        "runtime_identity_match": False,
+        "audit_complete": False,
+        "unmet_reason_codes": ["no_model_calls"],
+    }
     assert container.repository.get_provider_result("org-a", run.review_run_id) is not None
     assert (
         restarted.execute_job(org_id="org-a", job_id=queued["job_id"]).result_digest
@@ -553,6 +595,40 @@ def test_worker_restart_preserves_job_and_forces_auto_completion_gate(workbench)
     assert response.status_code == 200
     assert "event: review-stage" in response.text
     assert "review.completed" in response.text
+
+
+def test_review_exposes_only_a_bounded_complete_anthropic_execution_summary(workbench):
+    client, container = workbench
+    case, _document = _create_case_and_document(client)
+    container.service.agent = CallableAgentClient(_agent_result_with_audited_claude_calls)
+    queued = client.post(
+        f"/api/v1/cases/{case['case_id']}/reviews",
+        json={},
+        headers={**_auth(), "Idempotency-Key": "review-audited-claude"},
+    ).json()["job"]
+    run = container.service.execute_job(org_id="org-a", job_id=queued["job_id"])
+    summary = run.result_detail["model_execution_summary"]
+    assert summary == {
+        "provider": "anthropic",
+        "model_id": run.release_identity["model_id"],
+        "text_only": True,
+        "call_count": 1,
+        "input_tokens_total": 100,
+        "output_tokens_total": 50,
+        "prompt_hashes_complete": True,
+        "schema_hashes_complete": True,
+        "runtime_identity_match": True,
+        "audit_complete": True,
+        "unmet_reason_codes": [],
+    }
+    public_json = run.model_dump_json()
+    assert "provider-request-sensitive" not in public_json
+    assert "provider-message-sensitive" not in public_json
+    assert '"model_calls"' not in public_json
+    tampered = run.model_dump(mode="json")
+    tampered["result_detail"]["model_execution_summary"]["input_tokens_total"] += 1
+    with pytest.raises(ValueError, match="result_digest"):
+        type(run).model_validate(tampered)
 
 
 def test_revision_staleness_forbidden_targets_decision_and_chat_binding(workbench):
@@ -686,6 +762,9 @@ def test_revision_staleness_forbidden_targets_decision_and_chat_binding(workbenc
         headers={**_auth(), "Idempotency-Key": "chat-grounded-answer"},
     ).json()
     assert answer["answer_status"] == "answered"
+    assert answer["generation_mode"] == "deterministic_fallback"
+    assert answer["model_execution_summary"]["audit_complete"] is False
+    assert answer["model_execution_summary"]["unmet_reason_codes"] == ["no_model_calls"]
     replayed_answer = client.post(
         answer_url,
         json={"question": "왜 정상인가요?", "bound_result_digest": parent.result_digest},
@@ -737,6 +816,70 @@ def test_revision_staleness_forbidden_targets_decision_and_chat_binding(workbenc
         "correction_proposal.decided",
         "case_chat.answered",
     }
+
+
+def test_case_chat_preserves_a_safe_single_claude_call_summary(workbench):
+    client, container = workbench
+    case, _document = _create_case_and_document(client)
+    queued = client.post(
+        f"/api/v1/cases/{case['case_id']}/reviews",
+        json={},
+        headers={**_auth(), "Idempotency-Key": "chat-claude-parent"},
+    ).json()["job"]
+    run = container.service.execute_job(org_id="org-a", job_id=queued["job_id"])
+
+    def claude_answer(provider_result, _question, question_id):
+        fact = provider_result["fact_ledger"]["entries"][0]
+        runtime = provider_result["runtime_release"]
+        return AgentAnswerResponse(
+            question_id=question_id,
+            answer="근거 장부에 결박된 Claude 답변입니다.",
+            status="answered",
+            citations=[{"kind": fact["kind"], "reference_id": fact["reference_id"]}],
+            generation_mode="claude",
+            model_call={
+                "task_id": "customs_case_answer",
+                "provider": "anthropic",
+                "model_id": runtime["model_id"],
+                "prompt_sha256": runtime["chat_prompt_sha256"],
+                "output_schema_sha256": runtime["chat_schema_sha256"],
+                "request_id_sha256": "8" * 64,
+                "message_id_sha256": "9" * 64,
+                "input_tokens": 123,
+                "output_tokens": 45,
+                "latency_ms": 12,
+            },
+        )
+
+    container.service.agent = CallableAgentClient(_agent_result, answer=claude_answer)
+    response = client.post(
+        f"/api/v1/review-runs/{run.review_run_id}/answers",
+        json={
+            "question": "정상 판정의 근거는 무엇인가요?",
+            "bound_result_digest": run.result_digest,
+        },
+        headers={**_auth(), "Idempotency-Key": "chat-claude-audit"},
+    )
+    assert response.status_code == 201
+    record = response.json()
+    assert record["generation_mode"] == "claude"
+    assert record["model_execution_summary"] == {
+        "provider": "anthropic",
+        "model_id": run.release_identity["model_id"],
+        "text_only": True,
+        "call_count": 1,
+        "input_tokens_total": 123,
+        "output_tokens_total": 45,
+        "prompt_hashes_complete": True,
+        "schema_hashes_complete": True,
+        "runtime_identity_match": True,
+        "audit_complete": True,
+        "unmet_reason_codes": [],
+    }
+    serialized = response.text
+    assert "request_id_sha256" not in serialized
+    assert "message_id_sha256" not in serialized
+    assert '"model_call"' not in serialized
 
 
 def test_proposal_creation_is_durably_idempotent_and_conflict_detecting(workbench):

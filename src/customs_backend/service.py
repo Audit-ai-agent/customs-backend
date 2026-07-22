@@ -46,6 +46,7 @@ from customs_backend.domain import (
     JobStatus,
     MAX_TEXT_DOCUMENT_CHARACTERS,
     MAX_TEXT_DOCUMENT_UTF8_BYTES,
+    ModelExecutionSummary,
     OutboxRecord,
     Principal,
     RequiredAction,
@@ -90,6 +91,74 @@ from customs_backend.release import (
 LOGGER = logging.getLogger(__name__)
 CHAT_INTERACTIONS_PER_REVIEW_RUN = 100
 CHAT_INTERACTIONS_PER_ACTOR_PER_MINUTE = 10
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _bounded_model_execution_summary(
+    calls: list[dict[str, Any]],
+    *,
+    expected_model_id: object,
+    expected_prompt_sha256: object,
+    expected_schema_sha256: object,
+    expected_task_id: str | None = None,
+) -> ModelExecutionSummary:
+    """Reduce call audits to a bounded public projection without call identifiers."""
+
+    providers = {call.get("provider") for call in calls}
+    model_ids = {call.get("model_id") for call in calls if isinstance(call.get("model_id"), str)}
+    provider: Literal["anthropic"] | None = (
+        "anthropic" if calls and providers == {"anthropic"} else None
+    )
+    model_id = next(iter(model_ids)) if calls and len(model_ids) == 1 else None
+    text_only = bool(calls) and all(call.get("input_modality", "text") == "text" for call in calls)
+    input_tokens_total = sum(
+        value
+        for call in calls
+        if isinstance((value := call.get("input_tokens")), int) and not isinstance(value, bool)
+    )
+    output_tokens_total = sum(
+        value
+        for call in calls
+        if isinstance((value := call.get("output_tokens")), int) and not isinstance(value, bool)
+    )
+    prompt_hashes_complete = bool(calls) and all(
+        _is_sha256(call.get("prompt_sha256")) for call in calls
+    )
+    schema_hashes_complete = bool(calls) and all(
+        _is_sha256(call.get("output_schema_sha256")) for call in calls
+    )
+    runtime_identity_match = bool(calls) and all(
+        call.get("provider") == "anthropic"
+        and call.get("model_id") == expected_model_id
+        and call.get("prompt_sha256") == expected_prompt_sha256
+        and call.get("output_schema_sha256") == expected_schema_sha256
+        and (expected_task_id is None or call.get("task_id") == expected_task_id)
+        for call in calls
+    )
+    values: dict[str, Any] = {
+        "provider": provider,
+        "model_id": model_id,
+        "text_only": text_only,
+        "call_count": len(calls),
+        "input_tokens_total": input_tokens_total,
+        "output_tokens_total": output_tokens_total,
+        "prompt_hashes_complete": prompt_hashes_complete,
+        "schema_hashes_complete": schema_hashes_complete,
+        "runtime_identity_match": runtime_identity_match,
+    }
+    reasons = ModelExecutionSummary.expected_unmet_reason_codes(**values)
+    return ModelExecutionSummary(
+        **values,
+        audit_complete=not reasons,
+        unmet_reason_codes=reasons,
+    )
 
 
 def _warn_terminal_state_not_persisted(*, boundary: str, error: Exception) -> None:
@@ -2060,6 +2129,12 @@ class WorkbenchService:
             prefix="finding",
             code_key="finding_code",
         )
+        model_execution_summary = _bounded_model_execution_summary(
+            envelope.model_calls,
+            expected_model_id=envelope.runtime_release.model_id,
+            expected_prompt_sha256=envelope.runtime_release.extraction_prompt_sha256,
+            expected_schema_sha256=envelope.runtime_release.extraction_schema_sha256,
+        )
         detail = {
             key: provider_public[key]
             for key in {
@@ -2081,6 +2156,7 @@ class WorkbenchService:
             }
         }
         detail["review_stage_trace"] = [item.model_dump(mode="json") for item in stage_trace]
+        detail["model_execution_summary"] = model_execution_summary.model_dump(mode="json")
         effective_summary = {
             "provider_result_sha256": envelope.result_sha256,
             "input_manifest_digest": input_manifest_digest,
@@ -2095,6 +2171,7 @@ class WorkbenchService:
             "required_actions": [item.model_dump(mode="json") for item in required_actions],
             "review_stage_trace": [item.model_dump(mode="json") for item in stage_trace],
             "auto_completion_profile": profile_binding.model_dump(mode="json"),
+            "model_execution_summary": model_execution_summary.model_dump(mode="json"),
         }
         digest = canonical_digest(effective_summary)
         return ReviewRunRecord(
@@ -2175,6 +2252,7 @@ class WorkbenchService:
             "required_actions": [item.model_dump(mode="json") for item in actions],
             "review_stage_trace": [item.model_dump(mode="json") for item in run.review_stage_trace],
             "auto_completion_profile": run.auto_completion_profile.model_dump(mode="json"),
+            "model_execution_summary": run.result_detail["model_execution_summary"],
         }
         return run.model_copy(
             update={
@@ -2388,6 +2466,14 @@ class WorkbenchService:
                 for item in answer.citations
             ):
                 raise ConflictError("Agent answer cites evidence outside the bound FactLedger")
+            model_call = answer.model_call.model_dump(mode="json") if answer.model_call else None
+            model_execution_summary = _bounded_model_execution_summary(
+                [model_call] if model_call is not None else [],
+                expected_model_id=run.release_identity.get("model_id"),
+                expected_prompt_sha256=run.release_identity.get("chat_prompt_sha256"),
+                expected_schema_sha256=run.release_identity.get("chat_schema_sha256"),
+                expected_task_id="customs_case_answer",
+            )
             record = ChatRecord(
                 message_id=(
                     f"message_{canonical_digest({'idempotency_key': scoped_idempotency_key})}"
@@ -2399,6 +2485,8 @@ class WorkbenchService:
                 answer=answer.answer,
                 answer_status=answer.status,
                 citations=answer.citations,
+                generation_mode=answer.generation_mode,
+                model_execution_summary=model_execution_summary,
                 bound_result_digest=run.result_digest,
                 idempotency_key=scoped_idempotency_key,
                 idempotency_request_digest=idempotency_request_digest,

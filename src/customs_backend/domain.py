@@ -632,6 +632,126 @@ class ReviewGap(BaseModel):
     status: Literal["open", "resolved", "deferred"] = "open"
 
 
+ModelExecutionUnmetReason = Literal[
+    "no_model_calls",
+    "provider_not_anthropic",
+    "model_id_incomplete_or_mixed",
+    "non_text_model_call",
+    "non_positive_input_tokens",
+    "non_positive_output_tokens",
+    "prompt_hash_incomplete",
+    "schema_hash_incomplete",
+    "runtime_identity_mismatch",
+]
+
+
+class ModelExecutionSummary(BaseModel):
+    """Bounded, non-sensitive projection of provider model-call audit records.
+
+    This deliberately excludes document/request/message IDs, raw content, hashes,
+    latency detail, credentials, and provider responses.  ``audit_complete`` means
+    only that the provider-owned audit records are structurally complete and bound
+    to the runtime identity; it is not a model-quality or Production-release claim.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    provider: Literal["anthropic"] | None
+    model_id: str | None = Field(min_length=1, max_length=128)
+    text_only: bool
+    call_count: int = Field(ge=0, le=1000)
+    input_tokens_total: int = Field(ge=0, le=1_000_000_000_000)
+    output_tokens_total: int = Field(ge=0, le=1_000_000_000_000)
+    prompt_hashes_complete: bool
+    schema_hashes_complete: bool
+    runtime_identity_match: bool
+    audit_complete: bool
+    unmet_reason_codes: list[ModelExecutionUnmetReason] = Field(max_length=9)
+
+    @staticmethod
+    def expected_unmet_reason_codes(
+        *,
+        provider: str | None,
+        model_id: str | None,
+        text_only: bool,
+        call_count: int,
+        input_tokens_total: int,
+        output_tokens_total: int,
+        prompt_hashes_complete: bool,
+        schema_hashes_complete: bool,
+        runtime_identity_match: bool,
+    ) -> list[ModelExecutionUnmetReason]:
+        if call_count == 0:
+            return ["no_model_calls"]
+        reasons: list[ModelExecutionUnmetReason] = []
+        if provider != "anthropic":
+            reasons.append("provider_not_anthropic")
+        if model_id is None:
+            reasons.append("model_id_incomplete_or_mixed")
+        if not text_only:
+            reasons.append("non_text_model_call")
+        if input_tokens_total <= 0:
+            reasons.append("non_positive_input_tokens")
+        if output_tokens_total <= 0:
+            reasons.append("non_positive_output_tokens")
+        if not prompt_hashes_complete:
+            reasons.append("prompt_hash_incomplete")
+        if not schema_hashes_complete:
+            reasons.append("schema_hash_incomplete")
+        if not runtime_identity_match:
+            reasons.append("runtime_identity_mismatch")
+        return reasons
+
+    @model_validator(mode="after")
+    def derived_audit_state_is_consistent(self) -> "ModelExecutionSummary":
+        if self.call_count == 0 and (
+            self.provider is not None
+            or self.model_id is not None
+            or self.text_only
+            or self.input_tokens_total != 0
+            or self.output_tokens_total != 0
+            or self.prompt_hashes_complete
+            or self.schema_hashes_complete
+            or self.runtime_identity_match
+        ):
+            raise ValueError("an empty model execution summary cannot advertise observed calls")
+        expected = self.expected_unmet_reason_codes(
+            provider=self.provider,
+            model_id=self.model_id,
+            text_only=self.text_only,
+            call_count=self.call_count,
+            input_tokens_total=self.input_tokens_total,
+            output_tokens_total=self.output_tokens_total,
+            prompt_hashes_complete=self.prompt_hashes_complete,
+            schema_hashes_complete=self.schema_hashes_complete,
+            runtime_identity_match=self.runtime_identity_match,
+        )
+        if self.unmet_reason_codes != expected or self.audit_complete != (not expected):
+            raise ValueError("model execution summary derived state is inconsistent")
+        return self
+
+
+class AgenticCallAuditV1(BaseModel):
+    """Strict inbound audit for a single bounded Agentic Claude call."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    task_id: Literal[
+        "customs_review_coordinator",
+        "customs_narrative_report",
+        "customs_case_answer",
+    ]
+    provider: Literal["anthropic"]
+    model_id: str = Field(min_length=1, max_length=128)
+    prompt_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    output_schema_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    request_id_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    message_id_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    input_tokens: int = Field(ge=0, le=1_000_000_000, strict=True)
+    output_tokens: int = Field(ge=0, le=1_000_000_000, strict=True)
+    latency_ms: int = Field(ge=0, le=300_000, strict=True)
+
+
 class AgentReviewResultV3(BaseModel):
     """Strict top-level consumer for the provider-owned V3 wire.
 
@@ -866,6 +986,9 @@ class ReviewRunRecord(BaseModel):
 
     @model_validator(mode="after")
     def immutable_input_manifest_is_bound(self) -> "ReviewRunRecord":
+        model_execution_summary = ModelExecutionSummary.model_validate(
+            self.result_detail.get("model_execution_summary")
+        )
         if self.input_document_manifest:
             if self.review_as_of is None or self.trade_type is None:
                 raise ValueError("bound input manifest requires immutable review context")
@@ -890,6 +1013,30 @@ class ReviewRunRecord(BaseModel):
                 or self.auto_completion_profile.approval_digest is None
             ):
                 raise ValueError("automatic completion requires a signed public profile binding")
+        expected_result_digest = canonical_digest(
+            {
+                "provider_result_sha256": self.provider_result_sha256,
+                "input_manifest_digest": self.input_manifest_digest,
+                "input_document_manifest": [
+                    item.model_dump(mode="json") for item in self.input_document_manifest
+                ],
+                "execution_status": self.execution_status.value,
+                "assessment": self.assessment.value,
+                "review_disposition": self.review_disposition.value,
+                "assurance_level": self.assurance_level.value,
+                "completion_eligibility": self.completion_eligibility.model_dump(mode="json"),
+                "required_actions": [
+                    item.model_dump(mode="json") for item in self.required_actions
+                ],
+                "review_stage_trace": [
+                    item.model_dump(mode="json") for item in self.review_stage_trace
+                ],
+                "auto_completion_profile": self.auto_completion_profile.model_dump(mode="json"),
+                "model_execution_summary": model_execution_summary.model_dump(mode="json"),
+            }
+        )
+        if self.result_digest != expected_result_digest:
+            raise ValueError("result_digest does not bind the public effective review summary")
         return self
 
 
@@ -1084,6 +1231,8 @@ class GroundedQuestion(BaseModel):
 
 
 class ChatRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     message_id: str
     review_run_id: str
     case_id: str
@@ -1092,11 +1241,20 @@ class ChatRecord(BaseModel):
     answer: str
     answer_status: Literal["answered", "insufficient_evidence", "out_of_scope"]
     citations: list[dict[str, str]] = Field(default_factory=list)
+    generation_mode: Literal["claude", "deterministic_fallback"]
+    model_execution_summary: ModelExecutionSummary
     bound_result_digest: str
     idempotency_key: str = Field(min_length=1, max_length=512)
     idempotency_request_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     created_by: str
     created_at: datetime
+
+    @model_validator(mode="after")
+    def generation_mode_matches_model_execution(self) -> "ChatRecord":
+        expected_count = 1 if self.generation_mode == "claude" else 0
+        if self.model_execution_summary.call_count != expected_count:
+            raise ValueError("Chat generation mode does not match its model execution summary")
+        return self
 
 
 class ChatInteractionState(str, Enum):
@@ -1434,7 +1592,7 @@ class AgentAnswerResponse(BaseModel):
     citations: list[dict[str, str]] = Field(default_factory=list, max_length=100)
     generation_mode: Literal["claude", "deterministic_fallback"]
     citation_verification: Literal["passed"] = "passed"
-    model_call: dict[str, Any] | None = None
+    model_call: AgenticCallAuditV1 | None = None
 
     @model_validator(mode="after")
     def claude_requires_auditable_model_call(self) -> "AgentAnswerResponse":

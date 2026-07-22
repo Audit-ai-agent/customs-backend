@@ -18,7 +18,14 @@
   `/health/uat-ready`와 V2 metadata가 모두 준비되고 diagnostic identity가
   일치할 때만 200이다. 이후 각 review 요청도 Agent가 Evidence readiness를
   다시 fail-closed로 검사한다.
-- `/api/v1/uat/metadata`는 UI 표시용 비밀정보 없는 metadata만 반환한다.
+- `/api/v1/uat/metadata`는 검증된 V3 Evidence identity에서 가져온
+  `supported_review_as_of`를 포함한 UI 표시용 metadata만 반환한다.
+  Agent metadata가 없거나 identity/date/digest가 잘못되면 503으로 닫힌다.
+- Review Run의 `result_detail.model_execution_summary`는 Anthropic provider,
+  model ID, text-only 여부, 호출 수, 토큰 합계, prompt/schema hash
+  완전성과 runtime identity 일치 여부만 보존한다. Case Chat도
+  `generation_mode`과 동일한 bounded summary를 남긴다. request/message ID,
+  hash 값, raw prompt/response, 원문, credential은 public record에 넣지 않는다.
 
 ## Evidence profile
 

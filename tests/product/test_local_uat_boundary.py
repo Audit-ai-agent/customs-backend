@@ -14,6 +14,7 @@ from customs_backend.adapters import (
 )
 from customs_backend.api import Container, build_container, create_app
 from customs_backend.auth import OidcJwtVerifier
+from customs_backend.domain import canonical_digest
 from customs_backend.repository import InMemoryWorkbenchRepository
 from customs_backend.service import WorkbenchService
 from customs_backend.settings import Settings
@@ -46,6 +47,45 @@ def _local_uat_values(**overrides: Any) -> dict[str, Any]:
     }
     values.update(overrides)
     return values
+
+
+def _diagnostic_evidence_identity() -> dict[str, Any]:
+    base = {
+        "contract": "evidence-runtime-release",
+        "schema_version": "2.0",
+        "retrieval_schema_version": "1.0",
+        "provider_release": "evidence-api-v1.2.0",
+        "provider_revision": "a" * 40,
+        "provider_build_sha256": "b" * 64,
+        "retrieval_schema_sha256": "c" * 64,
+        "provider_source_manifest_sha256": "d" * 64,
+        "knowledge_generation_id": "e" * 64,
+        "knowledge_generation_attestation_sha256": "f" * 64,
+        "knowledge_source_manifest_sha256": "0" * 64,
+        "model_manifest_sha256": "1" * 64,
+        "index_config_sha256": "2" * 64,
+        "evaluation_report_sha256": "3" * 64,
+        "seal_attestation_sha256": "4" * 64,
+        "knowledge_snapshot_id": "diagnostic-snapshot",
+        "supported_review_as_of": "2026-07-10",
+    }
+    base["runtime_release_sha256"] = canonical_digest(base)
+    identity = {
+        "contract": "evidence-runtime-release",
+        "schema_version": "3.0",
+        "retrieval_schema_version": "3.0",
+        "base_runtime_release": base,
+        "retrieval_schema_sha256": "5" * 64,
+        "readiness_schema_sha256": "6" * 64,
+        "requirement_policy_schema_sha256": "7" * 64,
+        "requirement_policy_release": "diagnostic-policy-v1",
+        "requirement_policy_manifest_sha256": "8" * 64,
+        "coverage_matrix_sha256": "9" * 64,
+        "requirement_policy_approval_sha256": "a" * 64,
+        "reviewer_trust_store_sha256": "b" * 64,
+    }
+    identity["runtime_release_v3_sha256"] = canonical_digest(identity)
+    return identity
 
 
 def test_local_uat_settings_require_real_runtime_adapters_and_force_diagnostic_mode() -> None:
@@ -160,6 +200,7 @@ def _local_uat_app(*, agent_status: str = "ready") -> TestClient:
     repository = InMemoryWorkbenchRepository()
     object_store = InMemoryObjectStore()
     publisher = InMemoryJobPublisher()
+    evidence_identity = _diagnostic_evidence_identity()
     agent = CallableAgentClient(
         lambda _request: {},
         metadata={
@@ -175,6 +216,11 @@ def _local_uat_app(*, agent_status: str = "ready") -> TestClient:
                 "mock_fallback_allowed": False,
                 "auto_completion_allowed": False,
                 "evidence_mode": "preserved-3law",
+                "evidence_runtime_identity": evidence_identity,
+            },
+            "evidence_runtime_release_v3": {
+                "release_state": "diagnostic",
+                "identity": evidence_identity,
             },
         },
         uat_readiness={
@@ -260,6 +306,7 @@ def test_local_uat_readiness_is_separate_from_strict_production_readiness(
             "claude_mode": "actual",
             "evidence_profile": "preserved-3law",
             "evidence_scope_label": "REAL_3_OF_58",
+            "supported_review_as_of": "2026-07-10",
             "planner_mode": "shadow",
             "production_release": False,
         }
@@ -269,6 +316,27 @@ def test_local_uat_readiness_fails_closed_for_an_unready_agent(monkeypatch) -> N
     monkeypatch.setattr(OidcJwtVerifier, "health", lambda _self: True)
     with _local_uat_app(agent_status="unavailable") as client:
         assert client.get("/health/uat-ready").status_code == 503
+
+
+@pytest.mark.parametrize("mutation", ["missing", "invalid_date", "identity_drift"])
+def test_local_uat_metadata_fails_closed_for_invalid_agent_evidence_identity(
+    monkeypatch,
+    mutation: str,
+) -> None:
+    monkeypatch.setattr(OidcJwtVerifier, "health", lambda _self: True)
+    with _local_uat_app() as client:
+        metadata = client.app.state.container.agent._metadata
+        if mutation == "missing":
+            metadata.pop("evidence_runtime_release_v3")
+        elif mutation == "invalid_date":
+            metadata["evidence_runtime_release_v3"]["identity"]["base_runtime_release"][
+                "supported_review_as_of"
+            ] = "2026-07-10T00:00:00Z"
+        else:
+            metadata["uat"]["evidence_runtime_identity"] = _diagnostic_evidence_identity()
+            metadata["uat"]["evidence_runtime_identity"]["runtime_release_v3_sha256"] = "0" * 64
+        assert client.get("/health/uat-ready").status_code == 503
+        assert client.get("/api/v1/uat/metadata").status_code == 503
 
 
 def test_uat_endpoints_are_unavailable_outside_local_uat() -> None:

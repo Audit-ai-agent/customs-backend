@@ -385,6 +385,7 @@
         "type": "object"
       },
       "ChatRecord": {
+        "additionalProperties": false,
         "properties": {
           "answer": {
             "title": "Answer",
@@ -426,6 +427,14 @@
             "title": "Created By",
             "type": "string"
           },
+          "generation_mode": {
+            "enum": [
+              "claude",
+              "deterministic_fallback"
+            ],
+            "title": "Generation Mode",
+            "type": "string"
+          },
           "idempotency_key": {
             "maxLength": 512,
             "minLength": 1,
@@ -440,6 +449,9 @@
           "message_id": {
             "title": "Message Id",
             "type": "string"
+          },
+          "model_execution_summary": {
+            "$ref": "#/components/schemas/ModelExecutionSummary"
           },
           "org_id": {
             "title": "Org Id",
@@ -462,6 +474,8 @@
           "question",
           "answer",
           "answer_status",
+          "generation_mode",
+          "model_execution_summary",
           "bound_result_digest",
           "idempotency_key",
           "idempotency_request_digest",
@@ -1188,6 +1202,109 @@
           "updated_at"
         ],
         "title": "JobView",
+        "type": "object"
+      },
+      "ModelExecutionSummary": {
+        "additionalProperties": false,
+        "description": "Bounded, non-sensitive projection of provider model-call audit records.\n\nThis deliberately excludes document/request/message IDs, raw content, hashes,\nlatency detail, credentials, and provider responses.  ``audit_complete`` means\nonly that the provider-owned audit records are structurally complete and bound\nto the runtime identity; it is not a model-quality or Production-release claim.",
+        "properties": {
+          "audit_complete": {
+            "title": "Audit Complete",
+            "type": "boolean"
+          },
+          "call_count": {
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Call Count",
+            "type": "integer"
+          },
+          "input_tokens_total": {
+            "maximum": 1000000000000.0,
+            "minimum": 0.0,
+            "title": "Input Tokens Total",
+            "type": "integer"
+          },
+          "model_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Id"
+          },
+          "output_tokens_total": {
+            "maximum": 1000000000000.0,
+            "minimum": 0.0,
+            "title": "Output Tokens Total",
+            "type": "integer"
+          },
+          "prompt_hashes_complete": {
+            "title": "Prompt Hashes Complete",
+            "type": "boolean"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "const": "anthropic",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          },
+          "runtime_identity_match": {
+            "title": "Runtime Identity Match",
+            "type": "boolean"
+          },
+          "schema_hashes_complete": {
+            "title": "Schema Hashes Complete",
+            "type": "boolean"
+          },
+          "text_only": {
+            "title": "Text Only",
+            "type": "boolean"
+          },
+          "unmet_reason_codes": {
+            "items": {
+              "enum": [
+                "no_model_calls",
+                "provider_not_anthropic",
+                "model_id_incomplete_or_mixed",
+                "non_text_model_call",
+                "non_positive_input_tokens",
+                "non_positive_output_tokens",
+                "prompt_hash_incomplete",
+                "schema_hash_incomplete",
+                "runtime_identity_mismatch"
+              ],
+              "type": "string"
+            },
+            "maxItems": 9,
+            "title": "Unmet Reason Codes",
+            "type": "array"
+          }
+        },
+        "required": [
+          "provider",
+          "model_id",
+          "text_only",
+          "call_count",
+          "input_tokens_total",
+          "output_tokens_total",
+          "prompt_hashes_complete",
+          "schema_hashes_complete",
+          "runtime_identity_match",
+          "audit_complete",
+          "unmet_reason_codes"
+        ],
+        "title": "ModelExecutionSummary",
         "type": "object"
       },
       "ProblemDetailsV1": {
@@ -2208,6 +2325,11 @@
             "title": "Production Release",
             "type": "boolean"
           },
+          "supported_review_as_of": {
+            "format": "date",
+            "title": "Supported Review As Of",
+            "type": "string"
+          },
           "text_only": {
             "const": true,
             "default": true,
@@ -2218,6 +2340,7 @@
         "required": [
           "evidence_profile",
           "evidence_scope_label",
+          "supported_review_as_of",
           "planner_mode"
         ],
         "title": "UatMetadataResponse",

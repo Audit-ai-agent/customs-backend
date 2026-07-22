@@ -299,6 +299,23 @@ class EvidenceRuntimeReleaseIdentity(BaseModel):
     supported_review_as_of: date
     runtime_release_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
 
+    @field_validator("supported_review_as_of", mode="before")
+    @classmethod
+    def supported_date_is_exact_iso_date(cls, value: object) -> object:
+        if isinstance(value, datetime):
+            raise ValueError("supported_review_as_of must be an exact calendar date")
+        if isinstance(value, date):
+            return value
+        if not isinstance(value, str):
+            raise ValueError("supported_review_as_of must be an exact calendar date")
+        try:
+            parsed = date.fromisoformat(value)
+        except ValueError:
+            raise ValueError("supported_review_as_of must be an exact calendar date") from None
+        if parsed.isoformat() != value:
+            raise ValueError("supported_review_as_of must be an exact calendar date")
+        return value
+
     @model_validator(mode="after")
     def canonical_digest_matches(self) -> "EvidenceRuntimeReleaseIdentity":
         value = self.model_dump(mode="json", exclude={"runtime_release_sha256"})
@@ -618,6 +635,14 @@ class AgentServicePin(BaseModel):
             or not isinstance(evidence_v3.get("identity"), dict)
         ):
             raise ReleaseConfigurationError("Agent UAT Evidence identity is invalid")
+        try:
+            evidence_identity = EvidenceRuntimeReleaseIdentityV3.model_validate(
+                evidence_v3["identity"]
+            )
+        except (TypeError, ValueError):
+            raise ReleaseConfigurationError("Agent UAT Evidence identity is invalid") from None
+        if uat.get("evidence_runtime_identity") != evidence_identity.model_dump(mode="json"):
+            raise ReleaseConfigurationError("Agent UAT Evidence identity is not consistently bound")
         automatic = normalized.get("automatic_completion_release")
         if not isinstance(automatic, dict) or automatic.get("uat_forced_disabled") is not True:
             raise ReleaseConfigurationError("Agent UAT completion Gate is invalid")

@@ -4,7 +4,7 @@ import json
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated, Any, Literal, Never
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
@@ -64,6 +64,7 @@ from customs_backend.ports import (
 from customs_backend.release import (
     AgentReleasePin,
     AgentServicePin,
+    EvidenceRuntimeReleaseIdentityV3,
     ReleaseConfigurationError,
     load_auto_completion_approval,
     validate_agent_contract_bundle,
@@ -248,6 +249,7 @@ class UatMetadataResponse(BaseModel):
     claude_mode: Literal["actual"] = "actual"
     evidence_profile: Literal["synthetic-v3", "preserved-3law", "unknown"]
     evidence_scope_label: Literal["TEST_ONLY_V3", "REAL_3_OF_58", "UNKNOWN"]
+    supported_review_as_of: date
     planner_mode: Literal["shadow", "diagnostic_active"]
     production_release: Literal[False] = False
 
@@ -638,6 +640,59 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             "dependencies": dependency_status,
         }
 
+    def validated_local_uat_agent_metadata() -> tuple[
+        dict[str, Any], EvidenceRuntimeReleaseIdentityV3
+    ]:
+        agent_metadata = actual_container.agent.metadata()
+        uat_identity = agent_metadata.get("uat")
+        transport_limits = agent_metadata.get("transport_limits")
+        agentic_limits = agent_metadata.get("agentic_limits")
+        model_identity = agent_metadata.get("model")
+        evidence_release = agent_metadata.get("evidence_runtime_release_v3")
+        expected_planner_mode = {
+            "shadow": "shadow",
+            "diagnostic_active": "active",
+        }[actual_container.settings.uat_planner_mode]
+        if (
+            agent_metadata.get("status") != "ready"
+            or agent_metadata.get("service_api_version") != "internal-agent-service/v2"
+            or agent_metadata.get("service_mode") != "local_user_uat_diagnostic"
+            or agent_metadata.get("assurance_level") != "diagnostic"
+            or not isinstance(transport_limits, dict)
+            or transport_limits.get("text_only") is not True
+            or not isinstance(agentic_limits, dict)
+            or agentic_limits.get("effective_execution_mode") != expected_planner_mode
+            or not isinstance(model_identity, dict)
+            or not isinstance(model_identity.get("id"), str)
+            or not model_identity["id"]
+            or not isinstance(uat_identity, dict)
+            or uat_identity.get("diagnostic_only") is not True
+            or uat_identity.get("mock_fallback_allowed") is not False
+            or uat_identity.get("auto_completion_allowed") is not False
+            or not isinstance(evidence_release, dict)
+            or set(evidence_release) != {"release_state", "identity"}
+            or evidence_release.get("release_state") != "diagnostic"
+        ):
+            raise ReleaseConfigurationError("Agent is not local UAT diagnostic-ready")
+        expected_evidence_mode = actual_container.settings.uat_evidence_profile
+        if expected_evidence_mode != "unknown" and (
+            uat_identity.get("evidence_mode") != expected_evidence_mode
+        ):
+            raise ReleaseConfigurationError("Agent UAT Evidence profile differs")
+        try:
+            evidence_identity = EvidenceRuntimeReleaseIdentityV3.model_validate(
+                evidence_release["identity"]
+            )
+        except (KeyError, TypeError, ValueError):
+            raise ReleaseConfigurationError("Agent UAT Evidence identity is invalid") from None
+        if uat_identity.get("evidence_runtime_identity") != evidence_identity.model_dump(
+            mode="json"
+        ):
+            raise ReleaseConfigurationError("Agent UAT Evidence identity is not consistently bound")
+        if actual_container.service.service_pin is not None:
+            actual_container.service.service_pin.validate_local_uat_metadata(agent_metadata)
+        return agent_metadata, evidence_identity
+
     @app.get("/health/uat-ready", include_in_schema=False)
     def health_uat_ready() -> dict[str, Any]:
         if actual_container.settings.environment != "local_uat":
@@ -655,33 +710,10 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             except Exception:
                 dependency_status[name] = False
         try:
-            agent_metadata = actual_container.agent.metadata()
+            agent_metadata, _evidence_identity = validated_local_uat_agent_metadata()
             agent_uat_readiness = actual_container.agent.uat_readiness()
-            uat_identity = agent_metadata.get("uat")
-            transport_limits = agent_metadata.get("transport_limits")
-            agentic_limits = agent_metadata.get("agentic_limits")
-            model_identity = agent_metadata.get("model")
-            expected_planner_mode = {
-                "shadow": "shadow",
-                "diagnostic_active": "active",
-            }[actual_container.settings.uat_planner_mode]
             if (
-                agent_metadata.get("status") != "ready"
-                or agent_metadata.get("service_api_version") != "internal-agent-service/v2"
-                or agent_metadata.get("service_mode") != "local_user_uat_diagnostic"
-                or agent_metadata.get("assurance_level") != "diagnostic"
-                or not isinstance(transport_limits, dict)
-                or transport_limits.get("text_only") is not True
-                or not isinstance(agentic_limits, dict)
-                or agentic_limits.get("effective_execution_mode") != expected_planner_mode
-                or not isinstance(model_identity, dict)
-                or not isinstance(model_identity.get("id"), str)
-                or not model_identity["id"]
-                or not isinstance(uat_identity, dict)
-                or uat_identity.get("diagnostic_only") is not True
-                or uat_identity.get("mock_fallback_allowed") is not False
-                or uat_identity.get("auto_completion_allowed") is not False
-                or agent_uat_readiness.get("status") != "uat-ready"
+                agent_uat_readiness.get("status") != "uat-ready"
                 or agent_uat_readiness.get("diagnostic_only") is not True
                 or agent_uat_readiness.get("text_only") is not True
                 or agent_uat_readiness.get("mock_fallback_allowed") is not False
@@ -690,12 +722,9 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
                 raise ReleaseConfigurationError("Agent is not local UAT diagnostic-ready")
             expected_evidence_mode = actual_container.settings.uat_evidence_profile
             if expected_evidence_mode != "unknown" and (
-                uat_identity.get("evidence_mode") != expected_evidence_mode
-                or agent_uat_readiness.get("evidence_mode") != expected_evidence_mode
+                agent_uat_readiness.get("evidence_mode") != expected_evidence_mode
             ):
                 raise ReleaseConfigurationError("Agent UAT Evidence profile differs")
-            if actual_container.service.service_pin is not None:
-                actual_container.service.service_pin.validate_local_uat_metadata(agent_metadata)
             agent_ready = True
         except Exception:
             agent_metadata = {"status": "unavailable"}
@@ -733,9 +762,17 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             "unknown": "UNKNOWN",
         }
         evidence_scope = evidence_scope_by_profile[actual_container.settings.uat_evidence_profile]
+        try:
+            _agent_metadata, evidence_identity = validated_local_uat_agent_metadata()
+        except Exception:
+            raise HTTPException(
+                status_code=503,
+                detail="local UAT Agent metadata is invalid or unavailable",
+            ) from None
         return UatMetadataResponse(
             evidence_profile=actual_container.settings.uat_evidence_profile,
             evidence_scope_label=evidence_scope,
+            supported_review_as_of=evidence_identity.base_runtime_release.supported_review_as_of,
             planner_mode=actual_container.settings.uat_planner_mode,
         )
 

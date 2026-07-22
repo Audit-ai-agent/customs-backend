@@ -591,6 +591,10 @@ def test_unreleased_candidate_metadata_drift_fails_closed() -> None:
 def test_local_uat_metadata_preserves_the_exact_candidate_code_pin() -> None:
     pin = _release_pin().service_pin()
     metadata = _unreleased_metadata(pin)
+    _base_evidence, v3_evidence = _evidence_release_payloads(
+        pin.evidence_provider_contract,
+        snapshot_id="diagnostic-snapshot",
+    )
     metadata.update(
         {
             "status": "ready",
@@ -601,13 +605,14 @@ def test_local_uat_metadata_preserves_the_exact_candidate_code_pin() -> None:
                 "mock_fallback_allowed": False,
                 "auto_completion_allowed": False,
                 "evidence_mode": "synthetic-v3",
+                "evidence_runtime_identity": v3_evidence,
             },
         }
     )
     metadata["automatic_completion_release"]["uat_forced_disabled"] = True
     metadata["evidence_runtime_release_v3"] = {
         "release_state": "diagnostic",
-        "identity": {"diagnostic_manifest_sha256": "f" * 64},
+        "identity": v3_evidence,
     }
     assert pin.validate_local_uat_metadata(metadata) is metadata
 
@@ -615,6 +620,11 @@ def test_local_uat_metadata_preserves_the_exact_candidate_code_pin() -> None:
     drifted["agent"]["build_sha"] = "0" * 40
     with pytest.raises(ReleaseConfigurationError, match="candidate pin"):
         pin.validate_local_uat_metadata(drifted)
+
+    identity_drift = json.loads(json.dumps(metadata))
+    identity_drift["uat"]["evidence_runtime_identity"]["runtime_release_v3_sha256"] = "0" * 64
+    with pytest.raises(ReleaseConfigurationError, match="consistently bound"):
+        pin.validate_local_uat_metadata(identity_drift)
 
 
 def test_candidate_pin_cannot_enable_automatic_completion() -> None:
