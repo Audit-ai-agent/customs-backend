@@ -1641,7 +1641,7 @@
             "items": {
               "$ref": "#/components/schemas/ReviewStageTraceEntry"
             },
-            "maxItems": 20,
+            "maxItems": 64,
             "title": "Review Stage Trace",
             "type": "array"
           },
@@ -1694,7 +1694,7 @@
             "type": "array"
           },
           "sequence": {
-            "maximum": 20.0,
+            "maximum": 64.0,
             "minimum": 1.0,
             "title": "Sequence",
             "type": "integer"

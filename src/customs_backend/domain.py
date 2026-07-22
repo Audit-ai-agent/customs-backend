@@ -927,10 +927,19 @@ class AutoCompletionProfileBinding(BaseModel):
         return self
 
 
+MAX_REVIEW_STAGE_TRACE_ENTRIES = 64
+
+
 class ReviewStageTraceEntry(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    sequence: int = Field(ge=1, le=20)
+    # A revision result contains the original analysis plus the deterministic
+    # stages rerun after an approved correction.  The bounded Agent currently
+    # emits 21 mandatory-stage events for that valid path, so the former limit
+    # of 20 rejected a legitimate child Review at the persistence boundary.
+    # Keep a finite consumer-side bound without assuming that one run can only
+    # visit each mandatory stage once.
+    sequence: int = Field(ge=1, le=MAX_REVIEW_STAGE_TRACE_ENTRIES)
     stage: Literal[
         "load_case",
         "classify_documents",
@@ -975,7 +984,10 @@ class ReviewRunRecord(BaseModel):
     required_actions: list[RequiredAction] = Field(default_factory=list)
     narrative_report: dict[str, Any] = Field(default_factory=dict)
     action_trace: list[dict[str, Any]] = Field(default_factory=list)
-    review_stage_trace: list[ReviewStageTraceEntry] = Field(default_factory=list, max_length=20)
+    review_stage_trace: list[ReviewStageTraceEntry] = Field(
+        default_factory=list,
+        max_length=MAX_REVIEW_STAGE_TRACE_ENTRIES,
+    )
     result_detail: dict[str, Any]
     release_identity: dict[str, Any] = Field(default_factory=dict)
     auto_completion_profile: AutoCompletionProfileBinding = Field(

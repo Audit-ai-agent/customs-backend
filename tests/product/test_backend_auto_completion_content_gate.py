@@ -8,6 +8,7 @@ import pytest
 from tests.product.agent_v3_fixture import build_agent_v3_result
 
 from customs_backend.domain import (
+    MAX_REVIEW_STAGE_TRACE_ENTRIES,
     AgentDocumentInput,
     AgentReviewRequest,
     AgentReviewResultV3,
@@ -72,6 +73,17 @@ def _reasons(
 def test_complete_bound_agent_content_passes_the_backend_independent_gate() -> None:
     envelope, manifest = _complete_provider_and_manifest()
     assert _reasons(envelope, manifest) == set()
+
+
+def test_stage_trace_accepts_bounded_revision_rerun_events() -> None:
+    envelope, _manifest = _complete_provider_and_manifest()
+    revision_audit = [*envelope.audit_trail, *deepcopy(envelope.audit_trail[:10])]
+
+    trace = _sanitized_review_stage_trace(revision_audit)
+
+    assert len(trace) == 21
+    assert [entry.sequence for entry in trace] == list(range(1, 22))
+    assert len(trace) <= MAX_REVIEW_STAGE_TRACE_ENTRIES
 
 
 @pytest.mark.parametrize(
