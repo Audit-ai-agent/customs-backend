@@ -263,6 +263,19 @@ def _reconstruct_current_facts(
     }
 
 
+def reconstruct_current_agent_facts(
+    payload: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, list[str] | str]]:
+    """Return the Backend-owned projection of the Agent's current facts.
+
+    Consumers such as Case Chat must select current facts from this exact
+    projection, never from provider labels or other heuristics that can collide
+    with valid document identifiers.
+    """
+
+    return _reconstruct_current_facts(payload)
+
+
 def _expected_narrative(
     payload: dict[str, Any],
     references: dict[str, list[str] | str],
@@ -987,4 +1000,4 @@ def validate_agent_v3_semantics(payload: dict[str, Any]) -> None:
                 )
 
 
-__all__ = ["validate_agent_v3_semantics"]
+__all__ = ["reconstruct_current_agent_facts", "validate_agent_v3_semantics"]

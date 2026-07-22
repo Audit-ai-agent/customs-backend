@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from customs_backend.agent_v3_semantics import reconstruct_current_agent_facts
 from customs_backend.domain import AgentAnswerResponse, canonical_digest
 
 
@@ -118,12 +119,11 @@ def expected_answer_projection(
             refusal_text="이 질문은 현재 통관 Case의 문서·규정·심사 결과 범위를 벗어납니다.",
         )
 
-    ledger_entries = [
-        item
-        for item in provider_result.get("fact_ledger", {}).get("entries", [])
-        if isinstance(item, dict)
-        and not str(item.get("label", "")).startswith("investigation_input:")
-    ]
+    # Build current facts from the provider's V2 sources.  A label-prefix
+    # filter is not safe here because ``investigation_input:`` is also a valid
+    # document-id prefix; retained historical facts are excluded by identity,
+    # not by text.
+    ledger_entries, _current_references = reconstruct_current_agent_facts(provider_result)
     ledger_by_kind: dict[str, dict[str, dict[str, Any]]] = {}
     for entry in ledger_entries:
         kind = entry.get("kind")

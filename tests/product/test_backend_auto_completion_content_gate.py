@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from tests.product.agent_v3_fixture import build_agent_v3_result
 
 from customs_backend.agent_chat_semantics import expected_answer_projection
+from customs_backend.agent_v3_semantics import reconstruct_current_agent_facts
 from customs_backend.domain import (
     MAX_REVIEW_STAGE_TRACE_ENTRIES,
     AgentDocumentInput,
@@ -115,6 +116,32 @@ def _reasons(
 def test_complete_bound_agent_content_passes_the_backend_independent_gate() -> None:
     envelope, manifest = _complete_provider_and_manifest()
     assert _reasons(envelope, manifest) == set()
+
+
+def test_case_chat_uses_exact_current_fact_order_without_label_prefix_heuristics() -> None:
+    request = _complete_provider_request()
+    documents = [
+        document.model_copy(update={"document_id": f"investigation_input:{index}"})
+        for index, document in enumerate(request.documents)
+    ]
+    request = request.model_copy(update={"documents": documents})
+    result = build_agent_v3_result(request)
+
+    current_facts, _references = reconstruct_current_agent_facts(result)
+    expected_field_references = [
+        str(item["reference_id"]) for item in current_facts if item["kind"] == "field_source"
+    ][:20]
+    projection = expected_answer_projection(
+        provider_result=result,
+        question="문서",
+        effective_disposition=str(result["review_disposition"]),
+    )
+
+    assert projection.status == "answered"
+    assert [claim.citations[0]["reference_id"] for claim in projection.claims] == (
+        expected_field_references
+    )
+    assert all(claim.text.startswith("investigation_input:") for claim in projection.claims)
 
 
 def test_stage_trace_accepts_bounded_revision_rerun_events() -> None:
