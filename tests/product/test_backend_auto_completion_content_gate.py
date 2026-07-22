@@ -5,6 +5,7 @@ from copy import deepcopy
 from datetime import UTC, date, datetime
 
 import pytest
+from pydantic import ValidationError
 from tests.product.agent_v3_fixture import build_agent_v3_result
 
 from customs_backend.domain import (
@@ -13,6 +14,7 @@ from customs_backend.domain import (
     AgentReviewRequest,
     AgentReviewResultV3,
     InputDocumentManifestEntry,
+    canonical_digest,
 )
 from customs_backend.service import (
     _auto_completion_content_gate_reasons,
@@ -20,16 +22,14 @@ from customs_backend.service import (
 )
 
 
-def _complete_provider_and_manifest() -> tuple[
-    AgentReviewResultV3, list[InputDocumentManifestEntry]
-]:
+def _complete_provider_request() -> AgentReviewRequest:
     definitions = [
         ("doc-ci", "CI", "invoice"),
         ("doc-pl", "PL", "packing_list"),
         ("doc-bl", "BL", "bill_of_lading"),
         ("doc-co", "CO", "certificate_of_origin"),
     ]
-    request = AgentReviewRequest(
+    return AgentReviewRequest(
         review_run_id="run-content-gate",
         case_id="case-content-gate",
         documents=[
@@ -45,16 +45,57 @@ def _complete_provider_and_manifest() -> tuple[
         assertion_cutoff_at=datetime(2026, 7, 22, tzinfo=UTC),
         trade_type="import",
     )
-    envelope = AgentReviewResultV3.model_validate(build_agent_v3_result(request))
+
+
+def _audited_result(request: AgentReviewRequest, *, auto_complete: bool = False) -> dict:
+    result = build_agent_v3_result(request, auto_complete=auto_complete)
+    runtime = result["runtime_release"]
+    result["model_calls"] = [
+        {
+            "document_id": document.document_id,
+            "provider": "anthropic",
+            "model_id": runtime["model_id"],
+            "prompt_id": "customs_document_analysis",
+            "prompt_version": "1.2.0",
+            "request_id": f"provider-request-sensitive-{index}",
+            "message_id": f"provider-message-sensitive-{index}",
+            "stop_reason": "end_turn",
+            "input_tokens": 100 + index,
+            "output_tokens": 50 + index,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "latency_ms": 10,
+            "prompt_sha256": runtime["extraction_prompt_sha256"],
+            "output_schema_id": "document-analysis",
+            "output_schema_version": "1.0",
+            "output_schema_sha256": runtime["extraction_schema_sha256"],
+            "input_modality": "text",
+        }
+        for index, document in enumerate(request.documents)
+    ]
+    result["result_sha256"] = "0" * 64
+    result["result_sha256"] = canonical_digest(result)
+    return result
+
+
+def _complete_provider_and_manifest() -> tuple[
+    AgentReviewResultV3, list[InputDocumentManifestEntry]
+]:
+    request = _complete_provider_request()
+    envelope = AgentReviewResultV3.model_validate(_audited_result(request))
+    declared_to_document_type = {
+        "invoice": "CI",
+        "packing_list": "PL",
+        "bill_of_lading": "BL",
+        "certificate_of_origin": "CO",
+    }
     manifest = [
         InputDocumentManifestEntry(
             document_id=document.document_id,
-            document_type=document_type,
+            document_type=declared_to_document_type[document.declared_type],
             content_sha256=hashlib.sha256(document.content_text.encode("utf-8")).hexdigest(),
         )
-        for document, (_document_id, document_type, _declared_type) in zip(
-            request.documents, definitions, strict=True
-        )
+        for document in request.documents
     ]
     return envelope, manifest
 
@@ -84,6 +125,66 @@ def test_stage_trace_accepts_bounded_revision_rerun_events() -> None:
     assert len(trace) == 21
     assert [entry.sequence for entry in trace] == list(range(1, 22))
     assert len(trace) <= MAX_REVIEW_STAGE_TRACE_ENTRIES
+
+
+def test_consumer_rejects_trace_above_the_compiled_tool_budget() -> None:
+    request = _complete_provider_request()
+    result = _audited_result(request, auto_complete=True)
+    gap_id = f"gap_{'a' * 64}"
+    action_id = f"action_{'b' * 64}"
+    result["review_gaps"] = [
+        {
+            "gap_id": gap_id,
+            "gap_type": "field_uncertainty",
+            "reason_code": "adversarial_budget_probe",
+            "source_reference_ids": [],
+            "status": "resolved",
+        }
+    ]
+    result["review_plan"]["actions"] = [
+        {
+            "action_id": action_id,
+            "tool_name": "document.reread_span/v1",
+            "gap_id": gap_id,
+            "reason_code": "adversarial_budget_probe",
+            "input_reference_ids": [],
+        }
+    ]
+    result["action_trace"] = [
+        {
+            "action_id": action_id,
+            "cycle": 1,
+            "tool_name": "document.reread_span/v1",
+            "reason_code": "adversarial_budget_probe",
+            "input_reference_ids": [],
+            "output_reference_ids": [],
+            "status": "succeeded",
+            "duration_ms": 1,
+            "provider": "deterministic_policy",
+            "model_id": None,
+            "prompt_sha256": None,
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
+    ] * 7
+    result["observations"] = [
+        {
+            "observation_id": f"observation_{index:064x}",
+            "action_id": action_id,
+            "cycle": 1,
+            "tool_name": "document.reread_span/v1",
+            "status": "succeeded",
+            "reason_code": "adversarial_budget_probe",
+            "input_reference_ids": [],
+            "output_reference_ids": [],
+        }
+        for index in range(7)
+    ]
+    result["result_sha256"] = "0" * 64
+    result["result_sha256"] = canonical_digest(result)
+
+    with pytest.raises(ValidationError, match="bounded Tool-call limit"):
+        AgentReviewResultV3.model_validate(result)
 
 
 @pytest.mark.parametrize(
@@ -117,6 +218,16 @@ def test_stage_trace_accepts_bounded_revision_rerun_events() -> None:
             "backend_mandatory_stage_trace_invalid",
         ),
         (
+            lambda envelope, _manifest: envelope.model_calls.clear(),
+            "backend_model_execution_audit_incomplete",
+        ),
+        (
+            lambda envelope, _manifest: envelope.model_calls[-1].__setitem__(
+                "document_id", envelope.model_calls[0]["document_id"]
+            ),
+            "backend_model_execution_audit_incomplete",
+        ),
+        (
             lambda envelope, _manifest: envelope.narrative_report.__setitem__(
                 "regulatory_review", []
             ),
@@ -132,6 +243,8 @@ def test_stage_trace_accepts_bounded_revision_rerun_events() -> None:
         "field-source",
         "fact-ledger-coverage",
         "stage-order",
+        "model-audit",
+        "model-document-binding",
         "narrative-citation",
         "primary-type-profile",
     ],

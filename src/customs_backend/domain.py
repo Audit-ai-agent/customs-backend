@@ -830,20 +830,57 @@ class AgentReviewResultV3(BaseModel):
                 raise ValueError("narrative claim cites a fact outside the canonical ledger")
         gap_ids = {gap.gap_id for gap in self.review_gaps}
         planned_actions = self.review_plan.get("actions", [])
+        tool_call_limit = self.review_plan.get("tool_call_limit")
+        cycle_limit = self.review_plan.get("cycle_limit")
+        if (
+            not isinstance(planned_actions, list)
+            or isinstance(tool_call_limit, bool)
+            or not isinstance(tool_call_limit, int)
+            or not 0 <= tool_call_limit <= 6
+            or isinstance(cycle_limit, bool)
+            or not isinstance(cycle_limit, int)
+            or not 0 <= cycle_limit <= 2
+            or len(planned_actions) > tool_call_limit
+            or len(self.action_trace) > tool_call_limit
+        ):
+            raise ValueError("Agent plan or trace exceeds the bounded Tool-call limit")
         if any(
             not isinstance(action, dict) or action.get("gap_id") not in gap_ids
             for action in planned_actions
         ):
             raise ValueError("planned Agent actions must reference declared review gaps")
-        planned_ids = {
-            action.get("action_id") for action in planned_actions if isinstance(action, dict)
-        }
-        if any(item.get("action_id") not in planned_ids for item in self.action_trace):
+        planned_ids = [action.get("action_id") for action in planned_actions]
+        if any(not isinstance(action_id, str) for action_id in planned_ids) or len(
+            planned_ids
+        ) != len(set(planned_ids)):
+            raise ValueError("planned Agent action IDs must be present and unique")
+        planned_by_id = {action["action_id"]: action for action in planned_actions}
+        trace_ids = [item.get("action_id") for item in self.action_trace]
+        observation_ids = [item.get("action_id") for item in self.observations]
+        if any(action_id not in planned_by_id for action_id in trace_ids) or len(trace_ids) != len(
+            set(trace_ids)
+        ):
             raise ValueError("Agent action trace is not bound to the compiled plan")
-        if any(item.get("action_id") not in planned_ids for item in self.observations):
+        if any(action_id not in planned_by_id for action_id in observation_ids) or len(
+            observation_ids
+        ) != len(set(observation_ids)):
             raise ValueError("Agent observation is not bound to the compiled plan")
-        if len(self.observations) != len(self.action_trace):
+        if len(self.observations) != len(self.action_trace) or set(observation_ids) != set(
+            trace_ids
+        ):
             raise ValueError("every Agent Tool action requires exactly one observation")
+        trace_by_id = {item["action_id"]: item for item in self.action_trace}
+        observations_by_id = {item["action_id"]: item for item in self.observations}
+        if any(
+            isinstance(item.get("cycle"), bool)
+            or not isinstance(item.get("cycle"), int)
+            or not 0 <= item["cycle"] <= cycle_limit
+            or item.get("tool_name") != planned_by_id[item["action_id"]].get("tool_name")
+            or observations_by_id[item["action_id"]].get("tool_name") != item.get("tool_name")
+            or observations_by_id[item["action_id"]].get("cycle") != item.get("cycle")
+            for item in trace_by_id.values()
+        ):
+            raise ValueError("Agent Tool execution differs from its bounded compiled plan")
         expected_assessment = (
             Assessment.issues_detected
             if self.validation_issues or self.regulatory_findings

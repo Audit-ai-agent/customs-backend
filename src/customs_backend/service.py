@@ -327,6 +327,22 @@ def _auto_completion_content_gate_reasons(
     stage_trace: list[ReviewStageTraceEntry],
 ) -> set[str]:
     reasons: set[str] = set()
+    model_execution_summary = _bounded_model_execution_summary(
+        envelope.model_calls,
+        expected_model_id=envelope.runtime_release.model_id,
+        expected_prompt_sha256=envelope.runtime_release.extraction_prompt_sha256,
+        expected_schema_sha256=envelope.runtime_release.extraction_schema_sha256,
+    )
+    manifest_ids = {item.document_id for item in manifest}
+    model_document_ids = [call.get("document_id") for call in envelope.model_calls]
+    if (
+        not model_execution_summary.audit_complete
+        or model_execution_summary.call_count < len(manifest)
+        or any(not isinstance(document_id, str) for document_id in model_document_ids)
+        or len(model_document_ids) != len(set(model_document_ids))
+        or set(model_document_ids) != manifest_ids
+    ):
+        reasons.add("backend_model_execution_audit_incomplete")
     manifest_by_id = {item.document_id: item for item in manifest}
     if len(manifest_by_id) != len(manifest) or sorted(
         item.document_type for item in manifest
@@ -1976,6 +1992,12 @@ class WorkbenchService:
         required_actions = list(envelope.required_actions)
         backend_gate_reasons: set[str] = set()
         stage_trace = _sanitized_review_stage_trace(envelope.audit_trail)
+        model_execution_summary = _bounded_model_execution_summary(
+            envelope.model_calls,
+            expected_model_id=envelope.runtime_release.model_id,
+            expected_prompt_sha256=envelope.runtime_release.extraction_prompt_sha256,
+            expected_schema_sha256=envelope.runtime_release.extraction_schema_sha256,
+        )
         content_gate_reasons = _auto_completion_content_gate_reasons(
             envelope=envelope,
             manifest=input_document_manifest,
@@ -2128,12 +2150,6 @@ class WorkbenchService:
             kind="finding",
             prefix="finding",
             code_key="finding_code",
-        )
-        model_execution_summary = _bounded_model_execution_summary(
-            envelope.model_calls,
-            expected_model_id=envelope.runtime_release.model_id,
-            expected_prompt_sha256=envelope.runtime_release.extraction_prompt_sha256,
-            expected_schema_sha256=envelope.runtime_release.extraction_schema_sha256,
         )
         detail = {
             key: provider_public[key]
