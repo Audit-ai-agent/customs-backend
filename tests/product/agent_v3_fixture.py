@@ -82,12 +82,13 @@ def build_agent_v3_result(
         "cycle_limit": 2,
         "tool_call_limit": 6,
         "actions": [],
-        "provider": "deterministic_policy",
-        "model_id": None,
-        "prompt_sha256": None,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "latency_ms": 0,
+        "provider": "anthropic" if auto_complete else "deterministic_policy",
+        "model_id": "claude-test" if auto_complete else None,
+        "prompt_sha256": "2" * 64 if auto_complete else None,
+        "output_schema_sha256": "5" * 64 if auto_complete else None,
+        "input_tokens": 20 if auto_complete else 0,
+        "output_tokens": 10 if auto_complete else 0,
+        "latency_ms": 1 if auto_complete else 0,
     }
     plan = {"plan_id": _stable_id("plan", plan_payload), **plan_payload}
     contract_lock = load_agent_contract_lock()
@@ -276,9 +277,24 @@ def build_agent_v3_result(
             "document_consistency": [claim],
             "regulatory_review": [claim],
             "required_actions": [],
-            "generation_mode": "deterministic_fallback",
+            "generation_mode": "claude" if auto_complete else "deterministic_fallback",
             "citation_verification": "passed",
-            "model_call": None,
+            "model_call": (
+                {
+                    "task_id": "customs_narrative_report",
+                    "provider": "anthropic",
+                    "model_id": runtime_release["model_id"],
+                    "prompt_sha256": runtime_release["narrative_prompt_sha256"],
+                    "output_schema_sha256": runtime_release["narrative_schema_sha256"],
+                    "request_id_sha256": "d" * 64,
+                    "message_id_sha256": "e" * 64,
+                    "input_tokens": 20,
+                    "output_tokens": 10,
+                    "latency_ms": 1,
+                }
+                if auto_complete
+                else None
+            ),
         },
         "action_trace": [],
         "observations": [],

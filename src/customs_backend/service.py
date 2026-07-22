@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Literal
 
+from pydantic import ValidationError
+
 from customs_backend.assertion_signing import (
     RequirementPolicyIdentityResolver,
     SupportingAssertionSigner,
@@ -1920,7 +1922,12 @@ class WorkbenchService:
         expected_agent_input_sha256: str,
     ) -> ReviewRunRecord:
         validate_agent_v3_payload("review_result", result)
-        envelope = AgentReviewResultV3.model_validate(result)
+        try:
+            envelope = AgentReviewResultV3.model_validate(result)
+        except ValidationError as exc:
+            raise ConflictError(
+                "Agent result violates the trusted Backend policy boundary"
+            ) from exc
         try:
             expected_review_as_of = date.fromisoformat(str(job.request["review_as_of"]))
             expected_trade_type = str(job.request["trade_type"])

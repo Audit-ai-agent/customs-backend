@@ -803,11 +803,35 @@ class AgentReviewResultV3(BaseModel):
 
     @model_validator(mode="after")
     def provider_invariants(self) -> "AgentReviewResultV3":
-        fact_references = {
-            (item.get("kind"), item.get("reference_id"))
-            for item in self.fact_ledger.get("entries", [])
-            if isinstance(item, dict)
-        }
+        fact_entries = [
+            item for item in self.fact_ledger.get("entries", []) if isinstance(item, dict)
+        ]
+        fact_reference_ids = [item.get("reference_id") for item in fact_entries]
+        if any(not isinstance(reference_id, str) for reference_id in fact_reference_ids) or len(
+            fact_reference_ids
+        ) != len(set(fact_reference_ids)):
+            raise ValueError("FactLedger reference IDs must be globally unique")
+        for item in fact_entries:
+            canonical_fact = {
+                "kind": item.get("kind"),
+                "reference_id": item.get("reference_id"),
+                "label": item.get("label"),
+                "value": item.get("value"),
+                "document_id": item.get("document_id"),
+            }
+            expected_fact_digest = canonical_digest(canonical_fact)
+            if (
+                item.get("fact_id") != f"fact_{expected_fact_digest}"
+                or item.get("source_sha256") != expected_fact_digest
+            ):
+                raise ValueError("FactLedger entry identity must match its canonical contents")
+        if self.fact_ledger.get("ledger_id") != f"ledger_{canonical_digest(fact_entries)}":
+            raise ValueError("FactLedger identity must match its canonical entries")
+        fact_references = {(item.get("kind"), item.get("reference_id")) for item in fact_entries}
+        fact_kinds_by_reference: dict[str, set[str]] = {}
+        for kind, reference_id in fact_references:
+            if isinstance(kind, str) and isinstance(reference_id, str):
+                fact_kinds_by_reference.setdefault(reference_id, set()).add(kind)
         claims: list[Any] = []
         for section in (
             "summary",
@@ -828,10 +852,43 @@ class AgentReviewResultV3(BaseModel):
                 if isinstance(citation, dict)
             ):
                 raise ValueError("narrative claim cites a fact outside the canonical ledger")
+            canonical_claim = {
+                "text": claim.get("text"),
+                "material": claim.get("material", True),
+                "citations": citations,
+            }
+            if claim.get("claim_id") != f"claim_{canonical_digest(canonical_claim)}":
+                raise ValueError("narrative claim identity must match its canonical contents")
+        narrative_claim_ids = {
+            claim.get("claim_id")
+            for claim in claims
+            if isinstance(claim, dict) and isinstance(claim.get("claim_id"), str)
+        }
         gap_id_list = [gap.gap_id for gap in self.review_gaps]
         gap_ids = set(gap_id_list)
         if len(gap_id_list) != len(gap_ids):
             raise ValueError("Agent review gap IDs must be unique")
+        if any(
+            gap.source_reference_ids != sorted(gap.source_reference_ids)
+            or gap.gap_id
+            != "gap_"
+            + canonical_digest(
+                {
+                    "gap_type": gap.gap_type,
+                    "reason_code": gap.reason_code,
+                    "source_reference_ids": gap.source_reference_ids,
+                }
+            )
+            for gap in self.review_gaps
+        ):
+            raise ValueError("Agent review gap identity must match its canonical contents")
+        gap_by_id = {gap.gap_id: gap for gap in self.review_gaps}
+        if any(
+            len(gap.source_reference_ids) != len(set(gap.source_reference_ids))
+            or not set(gap.source_reference_ids).issubset(fact_kinds_by_reference)
+            for gap in self.review_gaps
+        ):
+            raise ValueError("Agent review gaps must bind unique canonical FactLedger references")
         planned_actions = self.review_plan.get("actions", [])
         tool_call_limit = self.review_plan.get("tool_call_limit")
         cycle_limit = self.review_plan.get("cycle_limit")
@@ -858,6 +915,76 @@ class AgentReviewResultV3(BaseModel):
         ) != len(set(planned_ids)):
             raise ValueError("planned Agent action IDs must be present and unique")
         planned_by_id = {action["action_id"]: action for action in planned_actions}
+        primary_tool_by_gap_type = {
+            "field_uncertainty": "document.reread_span/v1",
+            "evidence_incomplete": "evidence.retrieve/v3",
+            "validation_issue": "human.request/v1",
+            "regulatory_finding": "human.request/v1",
+            "human_approval_required": "human.request/v1",
+            "release_gate": "human.request/v1",
+        }
+        reread_reference_ids: set[str] = set()
+        for action in planned_actions:
+            gap = gap_by_id[action["gap_id"]]
+            input_reference_ids = action.get("input_reference_ids")
+            tool_name = action.get("tool_name")
+            if tool_name not in {
+                primary_tool_by_gap_type[gap.gap_type],
+                "explanation.compose/v1",
+            }:
+                raise ValueError("Agent Tool is not allowed to investigate its bound gap type")
+            if (
+                not isinstance(input_reference_ids, list)
+                or any(not isinstance(item, str) for item in input_reference_ids)
+                or len(input_reference_ids) != len(set(input_reference_ids))
+                or not set(input_reference_ids).issubset(gap.source_reference_ids)
+                or not set(input_reference_ids).issubset(fact_kinds_by_reference)
+            ):
+                raise ValueError(
+                    "Agent Tool inputs must bind unique declared FactLedger references"
+                )
+            if input_reference_ids != sorted(input_reference_ids):
+                raise ValueError("Agent Tool inputs must use canonical reference ordering")
+            canonical_action = {
+                "tool_name": tool_name,
+                "gap_id": action.get("gap_id"),
+                "reason_code": action.get("reason_code"),
+                "input_reference_ids": input_reference_ids,
+            }
+            if action.get("action_id") != f"action_{canonical_digest(canonical_action)}":
+                raise ValueError("Agent action identity must match its canonical contents")
+            if tool_name == "document.reread_span/v1":
+                if any(
+                    fact_kinds_by_reference[reference_id] != {"field_source"}
+                    for reference_id in input_reference_ids
+                ):
+                    raise ValueError("span reread inputs must bind canonical field sources")
+                if reread_reference_ids.intersection(input_reference_ids):
+                    raise ValueError("a canonical field may be reread at most once")
+                reread_reference_ids.update(input_reference_ids)
+            elif tool_name == "evidence.retrieve/v3" and any(
+                not fact_kinds_by_reference[reference_id].issubset({"evidence", "outcome"})
+                for reference_id in input_reference_ids
+            ):
+                raise ValueError("Evidence retrieval inputs must bind Evidence or outcome facts")
+        canonical_plan = {
+            key: self.review_plan.get(key)
+            for key in (
+                "mode",
+                "cycle_limit",
+                "tool_call_limit",
+                "actions",
+                "provider",
+                "model_id",
+                "prompt_sha256",
+                "output_schema_sha256",
+                "input_tokens",
+                "output_tokens",
+                "latency_ms",
+            )
+        }
+        if self.review_plan.get("plan_id") != f"plan_{canonical_digest(canonical_plan)}":
+            raise ValueError("Agent plan identity must match its canonical contents")
         trace_ids = [item.get("action_id") for item in self.action_trace]
         observation_action_ids = [item.get("action_id") for item in self.observations]
         observation_ids = [item.get("observation_id") for item in self.observations]
@@ -873,16 +1000,38 @@ class AgentReviewResultV3(BaseModel):
             observation_ids
         ) != len(set(observation_ids)):
             raise ValueError("Agent observation IDs must be present and unique")
+        if any(
+            item.get("observation_id")
+            != "observation_"
+            + canonical_digest(
+                {
+                    key: item.get(key)
+                    for key in (
+                        "action_id",
+                        "cycle",
+                        "tool_name",
+                        "status",
+                        "reason_code",
+                        "input_reference_ids",
+                        "output_reference_ids",
+                    )
+                }
+            )
+            for item in self.observations
+        ):
+            raise ValueError("Agent observation identity must match its canonical contents")
         if len(self.observations) != len(self.action_trace) or set(observation_action_ids) != set(
             trace_ids
         ):
             raise ValueError("every Agent Tool action requires exactly one observation")
+        if trace_ids != planned_ids[: len(trace_ids)] or observation_action_ids != trace_ids:
+            raise ValueError("Agent Tool execution order must follow the compiled plan")
         trace_by_id = {item["action_id"]: item for item in self.action_trace}
         observations_by_id = {item["action_id"]: item for item in self.observations}
         if any(
             isinstance(item.get("cycle"), bool)
             or not isinstance(item.get("cycle"), int)
-            or not 0 <= item["cycle"] <= cycle_limit
+            or not 0 <= item["cycle"] < cycle_limit
             or item.get("tool_name") != planned_by_id[item["action_id"]].get("tool_name")
             or item.get("reason_code") != planned_by_id[item["action_id"]].get("reason_code")
             or item.get("input_reference_ids")
@@ -900,6 +1049,57 @@ class AgentReviewResultV3(BaseModel):
             for item in trace_by_id.values()
         ):
             raise ValueError("Agent Tool execution differs from its bounded compiled plan")
+        allowed_output_reference_ids = {
+            *fact_kinds_by_reference,
+            *gap_ids,
+            *narrative_claim_ids,
+        }
+        if any(
+            not isinstance(item.get("output_reference_ids"), list)
+            or any(not isinstance(value, str) for value in item["output_reference_ids"])
+            or len(item["output_reference_ids"]) != len(set(item["output_reference_ids"]))
+            or not set(item["output_reference_ids"]).issubset(allowed_output_reference_ids)
+            for item in trace_by_id.values()
+        ):
+            raise ValueError("Agent Tool outputs must bind unique canonical result references")
+        # Trace reasons explain why an action was planned. Observation reasons
+        # are execution outcomes, so those two reason codes intentionally differ.
+        if any(
+            item.get("tool_name") != "explanation.compose/v1"
+            and (
+                item.get("provider") != "deterministic_policy"
+                or item.get("model_id") is not None
+                or item.get("prompt_sha256") is not None
+                or item.get("input_tokens") != 0
+                or item.get("output_tokens") != 0
+            )
+            for item in trace_by_id.values()
+        ):
+            raise ValueError("non-explanation Tool traces cannot claim direct model execution")
+        for item in trace_by_id.values():
+            if item.get("tool_name") != "explanation.compose/v1":
+                continue
+            narrative_call = self.narrative_report.get("model_call")
+            if item.get("provider") == "anthropic":
+                if (
+                    not isinstance(narrative_call, dict)
+                    or item.get("model_id") != self.runtime_release.model_id
+                    or item.get("model_id") != narrative_call.get("model_id")
+                    or item.get("prompt_sha256") != self.runtime_release.narrative_prompt_sha256
+                    or item.get("prompt_sha256") != narrative_call.get("prompt_sha256")
+                    or item.get("input_tokens") != narrative_call.get("input_tokens")
+                    or item.get("output_tokens") != narrative_call.get("output_tokens")
+                    or item.get("duration_ms") != narrative_call.get("latency_ms")
+                ):
+                    raise ValueError("Claude explanation trace must match the narrative call audit")
+            elif (
+                item.get("provider") != "deterministic_policy"
+                or item.get("model_id") is not None
+                or item.get("prompt_sha256") is not None
+                or item.get("input_tokens") != 0
+                or item.get("output_tokens") != 0
+            ):
+                raise ValueError("deterministic explanation trace cannot claim model execution")
         expected_assessment = (
             Assessment.issues_detected
             if self.validation_issues or self.regulatory_findings
@@ -933,6 +1133,65 @@ class AgentReviewResultV3(BaseModel):
             or self.runtime_release.kill_switch_active
         ):
             raise ValueError("provider auto completion violates deterministic V3 gates")
+        if self.review_disposition == ReviewDisposition.auto_review_complete:
+            plan_input_tokens = self.review_plan.get("input_tokens")
+            plan_output_tokens = self.review_plan.get("output_tokens")
+            narrative_call = self.narrative_report.get("model_call")
+            if (
+                self.review_plan.get("provider") != "anthropic"
+                or self.review_plan.get("model_id") != self.runtime_release.model_id
+                or self.review_plan.get("prompt_sha256")
+                != self.runtime_release.coordinator_prompt_sha256
+                or self.review_plan.get("output_schema_sha256")
+                != self.runtime_release.coordinator_schema_sha256
+                or isinstance(plan_input_tokens, bool)
+                or not isinstance(plan_input_tokens, int)
+                or plan_input_tokens <= 0
+                or isinstance(plan_output_tokens, bool)
+                or not isinstance(plan_output_tokens, int)
+                or plan_output_tokens <= 0
+                or self.narrative_report.get("generation_mode") != "claude"
+                or not isinstance(narrative_call, dict)
+                or narrative_call.get("task_id") != "customs_narrative_report"
+                or narrative_call.get("provider") != "anthropic"
+                or narrative_call.get("model_id") != self.runtime_release.model_id
+                or narrative_call.get("prompt_sha256")
+                != self.runtime_release.narrative_prompt_sha256
+                or narrative_call.get("output_schema_sha256")
+                != self.runtime_release.narrative_schema_sha256
+                or not isinstance(narrative_call.get("input_tokens"), int)
+                or isinstance(narrative_call.get("input_tokens"), bool)
+                or narrative_call.get("input_tokens", 0) <= 0
+                or not isinstance(narrative_call.get("output_tokens"), int)
+                or isinstance(narrative_call.get("output_tokens"), bool)
+                or narrative_call.get("output_tokens", 0) <= 0
+            ):
+                raise ValueError(
+                    "automatic completion requires exact Claude coordinator and narrative audit"
+                )
+        if self.review_disposition == ReviewDisposition.auto_review_complete and self.review_gaps:
+            resolver_by_gap_type = {
+                "field_uncertainty": "document.reread_span/v1",
+                "evidence_incomplete": "evidence.retrieve/v3",
+            }
+            actions_by_gap: dict[str, list[dict[str, Any]]] = {}
+            for action in planned_actions:
+                actions_by_gap.setdefault(action["gap_id"], []).append(action)
+            if self.review_plan.get("mode") != "active" or any(
+                gap.gap_type not in resolver_by_gap_type
+                or not any(
+                    action.get("tool_name") == resolver_by_gap_type[gap.gap_type]
+                    and bool(action.get("input_reference_ids"))
+                    for action in actions_by_gap.get(gap.gap_id, [])
+                )
+                for gap in self.review_gaps
+            ):
+                raise ValueError("automatic completion requires an active policy resolver per gap")
+            if any(
+                action.get("tool_name") in {"human.request/v1", "case.answer/v1"}
+                for action in planned_actions
+            ):
+                raise ValueError("human or chat Tools cannot resolve an automatic review")
         if self.review_disposition == ReviewDisposition.blocked and self.status != "blocked":
             raise ValueError("blocked disposition must preserve the deterministic status")
         payload = self.model_dump(mode="json")

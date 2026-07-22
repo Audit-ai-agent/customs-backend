@@ -468,7 +468,7 @@ def test_public_issue_and_finding_references_are_exactly_ledger_bound(workbench)
         json={},
         headers={**_auth(), "Idempotency-Key": "duplicate-ledger-reference"},
     ).json()["job"]
-    with pytest.raises(ConflictError, match="exactly bound"):
+    with pytest.raises(ConflictError, match="policy boundary"):
         container.service.execute_job(org_id="org-a", job_id=second_job["job_id"])
 
 
