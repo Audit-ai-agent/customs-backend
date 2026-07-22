@@ -9,6 +9,10 @@ from typing import Any, Literal
 
 from pydantic import ValidationError
 
+from customs_backend.agent_chat_semantics import (
+    expected_answer_projection,
+    validate_agent_answer_projection,
+)
 from customs_backend.assertion_signing import (
     RequirementPolicyIdentityResolver,
     SupportingAssertionSigner,
@@ -17,6 +21,7 @@ from customs_backend.assertion_signing import (
 )
 from customs_backend.domain import (
     AgentCallState,
+    AgentAnswerResponse,
     AgentDocumentInput,
     AgentHumanDecision,
     AgentReviewRequest,
@@ -412,7 +417,72 @@ def _auto_completion_content_gate_reasons(
             or any(not isinstance(claim, dict) or not claim.get("citations") for claim in claims)
         ):
             reasons.add(f"backend_narrative_{section}_citation_missing")
+    if not any(
+        isinstance(item, dict) and item.get("eligibility") != "blocked"
+        for item in envelope.rag_evidence
+    ):
+        reasons.add("backend_regulatory_evidence_missing")
     return reasons
+
+
+def _current_outcome_reference(fact_ledger: dict[str, Any]) -> str:
+    entries = fact_ledger.get("entries")
+    if not isinstance(entries, list):
+        raise ConflictError("Agent FactLedger is malformed")
+    matches = [
+        item.get("reference_id")
+        for item in entries
+        if isinstance(item, dict)
+        and item.get("kind") == "outcome"
+        and item.get("label") == "deterministic_outcome"
+        and isinstance(item.get("reference_id"), str)
+    ]
+    if len(matches) != 1:
+        raise ConflictError("Agent FactLedger requires exactly one current outcome")
+    return str(matches[0])
+
+
+def _backend_policy_narrative_overlay(
+    provider_narrative: dict[str, Any],
+    *,
+    fact_ledger: dict[str, Any],
+    disposition: ReviewDisposition,
+) -> dict[str, Any]:
+    """Replace stale provider action prose after a Backend state downgrade.
+
+    Provider summary/document/regulatory claims have already passed the independent
+    semantic projection.  Only the effective-action section is replaced; it cites
+    the canonical current outcome and uses one immutable Backend-owned sentence.
+    """
+
+    outcome_reference = _current_outcome_reference(fact_ledger)
+    text = (
+        "차단 원인을 해소한 뒤 새로운 Review Run으로 다시 실행해야 합니다."
+        if disposition == ReviewDisposition.blocked
+        else (
+            "Backend의 유효한 Release·입력·자동완료 Gate가 충족되지 않아 담당자 검토가 필요합니다."
+        )
+    )
+    citations = [{"kind": "outcome", "reference_id": outcome_reference}]
+    claim_payload = {"text": text, "material": True, "citations": citations}
+    overlay = {
+        key: value
+        for key, value in provider_narrative.items()
+        if key not in {"generation_mode", "generated_by", "model_call", "required_actions"}
+    }
+    overlay.update(
+        {
+            "required_actions": [
+                {
+                    "claim_id": f"claim_{canonical_digest(claim_payload)}",
+                    **claim_payload,
+                }
+            ],
+            "generated_by": "backend_policy_overlay",
+            "citation_verification": "passed",
+        }
+    )
+    return overlay
 
 
 _DECLARED_TYPE_MAP: dict[
@@ -1715,7 +1785,12 @@ class WorkbenchService:
                 call_started = True
                 raw_revision_response = self.agent.revise(revision_request)
                 response_received = True
-                revision_response = AgentRevisionResult.model_validate(raw_revision_response)
+                try:
+                    revision_response = AgentRevisionResult.model_validate(raw_revision_response)
+                except ValidationError as exc:
+                    raise ConflictError(
+                        "Agent revision response violates the trusted Backend policy boundary"
+                    ) from exc
                 if revision_response.parent_result_sha256 != running.request[
                     "parent_provider_result_sha256"
                 ] or revision_response.applied_decision_ids != [
@@ -1997,6 +2072,7 @@ class WorkbenchService:
         assurance = envelope.assurance_level
         eligibility = envelope.completion_eligibility
         required_actions = list(envelope.required_actions)
+        outcome_reference = _current_outcome_reference(envelope.fact_ledger)
         backend_gate_reasons: set[str] = set()
         stage_trace = _sanitized_review_stage_trace(envelope.audit_trail)
         model_execution_summary = _bounded_model_execution_summary(
@@ -2004,6 +2080,14 @@ class WorkbenchService:
             expected_model_id=envelope.runtime_release.model_id,
             expected_prompt_sha256=envelope.runtime_release.extraction_prompt_sha256,
             expected_schema_sha256=envelope.runtime_release.extraction_schema_sha256,
+        )
+        narrative_call = envelope.narrative_report.get("model_call")
+        narrative_execution_summary = _bounded_model_execution_summary(
+            [narrative_call] if isinstance(narrative_call, dict) else [],
+            expected_model_id=envelope.runtime_release.model_id,
+            expected_prompt_sha256=envelope.runtime_release.narrative_prompt_sha256,
+            expected_schema_sha256=envelope.runtime_release.narrative_schema_sha256,
+            expected_task_id="customs_narrative_report",
         )
         content_gate_reasons = _auto_completion_content_gate_reasons(
             envelope=envelope,
@@ -2017,9 +2101,11 @@ class WorkbenchService:
                 RequiredAction(
                     action_code="confirm_backend_release_pin",
                     message="승인된 Backend-Agent exact release pin이 없어 Production 보증을 적용하지 않았습니다.",
+                    source_reference_ids=[outcome_reference],
                 )
             )
         if backend_gate_reasons:
+            assurance = AssuranceLevel.production_candidate
             eligibility = eligibility.model_copy(
                 update={
                     "eligible": False,
@@ -2090,6 +2176,7 @@ class WorkbenchService:
             or content_gate_reasons
         ):
             disposition = ReviewDisposition.human_review_required
+            assurance = AssuranceLevel.production_candidate
             eligibility = eligibility.model_copy(
                 update={
                     "eligible": False,
@@ -2102,6 +2189,19 @@ class WorkbenchService:
                     ),
                 }
             )
+            if not any(
+                item.action_code == "complete_backend_human_review" for item in required_actions
+            ):
+                required_actions.append(
+                    RequiredAction(
+                        action_code="complete_backend_human_review",
+                        message=(
+                            "Backend Release·입력·자동완료 Gate를 확인하고 "
+                            "담당자 검토를 기록해야 합니다."
+                        ),
+                        source_reference_ids=[outcome_reference],
+                    )
+                )
         # Provider output is retained in the private repository only.  Public Case
         # responses receive an explicit allowlist so provider status, model traces,
         # prompts, retrieval requests, and other diagnostic payload cannot leak or
@@ -2171,7 +2271,6 @@ class WorkbenchService:
                 "validation_issues",
                 "regulatory_findings",
                 "rag_evidence",
-                "report",
                 "document_results",
                 "fact_ledger",
                 "review_gaps",
@@ -2180,6 +2279,19 @@ class WorkbenchService:
         }
         detail["review_stage_trace"] = [item.model_dump(mode="json") for item in stage_trace]
         detail["model_execution_summary"] = model_execution_summary.model_dump(mode="json")
+        detail["narrative_execution_summary"] = narrative_execution_summary.model_dump(mode="json")
+        effective_narrative = envelope.narrative_report
+        if (
+            disposition != envelope.review_disposition
+            or assurance != envelope.assurance_level
+            or eligibility != envelope.completion_eligibility
+            or required_actions != list(envelope.required_actions)
+        ):
+            effective_narrative = _backend_policy_narrative_overlay(
+                envelope.narrative_report,
+                fact_ledger=envelope.fact_ledger,
+                disposition=disposition,
+            )
         effective_summary = {
             "provider_result_sha256": envelope.result_sha256,
             "input_manifest_digest": input_manifest_digest,
@@ -2195,6 +2307,7 @@ class WorkbenchService:
             "review_stage_trace": [item.model_dump(mode="json") for item in stage_trace],
             "auto_completion_profile": profile_binding.model_dump(mode="json"),
             "model_execution_summary": model_execution_summary.model_dump(mode="json"),
+            "narrative_execution_summary": narrative_execution_summary.model_dump(mode="json"),
         }
         digest = canonical_digest(effective_summary)
         return ReviewRunRecord(
@@ -2217,7 +2330,7 @@ class WorkbenchService:
             assurance_level=assurance,
             completion_eligibility=eligibility,
             required_actions=required_actions,
-            narrative_report=envelope.narrative_report,
+            narrative_report=effective_narrative,
             action_trace=envelope.action_trace,
             review_stage_trace=stage_trace,
             result_detail=detail,
@@ -2244,11 +2357,13 @@ class WorkbenchService:
             update={"eligible": False, "unmet_reason_codes": reasons}
         )
         actions = list(run.required_actions)
+        outcome_reference = _current_outcome_reference(run.result_detail["fact_ledger"])
         if not any(item.action_code == "rerun_after_case_revision_change" for item in actions):
             actions.append(
                 RequiredAction(
                     action_code="rerun_after_case_revision_change",
                     message="심사 대기 중 Case 입력이 변경되어 현재 revision으로 재심사가 필요합니다.",
+                    source_reference_ids=[outcome_reference],
                 )
             )
         disposition = (
@@ -2276,6 +2391,7 @@ class WorkbenchService:
             "review_stage_trace": [item.model_dump(mode="json") for item in run.review_stage_trace],
             "auto_completion_profile": run.auto_completion_profile.model_dump(mode="json"),
             "model_execution_summary": run.result_detail["model_execution_summary"],
+            "narrative_execution_summary": run.result_detail["narrative_execution_summary"],
         }
         return run.model_copy(
             update={
@@ -2283,6 +2399,11 @@ class WorkbenchService:
                 "assurance_level": assurance_level,
                 "completion_eligibility": eligibility,
                 "required_actions": actions,
+                "narrative_report": _backend_policy_narrative_overlay(
+                    run.narrative_report,
+                    fact_ledger=run.result_detail["fact_ledger"],
+                    disposition=disposition,
+                ),
                 "result_digest": canonical_digest(effective_summary),
             }
         )
@@ -2393,6 +2514,11 @@ class WorkbenchService:
         provider_result = self.repository.get_provider_result(principal.org_id, review_run_id)
         if provider_result is None:
             raise ConflictError("provider result is unavailable for grounded chat")
+        expected_answer = expected_answer_projection(
+            provider_result=provider_result,
+            question=request.question,
+            effective_disposition=run.review_disposition.value,
+        )
         question_payload = {
             "review_run_id": review_run_id,
             "provider_result_sha256": run.provider_result_sha256,
@@ -2442,10 +2568,14 @@ class WorkbenchService:
             interaction_id=interaction.interaction_id,
         )
         try:
-            answer = self.agent.answer(
-                provider_result=provider_result,
-                question=request.question,
-                question_id=question_id,
+            answer = (
+                AgentAnswerResponse.model_validate(expected_answer.deterministic_wire(question_id))
+                if expected_answer.backend_owned_outcome
+                else self.agent.answer(
+                    provider_result=provider_result,
+                    question=request.question,
+                    question_id=question_id,
+                )
             )
         except AgentResponseRejectedError as exc:
             self.repository.mark_chat_interaction_terminal(
@@ -2477,8 +2607,17 @@ class WorkbenchService:
             raise
 
         try:
-            if answer.question_id != question_id:
-                raise ConflictError("Agent answer is not bound to the submitted question")
+            try:
+                validate_agent_answer_projection(
+                    expected=expected_answer,
+                    question_id=question_id,
+                    answer=answer,
+                    runtime_release=run.release_identity,
+                )
+            except ValueError as exc:
+                raise ConflictError(
+                    "Agent answer violates the trusted Backend semantic boundary"
+                ) from exc
             ledger_references = {
                 (str(item.get("kind")), str(item.get("reference_id")))
                 for item in provider_result.get("fact_ledger", {}).get("entries", [])

@@ -8,6 +8,8 @@ from typing import Any, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from customs_backend.agent_v3_semantics import validate_agent_v3_semantics
+
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
@@ -1105,7 +1107,12 @@ class AgentReviewResultV3(BaseModel):
             if self.validation_issues or self.regulatory_findings
             else (
                 Assessment.no_issue_detected
-                if self.retrieval_status == "ok" and self.retrieval_coverage == "complete"
+                if self.retrieval_status == "ok"
+                and self.retrieval_coverage == "complete"
+                and any(
+                    isinstance(item, dict) and item.get("eligibility") != "blocked"
+                    for item in self.rag_evidence
+                )
                 else Assessment.indeterminate
             )
         )
@@ -1131,6 +1138,10 @@ class AgentReviewResultV3(BaseModel):
             or self.runtime_release.reviewer_trust_store_sha256 is None
             or self.runtime_release.evidence_runtime_v3_sha256 is None
             or self.runtime_release.kill_switch_active
+            or not any(
+                isinstance(item, dict) and item.get("eligibility") != "blocked"
+                for item in self.rag_evidence
+            )
         ):
             raise ValueError("provider auto completion violates deterministic V3 gates")
         if self.review_disposition == ReviewDisposition.auto_review_complete:
@@ -1194,6 +1205,7 @@ class AgentReviewResultV3(BaseModel):
                 raise ValueError("human or chat Tools cannot resolve an automatic review")
         if self.review_disposition == ReviewDisposition.blocked and self.status != "blocked":
             raise ValueError("blocked disposition must preserve the deterministic status")
+        validate_agent_v3_semantics(self.model_dump(mode="json"))
         payload = self.model_dump(mode="json")
         payload["result_sha256"] = "0" * 64
         if self.result_sha256 != canonical_digest(payload):
@@ -1319,6 +1331,9 @@ class ReviewRunRecord(BaseModel):
         model_execution_summary = ModelExecutionSummary.model_validate(
             self.result_detail.get("model_execution_summary")
         )
+        narrative_execution_summary = ModelExecutionSummary.model_validate(
+            self.result_detail.get("narrative_execution_summary")
+        )
         if self.input_document_manifest:
             if self.review_as_of is None or self.trade_type is None:
                 raise ValueError("bound input manifest requires immutable review context")
@@ -1363,6 +1378,7 @@ class ReviewRunRecord(BaseModel):
                 ],
                 "auto_completion_profile": self.auto_completion_profile.model_dump(mode="json"),
                 "model_execution_summary": model_execution_summary.model_dump(mode="json"),
+                "narrative_execution_summary": narrative_execution_summary.model_dump(mode="json"),
             }
         )
         if self.result_digest != expected_result_digest:

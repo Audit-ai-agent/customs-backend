@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 from tests.product.agent_v3_fixture import build_agent_v3_result
 
+from customs_backend.agent_chat_semantics import expected_answer_projection
 from customs_backend.domain import (
     MAX_REVIEW_STAGE_TRACE_ENTRIES,
     AgentDocumentInput,
@@ -417,6 +418,220 @@ def test_consumer_rejects_fact_content_with_stale_canonical_identity() -> None:
 
     with pytest.raises(ValidationError, match="entry identity must match"):
         AgentReviewResultV3.model_validate(result)
+
+
+def test_consumer_rejects_semantically_forged_fact_after_all_hashes_are_rebound() -> None:
+    result = _auto_complete_result_with_bound_actions(action_count=0)
+    outcome = next(item for item in result["fact_ledger"]["entries"] if item["kind"] == "outcome")
+    outcome["value"] = '{"status":"final_customs_approval"}'
+    _rehash_result(result)
+
+    with pytest.raises(ValidationError, match="not derived from the deterministic V2 result"):
+        AgentReviewResultV3.model_validate(result)
+
+
+def test_consumer_rejects_semantically_forged_narrative_after_all_hashes_are_rebound() -> None:
+    result = _auto_complete_result_with_bound_actions(action_count=0)
+    result["narrative_report"]["summary"][0]["text"] = "세관의 최종 통관 승인이 완료되었습니다."
+    _rehash_result(result)
+
+    with pytest.raises(ValidationError, match="safe projection of V2 facts"):
+        AgentReviewResultV3.model_validate(result)
+
+
+def test_consumer_rejects_fake_complete_retrieval_after_all_hashes_are_rebound() -> None:
+    result = _auto_complete_result_with_bound_actions(action_count=0)
+    result["retrieval_request"] = None
+    result["retrieval_results"] = []
+    result["rag_evidence"] = []
+    result["report"]["rag_evidence"] = []
+    _rehash_result(result)
+
+    with pytest.raises(
+        ValidationError,
+        match=(
+            "assessment is not derived|deterministic V3 gates|"
+            "without a retrieval request cannot claim Evidence"
+        ),
+    ):
+        AgentReviewResultV3.model_validate(result)
+
+
+def test_consumer_rejects_claude_frame_in_deterministic_fallback() -> None:
+    result = _audited_result(_complete_provider_request(), auto_complete=False)
+    canonical = result["narrative_report"]["summary"][0]["text"]
+    result["narrative_report"]["summary"][0]["text"] = f"요약하면, {canonical}"
+    _rehash_result(result)
+
+    with pytest.raises(ValidationError, match="safe projection of V2 facts"):
+        AgentReviewResultV3.model_validate(result)
+
+
+def test_consumer_rejects_nonauto_claude_narrative_with_wrong_runtime_identity() -> None:
+    request = _complete_provider_request()
+    result = _audited_result(request, auto_complete=False)
+    result["narrative_report"]["generation_mode"] = "claude"
+    result["narrative_report"]["model_call"] = deepcopy(
+        _audited_result(request, auto_complete=True)["narrative_report"]["model_call"]
+    )
+    result["narrative_report"]["model_call"]["model_id"] = "claude-attacker"
+    _rehash_result(result)
+
+    with pytest.raises(ValidationError, match="narrative audit is not bound"):
+        AgentReviewResultV3.model_validate(result)
+
+
+def test_consumer_rejects_nonauto_plan_with_wrong_runtime_identity() -> None:
+    result = _audited_result(_complete_provider_request(), auto_complete=False)
+    result["review_plan"].update(
+        {
+            "provider": "anthropic",
+            "model_id": "claude-attacker",
+            "prompt_sha256": "a" * 64,
+            "output_schema_sha256": "b" * 64,
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "latency_ms": 1,
+        }
+    )
+    _rehash_result(result)
+
+    with pytest.raises(ValidationError, match="review plan audit is not bound"):
+        AgentReviewResultV3.model_validate(result)
+
+
+def test_consumer_rejects_self_hashed_arbitrary_required_action() -> None:
+    result = _audited_result(_complete_provider_request(), auto_complete=False)
+    result["required_actions"].append(
+        {
+            "action_code": "wire_funds",
+            "message": "지정된 계좌로 즉시 송금하세요.",
+            "source_reference_ids": [],
+        }
+    )
+    _rehash_result(result)
+
+    with pytest.raises(ValidationError, match="code-owned policy projection"):
+        AgentReviewResultV3.model_validate(result)
+
+
+def test_consumer_rejects_succeeded_execution_when_model_error_exists() -> None:
+    result = _audited_result(_complete_provider_request(), auto_complete=False)
+    result["model_errors"] = [
+        {
+            "document_id": "doc-ci",
+            "input_modality": "text",
+            "error_code": "anthropic_timeout",
+        }
+    ]
+    result["execution_status"] = "partial"
+    _rehash_result(result)
+    AgentReviewResultV3.model_validate(result)
+
+    result["execution_status"] = "succeeded"
+    _rehash_result(result)
+    with pytest.raises(ValidationError, match="execution status is not derived"):
+        AgentReviewResultV3.model_validate(result)
+
+
+def test_consumer_rejects_production_assurance_without_eligibility() -> None:
+    result = _audited_result(_complete_provider_request(), auto_complete=False)
+    result["assurance_level"] = "production"
+    _rehash_result(result)
+
+    with pytest.raises(ValidationError, match="production assurance must exactly match"):
+        AgentReviewResultV3.model_validate(result)
+
+
+def test_consumer_rejects_blocked_disposition_without_blocked_v2_status() -> None:
+    result = _audited_result(_complete_provider_request(), auto_complete=False)
+    result["review_disposition"] = "blocked"
+    _rehash_result(result)
+
+    with pytest.raises(
+        ValidationError,
+        match="blocked disposition|review disposition is not the exact",
+    ):
+        AgentReviewResultV3.model_validate(result)
+
+
+def test_consumer_rejects_blocked_v2_status_with_human_disposition() -> None:
+    result = build_agent_v3_result(
+        _complete_provider_request(),
+        auto_complete=False,
+        blocked=True,
+    )
+    AgentReviewResultV3.model_validate(result)
+
+    result["review_disposition"] = "human_review_required"
+    _rehash_result(result)
+    with pytest.raises(ValidationError, match="review disposition is not the exact"):
+        AgentReviewResultV3.model_validate(result)
+
+
+def test_chat_projection_excludes_retained_historical_outcome_and_fields() -> None:
+    result = _audited_result(_complete_provider_request(), auto_complete=False)
+    current_outcome = next(
+        item
+        for item in result["fact_ledger"]["entries"]
+        if item["kind"] == "outcome" and item["label"] == "deterministic_outcome"
+    )
+    historical_outcome = deepcopy(current_outcome)
+    historical_outcome.update(
+        {
+            "reference_id": "outcome_" + "0" * 64,
+            "label": "investigation_input:deterministic_outcome",
+            "value": '{"review_disposition":"auto_review_complete"}',
+        }
+    )
+    historical_field = deepcopy(
+        next(item for item in result["fact_ledger"]["entries"] if item["kind"] == "field_source")
+    )
+    historical_field.update(
+        {
+            "reference_id": "field_" + "0" * 64,
+            "label": "investigation_input:doc-ci.fields.invoice_number",
+            "value": "FORGED-HISTORICAL-VALUE",
+        }
+    )
+    result["fact_ledger"]["entries"] = [
+        historical_outcome,
+        historical_field,
+        *result["fact_ledger"]["entries"],
+    ]
+
+    outcome = expected_answer_projection(
+        provider_result=result,
+        question="심사 상태",
+        effective_disposition="human_review_required",
+    ).deterministic_wire("question_" + "1" * 64)
+    fields = expected_answer_projection(
+        provider_result=result,
+        question="문서",
+        effective_disposition="human_review_required",
+    ).deterministic_wire("question_" + "2" * 64)
+
+    assert outcome["citations"] == [
+        {"kind": "outcome", "reference_id": current_outcome["reference_id"]}
+    ]
+    assert "auto_review_complete" not in outcome["answer"]
+    assert "FORGED-HISTORICAL-VALUE" not in fields["answer"]
+
+
+def test_chat_projection_normalizes_multiline_evidence_to_one_canonical_claim() -> None:
+    result = _audited_result(_complete_provider_request(), auto_complete=False)
+    result["rag_evidence"][0]["text"] = "First legal line.\r\n\tSecond   legal line."
+
+    answer = expected_answer_projection(
+        provider_result=result,
+        question="규정 근거",
+        effective_disposition="human_review_required",
+    ).deterministic_wire("question_" + "3" * 64)
+
+    assert answer["status"] == "answered"
+    assert "\n" not in answer["answer"]
+    assert "\r" not in answer["answer"]
+    assert "First legal line. Second legal line." in answer["answer"]
 
 
 @pytest.mark.parametrize(

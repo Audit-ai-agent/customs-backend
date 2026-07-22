@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+import hashlib
+import json
 from threading import Event
 from types import SimpleNamespace
 
@@ -11,6 +13,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 from tests.product.agent_v3_fixture import build_agent_v3_result
 
+from customs_backend.agent_chat_semantics import expected_answer_projection
 from customs_backend.adapters import (
     CallableAgentClient,
     InMemoryJobPublisher,
@@ -54,6 +57,19 @@ def _rehash_agent_result(result: dict) -> dict:
     return result
 
 
+def _deterministic_chat_answer(
+    provider_result: dict,
+    question: str,
+    question_id: str,
+) -> AgentAnswerResponse:
+    expected = expected_answer_projection(
+        provider_result=provider_result,
+        question=question,
+        effective_disposition=str(provider_result["review_disposition"]),
+    )
+    return AgentAnswerResponse.model_validate(expected.deterministic_wire(question_id))
+
+
 def _agent_result_with_audited_claude_calls(request: AgentReviewRequest) -> dict:
     result = build_agent_v3_result(request)
     runtime = result["runtime_release"]
@@ -91,16 +107,60 @@ def _agent_result_with_bound_issue_and_finding(
         "issue_code": "invoice_number_mismatch",
         "severity": "medium",
         "message": "Invoice 번호가 일치하지 않습니다.",
+        "expected_value": None,
+        "observed_value": None,
+        "source_document_id": None,
+        "target_document_id": None,
+        "source_bbox": None,
+        "target_bbox": None,
+        "confidence": 0.95,
+        "confidence_basis": "deterministic_rule",
+        "needs_regulatory_review": False,
+    }
+    item_id = result["retrieval_results"][0]["item_id"]
+    evidence_source_id = "fixture:requirement:0303540000"
+    evidence_version_hash = "e" * 64
+    evidence_id = (
+        "ev_"
+        + hashlib.sha256(
+            f"{evidence_source_id}\x1f{evidence_version_hash}".encode("utf-8")
+        ).hexdigest()
+    )
+    evidence = {
+        "evidence_id": evidence_id,
+        "source_record_id": evidence_source_id,
+        "source_type": "customs_requirement",
+        "item_id": item_id,
+        "title": "Synthetic import requirement",
+        "text": "The synthetic item requires IMPORT_REQUIREMENT_CERT.",
+        "law_id": "fixture-law",
+        "law_name": "Synthetic requirement law",
+        "article_no": None,
+        "source_uri": "https://example.invalid/requirements/0303540000",
+        "valid_from": "2026-01-01",
+        "valid_to": None,
+        "version_hash": evidence_version_hash,
+        "matched_hs_code": "0303540000",
+        "trade_type": request.trade_type,
+        "required_document_code": "IMPORT_REQUIREMENT_CERT",
+        "required_document_name": "수입요건확인서",
+        "agencies": ["Synthetic authority"],
+        "retrieval_methods": ["exact_hs"],
+        "eligibility": "finding",
+        "score": 1.0,
+        "raw_scores": {"exact_hs": 1.0},
     }
     finding = {
         "finding_code": "supporting_document_required",
         "severity": "low",
         "message": "요건서류를 확인해야 합니다.",
-        "item_id": "item-1",
+        "item_id": item_id,
         "required_document_code": "IMPORT_REQUIREMENT_CERT",
         "required_document_name": "수입요건확인서",
-        "evidence_ids": ["evidence-1"],
+        "evidence_ids": [evidence_id],
         "confidence": 1.0,
+        "confidence_basis": "structured_requirement_policy",
+        "source": None,
     }
     issue_reference = f"issue_{canonical_digest({'index': 0, 'issue': issue})}"
     finding_reference = f"finding_{canonical_digest({'index': 0, 'finding': finding})}"
@@ -120,11 +180,37 @@ def _agent_result_with_bound_issue_and_finding(
         }
 
     issue_fact = fact("issue", issue_reference, issue["issue_code"], issue["message"])
+    status = "needs_review"
+    outcome_value = {
+        "status": status,
+        "requires_human_review": True,
+        "retrieval_status": "ok",
+        "retrieval_coverage": "complete",
+    }
+    outcome_reference = f"outcome_{canonical_digest(outcome_value)}"
     entries = [
-        *result["fact_ledger"]["entries"],
+        *[
+            item
+            for item in result["fact_ledger"]["entries"]
+            if item["kind"] not in {"evidence", "outcome"}
+        ],
+        fact("evidence", evidence_id, evidence["title"], evidence["text"]),
         issue_fact,
         fact("finding", finding_reference, finding["finding_code"], finding["message"]),
+        fact(
+            "outcome",
+            outcome_reference,
+            "deterministic_outcome",
+            json.dumps(
+                outcome_value,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        ),
     ]
+    entries.sort(key=lambda item: (item["kind"], item["reference_id"]))
     if duplicate_issue_fact:
         entries.append(dict(issue_fact))
     result["fact_ledger"] = {
@@ -133,8 +219,11 @@ def _agent_result_with_bound_issue_and_finding(
     }
     result["validation_issues"] = [issue]
     result["regulatory_findings"] = [finding]
+    result["retrieval_results"][0]["requirements_found"] = True
+    result["retrieval_results"][0]["evidence"] = [evidence]
+    result["rag_evidence"] = [evidence]
     result["assessment"] = "issues_detected"
-    result["status"] = "needs_review"
+    result["status"] = status
     result["requires_human_review"] = True
     result["review_disposition"] = "human_review_required"
     result["assurance_level"] = "production_candidate"
@@ -144,6 +233,77 @@ def _agent_result_with_bound_issue_and_finding(
         "scope": [],
         "unmet_reason_codes": ["issues_detected"],
     }
+    result["required_actions"] = [
+        {
+            "action_code": f"resolve_{issue['issue_code'].casefold()}",
+            "message": issue["message"],
+            "source_reference_ids": [issue_reference],
+        },
+        {
+            "action_code": f"resolve_{finding['finding_code'].casefold()}",
+            "message": finding["message"],
+            "source_reference_ids": [finding_reference, evidence_id],
+        },
+        {
+            "action_code": "obtain_production_release_approval",
+            "message": (
+                "Claude extraction과 법령 범위에 대한 독립 검수 및 Release 승인이 필요합니다."
+            ),
+            "source_reference_ids": [outcome_reference],
+        },
+    ]
+    result["report"]["overall_status"] = status
+    result["report"]["summary"].update(
+        {
+            "total_issues": 2,
+            "critical": 0,
+            "high": 0,
+            "medium": 1,
+            "low": 1,
+        }
+    )
+    result["report"]["issues"] = [{**issue, "recommendation": "Invoice 번호를 확인하세요."}]
+    result["report"]["regulatory_findings"] = [finding]
+    result["report"]["rag_evidence"] = [
+        {**evidence, "raw_scores": [{"method": "exact_hs", "score": 1.0}]}
+    ]
+
+    def claim(text: str, citations: list[dict]) -> dict:
+        payload = {"text": text, "material": True, "citations": citations}
+        return {"claim_id": f"claim_{canonical_digest(payload)}", **payload}
+
+    outcome_citation = [{"kind": "outcome", "reference_id": outcome_reference}]
+    result["narrative_report"].update(
+        {
+            "summary": [
+                claim(
+                    "문서 또는 규정 검토에서 담당자 확인이 필요한 항목이 발견되었습니다.",
+                    outcome_citation,
+                )
+            ],
+            "document_consistency": [
+                claim(
+                    f"{issue['issue_code']}: {issue['message']}",
+                    [{"kind": "issue", "reference_id": issue_reference}],
+                )
+            ],
+            "regulatory_review": [
+                claim(
+                    f"{finding['finding_code']}: {finding['message']}",
+                    [
+                        {"kind": "finding", "reference_id": finding_reference},
+                        {"kind": "evidence", "reference_id": evidence_id},
+                    ],
+                )
+            ],
+            "required_actions": [
+                claim(
+                    "담당자는 근거와 추출값을 확인한 뒤 수정 또는 승인을 기록해야 합니다.",
+                    outcome_citation,
+                )
+            ],
+        }
+    )
     result["result_sha256"] = "0" * 64
     result["result_sha256"] = canonical_digest(result)
     return result
@@ -156,18 +316,7 @@ def workbench():
     publisher = InMemoryJobPublisher()
     agent = CallableAgentClient(
         _agent_result,
-        answer=lambda run, _question, question_id: AgentAnswerResponse(
-            question_id=question_id,
-            answer="현재 심사 결과에 문제는 없습니다.",
-            status="answered",
-            citations=[
-                {
-                    "kind": run["fact_ledger"]["entries"][0]["kind"],
-                    "reference_id": run["fact_ledger"]["entries"][0]["reference_id"],
-                }
-            ],
-            generation_mode="deterministic_fallback",
-        ),
+        answer=_deterministic_chat_answer,
         metadata={"status": "ready", "release": "agent-v3"},
     )
     principals = {
@@ -573,6 +722,11 @@ def test_worker_restart_preserves_job_and_forces_auto_completion_gate(workbench)
     }.issubset(run.completion_eligibility.unmet_reason_codes)
     assert "model_calls" not in run.result_detail
     assert "runtime_release" not in run.result_detail
+    assert "report" not in run.result_detail
+    assert run.narrative_report["generated_by"] == "backend_policy_overlay"
+    assert run.narrative_report["required_actions"][0]["text"].startswith(
+        "Backend의 유효한 Release"
+    )
     assert run.result_detail["model_execution_summary"] == {
         "provider": None,
         "model_id": None,
@@ -585,6 +739,19 @@ def test_worker_restart_preserves_job_and_forces_auto_completion_gate(workbench)
         "runtime_identity_match": False,
         "audit_complete": False,
         "unmet_reason_codes": ["no_model_calls"],
+    }
+    assert run.result_detail["narrative_execution_summary"] == {
+        "provider": "anthropic",
+        "model_id": run.release_identity["model_id"],
+        "text_only": True,
+        "call_count": 1,
+        "input_tokens_total": 20,
+        "output_tokens_total": 10,
+        "prompt_hashes_complete": True,
+        "schema_hashes_complete": True,
+        "runtime_identity_match": True,
+        "audit_complete": True,
+        "unmet_reason_codes": [],
     }
     assert container.repository.get_provider_result("org-a", run.review_run_id) is not None
     assert (
@@ -751,14 +918,14 @@ def test_revision_staleness_forbidden_targets_decision_and_chat_binding(workbenc
     assert (
         client.post(
             answer_url,
-            json={"question": "왜 정상인가요?", "bound_result_digest": "0" * 64},
+            json={"question": "심사 상태는 어떤가요?", "bound_result_digest": "0" * 64},
             headers={**_auth(), "Idempotency-Key": "chat-stale-binding"},
         ).status_code
         == 409
     )
     answer = client.post(
         answer_url,
-        json={"question": "왜 정상인가요?", "bound_result_digest": parent.result_digest},
+        json={"question": "심사 상태는 어떤가요?", "bound_result_digest": parent.result_digest},
         headers={**_auth(), "Idempotency-Key": "chat-grounded-answer"},
     ).json()
     assert answer["answer_status"] == "answered"
@@ -767,7 +934,7 @@ def test_revision_staleness_forbidden_targets_decision_and_chat_binding(workbenc
     assert answer["model_execution_summary"]["unmet_reason_codes"] == ["no_model_calls"]
     replayed_answer = client.post(
         answer_url,
-        json={"question": "왜 정상인가요?", "bound_result_digest": parent.result_digest},
+        json={"question": "심사 상태는 어떤가요?", "bound_result_digest": parent.result_digest},
         headers={**_auth(), "Idempotency-Key": "chat-grounded-answer"},
     )
     assert replayed_answer.status_code == 201
@@ -788,7 +955,11 @@ def test_revision_staleness_forbidden_targets_decision_and_chat_binding(workbenc
     )
     provider_result = container.repository.get_provider_result("org-a", parent.review_run_id)
     assert provider_result is not None
-    expected_fact = provider_result["fact_ledger"]["entries"][0]
+    expected_fact = next(
+        item
+        for item in provider_result["fact_ledger"]["entries"]
+        if item["kind"] == "outcome" and item["label"] == "deterministic_outcome"
+    )
     assert answer["citations"] == [
         {"kind": expected_fact["kind"], "reference_id": expected_fact["reference_id"]}
     ]
@@ -828,39 +999,42 @@ def test_case_chat_preserves_a_safe_single_claude_call_summary(workbench):
     ).json()["job"]
     run = container.service.execute_job(org_id="org-a", job_id=queued["job_id"])
 
-    def claude_answer(provider_result, _question, question_id):
-        fact = provider_result["fact_ledger"]["entries"][0]
+    def claude_answer(provider_result, question, question_id):
         runtime = provider_result["runtime_release"]
+        expected = expected_answer_projection(
+            provider_result=provider_result,
+            question=question,
+            effective_disposition=str(provider_result["review_disposition"]),
+        )
+        wire = expected.deterministic_wire(question_id)
+        wire["answer"] = "\n".join(f"근거 확인 결과: {claim.text}" for claim in expected.claims)
+        wire["generation_mode"] = "claude"
+        wire["model_call"] = {
+            "task_id": "customs_case_answer",
+            "provider": "anthropic",
+            "model_id": runtime["model_id"],
+            "prompt_sha256": runtime["chat_prompt_sha256"],
+            "output_schema_sha256": runtime["chat_schema_sha256"],
+            "request_id_sha256": "8" * 64,
+            "message_id_sha256": "9" * 64,
+            "input_tokens": 123,
+            "output_tokens": 45,
+            "latency_ms": 12,
+        }
         return AgentAnswerResponse(
-            question_id=question_id,
-            answer="근거 장부에 결박된 Claude 답변입니다.",
-            status="answered",
-            citations=[{"kind": fact["kind"], "reference_id": fact["reference_id"]}],
-            generation_mode="claude",
-            model_call={
-                "task_id": "customs_case_answer",
-                "provider": "anthropic",
-                "model_id": runtime["model_id"],
-                "prompt_sha256": runtime["chat_prompt_sha256"],
-                "output_schema_sha256": runtime["chat_schema_sha256"],
-                "request_id_sha256": "8" * 64,
-                "message_id_sha256": "9" * 64,
-                "input_tokens": 123,
-                "output_tokens": 45,
-                "latency_ms": 12,
-            },
+            **wire,
         )
 
     container.service.agent = CallableAgentClient(_agent_result, answer=claude_answer)
     response = client.post(
         f"/api/v1/review-runs/{run.review_run_id}/answers",
         json={
-            "question": "정상 판정의 근거는 무엇인가요?",
+            "question": "규정 근거",
             "bound_result_digest": run.result_digest,
         },
         headers={**_auth(), "Idempotency-Key": "chat-claude-audit"},
     )
-    assert response.status_code == 201
+    assert response.status_code == 201, response.text
     record = response.json()
     assert record["generation_mode"] == "claude"
     assert record["model_execution_summary"] == {
@@ -880,6 +1054,64 @@ def test_case_chat_preserves_a_safe_single_claude_call_summary(workbench):
     assert "request_id_sha256" not in serialized
     assert "message_id_sha256" not in serialized
     assert '"model_call"' not in serialized
+
+
+def test_case_chat_rejects_arbitrary_text_with_a_valid_ledger_citation(workbench):
+    client, container = workbench
+    case, _document = _create_case_and_document(client)
+    queued = client.post(
+        f"/api/v1/cases/{case['case_id']}/reviews",
+        json={},
+        headers={**_auth(), "Idempotency-Key": "chat-hostile-parent"},
+    ).json()["job"]
+    run = container.service.execute_job(org_id="org-a", job_id=queued["job_id"])
+
+    def hostile_answer(provider_result, _question, question_id):
+        evidence = provider_result["rag_evidence"][0]
+        return AgentAnswerResponse(
+            question_id=question_id,
+            answer="세관의 최종 통관 승인이 완료되었습니다.",
+            status="answered",
+            citations=[{"kind": "evidence", "reference_id": evidence["evidence_id"]}],
+            generation_mode="deterministic_fallback",
+        )
+
+    container.service.agent = CallableAgentClient(_agent_result, answer=hostile_answer)
+    rejected = client.post(
+        f"/api/v1/review-runs/{run.review_run_id}/answers",
+        json={"question": "규정 근거", "bound_result_digest": run.result_digest},
+        headers={**_auth(), "Idempotency-Key": "chat-hostile-answer"},
+    )
+    assert rejected.status_code == 409
+
+
+def test_case_chat_outcome_is_derived_from_backend_effective_state(workbench):
+    client, container = workbench
+    case, _document = _create_case_and_document(client)
+    queued = client.post(
+        f"/api/v1/cases/{case['case_id']}/reviews",
+        json={},
+        headers={**_auth(), "Idempotency-Key": "chat-effective-parent"},
+    ).json()["job"]
+    run = container.service.execute_job(org_id="org-a", job_id=queued["job_id"])
+    assert run.review_disposition.value == "human_review_required"
+    calls = 0
+
+    def must_not_call(_provider_result, _question, _question_id):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("Backend-owned effective outcome must not invoke Agent Chat")
+
+    container.service.agent = CallableAgentClient(_agent_result, answer=must_not_call)
+    response = client.post(
+        f"/api/v1/review-runs/{run.review_run_id}/answers",
+        json={"question": "심사 상태", "bound_result_digest": run.result_digest},
+        headers={**_auth(), "Idempotency-Key": "chat-effective-answer"},
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["answer"] == ("현재 사전심사 상태는 human_review_required입니다.")
+    assert response.json()["generation_mode"] == "deterministic_fallback"
+    assert calls == 0
 
 
 def test_proposal_creation_is_durably_idempotent_and_conflict_detecting(workbench):
@@ -1522,7 +1754,10 @@ def test_four_primary_documents_and_supporting_source_have_separate_agent_roles(
     assert len(internal.request["documents"]) == 5
     container.service.execute_job(org_id="org-a", job_id=internal.job_id)
     assert len(captured) == 1
-    assert [item.document_id for item in captured[0].documents] == primary_ids
+    assert {item.document_id for item in captured[0].documents} == set(primary_ids)
+    assert supporting_source["document_id"] not in {
+        item.document_id for item in captured[0].documents
+    }
     assert len(captured[0].supporting_documents) == 1
     assert captured[0].supporting_documents[0].source_sha256 == supporting_source["content_sha256"]
 
@@ -1930,6 +2165,8 @@ def test_case_revision_drift_downgrades_production_assurance_and_completion(work
     synthetic_production = run.model_copy(update={"assurance_level": "production"})
     drifted = WorkbenchService._case_drift_run(synthetic_production)
     assert drifted.assurance_level.value == "production_candidate"
+    assert drifted.narrative_report["generated_by"] == "backend_policy_overlay"
+    assert "담당자 검토" in drifted.narrative_report["required_actions"][0]["text"]
 
 
 def test_case_change_during_agent_call_is_checked_atomically_at_commit(workbench):
@@ -2220,14 +2457,7 @@ def test_case_chat_has_a_durable_single_call_barrier_under_concurrency(workbench
         calls += 1
         started.set()
         assert release.wait(timeout=5)
-        fact = _result["fact_ledger"]["entries"][0]
-        return AgentAnswerResponse(
-            question_id=question_id,
-            answer="한 번만 생성된 근거 기반 답변입니다.",
-            status="answered",
-            citations=[{"kind": fact["kind"], "reference_id": fact["reference_id"]}],
-            generation_mode="deterministic_fallback",
-        )
+        return _deterministic_chat_answer(_result, _question, question_id)
 
     container.service.agent = CallableAgentClient(_agent_result, answer=answer)
     url = f"/api/v1/review-runs/{run.review_run_id}/answers"
@@ -2262,14 +2492,7 @@ def test_case_chat_response_persistence_failure_closes_the_call_barrier(workbenc
     def answer(_result, _question, question_id):
         nonlocal calls
         calls += 1
-        fact = _result["fact_ledger"]["entries"][0]
-        return AgentAnswerResponse(
-            question_id=question_id,
-            answer="영속화 직전까지 유효한 답변입니다.",
-            status="answered",
-            citations=[{"kind": fact["kind"], "reference_id": fact["reference_id"]}],
-            generation_mode="deterministic_fallback",
-        )
+        return _deterministic_chat_answer(_result, _question, question_id)
 
     container.service.agent = CallableAgentClient(_agent_result, answer=answer)
     original_complete = container.repository.complete_chat_interaction
