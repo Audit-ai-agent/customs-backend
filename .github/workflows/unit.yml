@@ -80,7 +80,7 @@ jobs:
               )
           PY
 
-      - name: Apply migrations explicitly in order (003 to 006)
+      - name: Apply migrations explicitly in order (003 to 007)
         env:
           CUSTOMS_BACKEND_ENVIRONMENT: test
           CUSTOMS_BACKEND_PROCESS_ROLE: migration
@@ -94,8 +94,18 @@ jobs:
           uv run --locked alembic current | grep -Fx "20260722_0005"
           uv run --locked python tools/verify_legacy_005_upgrade.py seed
           uv run --locked alembic upgrade 20260722_0006
-          uv run --locked alembic current | grep -Fx "20260722_0006 (head)"
+          uv run --locked alembic current | grep -Fx "20260722_0006"
           uv run --locked python tools/verify_legacy_005_upgrade.py verify
+          uv run --locked python tools/verify_legacy_005_upgrade.py seed-invalid-006
+          if uv run --locked alembic upgrade 20260722_0007; then
+            echo "migration 007 accepted missing actor provenance" >&2
+            exit 1
+          fi
+          uv run --locked alembic current | grep -Fx "20260722_0006"
+          uv run --locked python tools/verify_legacy_005_upgrade.py remove-invalid-006
+          uv run --locked alembic upgrade 20260722_0007
+          uv run --locked alembic current | grep -Fx "20260722_0007 (head)"
+          uv run --locked python tools/verify_legacy_005_upgrade.py verify-007
 
       - name: Unit, product, contract, and live PostgreSQL tests
         env:
@@ -212,7 +222,58 @@ jobs:
         run: uv build --wheel
 
       - name: Build pinned production container
-        run: docker build --tag customs-backend:ci .
+        run: docker build --pull --tag customs-backend:ci .
+
+      - name: Verify minimal non-root runtime image
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_user="$(docker image inspect customs-backend:ci --format '{{.Config.User}}')"
+          test "${actual_user}" = "10001:10001"
+          docker run --rm -i --entrypoint python customs-backend:ci - <<'PY'
+          import importlib.util
+          from pathlib import Path
+
+          import customs_backend
+          import operational_db
+
+          assert importlib.util.find_spec("pip") is None
+          assert importlib.util.find_spec("setuptools") is None
+          assert importlib.util.find_spec("wheel") is None
+          assert importlib.util.find_spec("uv") is None
+          assert Path(
+              "/app/packages/operational_db/migrations/007_atomic_chat_quota.sql"
+          ).is_file()
+          PY
+
+      - name: Generate container SBOM and reject every High or Critical vulnerability
+        shell: bash
+        run: |
+          set -euo pipefail
+          scanner='aquasec/trivy@sha256:086971aaf400beebd94e8300fd8ea623774419597169156cec56eec5b00dfb1e'
+          mkdir -p "${RUNNER_TEMP}/trivy-cache"
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD:/workspace" \
+            -v "${RUNNER_TEMP}/trivy-cache:/root/.cache/trivy" \
+            "$scanner" image --format cyclonedx \
+            --output /workspace/backend-image.cdx.json customs-backend:ci
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD:/workspace" \
+            -v "${RUNNER_TEMP}/trivy-cache:/root/.cache/trivy" \
+            "$scanner" image --exit-code 1 --severity HIGH,CRITICAL \
+            --format json --output /workspace/backend-trivy.json customs-backend:ci
+
+      - name: Preserve Backend container security evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: backend-container-security-${{ github.sha }}
+          path: |
+            backend-image.cdx.json
+            backend-trivy.json
+          if-no-files-found: error
+          retention-days: 30
 
   security:
     name: Secret, SAST, and dependency audit

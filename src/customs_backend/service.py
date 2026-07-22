@@ -74,7 +74,6 @@ from customs_backend.ports import (
     JobPublisher,
     NotFoundError,
     ObjectStore,
-    QuotaExceededError,
     WorkbenchRepository,
 )
 from customs_backend.release import (
@@ -89,6 +88,8 @@ from customs_backend.release import (
 
 
 LOGGER = logging.getLogger(__name__)
+CHAT_INTERACTIONS_PER_REVIEW_RUN = 100
+CHAT_INTERACTIONS_PER_ACTOR_PER_MINUTE = 10
 
 
 def _warn_terminal_state_not_persisted(*, boundary: str, error: Exception) -> None:
@@ -2288,17 +2289,6 @@ class WorkbenchService:
         if run.result_digest != request.bound_result_digest:
             raise ConflictError("chat binding digest is stale")
         now = utc_now()
-        history = self.repository.list_chat(principal.org_id, review_run_id)
-        if len(history) >= 100:
-            raise QuotaExceededError("chat quota for this review run is exhausted")
-        recent_by_actor = [
-            item
-            for item in history
-            if item.created_by == principal.subject
-            and item.created_at >= now - timedelta(minutes=1)
-        ]
-        if len(recent_by_actor) >= 10:
-            raise QuotaExceededError("chat rate limit exceeded; retry after one minute")
         provider_result = self.repository.get_provider_result(principal.org_id, review_run_id)
         if provider_result is None:
             raise ConflictError("provider result is unavailable for grounded chat")
@@ -2308,7 +2298,6 @@ class WorkbenchService:
             "question": request.question,
         }
         question_id = f"question_{canonical_digest(question_payload)}"
-        now = utc_now()
         proposed_interaction = ChatInteractionRecord(
             interaction_id=(
                 f"interaction_{canonical_digest({'idempotency_key': scoped_idempotency_key})}"
@@ -2329,7 +2318,12 @@ class WorkbenchService:
             created_at=now,
             updated_at=now,
         )
-        interaction, created = self.repository.reserve_chat_interaction(proposed_interaction)
+        interaction, created = self.repository.reserve_chat_interaction(
+            proposed_interaction,
+            actor_window_started_at=now - timedelta(minutes=1),
+            actor_window_limit=CHAT_INTERACTIONS_PER_ACTOR_PER_MINUTE,
+            review_run_limit=CHAT_INTERACTIONS_PER_REVIEW_RUN,
+        )
         if not created:
             if interaction.idempotency_request_digest != idempotency_request_digest:
                 raise ConflictError("chat idempotency key was reused with another request")

@@ -5,7 +5,7 @@ import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
-from threading import Event
+from threading import Event, Lock
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -22,6 +22,7 @@ from customs_backend.domain import (
     AgentReviewRequest,
     AuditRecord,
     CaseCreate,
+    ChatInteractionRecord,
     CorrectionOperation,
     CorrectionProposalCreate,
     CorrectionProposalDecisionCreate,
@@ -35,7 +36,7 @@ from customs_backend.domain import (
     canonical_digest,
     utc_now,
 )
-from customs_backend.ports import ConflictError, NotFoundError
+from customs_backend.ports import ConflictError, NotFoundError, QuotaExceededError
 from customs_backend.repository import PostgresWorkbenchRepository
 from customs_backend.service import WorkbenchService
 
@@ -93,6 +94,15 @@ def test_postgres_migration_atomicity_persistence_and_isolation() -> None:
                 )
             ).scalars()
         )
+        chat_interaction_columns = set(
+            connection.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema='operations' "
+                    "AND table_name='case_chat_interactions'"
+                )
+            ).scalars()
+        )
     assert {
         "agent_call_state",
         "agent_call_endpoint",
@@ -106,6 +116,7 @@ def test_postgres_migration_atomicity_persistence_and_isolation() -> None:
         "idempotency_key",
         "idempotency_request_digest",
     } <= decision_columns
+    assert {"created_by", "created_at"} <= chat_interaction_columns
 
     repository = PostgresWorkbenchRepository(dsn)
     objects = InMemoryObjectStore()
@@ -338,6 +349,143 @@ def test_postgres_migration_atomicity_persistence_and_isolation() -> None:
         stored_answer = first_answer.result(timeout=10)
     assert ask_once() == stored_answer
     assert chat_calls == 1
+
+    # Eleven distinct keys arrive together for one actor. The reservation
+    # transaction must durably admit exactly ten; counting only completed chat
+    # history before reserving would allow all eleven through this boundary.
+    quota_actor = Principal(
+        subject="postgres-chat-quota-actor",
+        org_id=reviewer_a.org_id,
+        roles=frozenset({Role.approver}),
+    )
+    quota_calls: list[str] = []
+    quota_calls_lock = Lock()
+
+    def quota_answer(provider_result, _question, question_id):
+        with quota_calls_lock:
+            quota_calls.append(question_id)
+        fact = provider_result["fact_ledger"]["entries"][0]
+        return AgentAnswerResponse(
+            question_id=question_id,
+            answer="Atomic PostgreSQL quota answer",
+            status="answered",
+            citations=[{"kind": fact["kind"], "reference_id": fact["reference_id"]}],
+            generation_mode="deterministic_fallback",
+        )
+
+    restarted_service.agent = CallableAgentClient(review, answer=quota_answer)
+
+    def ask_unique(index: int):
+        return restarted_service.answer(
+            quota_actor,
+            current_parent.review_run_id,
+            GroundedQuestion(
+                question=f"동시 quota 질문 {index}",
+                bound_result_digest=current_parent.result_digest,
+            ),
+            f"postgres-chat-quota-{index}",
+        )
+
+    admitted = []
+    rejected = []
+    with ThreadPoolExecutor(max_workers=11) as executor:
+        futures = [executor.submit(ask_unique, index) for index in range(11)]
+        for future in futures:
+            try:
+                admitted.append(future.result(timeout=15))
+            except QuotaExceededError as exc:
+                rejected.append(exc)
+    assert len(admitted) == 10
+    assert len(rejected) == 1
+    assert len(quota_calls) == 10
+    assert len({item.message_id for item in admitted}) == 10
+    assert (
+        len(
+            [
+                item
+                for item in restarted_repository.list_chat(
+                    reviewer_a.org_id, current_parent.review_run_id
+                )
+                if item.created_by == quota_actor.subject
+            ]
+        )
+        == 10
+    )
+
+    # The authoritative 100/run cap counts durable reservations, calls already
+    # started, and completed responses. Fill this Run to 99 with a deliberate
+    # state mix, then race two different actors for the final slot.
+    def quota_interaction(label: str, actor: str) -> ChatInteractionRecord:
+        now = utc_now()
+        return ChatInteractionRecord(
+            interaction_id=f"interaction_{uuid.uuid4().hex}",
+            review_run_id=current_parent.review_run_id,
+            case_id=current_parent.case_id,
+            org_id=reviewer_a.org_id,
+            idempotency_key=f"postgres-run-cap-{label}",
+            idempotency_request_digest=canonical_digest({"label": label, "kind": "request"}),
+            agent_request_sha256=canonical_digest({"label": label, "kind": "agent"}),
+            created_by=actor,
+            created_at=now,
+            updated_at=now,
+        )
+
+    for index in range(88):
+        proposed = quota_interaction(
+            f"fill-{index}",
+            f"postgres-run-cap-actor-{index // 10}",
+        )
+        reserved, created = restarted_repository.reserve_chat_interaction(
+            proposed,
+            actor_window_started_at=proposed.created_at - timedelta(minutes=1),
+            actor_window_limit=10,
+            review_run_limit=100,
+        )
+        assert created
+        if index % 2 == 0:
+            restarted_repository.start_chat_call_once(
+                org_id=reviewer_a.org_id,
+                interaction_id=reserved.interaction_id,
+            )
+
+    def reserve_final_slot(index: int):
+        proposed = quota_interaction(
+            f"final-{index}",
+            f"postgres-run-cap-final-actor-{index}",
+        )
+        return restarted_repository.reserve_chat_interaction(
+            proposed,
+            actor_window_started_at=proposed.created_at - timedelta(minutes=1),
+            actor_window_limit=10,
+            review_run_limit=100,
+        )
+
+    final_admitted = []
+    final_rejected = []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(reserve_final_slot, index) for index in range(2)]
+        for future in futures:
+            try:
+                final_admitted.append(future.result(timeout=10))
+            except QuotaExceededError as exc:
+                final_rejected.append(exc)
+    assert len(final_admitted) == 1
+    assert len(final_rejected) == 1
+    with engine.connect() as connection:
+        state_counts = dict(
+            connection.execute(
+                text(
+                    "SELECT state, count(*) FROM operations.case_chat_interactions "
+                    "WHERE org_id = :org_id AND review_run_id = :review_run_id "
+                    "GROUP BY state"
+                ),
+                {
+                    "org_id": reviewer_a.org_id,
+                    "review_run_id": current_parent.review_run_id,
+                },
+            ).all()
+        )
+    assert state_counts == {"call_started": 44, "completed": 11, "reserved": 45}
 
     proposal_request = CorrectionProposalCreate(
         parent_result_digest=current_parent.result_digest,

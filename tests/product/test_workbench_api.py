@@ -851,6 +851,18 @@ def test_valid_agent_response_persistence_failure_is_not_contract_rejection(work
     assert stored is not None
     assert stored.status.value == "response_persistence_uncertain"
     assert stored.agent_call_state.value == "response_persistence_uncertain"
+    monkeypatch.setattr(
+        "customs_backend.api.time.sleep",
+        lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("terminal SSE stream attempted to poll again")
+        ),
+    )
+    streamed = client.get(
+        f"/api/v1/jobs/{queued['job_id']}/events/stream",
+        headers=_auth(),
+    )
+    assert streamed.status_code == 200
+    assert "review.response_persistence_uncertain" in streamed.text
     with pytest.raises(ConflictError):
         container.service.execute_job(org_id="org-a", job_id=queued["job_id"])
     assert calls == 1

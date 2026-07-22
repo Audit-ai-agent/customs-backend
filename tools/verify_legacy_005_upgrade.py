@@ -1,4 +1,4 @@
-"""Seed a real revision-005 database and verify the forward-only 006 backfill.
+"""Verify real revision-005 -> 006 -> 007 forward-only backfills.
 
 This tool is deliberately split into ``seed`` and ``verify`` phases so CI and
 local release evidence execute the actual Alembic 005 -> 006 transition between
@@ -28,6 +28,7 @@ RUN_ID = "legacy-run-005"
 PROPOSAL_ID = "legacy-proposal-005"
 DECISION_ID = "legacy-decision-005"
 MESSAGE_ID = "legacy-message-005"
+INVALID_INTERACTION_ID = "legacy-invalid-actor-006"
 ORG_ID = "legacy-org"
 SHA = "a" * 64
 CREATED_AT = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
@@ -203,9 +204,116 @@ def verify(dsn: str) -> None:
             raise RuntimeError("human decision append-only trigger was not restored")
 
 
+def seed_invalid_006(dsn: str) -> None:
+    """Insert a corrupt 006 row and prove 007 refuses to invent actor provenance."""
+
+    record = {
+        "interaction_id": INVALID_INTERACTION_ID,
+        "review_run_id": RUN_ID,
+        "case_id": CASE_ID,
+        "org_id": ORG_ID,
+        "idempotency_key": "legacy:invalid-actor:006",
+        "idempotency_request_digest": SHA,
+        "agent_request_sha256": SHA,
+        "state": "reserved",
+        "message_id": None,
+        "error_code": None,
+        "call_started_at": None,
+        # created_by is intentionally absent: 007 must fail closed.
+        "created_at": CREATED_AT.isoformat(),
+        "updated_at": CREATED_AT.isoformat(),
+    }
+    with psycopg.connect(dsn, autocommit=True) as connection:
+        revision = connection.execute(
+            "SELECT version_num FROM operations.alembic_version"
+        ).fetchone()
+        if revision != ("20260722_0006",):
+            raise RuntimeError(f"invalid fixture requires revision 006, got {revision!r}")
+        connection.execute(
+            """
+            INSERT INTO operations.case_chat_interactions(
+              interaction_id, review_run_id, case_id, org_id, idempotency_key,
+              idempotency_request_digest, agent_request_sha256, state,
+              message_id, record_json, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'reserved', NULL, %s, %s)
+            """,
+            (
+                INVALID_INTERACTION_ID,
+                RUN_ID,
+                CASE_ID,
+                ORG_ID,
+                "legacy:invalid-actor:006",
+                SHA,
+                SHA,
+                Jsonb(record),
+                CREATED_AT,
+            ),
+        )
+
+
+def remove_invalid_006(dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as connection:
+        revision = connection.execute(
+            "SELECT version_num FROM operations.alembic_version"
+        ).fetchone()
+        if revision != ("20260722_0006",):
+            raise RuntimeError(f"fixture cleanup requires revision 006, got {revision!r}")
+        deleted = connection.execute(
+            "DELETE FROM operations.case_chat_interactions WHERE interaction_id = %s",
+            (INVALID_INTERACTION_ID,),
+        ).rowcount
+        if deleted != 1:
+            raise RuntimeError("invalid revision-006 fixture was not present")
+
+
+def verify_007(dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as connection:
+        revision = connection.execute(
+            "SELECT version_num FROM operations.alembic_version"
+        ).fetchone()
+        if revision != ("20260722_0007",):
+            raise RuntimeError(
+                f"legacy fixture verification requires revision 007, got {revision!r}"
+            )
+        row = connection.execute(
+            """
+            SELECT created_by, created_at
+            FROM operations.case_chat_interactions
+            WHERE message_id = %s
+            """,
+            (MESSAGE_ID,),
+        ).fetchone()
+        if row != ("legacy-reviewer", CREATED_AT):
+            raise RuntimeError(f"revision 007 actor provenance backfill drifted: {row!r}")
+        index_exists = connection.execute(
+            """
+            SELECT EXISTS (
+              SELECT 1 FROM pg_indexes
+              WHERE schemaname = 'operations'
+                AND indexname = 'idx_case_chat_interactions_actor_window'
+            )
+            """
+        ).fetchone()
+        if index_exists != (True,):
+            raise RuntimeError("revision 007 actor-window index is missing")
+        if connection.execute(
+            "SELECT 1 FROM operations.case_chat_interactions WHERE created_by IS NULL"
+        ).fetchone():
+            raise RuntimeError("revision 007 retained an interaction without actor provenance")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=("seed", "verify"))
+    parser.add_argument(
+        "phase",
+        choices=(
+            "seed",
+            "verify",
+            "seed-invalid-006",
+            "remove-invalid-006",
+            "verify-007",
+        ),
+    )
     parser.add_argument(
         "--dsn",
         default=os.environ.get("CUSTOMS_BACKEND_DATABASE_URL"),
@@ -217,8 +325,14 @@ def main() -> int:
     dsn = _psycopg_dsn(args.dsn)
     if args.phase == "seed":
         seed(dsn)
-    else:
+    elif args.phase == "verify":
         verify(dsn)
+    elif args.phase == "seed-invalid-006":
+        seed_invalid_006(dsn)
+    elif args.phase == "remove-invalid-006":
+        remove_invalid_006(dsn)
+    else:
+        verify_007(dsn)
     print(f"legacy_005_upgrade_{args.phase}=PASS")
     return 0
 

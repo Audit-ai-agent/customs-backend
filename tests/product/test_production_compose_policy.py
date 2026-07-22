@@ -9,6 +9,35 @@ from tools.verify_production_deployment_inputs import validate_environment
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_backend_runtime_image_is_digest_pinned_minimal_alpine() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github/workflows/unit.yml").read_text(encoding="utf-8")
+    exact_base = (
+        "python:3.11.15-alpine3.24@sha256:"
+        "25976e9d34a0fab1f278cae931f34c8303d97bf0c0d7f85b6b4dcf641d7702a4"
+    )
+    runtime = dockerfile.split(f"FROM {exact_base} AS runtime", 1)[1]
+
+    assert dockerfile.count(f"FROM {exact_base}") == 2
+    assert "uv sync --frozen --no-dev --extra production --no-editable" in dockerfile
+    assert "COPY --from=build --chown=10001:10001 /app/.venv /app/.venv" in runtime
+    assert (
+        "COPY --from=build --chown=10001:10001 "
+        "/app/packages/operational_db/migrations "
+        "/app/packages/operational_db/migrations"
+    ) in runtime
+    assert "COPY --from=uv" not in runtime
+    assert "/usr/local/lib/python3.11/site-packages/*" in runtime
+    assert "/usr/local/lib/python3.11/ensurepip" in runtime
+    assert "USER 10001:10001" in runtime
+    assert "docker build --pull --tag customs-backend:ci ." in workflow
+    assert (
+        "aquasec/trivy@sha256:086971aaf400beebd94e8300fd8ea623774419597169156cec56eec5b00dfb1e"
+    ) in workflow
+    assert "--exit-code 1 --severity HIGH,CRITICAL" in workflow
+    assert "ignore-unfixed" not in workflow
+
+
 def test_agent_has_only_allowlisted_proxy_egress() -> None:
     compose = (ROOT / "compose.production.yaml").read_text(encoding="utf-8")
     agent = compose.split("\n  agent:\n", 1)[1].split("\n  egress-proxy:\n", 1)[0]

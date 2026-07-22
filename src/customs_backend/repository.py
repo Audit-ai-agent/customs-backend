@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime
 from threading import RLock
 from typing import Any
 
@@ -40,7 +41,7 @@ from customs_backend.domain import (
     VerificationAssertionRecord,
     utc_now,
 )
-from customs_backend.ports import ConflictError
+from customs_backend.ports import ConflictError, QuotaExceededError
 
 _ACTIVE_JOB_STATUSES = {
     JobStatus.queued,
@@ -49,6 +50,8 @@ _ACTIVE_JOB_STATUSES = {
     JobStatus.response_persistence_uncertain,
 }
 _ACTIVE_JOB_STATUS_VALUES = tuple(item.value for item in _ACTIVE_JOB_STATUSES)
+_CHAT_QUOTA_STATES = frozenset(ChatInteractionState)
+_CHAT_QUOTA_STATE_VALUES = tuple(item.value for item in _CHAT_QUOTA_STATES)
 
 
 class InMemoryWorkbenchRepository:
@@ -893,7 +896,12 @@ class InMemoryWorkbenchRepository:
             return self._copy(proposal)
 
     def reserve_chat_interaction(
-        self, interaction: ChatInteractionRecord
+        self,
+        interaction: ChatInteractionRecord,
+        *,
+        actor_window_started_at: datetime,
+        actor_window_limit: int,
+        review_run_limit: int,
     ) -> tuple[ChatInteractionRecord, bool]:
         with self._lock:
             existing = next(
@@ -909,6 +917,22 @@ class InMemoryWorkbenchRepository:
                 if existing.idempotency_request_digest != interaction.idempotency_request_digest:
                     raise ConflictError("chat idempotency key was reused with another request")
                 return self._copy(existing), False
+            counted = [
+                item
+                for item in self._chat_interactions.values()
+                if item.org_id == interaction.org_id
+                and item.review_run_id == interaction.review_run_id
+                and item.state in _CHAT_QUOTA_STATES
+            ]
+            if len(counted) >= review_run_limit:
+                raise QuotaExceededError("chat quota for this review run is exhausted")
+            recent_by_actor = sum(
+                item.created_by == interaction.created_by
+                and item.created_at >= actor_window_started_at
+                for item in counted
+            )
+            if recent_by_actor >= actor_window_limit:
+                raise QuotaExceededError("chat rate limit exceeded; retry after one minute")
             self._chat_interactions[interaction.interaction_id] = self._copy(interaction)
             return self._copy(interaction), True
 
@@ -1223,6 +1247,8 @@ class _ChatInteractionRow(Base):
     agent_request_sha256: Mapped[str] = mapped_column(String)
     state: Mapped[str] = mapped_column(String)
     message_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_by: Mapped[str] = mapped_column(String, index=True)
+    created_at: Mapped[Any] = mapped_column(DateTime(timezone=True), index=True)
     record_json: Mapped[dict[str, Any]] = mapped_column(JSON)
 
 
@@ -2657,13 +2683,29 @@ class PostgresWorkbenchRepository:
         return proposal
 
     def reserve_chat_interaction(
-        self, interaction: ChatInteractionRecord
+        self,
+        interaction: ChatInteractionRecord,
+        *,
+        actor_window_started_at: datetime,
+        actor_window_limit: int,
+        review_run_limit: int,
     ) -> tuple[ChatInteractionRecord, bool]:
         with Session(self._engine) as session, session.begin():
-            session.execute(
-                text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
-                {"key": f"chat:{interaction.org_id}:{interaction.idempotency_key}"},
-            )
+            # The run-wide lock makes the 100-interaction cap authoritative even
+            # across actors. The actor lock binds the rolling-window check and the
+            # insert into one transaction across every Backend process.
+            for lock_key in (
+                f"chat-quota-run:{interaction.org_id}:{interaction.review_run_id}",
+                (
+                    "chat-quota-actor:"
+                    f"{interaction.org_id}:{interaction.review_run_id}:{interaction.created_by}"
+                ),
+                f"chat:{interaction.org_id}:{interaction.idempotency_key}",
+            ):
+                session.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                    {"key": lock_key},
+                )
             existing = session.scalar(
                 select(_ChatInteractionRow).where(
                     _ChatInteractionRow.org_id == interaction.org_id,
@@ -2675,6 +2717,27 @@ class PostgresWorkbenchRepository:
                 if record.idempotency_request_digest != interaction.idempotency_request_digest:
                     raise ConflictError("chat idempotency key was reused with another request")
                 return record, False
+            quota_filters = (
+                _ChatInteractionRow.org_id == interaction.org_id,
+                _ChatInteractionRow.review_run_id == interaction.review_run_id,
+                _ChatInteractionRow.state.in_(_CHAT_QUOTA_STATE_VALUES),
+            )
+            run_count = session.scalar(
+                select(func.count()).select_from(_ChatInteractionRow).where(*quota_filters)
+            )
+            if int(run_count or 0) >= review_run_limit:
+                raise QuotaExceededError("chat quota for this review run is exhausted")
+            actor_window_count = session.scalar(
+                select(func.count())
+                .select_from(_ChatInteractionRow)
+                .where(
+                    *quota_filters,
+                    _ChatInteractionRow.created_by == interaction.created_by,
+                    _ChatInteractionRow.created_at >= actor_window_started_at,
+                )
+            )
+            if int(actor_window_count or 0) >= actor_window_limit:
+                raise QuotaExceededError("chat rate limit exceeded; retry after one minute")
             session.add(
                 _ChatInteractionRow(
                     interaction_id=interaction.interaction_id,
@@ -2686,6 +2749,8 @@ class PostgresWorkbenchRepository:
                     agent_request_sha256=interaction.agent_request_sha256,
                     state=interaction.state.value,
                     message_id=None,
+                    created_by=interaction.created_by,
+                    created_at=interaction.created_at,
                     record_json=self._dump(interaction),
                 )
             )

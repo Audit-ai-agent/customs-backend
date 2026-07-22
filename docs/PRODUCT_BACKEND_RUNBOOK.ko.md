@@ -142,6 +142,11 @@ manifest에 보존하되 Agent 분류 대상에서 제외한다. Backend→Agent
   고치지 말고 새 보정 이벤트/Run과 forward-only migration을 추가한다.
 - DB·MinIO·Data generation backup을 같은 release manifest에 묶어 restore 후 hash를 대조한다.
 - 코드 문제는 이전 exact image digest로 compose를 돌리고 forward-only 보정 migration을 작성한다.
+- Chat quota는 migration `007`의 `created_by`·`created_at` provenance와
+  PostgreSQL transaction advisory lock에 의존한다. `007`이 적용된 DB에서는
+  schema를 `006`으로 downgrade하지 않는다. 코드 rollback이 필요하면 `007`을
+  이해하는 이전 exact image로 되돌리고 schema는 유지한 뒤, 문제를 새
+  forward-only 보정 migration으로 해결한다.
 
 ## 비밀정보·감사
 

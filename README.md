@@ -57,7 +57,7 @@ uv run --locked --extra unit pytest packages/operational_db/tests tests/unit tes
 ```
 
 GitHub Gate는 exact action SHA와 uv `0.11.28`을 사용한다. ephemeral PostgreSQL에서
-migration `003 → 004 → 005 → 006`, runtime/migrator 권한·append-only 변조 방지,
+migration `003 → 004 → 005 → 006 → 007`, runtime/migrator 권한·append-only 변조 방지,
 JUnit skip 0, OpenAPI byte drift, Docker build, Gitleaks/Bandit, hash가 포함된
 `uv.lock` 전체 dependency audit를 검사한다. Cross-repository Gate는 조직 변수의
 exact Agent commit/wheel SHA를 사용한다. PR에는 cross-repository credential을

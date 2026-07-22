@@ -839,6 +839,7 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
                         "failed",
                         "delivery_uncertain",
                         "response_received_rejected",
+                        "response_persistence_uncertain",
                     }
                     and all(event.sequence < next_sequence for event in events)
                 ):

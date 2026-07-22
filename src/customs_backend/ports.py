@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any, Protocol
 
 from customs_backend.domain import (
@@ -224,7 +225,12 @@ class WorkbenchRepository(Protocol):
         outbox: OutboxRecord | None = None,
     ) -> CorrectionProposalRecord: ...
     def reserve_chat_interaction(
-        self, interaction: ChatInteractionRecord
+        self,
+        interaction: ChatInteractionRecord,
+        *,
+        actor_window_started_at: datetime,
+        actor_window_limit: int,
+        review_run_limit: int,
     ) -> tuple[ChatInteractionRecord, bool]: ...
     def start_chat_call_once(
         self, *, org_id: str, interaction_id: str
