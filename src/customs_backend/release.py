@@ -587,6 +587,47 @@ class AgentServicePin(BaseModel):
             raise ReleaseConfigurationError("Agent metadata shape is invalid") from None
         return value
 
+    def validate_local_uat_metadata(self, value: object) -> dict[str, Any]:
+        """Validate the exact candidate code pin without promoting diagnostic Data.
+
+        The local UAT Agent adds an explicit diagnostic envelope and binds a
+        non-release Evidence identity.  Strip only those known annotations, then
+        reuse the strict candidate validator for every code, contract, prompt,
+        model, policy, and tool-registry field.
+        """
+
+        if not isinstance(value, dict):
+            raise ReleaseConfigurationError("Agent UAT metadata must be an object")
+        normalized = dict(value)
+        expected_annotations = {
+            "status": "ready",
+            "service_mode": "local_user_uat_diagnostic",
+            "assurance_level": "diagnostic",
+        }
+        for key, expected in expected_annotations.items():
+            if normalized.pop(key, None) != expected:
+                raise ReleaseConfigurationError("Agent UAT metadata annotation is invalid")
+        uat = normalized.pop("uat", None)
+        if not isinstance(uat, dict):
+            raise ReleaseConfigurationError("Agent UAT metadata annotation is invalid")
+        evidence_v3 = normalized.get("evidence_runtime_release_v3")
+        if (
+            not isinstance(evidence_v3, dict)
+            or set(evidence_v3) != {"release_state", "identity"}
+            or evidence_v3.get("release_state") != "diagnostic"
+            or not isinstance(evidence_v3.get("identity"), dict)
+        ):
+            raise ReleaseConfigurationError("Agent UAT Evidence identity is invalid")
+        automatic = normalized.get("automatic_completion_release")
+        if not isinstance(automatic, dict) or automatic.get("uat_forced_disabled") is not True:
+            raise ReleaseConfigurationError("Agent UAT completion Gate is invalid")
+        normalized["automatic_completion_release"] = {
+            key: item for key, item in automatic.items() if key != "uat_forced_disabled"
+        }
+        normalized["evidence_runtime_release_v3"] = {"release_state": "unreleased"}
+        self.validate_unreleased_metadata(normalized)
+        return value
+
 
 class AgentReleasePin(BaseModel):
     model_config = ConfigDict(extra="forbid")

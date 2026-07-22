@@ -295,6 +295,20 @@ class HttpAgentClient:
                 response_name="metadata",
             )
 
+    def uat_readiness(self) -> dict[str, Any]:
+        with self._client.stream("GET", "/health/uat-ready") as response:
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise AgentResponseRejectedError(
+                    f"Agent UAT readiness returned HTTP {response.status_code}"
+                ) from exc
+            return self._decode_object(
+                response,
+                maximum_bytes=1_000_000,
+                response_name="UAT readiness",
+            )
+
     def close(self) -> None:
         self._client.close()
 
@@ -309,6 +323,7 @@ class CallableAgentClient:
         revise: Callable[[AgentRevisionRequest], dict[str, Any]] | None = None,
         answer: Callable[[dict[str, Any], str, str], AgentAnswerResponse] | None = None,
         metadata: dict[str, Any] | None = None,
+        uat_readiness: dict[str, Any] | None = None,
     ) -> None:
         self._review = review
         self._revise = revise or (
@@ -327,6 +342,7 @@ class CallableAgentClient:
             )
         )
         self._metadata = metadata or {"assurance_level": "diagnostic"}
+        self._uat_readiness = uat_readiness or {"status": "unavailable"}
 
     def review(self, request: AgentReviewRequest) -> dict[str, Any]:
         return self._review(request)
@@ -345,3 +361,6 @@ class CallableAgentClient:
 
     def metadata(self) -> dict[str, Any]:
         return dict(self._metadata)
+
+    def uat_readiness(self) -> dict[str, Any]:
+        return dict(self._uat_readiness)

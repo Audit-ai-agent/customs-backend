@@ -588,6 +588,35 @@ def test_unreleased_candidate_metadata_drift_fails_closed() -> None:
         pin.validate_unreleased_metadata(drifted)
 
 
+def test_local_uat_metadata_preserves_the_exact_candidate_code_pin() -> None:
+    pin = _release_pin().service_pin()
+    metadata = _unreleased_metadata(pin)
+    metadata.update(
+        {
+            "status": "ready",
+            "service_mode": "local_user_uat_diagnostic",
+            "assurance_level": "diagnostic",
+            "uat": {
+                "diagnostic_only": True,
+                "mock_fallback_allowed": False,
+                "auto_completion_allowed": False,
+                "evidence_mode": "synthetic-v3",
+            },
+        }
+    )
+    metadata["automatic_completion_release"]["uat_forced_disabled"] = True
+    metadata["evidence_runtime_release_v3"] = {
+        "release_state": "diagnostic",
+        "identity": {"diagnostic_manifest_sha256": "f" * 64},
+    }
+    assert pin.validate_local_uat_metadata(metadata) is metadata
+
+    drifted = json.loads(json.dumps(metadata))
+    drifted["agent"]["build_sha"] = "0" * 40
+    with pytest.raises(ReleaseConfigurationError, match="candidate pin"):
+        pin.validate_local_uat_metadata(drifted)
+
+
 def test_candidate_pin_cannot_enable_automatic_completion() -> None:
     pin = _release_pin().service_pin()
     with pytest.raises(ValueError, match="release approval"):

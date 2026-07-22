@@ -13,12 +13,14 @@ from customs_backend.settings import get_settings
 def main() -> None:
     settings = get_settings()
     if (
-        settings.environment != "production"
+        settings.environment not in {"local_uat", "production"}
         or settings.process_role != "outbox"
         or settings.database_url is None
         or settings.redis_url is None
     ):
-        raise RuntimeError("outbox dispatcher requires the minimal production outbox role")
+        raise RuntimeError(
+            "outbox dispatcher requires the minimal production or local_uat outbox role"
+        )
     service = WorkbenchService(
         repository=PostgresWorkbenchRepository(settings.database_url.get_secret_value()),
         object_store=InMemoryObjectStore(),

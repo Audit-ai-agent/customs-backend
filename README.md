@@ -74,6 +74,10 @@ uv run --locked python tools/export_product_openapi.py
 
 제품 설정·migration·Docker 운영은
 [`docs/PRODUCT_BACKEND_RUNBOOK.ko.md`](docs/PRODUCT_BACKEND_RUNBOOK.ko.md)를 따른다.
+Production 안전장치를 유지한 채 사용자 관점의 로컬 실행을 조합할 때는
+[`docs/LOCAL_UAT_BACKEND.ko.md`](docs/LOCAL_UAT_BACKEND.ko.md)의 명시적
+`local_uat` 경계와 `deploy/uat/*.env.example`을 사용한다. 네 저장소 Compose와
+실제 secret은 이 저장소가 아니라 개인 `_engineering` harness가 소유한다.
 
 Operational DB migration:
 

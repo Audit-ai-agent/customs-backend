@@ -15,7 +15,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    environment: Literal["development", "test", "production"] = "development"
+    environment: Literal["development", "test", "local_uat", "production"] = "development"
     process_role: Literal["runtime", "migration", "outbox"] = "runtime"
     public_base_url: str = "http://127.0.0.1:8080"
     database_url: SecretStr | None = Field(default=None, repr=False)
@@ -126,6 +126,9 @@ class Settings(BaseSettings):
     job_lease_seconds: int = Field(default=300, ge=60, le=1800)
     job_max_attempts: int = Field(default=3, ge=1, le=3)
     outbox_lease_seconds: int = Field(default=30, ge=5, le=300)
+    uat_evidence_profile: Literal["synthetic-v3", "preserved-3law", "unknown"] = "unknown"
+    uat_planner_mode: Literal["shadow", "diagnostic_active"] = "shadow"
+    uat_claude_mode: Literal["actual"] = "actual"
 
     @field_validator("agent_base_url", "public_base_url")
     @classmethod
@@ -134,6 +137,79 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def production_is_fail_closed(self) -> "Settings":
+        if self.environment == "local_uat":
+            release_only = {
+                "agent_expected_model_revision": self.agent_expected_model_revision,
+                "agent_expected_evidence_snapshot_id": self.agent_expected_evidence_snapshot_id,
+                "agent_expected_evidence_runtime_release_sha256": (
+                    self.agent_expected_evidence_runtime_release_sha256
+                ),
+                "agent_expected_evidence_runtime_v3_sha256": (
+                    self.agent_expected_evidence_runtime_v3_sha256
+                ),
+                "agent_expected_release_profile_id": self.agent_expected_release_profile_id,
+                "agent_expected_release_profile_sha256": (
+                    self.agent_expected_release_profile_sha256
+                ),
+                "agent_expected_release_profile_subject_sha256": (
+                    self.agent_expected_release_profile_subject_sha256
+                ),
+                "agent_expected_release_profile_evaluation_report_sha256": (
+                    self.agent_expected_release_profile_evaluation_report_sha256
+                ),
+                "agent_expected_reviewer_trust_store_sha256": (
+                    self.agent_expected_reviewer_trust_store_sha256
+                ),
+                "assertion_signing_key_registry_path": self.assertion_signing_key_registry_path,
+                "requirement_policy_release_path": self.requirement_policy_release_path,
+                "requirement_policy_trust_store_path": self.requirement_policy_trust_store_path,
+                "evidence_runtime_v3_release_path": self.evidence_runtime_v3_release_path,
+                "auto_completion_profile_id": self.auto_completion_profile_id,
+                "auto_completion_approval_digest": self.auto_completion_approval_digest,
+                "auto_completion_approval_manifest_path": (
+                    self.auto_completion_approval_manifest_path
+                ),
+            }
+            configured_release_only = sorted(
+                name for name, value in release_only.items() if value is not None
+            )
+            if configured_release_only:
+                raise ValueError(
+                    "local_uat rejects Production release-only configuration: "
+                    + ", ".join(configured_release_only)
+                )
+            if self.auto_completion_enabled:
+                raise ValueError("local_uat requires auto_completion_enabled=false")
+            if self.agent_expected_assertion_trust_store_release_state not in (None, "unreleased"):
+                raise ValueError("local_uat accepts only an unreleased Agent trust-store identity")
+            if self.database_url is None:
+                raise ValueError("local_uat configuration requires database_url")
+            database_url = self.database_url.get_secret_value()
+            if not database_url.startswith(("postgresql://", "postgresql+psycopg://")):
+                raise ValueError("local_uat database_url must be PostgreSQL")
+            if self.process_role == "migration":
+                return self
+            if self.process_role == "outbox":
+                if self.redis_url is None:
+                    raise ValueError("local_uat outbox configuration requires redis_url")
+                return self
+            required = {
+                "oidc_issuer": self.oidc_issuer,
+                "oidc_audience": self.oidc_audience,
+                "oidc_jwks_url": self.oidc_jwks_url,
+                "oidc_client_id": self.oidc_client_id,
+                "oidc_authorization_endpoint": self.oidc_authorization_endpoint,
+                "oidc_token_endpoint": self.oidc_token_endpoint,
+                "agent_service_token": self.agent_service_token,
+                "redis_url": self.redis_url,
+                "minio_endpoint": self.minio_endpoint,
+                "minio_access_key": self.minio_access_key,
+                "minio_secret_key": self.minio_secret_key,
+            }
+            missing = sorted(name for name, value in required.items() if value is None)
+            if missing:
+                raise ValueError("local_uat configuration is incomplete: " + ", ".join(missing))
+            return self
         if self.environment != "production":
             return self
         if self.process_role == "migration":

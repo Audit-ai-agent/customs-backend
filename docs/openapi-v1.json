@@ -2149,6 +2149,80 @@
         "title": "TextDocumentCreate",
         "type": "object"
       },
+      "UatMetadataResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "assurance_ceiling": {
+            "const": "diagnostic",
+            "default": "diagnostic",
+            "title": "Assurance Ceiling",
+            "type": "string"
+          },
+          "auto_completion_enabled": {
+            "const": false,
+            "default": false,
+            "title": "Auto Completion Enabled",
+            "type": "boolean"
+          },
+          "claude_mode": {
+            "const": "actual",
+            "default": "actual",
+            "title": "Claude Mode",
+            "type": "string"
+          },
+          "evidence_profile": {
+            "enum": [
+              "synthetic-v3",
+              "preserved-3law",
+              "unknown"
+            ],
+            "title": "Evidence Profile",
+            "type": "string"
+          },
+          "evidence_scope_label": {
+            "enum": [
+              "TEST_ONLY_V3",
+              "REAL_3_OF_58",
+              "UNKNOWN"
+            ],
+            "title": "Evidence Scope Label",
+            "type": "string"
+          },
+          "mode": {
+            "const": "local_uat",
+            "default": "local_uat",
+            "title": "Mode",
+            "type": "string"
+          },
+          "planner_mode": {
+            "enum": [
+              "shadow",
+              "diagnostic_active"
+            ],
+            "title": "Planner Mode",
+            "type": "string"
+          },
+          "production_release": {
+            "const": false,
+            "default": false,
+            "title": "Production Release",
+            "type": "boolean"
+          },
+          "text_only": {
+            "const": true,
+            "default": true,
+            "title": "Text Only",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "evidence_profile",
+          "evidence_scope_label",
+          "planner_mode"
+        ],
+        "title": "UatMetadataResponse",
+        "type": "object"
+      },
       "VerificationAssertionCreate": {
         "additionalProperties": false,
         "properties": {
@@ -6004,6 +6078,114 @@
           }
         ],
         "summary": "Session"
+      }
+    },
+    "/api/v1/uat/metadata": {
+      "get": {
+        "operationId": "uat_metadata_api_v1_uat_metadata_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UatMetadataResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Problem Details V1 fail-closed response."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Problem Details V1 fail-closed response."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Problem Details V1 fail-closed response."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Problem Details V1 fail-closed response."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Problem Details V1 fail-closed response."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Problem Details V1 fail-closed response."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Problem Details V1 fail-closed response."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Problem Details V1 fail-closed response."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Problem Details V1 fail-closed response."
+          }
+        },
+        "summary": "Uat Metadata"
       }
     }
   }

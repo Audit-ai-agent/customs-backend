@@ -238,6 +238,20 @@ class AuthConfigResponse(BaseModel):
     token_storage: str = "memory_only"
 
 
+class UatMetadataResponse(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    mode: Literal["local_uat"] = "local_uat"
+    assurance_ceiling: Literal["diagnostic"] = "diagnostic"
+    text_only: Literal[True] = True
+    auto_completion_enabled: Literal[False] = False
+    claude_mode: Literal["actual"] = "actual"
+    evidence_profile: Literal["synthetic-v3", "preserved-3law", "unknown"]
+    evidence_scope_label: Literal["TEST_ONLY_V3", "REAL_3_OF_58", "UNKNOWN"]
+    planner_mode: Literal["shadow", "diagnostic_active"]
+    production_release: Literal[False] = False
+
+
 @dataclass
 class Container:
     settings: Settings
@@ -367,7 +381,7 @@ def build_container(settings: Settings) -> Container:
         expected_release_pin=release_pin,
         expected_backend_decision_policy_release=settings.human_decision_policy_release,
     )
-    if settings.environment == "production":
+    if settings.environment in {"local_uat", "production"}:
         if (
             settings.database_url is None
             or settings.agent_service_token is None
@@ -376,7 +390,9 @@ def build_container(settings: Settings) -> Container:
             or settings.minio_secret_key is None
             or settings.redis_url is None
         ):
-            raise ReleaseConfigurationError("production dependencies are incomplete")
+            raise ReleaseConfigurationError(
+                f"{settings.environment} runtime dependencies are incomplete"
+            )
         repository: WorkbenchRepository = PostgresWorkbenchRepository(
             settings.database_url.get_secret_value()
         )
@@ -456,6 +472,9 @@ class _UnavailableAgentClient:
         self._fail()
 
     def metadata(self) -> dict[str, Any]:
+        self._fail()
+
+    def uat_readiness(self) -> dict[str, Any]:
         self._fail()
 
 
@@ -563,6 +582,11 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
 
     @app.get("/health/ready", include_in_schema=False)
     def health_ready() -> dict[str, Any]:
+        if actual_container.settings.environment == "local_uat":
+            raise HTTPException(
+                status_code=503,
+                detail="local UAT is never Production release-ready",
+            )
         verifier = actual_container.token_verifier
         auth_ready = not isinstance(verifier, OidcJwtVerifier) or verifier.health()
         dependency_status: dict[str, bool] = {}
@@ -613,6 +637,107 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             "agent": agent_metadata,
             "dependencies": dependency_status,
         }
+
+    @app.get("/health/uat-ready", include_in_schema=False)
+    def health_uat_ready() -> dict[str, Any]:
+        if actual_container.settings.environment != "local_uat":
+            raise HTTPException(status_code=404, detail="local UAT endpoint is unavailable")
+        verifier = actual_container.token_verifier
+        auth_ready = isinstance(verifier, OidcJwtVerifier) and verifier.health()
+        dependency_status: dict[str, bool] = {}
+        for name, check in [
+            ("repository", actual_container.repository.health),
+            ("object_store", actual_container.object_store.health),
+            ("job_broker", actual_container.publisher.health),
+        ]:
+            try:
+                dependency_status[name] = check()
+            except Exception:
+                dependency_status[name] = False
+        try:
+            agent_metadata = actual_container.agent.metadata()
+            agent_uat_readiness = actual_container.agent.uat_readiness()
+            uat_identity = agent_metadata.get("uat")
+            transport_limits = agent_metadata.get("transport_limits")
+            agentic_limits = agent_metadata.get("agentic_limits")
+            model_identity = agent_metadata.get("model")
+            expected_planner_mode = {
+                "shadow": "shadow",
+                "diagnostic_active": "active",
+            }[actual_container.settings.uat_planner_mode]
+            if (
+                agent_metadata.get("status") != "ready"
+                or agent_metadata.get("service_api_version") != "internal-agent-service/v2"
+                or agent_metadata.get("service_mode") != "local_user_uat_diagnostic"
+                or agent_metadata.get("assurance_level") != "diagnostic"
+                or not isinstance(transport_limits, dict)
+                or transport_limits.get("text_only") is not True
+                or not isinstance(agentic_limits, dict)
+                or agentic_limits.get("effective_execution_mode") != expected_planner_mode
+                or not isinstance(model_identity, dict)
+                or not isinstance(model_identity.get("id"), str)
+                or not model_identity["id"]
+                or not isinstance(uat_identity, dict)
+                or uat_identity.get("diagnostic_only") is not True
+                or uat_identity.get("mock_fallback_allowed") is not False
+                or uat_identity.get("auto_completion_allowed") is not False
+                or agent_uat_readiness.get("status") != "uat-ready"
+                or agent_uat_readiness.get("diagnostic_only") is not True
+                or agent_uat_readiness.get("text_only") is not True
+                or agent_uat_readiness.get("mock_fallback_allowed") is not False
+                or agent_uat_readiness.get("auto_completion_allowed") is not False
+            ):
+                raise ReleaseConfigurationError("Agent is not local UAT diagnostic-ready")
+            expected_evidence_mode = actual_container.settings.uat_evidence_profile
+            if expected_evidence_mode != "unknown" and (
+                uat_identity.get("evidence_mode") != expected_evidence_mode
+                or agent_uat_readiness.get("evidence_mode") != expected_evidence_mode
+            ):
+                raise ReleaseConfigurationError("Agent UAT Evidence profile differs")
+            if actual_container.service.service_pin is not None:
+                actual_container.service.service_pin.validate_local_uat_metadata(agent_metadata)
+            agent_ready = True
+        except Exception:
+            agent_metadata = {"status": "unavailable"}
+            agent_uat_readiness = {"status": "unavailable"}
+            agent_ready = False
+        if (
+            not auth_ready
+            or not agent_ready
+            or actual_container.service.auto_completion_enabled
+            or not all(dependency_status.values())
+        ):
+            raise HTTPException(status_code=503, detail="local UAT dependency is not ready")
+        return {
+            "status": "ready",
+            "mode": "local_uat",
+            "assurance_ceiling": "diagnostic",
+            "text_only": True,
+            "auto_completion_enabled": False,
+            "production_release": False,
+            "agent": agent_metadata,
+            "agent_uat": agent_uat_readiness,
+            "dependencies": dependency_status,
+        }
+
+    @app.get("/api/v1/uat/metadata", response_model=UatMetadataResponse)
+    def uat_metadata() -> UatMetadataResponse:
+        if actual_container.settings.environment != "local_uat":
+            raise HTTPException(status_code=404, detail="local UAT metadata is unavailable")
+        evidence_scope_by_profile: dict[
+            str,
+            Literal["TEST_ONLY_V3", "REAL_3_OF_58", "UNKNOWN"],
+        ] = {
+            "synthetic-v3": "TEST_ONLY_V3",
+            "preserved-3law": "REAL_3_OF_58",
+            "unknown": "UNKNOWN",
+        }
+        evidence_scope = evidence_scope_by_profile[actual_container.settings.uat_evidence_profile]
+        return UatMetadataResponse(
+            evidence_profile=actual_container.settings.uat_evidence_profile,
+            evidence_scope_label=evidence_scope,
+            planner_mode=actual_container.settings.uat_planner_mode,
+        )
 
     @app.get("/api/v1/auth/config", response_model=AuthConfigResponse)
     def auth_config() -> AuthConfigResponse:
