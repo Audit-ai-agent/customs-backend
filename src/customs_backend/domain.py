@@ -828,7 +828,10 @@ class AgentReviewResultV3(BaseModel):
                 if isinstance(citation, dict)
             ):
                 raise ValueError("narrative claim cites a fact outside the canonical ledger")
-        gap_ids = {gap.gap_id for gap in self.review_gaps}
+        gap_id_list = [gap.gap_id for gap in self.review_gaps]
+        gap_ids = set(gap_id_list)
+        if len(gap_id_list) != len(gap_ids):
+            raise ValueError("Agent review gap IDs must be unique")
         planned_actions = self.review_plan.get("actions", [])
         tool_call_limit = self.review_plan.get("tool_call_limit")
         cycle_limit = self.review_plan.get("cycle_limit")
@@ -856,16 +859,21 @@ class AgentReviewResultV3(BaseModel):
             raise ValueError("planned Agent action IDs must be present and unique")
         planned_by_id = {action["action_id"]: action for action in planned_actions}
         trace_ids = [item.get("action_id") for item in self.action_trace]
-        observation_ids = [item.get("action_id") for item in self.observations]
+        observation_action_ids = [item.get("action_id") for item in self.observations]
+        observation_ids = [item.get("observation_id") for item in self.observations]
         if any(action_id not in planned_by_id for action_id in trace_ids) or len(trace_ids) != len(
             set(trace_ids)
         ):
             raise ValueError("Agent action trace is not bound to the compiled plan")
-        if any(action_id not in planned_by_id for action_id in observation_ids) or len(
+        if any(action_id not in planned_by_id for action_id in observation_action_ids) or len(
+            observation_action_ids
+        ) != len(set(observation_action_ids)):
+            raise ValueError("Agent observation is not bound to the compiled plan")
+        if any(not isinstance(observation_id, str) for observation_id in observation_ids) or len(
             observation_ids
         ) != len(set(observation_ids)):
-            raise ValueError("Agent observation is not bound to the compiled plan")
-        if len(self.observations) != len(self.action_trace) or set(observation_ids) != set(
+            raise ValueError("Agent observation IDs must be present and unique")
+        if len(self.observations) != len(self.action_trace) or set(observation_action_ids) != set(
             trace_ids
         ):
             raise ValueError("every Agent Tool action requires exactly one observation")
@@ -876,8 +884,19 @@ class AgentReviewResultV3(BaseModel):
             or not isinstance(item.get("cycle"), int)
             or not 0 <= item["cycle"] <= cycle_limit
             or item.get("tool_name") != planned_by_id[item["action_id"]].get("tool_name")
-            or observations_by_id[item["action_id"]].get("tool_name") != item.get("tool_name")
-            or observations_by_id[item["action_id"]].get("cycle") != item.get("cycle")
+            or item.get("reason_code") != planned_by_id[item["action_id"]].get("reason_code")
+            or item.get("input_reference_ids")
+            != planned_by_id[item["action_id"]].get("input_reference_ids")
+            or any(
+                observations_by_id[item["action_id"]].get(key) != item.get(key)
+                for key in (
+                    "tool_name",
+                    "cycle",
+                    "status",
+                    "input_reference_ids",
+                    "output_reference_ids",
+                )
+            )
             for item in trace_by_id.values()
         ):
             raise ValueError("Agent Tool execution differs from its bounded compiled plan")
@@ -898,9 +917,12 @@ class AgentReviewResultV3(BaseModel):
             or self.assurance_level != AssuranceLevel.production
             or not self.completion_eligibility.eligible
             or self.required_actions
-            or any(gap.status == "open" for gap in self.review_gaps)
+            or any(gap.status != "resolved" for gap in self.review_gaps)
             or self.status != "completed"
             or self.requires_human_review
+            or set(trace_ids) != set(planned_ids)
+            or set(observation_action_ids) != set(planned_ids)
+            or any(item.get("status") != "succeeded" for item in self.action_trace)
             or any(item.get("status") != "succeeded" for item in self.observations)
             or self.runtime_release.release_profile_state != "approved"
             or self.runtime_release.release_profile_sha256 is None

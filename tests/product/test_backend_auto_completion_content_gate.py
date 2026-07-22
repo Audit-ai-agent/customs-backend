@@ -127,63 +127,134 @@ def test_stage_trace_accepts_bounded_revision_rerun_events() -> None:
     assert len(trace) <= MAX_REVIEW_STAGE_TRACE_ENTRIES
 
 
-def test_consumer_rejects_trace_above_the_compiled_tool_budget() -> None:
-    request = _complete_provider_request()
-    result = _audited_result(request, auto_complete=True)
-    gap_id = f"gap_{'a' * 64}"
-    action_id = f"action_{'b' * 64}"
-    result["review_gaps"] = [
-        {
-            "gap_id": gap_id,
-            "gap_type": "field_uncertainty",
-            "reason_code": "adversarial_budget_probe",
-            "source_reference_ids": [],
-            "status": "resolved",
-        }
-    ]
-    result["review_plan"]["actions"] = [
-        {
-            "action_id": action_id,
-            "tool_name": "document.reread_span/v1",
-            "gap_id": gap_id,
-            "reason_code": "adversarial_budget_probe",
-            "input_reference_ids": [],
-        }
-    ]
-    result["action_trace"] = [
-        {
-            "action_id": action_id,
-            "cycle": 1,
-            "tool_name": "document.reread_span/v1",
-            "reason_code": "adversarial_budget_probe",
-            "input_reference_ids": [],
-            "output_reference_ids": [],
-            "status": "succeeded",
-            "duration_ms": 1,
-            "provider": "deterministic_policy",
-            "model_id": None,
-            "prompt_sha256": None,
-            "input_tokens": 0,
-            "output_tokens": 0,
-        }
-    ] * 7
-    result["observations"] = [
-        {
-            "observation_id": f"observation_{index:064x}",
-            "action_id": action_id,
-            "cycle": 1,
-            "tool_name": "document.reread_span/v1",
-            "status": "succeeded",
-            "reason_code": "adversarial_budget_probe",
-            "input_reference_ids": [],
-            "output_reference_ids": [],
-        }
-        for index in range(7)
-    ]
+def _auto_complete_result_with_bound_actions(action_count: int = 1) -> dict:
+    result = _audited_result(_complete_provider_request(), auto_complete=True)
+    result["review_gaps"] = []
+    result["review_plan"]["actions"] = []
+    result["action_trace"] = []
+    result["observations"] = []
+    for index in range(action_count):
+        gap_id = f"gap_{index + 1:064x}"
+        action_id = f"action_{index + 1:064x}"
+        reason_code = f"adversarial_binding_probe_{index + 1}"
+        result["review_gaps"].append(
+            {
+                "gap_id": gap_id,
+                "gap_type": "field_uncertainty",
+                "reason_code": reason_code,
+                "source_reference_ids": [],
+                "status": "resolved",
+            }
+        )
+        result["review_plan"]["actions"].append(
+            {
+                "action_id": action_id,
+                "tool_name": "document.reread_span/v1",
+                "gap_id": gap_id,
+                "reason_code": reason_code,
+                "input_reference_ids": [],
+            }
+        )
+        result["action_trace"].append(
+            {
+                "action_id": action_id,
+                "cycle": 1,
+                "tool_name": "document.reread_span/v1",
+                "reason_code": reason_code,
+                "input_reference_ids": [],
+                "output_reference_ids": [],
+                "status": "succeeded",
+                "duration_ms": 1,
+                "provider": "deterministic_policy",
+                "model_id": None,
+                "prompt_sha256": None,
+                "input_tokens": 0,
+                "output_tokens": 0,
+            }
+        )
+        result["observations"].append(
+            {
+                "observation_id": f"observation_{index + 1:064x}",
+                "action_id": action_id,
+                "cycle": 1,
+                "tool_name": "document.reread_span/v1",
+                "status": "succeeded",
+                "reason_code": f"{reason_code}_outcome",
+                "input_reference_ids": [],
+                "output_reference_ids": [],
+            }
+        )
+    return result
+
+
+def _rehash_result(result: dict) -> None:
     result["result_sha256"] = "0" * 64
     result["result_sha256"] = canonical_digest(result)
 
+
+def test_consumer_rejects_trace_above_the_compiled_tool_budget() -> None:
+    result = _auto_complete_result_with_bound_actions()
+    result["action_trace"] *= 7
+    result["observations"] *= 7
+    _rehash_result(result)
+
     with pytest.raises(ValidationError, match="bounded Tool-call limit"):
+        AgentReviewResultV3.model_validate(result)
+
+
+def test_consumer_rejects_failed_trace_with_succeeded_observation() -> None:
+    result = _auto_complete_result_with_bound_actions()
+    result["action_trace"][0]["status"] = "failed"
+    _rehash_result(result)
+
+    with pytest.raises(ValidationError, match="differs from its bounded compiled plan"):
+        AgentReviewResultV3.model_validate(result)
+
+
+def test_consumer_rejects_duplicate_observation_identity() -> None:
+    result = _auto_complete_result_with_bound_actions(action_count=2)
+    result["observations"][1]["observation_id"] = result["observations"][0]["observation_id"]
+    _rehash_result(result)
+
+    with pytest.raises(ValidationError, match="observation IDs must be present and unique"):
+        AgentReviewResultV3.model_validate(result)
+
+
+def test_consumer_accepts_distinct_execution_outcome_reason() -> None:
+    result = _auto_complete_result_with_bound_actions()
+    _rehash_result(result)
+
+    validated = AgentReviewResultV3.model_validate(result)
+
+    assert validated.observations[0]["reason_code"].endswith("_outcome")
+
+
+def test_consumer_rejects_unexecuted_planned_action_for_auto_completion() -> None:
+    result = _auto_complete_result_with_bound_actions()
+    result["action_trace"] = []
+    result["observations"] = []
+    _rehash_result(result)
+
+    with pytest.raises(ValidationError, match="deterministic V3 gates"):
+        AgentReviewResultV3.model_validate(result)
+
+
+def test_consumer_rejects_deferred_gap_for_auto_completion() -> None:
+    result = _auto_complete_result_with_bound_actions()
+    result["review_gaps"][0]["status"] = "deferred"
+    _rehash_result(result)
+
+    with pytest.raises(ValidationError, match="deterministic V3 gates"):
+        AgentReviewResultV3.model_validate(result)
+
+
+def test_consumer_rejects_duplicate_gap_identity() -> None:
+    result = _auto_complete_result_with_bound_actions(action_count=2)
+    result["review_gaps"][1]["gap_id"] = result["review_gaps"][0]["gap_id"]
+    result["review_plan"]["actions"][1]["gap_id"] = result["review_gaps"][0]["gap_id"]
+    _rehash_result(result)
+
+    with pytest.raises(ValidationError, match="review gap IDs must be unique"):
         AgentReviewResultV3.model_validate(result)
 
 
