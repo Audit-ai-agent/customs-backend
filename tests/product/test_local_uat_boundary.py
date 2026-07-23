@@ -37,11 +37,13 @@ def _local_uat_values(**overrides: Any) -> dict[str, Any]:
         ),
         "agent_base_url": "http://agent-uat:8080",
         "agent_service_token": "uat-agent-token",
+        "agent_timeout_seconds": 435,
         "redis_url": "redis://redis:6379/0",
         "minio_endpoint": "minio:9000",
         "minio_access_key": "uat-minio-user",
         "minio_secret_key": "uat-minio-secret",
         "auto_completion_enabled": False,
+        "job_lease_seconds": 600,
         "uat_evidence_profile": "preserved-3law-v3-diagnostic",
         "uat_evidence_data_source": "ACTUAL_POSTGRESQL_QDRANT_NEO4J_READ_ONLY",
         "uat_evidence_expected_production_law_count": 58,
@@ -99,6 +101,8 @@ def test_local_uat_settings_require_real_runtime_adapters_and_force_diagnostic_m
     settings = Settings(**_local_uat_values())
     assert settings.environment == "local_uat"
     assert settings.auto_completion_enabled is False
+    assert settings.agent_timeout_seconds == 435
+    assert settings.job_lease_seconds == 600
     assert settings.uat_claude_mode == "actual"
     assert (
         Settings(
@@ -136,6 +140,62 @@ def test_local_uat_settings_require_real_runtime_adapters_and_force_diagnostic_m
             **_local_uat_values(
                 uat_evidence_profile="synthetic-v3",
                 uat_evidence_data_source="SYNTHETIC_V3_NO_RAG_QUALITY",
+            )
+        )
+
+
+def test_agent_timeout_parses_from_environment_and_has_safe_bounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "CUSTOMS_BACKEND_AGENT_TIMEOUT_SECONDS"
+    monkeypatch.setenv(name, "435")
+    assert Settings(_env_file=None).agent_timeout_seconds == 435
+
+    for value in (0, 901):
+        with pytest.raises(ValueError):
+            Settings(agent_timeout_seconds=value)
+
+    assert Settings(agent_timeout_seconds=1).agent_timeout_seconds == 1
+    assert Settings(agent_timeout_seconds=900).agent_timeout_seconds == 900
+
+
+def test_synthetic_local_uat_retains_the_existing_timeout_and_lease_defaults() -> None:
+    values = _local_uat_values(
+        uat_evidence_profile="synthetic-v3",
+        uat_evidence_data_source="SYNTHETIC_V3_NO_RAG_QUALITY",
+        uat_evidence_observed_law_count=0,
+        uat_evidence_observed_article_count=0,
+        uat_evidence_qdrant_point_count=0,
+        uat_evidence_neo4j_article_count=0,
+    )
+    values.pop("agent_timeout_seconds")
+    values.pop("job_lease_seconds")
+
+    settings = Settings(**values)
+
+    assert settings.agent_timeout_seconds == 180
+    assert settings.job_lease_seconds == 300
+
+
+@pytest.mark.parametrize(
+    ("agent_timeout_seconds", "job_lease_seconds", "message"),
+    [
+        (180, 600, "agent_timeout_seconds >= 435"),
+        (434, 600, "agent_timeout_seconds >= 435"),
+        (435, 435, "job_lease_seconds > agent_timeout_seconds"),
+        (600, 435, "job_lease_seconds > agent_timeout_seconds"),
+    ],
+)
+def test_preserved_three_law_local_uat_rejects_unsafe_timeout_chains(
+    agent_timeout_seconds: int,
+    job_lease_seconds: int,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        Settings(
+            **_local_uat_values(
+                agent_timeout_seconds=agent_timeout_seconds,
+                job_lease_seconds=job_lease_seconds,
             )
         )
 
@@ -238,7 +298,23 @@ def test_local_uat_container_selects_only_real_boundary_adapters(monkeypatch) ->
     assert isinstance(container.object_store, FakeMinio)
     assert isinstance(container.publisher, FakeDramatiq)
     assert isinstance(container.agent, FakeHttpAgent)
+    assert container.agent.values["timeout_seconds"] == 435
     assert container.service.auto_completion_enabled is False
+
+    development_container = build_container(
+        Settings(
+            environment="test",
+            agent_base_url="http://agent.test",
+            agent_service_token="test-agent-token",
+            agent_timeout_seconds=321,
+        )
+    )
+    assert isinstance(development_container.agent, FakeHttpAgent)
+    assert development_container.agent.values == {
+        "base_url": "http://agent.test",
+        "service_token": "test-agent-token",
+        "timeout_seconds": 321,
+    }
 
 
 def _local_uat_app(*, agent_status: str = "ready") -> TestClient:

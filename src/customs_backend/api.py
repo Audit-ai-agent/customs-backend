@@ -441,6 +441,7 @@ def build_container(settings: Settings) -> Container:
         agent: AgentClient = HttpAgentClient(
             base_url=settings.agent_base_url,
             service_token=settings.agent_service_token.get_secret_value(),
+            timeout_seconds=settings.agent_timeout_seconds,
         )
     else:
         repository = InMemoryWorkbenchRepository()
@@ -454,6 +455,7 @@ def build_container(settings: Settings) -> Container:
             agent = HttpAgentClient(
                 base_url=settings.agent_base_url,
                 service_token=settings.agent_service_token.get_secret_value(),
+                timeout_seconds=settings.agent_timeout_seconds,
             )
     service = WorkbenchService(
         repository=repository,

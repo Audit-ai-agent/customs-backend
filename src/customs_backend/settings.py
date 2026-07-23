@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     oidc_roles_claim: str = "roles"
     agent_base_url: str = "http://127.0.0.1:8080"
     agent_service_token: SecretStr | None = Field(default=None, repr=False)
+    agent_timeout_seconds: int = Field(default=180, ge=1, le=900)
     agent_expected_build_sha: str | None = Field(
         default=None, pattern=r"^[a-f0-9]{40}$|^[a-f0-9]{64}$"
     )
@@ -228,6 +229,17 @@ class Settings(BaseSettings):
             if self.uat_evidence_expected_production_law_count != 58:
                 raise ValueError("local_uat Evidence scope requires expected Production count 58")
             if self.uat_evidence_profile == "preserved-3law-v3-diagnostic":
+                # The Agent owns a 420-second run budget. Keep 15 seconds outside
+                # that budget so Backend can receive the terminal HTTP response.
+                if self.agent_timeout_seconds < 435:
+                    raise ValueError(
+                        "preserved 3-law UAT requires agent_timeout_seconds >= 435 "
+                        "to exceed the Agent service run budget"
+                    )
+                if self.job_lease_seconds <= self.agent_timeout_seconds:
+                    raise ValueError(
+                        "preserved 3-law UAT requires job_lease_seconds > agent_timeout_seconds"
+                    )
                 if (
                     self.uat_evidence_data_source != "ACTUAL_POSTGRESQL_QDRANT_NEO4J_READ_ONLY"
                     or self.uat_evidence_observed_law_count != 3
