@@ -42,7 +42,14 @@ def _local_uat_values(**overrides: Any) -> dict[str, Any]:
         "minio_access_key": "uat-minio-user",
         "minio_secret_key": "uat-minio-secret",
         "auto_completion_enabled": False,
-        "uat_evidence_profile": "preserved-3law",
+        "uat_evidence_profile": "preserved-3law-v3-diagnostic",
+        "uat_evidence_data_source": "ACTUAL_POSTGRESQL_QDRANT_NEO4J_READ_ONLY",
+        "uat_evidence_expected_production_law_count": 58,
+        "uat_evidence_observed_law_count": 3,
+        "uat_evidence_observed_article_count": 1007,
+        "uat_evidence_qdrant_point_count": 1007,
+        "uat_evidence_neo4j_article_count": 1007,
+        "uat_evidence_rag_quality_evaluated": False,
         "uat_planner_mode": "shadow",
     }
     values.update(overrides)
@@ -112,6 +119,17 @@ def test_local_uat_settings_require_real_runtime_adapters_and_force_diagnostic_m
         Settings(**_local_uat_values(database_url="sqlite:///uat.db"))
     with pytest.raises(ValueError, match="auto_completion_enabled=false"):
         Settings(**_local_uat_values(auto_completion_enabled=True))
+    with pytest.raises(ValueError, match="corroborated 3/58"):
+        Settings(**_local_uat_values(uat_evidence_observed_law_count=2))
+    with pytest.raises(ValueError, match="corroborated 3/58"):
+        Settings(**_local_uat_values(uat_evidence_qdrant_point_count=1006))
+    with pytest.raises(ValueError, match="zero actual-store observations"):
+        Settings(
+            **_local_uat_values(
+                uat_evidence_profile="synthetic-v3",
+                uat_evidence_data_source="SYNTHETIC_V3_NO_RAG_QUALITY",
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -215,7 +233,7 @@ def _local_uat_app(*, agent_status: str = "ready") -> TestClient:
                 "diagnostic_only": True,
                 "mock_fallback_allowed": False,
                 "auto_completion_allowed": False,
-                "evidence_mode": "preserved-3law",
+                "evidence_mode": "preserved-3law-v3-diagnostic",
                 "evidence_runtime_identity": evidence_identity,
             },
             "evidence_runtime_release_v3": {
@@ -229,7 +247,7 @@ def _local_uat_app(*, agent_status: str = "ready") -> TestClient:
             "text_only": True,
             "mock_fallback_allowed": False,
             "auto_completion_allowed": False,
-            "evidence_mode": "preserved-3law",
+            "evidence_mode": "preserved-3law-v3-diagnostic",
         },
     )
     verifier = OidcJwtVerifier(
@@ -295,6 +313,20 @@ def test_local_uat_readiness_is_separate_from_strict_production_readiness(
         assert ready.json()["mode"] == "local_uat"
         assert ready.json()["auto_completion_enabled"] is False
         assert ready.json()["production_release"] is False
+        assert ready.json()["evidence_profile"] == "preserved-3law-v3-diagnostic"
+        assert ready.json()["evidence_scope_label"] == "ACTUAL_3_LAW_RAG_3_OF_58"
+        assert ready.json()["evidence_dataset"] == {
+            "data_source": "ACTUAL_POSTGRESQL_QDRANT_NEO4J_READ_ONLY",
+            "expected_production_law_count": 58,
+            "observed_law_count": 3,
+            "observed_article_count": 1007,
+            "store_counts": {
+                "postgresql_article_count": 1007,
+                "qdrant_point_count": 1007,
+                "neo4j_article_count": 1007,
+            },
+            "rag_quality_evaluated": False,
+        }
 
         metadata = client.get("/api/v1/uat/metadata")
         assert metadata.status_code == 200
@@ -304,12 +336,25 @@ def test_local_uat_readiness_is_separate_from_strict_production_readiness(
             "text_only": True,
             "auto_completion_enabled": False,
             "claude_mode": "actual",
-            "evidence_profile": "preserved-3law",
-            "evidence_scope_label": "REAL_3_OF_58",
+            "evidence_profile": "preserved-3law-v3-diagnostic",
+            "evidence_scope_label": "ACTUAL_3_LAW_RAG_3_OF_58",
+            "evidence_dataset": {
+                "data_source": "ACTUAL_POSTGRESQL_QDRANT_NEO4J_READ_ONLY",
+                "expected_production_law_count": 58,
+                "observed_law_count": 3,
+                "observed_article_count": 1007,
+                "store_counts": {
+                    "postgresql_article_count": 1007,
+                    "qdrant_point_count": 1007,
+                    "neo4j_article_count": 1007,
+                },
+                "rag_quality_evaluated": False,
+            },
             "supported_review_as_of": "2026-07-10",
             "planner_mode": "shadow",
             "production_release": False,
         }
+        assert ready.json()["evidence_dataset"] == metadata.json()["evidence_dataset"]
 
 
 def test_local_uat_readiness_fails_closed_for_an_unready_agent(monkeypatch) -> None:

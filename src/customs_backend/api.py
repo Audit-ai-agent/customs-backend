@@ -239,6 +239,29 @@ class AuthConfigResponse(BaseModel):
     token_storage: str = "memory_only"
 
 
+class UatEvidenceStoreCountsResponse(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    postgresql_article_count: int = Field(ge=0, le=10_000_000)
+    qdrant_point_count: int = Field(ge=0, le=10_000_000)
+    neo4j_article_count: int = Field(ge=0, le=10_000_000)
+
+
+class UatEvidenceDatasetResponse(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    data_source: Literal[
+        "SYNTHETIC_V3_NO_RAG_QUALITY",
+        "ACTUAL_POSTGRESQL_QDRANT_NEO4J_READ_ONLY",
+        "UNKNOWN",
+    ]
+    expected_production_law_count: int = Field(ge=1, le=10_000)
+    observed_law_count: int = Field(ge=0, le=10_000)
+    observed_article_count: int = Field(ge=0, le=10_000_000)
+    store_counts: UatEvidenceStoreCountsResponse
+    rag_quality_evaluated: Literal[False] = False
+
+
 class UatMetadataResponse(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -247,8 +270,17 @@ class UatMetadataResponse(BaseModel):
     text_only: Literal[True] = True
     auto_completion_enabled: Literal[False] = False
     claude_mode: Literal["actual"] = "actual"
-    evidence_profile: Literal["synthetic-v3", "preserved-3law", "unknown"]
-    evidence_scope_label: Literal["TEST_ONLY_V3", "REAL_3_OF_58", "UNKNOWN"]
+    evidence_profile: Literal[
+        "synthetic-v3",
+        "preserved-3law-v3-diagnostic",
+        "unknown",
+    ]
+    evidence_scope_label: Literal[
+        "TEST_ONLY_V3",
+        "ACTUAL_3_LAW_RAG_3_OF_58",
+        "UNKNOWN",
+    ]
+    evidence_dataset: UatEvidenceDatasetResponse
     supported_review_as_of: date
     planner_mode: Literal["shadow", "diagnostic_active"]
     production_release: Literal[False] = False
@@ -693,6 +725,34 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             actual_container.service.service_pin.validate_local_uat_metadata(agent_metadata)
         return agent_metadata, evidence_identity
 
+    def local_uat_evidence_scope() -> Literal[
+        "TEST_ONLY_V3", "ACTUAL_3_LAW_RAG_3_OF_58", "UNKNOWN"
+    ]:
+        profile = actual_container.settings.uat_evidence_profile
+        if profile == "synthetic-v3":
+            return "TEST_ONLY_V3"
+        if profile == "preserved-3law-v3-diagnostic":
+            return "ACTUAL_3_LAW_RAG_3_OF_58"
+        return "UNKNOWN"
+
+    def local_uat_evidence_dataset() -> UatEvidenceDatasetResponse:
+        return UatEvidenceDatasetResponse(
+            data_source=actual_container.settings.uat_evidence_data_source,
+            expected_production_law_count=(
+                actual_container.settings.uat_evidence_expected_production_law_count
+            ),
+            observed_law_count=actual_container.settings.uat_evidence_observed_law_count,
+            observed_article_count=(actual_container.settings.uat_evidence_observed_article_count),
+            store_counts=UatEvidenceStoreCountsResponse(
+                postgresql_article_count=(
+                    actual_container.settings.uat_evidence_observed_article_count
+                ),
+                qdrant_point_count=actual_container.settings.uat_evidence_qdrant_point_count,
+                neo4j_article_count=(actual_container.settings.uat_evidence_neo4j_article_count),
+            ),
+            rag_quality_evaluated=(actual_container.settings.uat_evidence_rag_quality_evaluated),
+        )
+
     @app.get("/health/uat-ready", include_in_schema=False)
     def health_uat_ready() -> dict[str, Any]:
         if actual_container.settings.environment != "local_uat":
@@ -744,6 +804,9 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             "text_only": True,
             "auto_completion_enabled": False,
             "production_release": False,
+            "evidence_profile": actual_container.settings.uat_evidence_profile,
+            "evidence_scope_label": local_uat_evidence_scope(),
+            "evidence_dataset": local_uat_evidence_dataset().model_dump(mode="json"),
             "agent": agent_metadata,
             "agent_uat": agent_uat_readiness,
             "dependencies": dependency_status,
@@ -753,15 +816,6 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
     def uat_metadata() -> UatMetadataResponse:
         if actual_container.settings.environment != "local_uat":
             raise HTTPException(status_code=404, detail="local UAT metadata is unavailable")
-        evidence_scope_by_profile: dict[
-            str,
-            Literal["TEST_ONLY_V3", "REAL_3_OF_58", "UNKNOWN"],
-        ] = {
-            "synthetic-v3": "TEST_ONLY_V3",
-            "preserved-3law": "REAL_3_OF_58",
-            "unknown": "UNKNOWN",
-        }
-        evidence_scope = evidence_scope_by_profile[actual_container.settings.uat_evidence_profile]
         try:
             _agent_metadata, evidence_identity = validated_local_uat_agent_metadata()
         except Exception:
@@ -771,7 +825,8 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             ) from None
         return UatMetadataResponse(
             evidence_profile=actual_container.settings.uat_evidence_profile,
-            evidence_scope_label=evidence_scope,
+            evidence_scope_label=local_uat_evidence_scope(),
+            evidence_dataset=local_uat_evidence_dataset(),
             supported_review_as_of=evidence_identity.base_runtime_release.supported_review_as_of,
             planner_mode=actual_container.settings.uat_planner_mode,
         )

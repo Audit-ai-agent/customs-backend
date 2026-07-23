@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import ValidationError
 
@@ -98,6 +101,283 @@ from customs_backend.release import (
 LOGGER = logging.getLogger(__name__)
 CHAT_INTERACTIONS_PER_REVIEW_RUN = 100
 CHAT_INTERACTIONS_PER_ACTOR_PER_MINUTE = 10
+_SAFE_RETRIEVAL_METHODS = frozenset({"exact_hs", "dense", "bm25", "graph"})
+_SAFE_RETRIEVAL_SCORE_KEYS = frozenset(
+    {"exact_hs", "dense", "bm25", "graph", "rrf", "lexical_overlap"}
+)
+_SAFE_EVIDENCE_SOURCE_TYPES = frozenset(
+    {"law_article", "customs_requirement", "hsk_entry", "notice"}
+)
+_SHA256 = re.compile(r"^[a-f0-9]{64}$")
+
+
+def _bounded_provenance_text(
+    value: object,
+    *,
+    field: str,
+    maximum: int,
+    optional: bool = False,
+) -> str | None:
+    if value is None and optional:
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+        raise ConflictError(f"Agent {field} is not safe for public retrieval provenance")
+    return value
+
+
+def _bounded_hs_code(value: object, *, field: str, optional: bool = False) -> str | None:
+    text = _bounded_provenance_text(value, field=field, maximum=10, optional=optional)
+    if text is None:
+        return None
+    if len(text) not in {6, 10} or not text.isascii() or not text.isdigit():
+        raise ConflictError(f"Agent {field} is not a supported HS code")
+    return text
+
+
+def _safe_public_evidence_uri(value: object) -> str:
+    source_uri = _bounded_provenance_text(
+        value,
+        field="Evidence source URI",
+        maximum=2048,
+    )
+    if source_uri is None:
+        raise ConflictError("Agent Evidence source URI is missing")
+    parsed = urlsplit(source_uri)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ConflictError("Agent Evidence source URI is not a safe HTTPS reference")
+    # Query strings and fragments are not needed to identify the legal source and
+    # can accidentally carry access tokens.  The public projection deliberately
+    # removes them while the provider-owned result remains hash-bound internally.
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
+def _finite_score(value: object, *, field: str, optional: bool = False) -> float | None:
+    if value is None and optional:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ConflictError(f"Agent {field} is not numeric")
+    score = float(value)
+    if not math.isfinite(score) or abs(score) > 1_000_000_000:
+        raise ConflictError(f"Agent {field} is outside the public score boundary")
+    return score
+
+
+def _safe_evidence_provenance(envelope: AgentReviewResultV3) -> dict[str, Any]:
+    """Project only review-safe query and ranking facts from the Agent result.
+
+    The browser must not infer an actual RAG run merely from a profile label.
+    This projection is created only from the already validated, result-hash-bound
+    retrieval request/results.  It contains no provider URL, credential, raw
+    response, model embedding, database identity, or arbitrary executable input.
+    """
+
+    request = envelope.retrieval_request
+    if request is None:
+        if envelope.retrieval_results or envelope.rag_evidence:
+            raise ConflictError("Agent retrieval provenance is missing its request")
+        return {
+            "query_intent": None,
+            "items": [],
+            "ranked_evidence": [],
+        }
+    if not isinstance(request, dict):
+        raise ConflictError("Agent retrieval request is malformed")
+    query_intent = _bounded_provenance_text(
+        request.get("query_intent"),
+        field="retrieval query intent",
+        maximum=256,
+    )
+    request_items = request.get("items")
+    if not isinstance(request_items, list) or not 1 <= len(request_items) <= 100:
+        raise ConflictError("Agent retrieval query items are malformed")
+    result_by_item: dict[str, dict[str, Any]] = {}
+    for raw_result in envelope.retrieval_results:
+        if not isinstance(raw_result, dict):
+            raise ConflictError("Agent retrieval result is malformed")
+        item_id = _bounded_provenance_text(
+            raw_result.get("item_id"),
+            field="retrieval result item ID",
+            maximum=256,
+        )
+        if item_id is None:
+            raise ConflictError("Agent retrieval result item ID is missing")
+        if item_id in result_by_item:
+            raise ConflictError("Agent retrieval result item IDs are duplicated")
+        result_by_item[item_id] = raw_result
+
+    query_items: list[dict[str, Any]] = []
+    request_item_ids: set[str] = set()
+    for raw_item in request_items:
+        if not isinstance(raw_item, dict):
+            raise ConflictError("Agent retrieval query item is malformed")
+        item_id = _bounded_provenance_text(
+            raw_item.get("item_id"),
+            field="retrieval query item ID",
+            maximum=256,
+        )
+        if item_id is None:
+            raise ConflictError("Agent retrieval query item ID is missing")
+        if item_id in request_item_ids:
+            raise ConflictError("Agent retrieval query item IDs are duplicated")
+        request_item_ids.add(item_id)
+        result = result_by_item.get(item_id)
+        if result is None:
+            raise ConflictError("Agent retrieval query/result items differ")
+        hs_resolution = _bounded_provenance_text(
+            result.get("hs_resolution"),
+            field="HS resolution",
+            maximum=32,
+        )
+        if hs_resolution not in {
+            "exact",
+            "unique_descendant",
+            "ambiguous",
+            "invalid",
+            "missing",
+        }:
+            raise ConflictError("Agent HS resolution is unsupported")
+        coverage = _bounded_provenance_text(
+            result.get("coverage"),
+            field="retrieval coverage",
+            maximum=16,
+        )
+        if coverage not in {"complete", "partial", "unknown"}:
+            raise ConflictError("Agent retrieval coverage is unsupported")
+        requirements_found = result.get("requirements_found")
+        if not isinstance(requirements_found, bool):
+            raise ConflictError("Agent requirements_found is not boolean")
+        query_items.append(
+            {
+                "item_id": item_id,
+                "query_description": _bounded_provenance_text(
+                    raw_item.get("description"),
+                    field="retrieval query description",
+                    maximum=2000,
+                ),
+                "requested_hs_code": _bounded_hs_code(
+                    raw_item.get("hs_code"),
+                    field="requested HS code",
+                    optional=True,
+                ),
+                "hs_resolution": hs_resolution,
+                "resolved_hsk10": _bounded_hs_code(
+                    result.get("resolved_hsk10"),
+                    field="resolved HSK10",
+                    optional=True,
+                ),
+                "coverage": coverage,
+                "requirements_found": requirements_found,
+            }
+        )
+    if set(result_by_item) != request_item_ids:
+        raise ConflictError("Agent retrieval query/result items differ")
+
+    ranked_evidence: list[dict[str, Any]] = []
+    seen_evidence_ids: set[str] = set()
+    for item in query_items:
+        raw_result = result_by_item[item["item_id"]]
+        raw_evidence = raw_result.get("evidence")
+        if not isinstance(raw_evidence, list) or len(raw_evidence) > 1000:
+            raise ConflictError("Agent ranked Evidence is malformed")
+        for rank, evidence in enumerate(raw_evidence, start=1):
+            if not isinstance(evidence, dict):
+                raise ConflictError("Agent ranked Evidence item is malformed")
+            evidence_id = _bounded_provenance_text(
+                evidence.get("evidence_id"),
+                field="Evidence ID",
+                maximum=256,
+            )
+            if evidence_id is None:
+                raise ConflictError("Agent Evidence ID is missing")
+            if evidence_id in seen_evidence_ids:
+                raise ConflictError("Agent ranked Evidence IDs are duplicated")
+            seen_evidence_ids.add(evidence_id)
+            source_type = _bounded_provenance_text(
+                evidence.get("source_type"),
+                field="Evidence source type",
+                maximum=64,
+            )
+            if source_type not in _SAFE_EVIDENCE_SOURCE_TYPES:
+                raise ConflictError("Agent Evidence source type is unsupported")
+            methods = evidence.get("retrieval_methods")
+            if (
+                not isinstance(methods, list)
+                or not methods
+                or len(methods) != len(set(methods))
+                or any(method not in _SAFE_RETRIEVAL_METHODS for method in methods)
+            ):
+                raise ConflictError("Agent Evidence retrieval methods are unsupported")
+            raw_scores = evidence.get("raw_scores")
+            if not isinstance(raw_scores, dict) or any(
+                key not in _SAFE_RETRIEVAL_SCORE_KEYS for key in raw_scores
+            ):
+                raise ConflictError("Agent Evidence raw score methods are unsupported")
+            score_projection = {
+                key: _finite_score(value, field=f"Evidence raw score {key}")
+                for key, value in sorted(raw_scores.items())
+            }
+            version_hash = _bounded_provenance_text(
+                evidence.get("version_hash"),
+                field="Evidence version hash",
+                maximum=64,
+            )
+            if version_hash is None or _SHA256.fullmatch(version_hash) is None:
+                raise ConflictError("Agent Evidence version hash is invalid")
+            ranked_evidence.append(
+                {
+                    "evidence_id": evidence_id,
+                    "item_id": item["item_id"],
+                    "rank": rank,
+                    "source_type": source_type,
+                    "retrieval_methods": list(methods),
+                    "score": _finite_score(
+                        evidence.get("score"),
+                        field="Evidence score",
+                        optional=True,
+                    ),
+                    "raw_scores": score_projection,
+                    "law_id": _bounded_provenance_text(
+                        evidence.get("law_id"),
+                        field="Evidence law ID",
+                        maximum=128,
+                        optional=True,
+                    ),
+                    "law_name": _bounded_provenance_text(
+                        evidence.get("law_name"),
+                        field="Evidence law name",
+                        maximum=512,
+                        optional=True,
+                    ),
+                    "article_no": _bounded_provenance_text(
+                        evidence.get("article_no"),
+                        field="Evidence article number",
+                        maximum=128,
+                        optional=True,
+                    ),
+                    "version_hash": version_hash,
+                    "source_uri": _safe_public_evidence_uri(evidence.get("source_uri")),
+                }
+            )
+
+    provider_evidence_ids = {
+        item.get("evidence_id") for item in envelope.rag_evidence if isinstance(item, dict)
+    }
+    if (
+        None in provider_evidence_ids
+        or len(provider_evidence_ids) != len(envelope.rag_evidence)
+        or provider_evidence_ids != seen_evidence_ids
+    ):
+        raise ConflictError("Agent ranked Evidence differs from public Evidence")
+    return {
+        "query_intent": query_intent,
+        "items": query_items,
+        "ranked_evidence": ranked_evidence,
+    }
 
 
 def _is_sha256(value: object) -> bool:
@@ -2280,6 +2560,7 @@ class WorkbenchService:
         detail["review_stage_trace"] = [item.model_dump(mode="json") for item in stage_trace]
         detail["model_execution_summary"] = model_execution_summary.model_dump(mode="json")
         detail["narrative_execution_summary"] = narrative_execution_summary.model_dump(mode="json")
+        detail["evidence_provenance"] = _safe_evidence_provenance(envelope)
         effective_narrative = envelope.narrative_report
         if (
             disposition != envelope.review_disposition

@@ -753,6 +753,35 @@ def test_worker_restart_preserves_job_and_forces_auto_completion_gate(workbench)
         "audit_complete": True,
         "unmet_reason_codes": [],
     }
+    provenance = run.result_detail["evidence_provenance"]
+    assert provenance["query_intent"] == "required_import_documents"
+    assert provenance["items"] == [
+        {
+            "item_id": run.result_detail["retrieval_results"][0]["item_id"],
+            "query_description": "Synthetic no-requirement line item",
+            "requested_hs_code": "0303540000",
+            "hs_resolution": "exact",
+            "resolved_hsk10": "0303540000",
+            "coverage": "complete",
+            "requirements_found": False,
+        }
+    ]
+    assert provenance["ranked_evidence"] == [
+        {
+            "evidence_id": run.result_detail["rag_evidence"][0]["evidence_id"],
+            "item_id": run.result_detail["retrieval_results"][0]["item_id"],
+            "rank": 1,
+            "source_type": "hsk_entry",
+            "retrieval_methods": ["exact_hs"],
+            "score": 1.0,
+            "raw_scores": {"exact_hs": 1.0},
+            "law_id": None,
+            "law_name": None,
+            "article_no": None,
+            "version_hash": "f" * 64,
+            "source_uri": "https://example.invalid/hsk/0303540000",
+        }
+    ]
     assert container.repository.get_provider_result("org-a", run.review_run_id) is not None
     assert (
         restarted.execute_job(org_id="org-a", job_id=queued["job_id"]).result_digest

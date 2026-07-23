@@ -2266,6 +2266,86 @@
         "title": "TextDocumentCreate",
         "type": "object"
       },
+      "UatEvidenceDatasetResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "data_source": {
+            "enum": [
+              "SYNTHETIC_V3_NO_RAG_QUALITY",
+              "ACTUAL_POSTGRESQL_QDRANT_NEO4J_READ_ONLY",
+              "UNKNOWN"
+            ],
+            "title": "Data Source",
+            "type": "string"
+          },
+          "expected_production_law_count": {
+            "maximum": 10000.0,
+            "minimum": 1.0,
+            "title": "Expected Production Law Count",
+            "type": "integer"
+          },
+          "observed_article_count": {
+            "maximum": 10000000.0,
+            "minimum": 0.0,
+            "title": "Observed Article Count",
+            "type": "integer"
+          },
+          "observed_law_count": {
+            "maximum": 10000.0,
+            "minimum": 0.0,
+            "title": "Observed Law Count",
+            "type": "integer"
+          },
+          "rag_quality_evaluated": {
+            "const": false,
+            "default": false,
+            "title": "Rag Quality Evaluated",
+            "type": "boolean"
+          },
+          "store_counts": {
+            "$ref": "#/components/schemas/UatEvidenceStoreCountsResponse"
+          }
+        },
+        "required": [
+          "data_source",
+          "expected_production_law_count",
+          "observed_law_count",
+          "observed_article_count",
+          "store_counts"
+        ],
+        "title": "UatEvidenceDatasetResponse",
+        "type": "object"
+      },
+      "UatEvidenceStoreCountsResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "neo4j_article_count": {
+            "maximum": 10000000.0,
+            "minimum": 0.0,
+            "title": "Neo4J Article Count",
+            "type": "integer"
+          },
+          "postgresql_article_count": {
+            "maximum": 10000000.0,
+            "minimum": 0.0,
+            "title": "Postgresql Article Count",
+            "type": "integer"
+          },
+          "qdrant_point_count": {
+            "maximum": 10000000.0,
+            "minimum": 0.0,
+            "title": "Qdrant Point Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "postgresql_article_count",
+          "qdrant_point_count",
+          "neo4j_article_count"
+        ],
+        "title": "UatEvidenceStoreCountsResponse",
+        "type": "object"
+      },
       "UatMetadataResponse": {
         "additionalProperties": false,
         "properties": {
@@ -2287,10 +2367,13 @@
             "title": "Claude Mode",
             "type": "string"
           },
+          "evidence_dataset": {
+            "$ref": "#/components/schemas/UatEvidenceDatasetResponse"
+          },
           "evidence_profile": {
             "enum": [
               "synthetic-v3",
-              "preserved-3law",
+              "preserved-3law-v3-diagnostic",
               "unknown"
             ],
             "title": "Evidence Profile",
@@ -2299,7 +2382,7 @@
           "evidence_scope_label": {
             "enum": [
               "TEST_ONLY_V3",
-              "REAL_3_OF_58",
+              "ACTUAL_3_LAW_RAG_3_OF_58",
               "UNKNOWN"
             ],
             "title": "Evidence Scope Label",
@@ -2340,6 +2423,7 @@
         "required": [
           "evidence_profile",
           "evidence_scope_label",
+          "evidence_dataset",
           "supported_review_as_of",
           "planner_mode"
         ],

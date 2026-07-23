@@ -31,11 +31,20 @@
 
 - `synthetic-v3`: 전체 제품 흐름용 합성 Evidence. 화면에는
   `TEST_ONLY_V3`로 표시하며 RAG 품질 증거로 사용하지 않는다.
-- `preserved-3law`: 보존된 실제 3법령 진단 corpus. 화면에는
-  `REAL_3_OF_58`로 표시하며 법적 coverage나 Production readiness로
+- `preserved-3law-v3-diagnostic`: 보존된 실제 3법령 진단 corpus를
+  PostgreSQL structured lookup, Qdrant dense/BM25, Neo4j graph expansion으로
+  조회하는 process-level 실행 프로필이다. 화면에는
+  `ACTUAL_3_LAW_RAG_3_OF_58`로 표시하며 법적 coverage나 Production readiness로
   해석하지 않는다.
 - `unknown`: 원천을 확인하지 못한 안전한 기본값. UAT 결과를 증거로
   채택하기 전에 명시적인 profile로 다시 실행한다.
+
+Backend는 Harness가 봉인된 Data 진단 manifest에서 주입한
+`CUSTOMS_BACKEND_UAT_EVIDENCE_*` 관측값을 시작 시 검증한다. 실제 3법령
+프로필은 `3/58`, PostgreSQL 조문 수, Qdrant point 수, Neo4j 조문 수가
+모두 결박되고 세 저장소 수가 일치해야 시작된다. `/api/v1/uat/metadata`는
+이 안전한 개수와 `rag_quality_evaluated=false`를 공개하지만 Data URL,
+DSN, token, 원본 manifest 경로는 공개하지 않는다.
 
 ## 설정 소유권
 
@@ -47,6 +56,12 @@
 Runtime, migration, outbox에는 각각 분리된 env를 사용한다. Worker는 runtime
 env를 사용하므로 동일한 PostgreSQL, MinIO, Redis, OIDC, Agent HTTP 경계를
 선택한다. Outbox dispatcher에는 DB와 Redis 외 secret을 주지 않는다.
+
+Evidence 프로필은 Review 요청의 사용자 입력이 아니다. Harness가 Data·Agent·Backend를
+시작할 때 한 프로필을 선택하고 세 프로세스의 readiness identity가 정확히 일치해야
+한다. 브라우저에는 현재 활성 프로필만 안전한 metadata로 공개하며 임의 URL, token,
+process 재시작 API는 제공하지 않는다. 다른 프로필을 확인하려면 Harness가 기존 UAT를
+내리고 같은 exact source로 다시 기동해야 한다.
 
 ## 판정 기준
 

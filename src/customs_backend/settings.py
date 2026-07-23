@@ -126,7 +126,22 @@ class Settings(BaseSettings):
     job_lease_seconds: int = Field(default=300, ge=60, le=1800)
     job_max_attempts: int = Field(default=3, ge=1, le=3)
     outbox_lease_seconds: int = Field(default=30, ge=5, le=300)
-    uat_evidence_profile: Literal["synthetic-v3", "preserved-3law", "unknown"] = "unknown"
+    uat_evidence_profile: Literal[
+        "synthetic-v3",
+        "preserved-3law-v3-diagnostic",
+        "unknown",
+    ] = "unknown"
+    uat_evidence_data_source: Literal[
+        "SYNTHETIC_V3_NO_RAG_QUALITY",
+        "ACTUAL_POSTGRESQL_QDRANT_NEO4J_READ_ONLY",
+        "UNKNOWN",
+    ] = "UNKNOWN"
+    uat_evidence_expected_production_law_count: int = Field(default=58, ge=1, le=10_000)
+    uat_evidence_observed_law_count: int = Field(default=0, ge=0, le=10_000)
+    uat_evidence_observed_article_count: int = Field(default=0, ge=0, le=10_000_000)
+    uat_evidence_qdrant_point_count: int = Field(default=0, ge=0, le=10_000_000)
+    uat_evidence_neo4j_article_count: int = Field(default=0, ge=0, le=10_000_000)
+    uat_evidence_rag_quality_evaluated: Literal[False] = False
     uat_planner_mode: Literal["shadow", "diagnostic_active"] = "shadow"
     uat_claude_mode: Literal["actual"] = "actual"
 
@@ -193,6 +208,35 @@ class Settings(BaseSettings):
                 if self.redis_url is None:
                     raise ValueError("local_uat outbox configuration requires redis_url")
                 return self
+            observed_counts = (
+                self.uat_evidence_observed_law_count,
+                self.uat_evidence_observed_article_count,
+                self.uat_evidence_qdrant_point_count,
+                self.uat_evidence_neo4j_article_count,
+            )
+            if self.uat_evidence_expected_production_law_count != 58:
+                raise ValueError("local_uat Evidence scope requires expected Production count 58")
+            if self.uat_evidence_profile == "preserved-3law-v3-diagnostic":
+                if (
+                    self.uat_evidence_data_source != "ACTUAL_POSTGRESQL_QDRANT_NEO4J_READ_ONLY"
+                    or self.uat_evidence_observed_law_count != 3
+                    or self.uat_evidence_observed_article_count <= 0
+                    or self.uat_evidence_qdrant_point_count
+                    != self.uat_evidence_observed_article_count
+                    or self.uat_evidence_neo4j_article_count
+                    != self.uat_evidence_observed_article_count
+                ):
+                    raise ValueError(
+                        "preserved 3-law UAT requires corroborated 3/58 "
+                        "PostgreSQL/Qdrant/Neo4j counts"
+                    )
+            elif self.uat_evidence_profile == "synthetic-v3":
+                if self.uat_evidence_data_source != "SYNTHETIC_V3_NO_RAG_QUALITY" or any(
+                    observed_counts
+                ):
+                    raise ValueError("synthetic UAT requires zero actual-store observations")
+            elif self.uat_evidence_data_source != "UNKNOWN" or any(observed_counts):
+                raise ValueError("unknown UAT Evidence profile cannot assert Data observations")
             required = {
                 "oidc_issuer": self.oidc_issuer,
                 "oidc_audience": self.oidc_audience,
