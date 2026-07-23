@@ -124,6 +124,7 @@ class Settings(BaseSettings):
     requirement_policy_release_path: str | None = None
     requirement_policy_trust_store_path: str | None = None
     evidence_runtime_v3_release_path: str | None = None
+    review_actor_time_limit_seconds: int = Field(default=240, ge=60, le=1800)
     job_lease_seconds: int = Field(default=300, ge=60, le=1800)
     job_max_attempts: int = Field(default=3, ge=1, le=3)
     outbox_lease_seconds: int = Field(default=30, ge=5, le=300)
@@ -164,6 +165,15 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def production_is_fail_closed(self) -> "Settings":
+        if self.process_role == "runtime":
+            if self.review_actor_time_limit_seconds <= self.agent_timeout_seconds:
+                raise ValueError(
+                    "runtime requires review_actor_time_limit_seconds > agent_timeout_seconds"
+                )
+            if self.job_lease_seconds <= self.review_actor_time_limit_seconds:
+                raise ValueError(
+                    "runtime requires job_lease_seconds > review_actor_time_limit_seconds"
+                )
         if self.environment == "local_uat":
             release_only = {
                 "agent_expected_model_revision": self.agent_expected_model_revision,
@@ -235,10 +245,6 @@ class Settings(BaseSettings):
                     raise ValueError(
                         "preserved 3-law UAT requires agent_timeout_seconds >= 435 "
                         "to exceed the Agent service run budget"
-                    )
-                if self.job_lease_seconds <= self.agent_timeout_seconds:
-                    raise ValueError(
-                        "preserved 3-law UAT requires job_lease_seconds > agent_timeout_seconds"
                     )
                 if (
                     self.uat_evidence_data_source != "ACTUAL_POSTGRESQL_QDRANT_NEO4J_READ_ONLY"
@@ -436,6 +442,10 @@ class Settings(BaseSettings):
                 "auto completion requires an approved profile and two-reviewer approval digest"
             )
         return self
+
+    @property
+    def review_actor_time_limit_milliseconds(self) -> int:
+        return self.review_actor_time_limit_seconds * 1000
 
 
 @lru_cache(maxsize=1)

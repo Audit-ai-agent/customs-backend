@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+import sys
 from typing import Any
 
 import pytest
@@ -43,6 +45,7 @@ def _local_uat_values(**overrides: Any) -> dict[str, Any]:
         "minio_access_key": "uat-minio-user",
         "minio_secret_key": "uat-minio-secret",
         "auto_completion_enabled": False,
+        "review_actor_time_limit_seconds": 540,
         "job_lease_seconds": 600,
         "uat_evidence_profile": "preserved-3law-v3-diagnostic",
         "uat_evidence_data_source": "ACTUAL_POSTGRESQL_QDRANT_NEO4J_READ_ONLY",
@@ -102,6 +105,8 @@ def test_local_uat_settings_require_real_runtime_adapters_and_force_diagnostic_m
     assert settings.environment == "local_uat"
     assert settings.auto_completion_enabled is False
     assert settings.agent_timeout_seconds == 435
+    assert settings.review_actor_time_limit_seconds == 540
+    assert settings.review_actor_time_limit_milliseconds == 540_000
     assert settings.job_lease_seconds == 600
     assert settings.uat_claude_mode == "actual"
     assert (
@@ -149,6 +154,8 @@ def test_agent_timeout_parses_from_environment_and_has_safe_bounds(
 ) -> None:
     name = "CUSTOMS_BACKEND_AGENT_TIMEOUT_SECONDS"
     monkeypatch.setenv(name, "435")
+    monkeypatch.setenv("CUSTOMS_BACKEND_REVIEW_ACTOR_TIME_LIMIT_SECONDS", "540")
+    monkeypatch.setenv("CUSTOMS_BACKEND_JOB_LEASE_SECONDS", "600")
     assert Settings(_env_file=None).agent_timeout_seconds == 435
 
     for value in (0, 901):
@@ -156,7 +163,51 @@ def test_agent_timeout_parses_from_environment_and_has_safe_bounds(
             Settings(agent_timeout_seconds=value)
 
     assert Settings(agent_timeout_seconds=1).agent_timeout_seconds == 1
-    assert Settings(agent_timeout_seconds=900).agent_timeout_seconds == 900
+    assert (
+        Settings(
+            agent_timeout_seconds=900,
+            review_actor_time_limit_seconds=901,
+            job_lease_seconds=902,
+        ).agent_timeout_seconds
+        == 900
+    )
+
+
+def test_review_actor_time_limit_parses_from_environment_and_has_safe_bounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "CUSTOMS_BACKEND_REVIEW_ACTOR_TIME_LIMIT_SECONDS"
+    monkeypatch.setenv(name, "540")
+    monkeypatch.setenv("CUSTOMS_BACKEND_JOB_LEASE_SECONDS", "600")
+    assert Settings(_env_file=None).review_actor_time_limit_milliseconds == 540_000
+
+    for value in (59, 1801):
+        with pytest.raises(ValueError):
+            Settings(review_actor_time_limit_seconds=value)
+
+
+def test_review_worker_registers_the_configured_hard_time_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from customs_backend import api as api_module
+    from customs_backend import settings as settings_module
+
+    settings = Settings(**_local_uat_values())
+    fake_container = object()
+    monkeypatch.setattr(settings_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(api_module, "build_container", lambda _settings: fake_container)
+    sys.modules.pop("customs_backend.worker", None)
+
+    try:
+        worker_module = importlib.import_module("customs_backend.worker")
+        assert worker_module._container() is fake_container
+        assert (
+            worker_module.execute_review_job.options["time_limit"]
+            == settings.review_actor_time_limit_milliseconds
+            == 540_000
+        )
+    finally:
+        sys.modules.pop("customs_backend.worker", None)
 
 
 def test_synthetic_local_uat_retains_the_existing_timeout_and_lease_defaults() -> None:
@@ -169,25 +220,35 @@ def test_synthetic_local_uat_retains_the_existing_timeout_and_lease_defaults() -
         uat_evidence_neo4j_article_count=0,
     )
     values.pop("agent_timeout_seconds")
+    values.pop("review_actor_time_limit_seconds")
     values.pop("job_lease_seconds")
 
     settings = Settings(**values)
 
     assert settings.agent_timeout_seconds == 180
+    assert settings.review_actor_time_limit_seconds == 240
     assert settings.job_lease_seconds == 300
 
 
 @pytest.mark.parametrize(
-    ("agent_timeout_seconds", "job_lease_seconds", "message"),
+    (
+        "agent_timeout_seconds",
+        "review_actor_time_limit_seconds",
+        "job_lease_seconds",
+        "message",
+    ),
     [
-        (180, 600, "agent_timeout_seconds >= 435"),
-        (434, 600, "agent_timeout_seconds >= 435"),
-        (435, 435, "job_lease_seconds > agent_timeout_seconds"),
-        (600, 435, "job_lease_seconds > agent_timeout_seconds"),
+        (180, 540, 600, "agent_timeout_seconds >= 435"),
+        (434, 540, 600, "agent_timeout_seconds >= 435"),
+        (435, 435, 600, "review_actor_time_limit_seconds > agent_timeout_seconds"),
+        (540, 540, 600, "review_actor_time_limit_seconds > agent_timeout_seconds"),
+        (435, 540, 540, "job_lease_seconds > review_actor_time_limit_seconds"),
+        (435, 600, 540, "job_lease_seconds > review_actor_time_limit_seconds"),
     ],
 )
 def test_preserved_three_law_local_uat_rejects_unsafe_timeout_chains(
     agent_timeout_seconds: int,
+    review_actor_time_limit_seconds: int,
     job_lease_seconds: int,
     message: str,
 ) -> None:
@@ -195,6 +256,7 @@ def test_preserved_three_law_local_uat_rejects_unsafe_timeout_chains(
         Settings(
             **_local_uat_values(
                 agent_timeout_seconds=agent_timeout_seconds,
+                review_actor_time_limit_seconds=review_actor_time_limit_seconds,
                 job_lease_seconds=job_lease_seconds,
             )
         )
@@ -307,6 +369,8 @@ def test_local_uat_container_selects_only_real_boundary_adapters(monkeypatch) ->
             agent_base_url="http://agent.test",
             agent_service_token="test-agent-token",
             agent_timeout_seconds=321,
+            review_actor_time_limit_seconds=360,
+            job_lease_seconds=400,
         )
     )
     assert isinstance(development_container.agent, FakeHttpAgent)
