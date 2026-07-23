@@ -150,6 +150,17 @@ class Settings(BaseSettings):
     def strip_url(cls, value: str) -> str:
         return value.rstrip("/")
 
+    @field_validator("uat_evidence_rag_quality_evaluated", mode="before")
+    @classmethod
+    def parse_false_only_rag_quality_claim(cls, value: object) -> Literal[False]:
+        # Environment variables arrive as strings. Accept only the explicit
+        # spelling used by the harness and keep the all-environment false-only
+        # type invariant; permissive boolean spellings such as 0/no/off could
+        # otherwise conceal a configuration error.
+        if value is False or (isinstance(value, str) and value.strip().casefold() == "false"):
+            return False
+        raise ValueError("uat_evidence_rag_quality_evaluated must be explicit false")
+
     @model_validator(mode="after")
     def production_is_fail_closed(self) -> "Settings":
         if self.environment == "local_uat":

@@ -100,6 +100,12 @@ def test_local_uat_settings_require_real_runtime_adapters_and_force_diagnostic_m
     assert settings.environment == "local_uat"
     assert settings.auto_completion_enabled is False
     assert settings.uat_claude_mode == "actual"
+    assert (
+        Settings(
+            **_local_uat_values(uat_evidence_rag_quality_evaluated="false")
+        ).uat_evidence_rag_quality_evaluated
+        is False
+    )
 
     for name in (
         "oidc_issuer",
@@ -119,6 +125,8 @@ def test_local_uat_settings_require_real_runtime_adapters_and_force_diagnostic_m
         Settings(**_local_uat_values(database_url="sqlite:///uat.db"))
     with pytest.raises(ValueError, match="auto_completion_enabled=false"):
         Settings(**_local_uat_values(auto_completion_enabled=True))
+    with pytest.raises(ValueError, match="must be explicit false"):
+        Settings(**_local_uat_values(uat_evidence_rag_quality_evaluated=True))
     with pytest.raises(ValueError, match="corroborated 3/58"):
         Settings(**_local_uat_values(uat_evidence_observed_law_count=2))
     with pytest.raises(ValueError, match="corroborated 3/58"):
@@ -130,6 +138,26 @@ def test_local_uat_settings_require_real_runtime_adapters_and_force_diagnostic_m
                 uat_evidence_data_source="SYNTHETIC_V3_NO_RAG_QUALITY",
             )
         )
+
+
+@pytest.mark.parametrize("value", [True, "true", 1, "1", 0, "0", "no", "off"])
+def test_rag_quality_claim_rejects_non_false_values_before_environment_policy(
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match="must be explicit false"):
+        Settings(uat_evidence_rag_quality_evaluated=value)  # type: ignore[arg-type]
+
+
+def test_rag_quality_claim_parses_the_actual_base_settings_environment_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "CUSTOMS_BACKEND_UAT_EVIDENCE_RAG_QUALITY_EVALUATED"
+    monkeypatch.setenv(name, "false")
+    assert Settings(_env_file=None).uat_evidence_rag_quality_evaluated is False
+
+    monkeypatch.setenv(name, "true")
+    with pytest.raises(ValueError, match="must be explicit false"):
+        Settings(_env_file=None)
 
 
 @pytest.mark.parametrize(
