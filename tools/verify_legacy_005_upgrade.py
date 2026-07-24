@@ -38,6 +38,44 @@ def _psycopg_dsn(value: str) -> str:
     return value.replace("postgresql+psycopg://", "postgresql://", 1)
 
 
+def _legacy_chat_record() -> dict[str, object]:
+    """Return a revision-005 row that remains valid after the 006 backfill.
+
+    Revision 005 predates durable chat idempotency, so those two fields stay
+    absent and migration 006 must still add them.  The stored response itself
+    is a deterministic legacy answer with no model call; recording that
+    canonical execution projection does not claim a historical Claude call.
+    """
+
+    return {
+        "message_id": MESSAGE_ID,
+        "review_run_id": RUN_ID,
+        "case_id": CASE_ID,
+        "org_id": ORG_ID,
+        "question": "legacy grounded question",
+        "answer": "legacy grounded answer",
+        "answer_status": "answered",
+        "citations": [],
+        "generation_mode": "deterministic_fallback",
+        "model_execution_summary": {
+            "provider": None,
+            "model_id": None,
+            "text_only": False,
+            "call_count": 0,
+            "input_tokens_total": 0,
+            "output_tokens_total": 0,
+            "prompt_hashes_complete": False,
+            "schema_hashes_complete": False,
+            "runtime_identity_match": False,
+            "audit_complete": False,
+            "unmet_reason_codes": ["no_model_calls"],
+        },
+        "bound_result_digest": SHA,
+        "created_by": "legacy-reviewer",
+        "created_at": CREATED_AT.isoformat(),
+    }
+
+
 def seed(dsn: str) -> None:
     proposal = {
         "proposal_id": PROPOSAL_ID,
@@ -77,19 +115,7 @@ def seed(dsn: str) -> None:
         "decided_by": "legacy-approver",
         "created_at": CREATED_AT.isoformat(),
     }
-    message = {
-        "message_id": MESSAGE_ID,
-        "review_run_id": RUN_ID,
-        "case_id": CASE_ID,
-        "org_id": ORG_ID,
-        "question": "legacy grounded question",
-        "answer": "legacy grounded answer",
-        "answer_status": "answered",
-        "citations": [],
-        "bound_result_digest": SHA,
-        "created_by": "legacy-reviewer",
-        "created_at": CREATED_AT.isoformat(),
-    }
+    message = _legacy_chat_record()
     with psycopg.connect(dsn, autocommit=True) as connection:
         revision = connection.execute(
             "SELECT version_num FROM operations.alembic_version"
@@ -176,7 +202,12 @@ def verify(dsn: str) -> None:
             """,
             (MESSAGE_ID,),
         ).fetchone()
-        if not all((proposal_json, decision_json, message_json, interaction_json)):
+        if (
+            proposal_json is None
+            or decision_json is None
+            or message_json is None
+            or interaction_json is None
+        ):
             raise RuntimeError("revision 006 did not preserve every legacy fixture row")
         proposal = CorrectionProposalRecord.model_validate(proposal_json[0])
         decision = HumanDecisionRecord.model_validate(decision_json[0])
