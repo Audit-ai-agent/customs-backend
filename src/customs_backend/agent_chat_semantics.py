@@ -12,6 +12,11 @@ _QUESTION_TOKEN = re.compile(r"[0-9A-Za-z가-힣]{2,}")
 _QUESTION_STOP_WORDS = frozenset(
     {"어떤", "무엇", "있나요", "인가요", "대해", "대한", "현재", "이번", "해당", "알려줘"}
 )
+_HANGUL_TOKEN = re.compile(r"^[가-힣]+$")
+_ISSUE_KEYWORDS = frozenset({"문제", "오류", "불일치", "위험", "finding", "issue"})
+_REGULATION_KEYWORDS = frozenset({"법령", "규정", "요건", "서류", "근거", "evidence"})
+_OUTCOME_KEYWORDS = frozenset({"결과", "상태", "완료", "심사", "outcome", "status"})
+_FIELD_KEYWORDS = frozenset({"문서", "금액", "수량", "원산지", "송장", "선하", "품목", "hsk", "hs"})
 _ANSWER_PREFIXES = ("", "확인된 Case 근거에 따르면, ", "근거 확인 결과: ")
 
 
@@ -77,6 +82,29 @@ def _bounded_claims(claims: list[_Claim]) -> tuple[_Claim, ...]:
     return tuple(selected)
 
 
+def _matches_intent(
+    tokens: set[str],
+    *,
+    keywords: frozenset[str],
+) -> bool:
+    """Recognize bounded domain intent without attempting Korean morphology.
+
+    Korean particles and sentence endings are attached to the preceding noun,
+    so a bounded domain keyword may occur inside one Hangul token
+    (for example ``결과인가요``).  English keywords remain exact-token matches
+    to avoid accepting unrelated words that merely contain ``status`` or
+    ``issue``.
+    """
+
+    for keyword in keywords:
+        if keyword.isascii():
+            if keyword in tokens:
+                return True
+        elif any(_HANGUL_TOKEN.fullmatch(token) and keyword in token for token in tokens):
+            return True
+    return False
+
+
 def expected_answer_projection(
     *,
     provider_result: dict[str, Any],
@@ -103,15 +131,21 @@ def expected_answer_projection(
         for token in _QUESTION_TOKEN.findall(question)
         if token.casefold() not in _QUESTION_STOP_WORDS
     }
-    issue_intent = bool(tokens.intersection({"문제", "오류", "불일치", "위험", "finding", "issue"}))
-    regulation_intent = bool(
-        tokens.intersection({"법령", "규정", "요건", "서류", "근거", "evidence"})
+    issue_intent = _matches_intent(
+        tokens,
+        keywords=_ISSUE_KEYWORDS,
     )
-    outcome_intent = bool(
-        tokens.intersection({"결과", "상태", "완료", "심사", "outcome", "status"})
+    regulation_intent = _matches_intent(
+        tokens,
+        keywords=_REGULATION_KEYWORDS,
     )
-    field_intent = bool(
-        tokens.intersection({"문서", "금액", "수량", "원산지", "송장", "선하", "품목", "hsk", "hs"})
+    outcome_intent = _matches_intent(
+        tokens,
+        keywords=_OUTCOME_KEYWORDS,
+    )
+    field_intent = _matches_intent(
+        tokens,
+        keywords=_FIELD_KEYWORDS,
     )
     if not (issue_intent or regulation_intent or outcome_intent or field_intent):
         return ExpectedAnswerProjection(

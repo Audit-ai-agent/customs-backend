@@ -12,6 +12,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import DBAPIError
 from tests.product.agent_v3_fixture import build_agent_v3_result
 
+from customs_backend.agent_chat_semantics import expected_answer_projection
 from customs_backend.adapters import (
     CallableAgentClient,
     InMemoryJobPublisher,
@@ -311,23 +312,25 @@ def test_postgres_migration_atomicity_persistence_and_isolation() -> None:
     chat_release = Event()
     chat_calls = 0
 
-    def answer(provider_result, _question, question_id):
+    def answer(provider_result, requested_question, question_id):
         nonlocal chat_calls
         chat_calls += 1
         chat_entered.set()
         assert chat_release.wait(timeout=10)
-        fact = provider_result["fact_ledger"]["entries"][0]
-        return AgentAnswerResponse(
-            question_id=question_id,
-            answer="PostgreSQL call-once answer",
-            status="answered",
-            citations=[{"kind": fact["kind"], "reference_id": fact["reference_id"]}],
-            generation_mode="deterministic_fallback",
+        return AgentAnswerResponse.model_validate(
+            expected_answer_projection(
+                provider_result=provider_result,
+                question=requested_question,
+                effective_disposition=current_parent.review_disposition.value,
+            ).deterministic_wire(question_id)
         )
 
     restarted_service.agent = CallableAgentClient(review, answer=answer)
     question = GroundedQuestion(
-        question="왜 이 결과인가요?",
+        # A field-intent question must cross the external Agent call-once
+        # barrier. Outcome questions are intentionally answered by the
+        # Backend-owned canonical projection without an Agent call.
+        question="문서",
         bound_result_digest=current_parent.result_digest,
     )
 
@@ -361,16 +364,15 @@ def test_postgres_migration_atomicity_persistence_and_isolation() -> None:
     quota_calls: list[str] = []
     quota_calls_lock = Lock()
 
-    def quota_answer(provider_result, _question, question_id):
+    def quota_answer(provider_result, requested_question, question_id):
         with quota_calls_lock:
             quota_calls.append(question_id)
-        fact = provider_result["fact_ledger"]["entries"][0]
-        return AgentAnswerResponse(
-            question_id=question_id,
-            answer="Atomic PostgreSQL quota answer",
-            status="answered",
-            citations=[{"kind": fact["kind"], "reference_id": fact["reference_id"]}],
-            generation_mode="deterministic_fallback",
+        return AgentAnswerResponse.model_validate(
+            expected_answer_projection(
+                provider_result=provider_result,
+                question=requested_question,
+                effective_disposition=current_parent.review_disposition.value,
+            ).deterministic_wire(question_id)
         )
 
     restarted_service.agent = CallableAgentClient(review, answer=quota_answer)
@@ -380,7 +382,9 @@ def test_postgres_migration_atomicity_persistence_and_isolation() -> None:
             quota_actor,
             current_parent.review_run_id,
             GroundedQuestion(
-                question=f"동시 quota 질문 {index}",
+                # Keep every admitted request on the external field-answer
+                # path while distinct idempotency keys exercise the quota.
+                question="문서",
                 bound_result_digest=current_parent.result_digest,
             ),
             f"postgres-chat-quota-{index}",

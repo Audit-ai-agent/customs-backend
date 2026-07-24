@@ -695,6 +695,54 @@ def test_chat_projection_normalizes_multiline_evidence_to_one_canonical_claim() 
     assert "First legal line. Second legal line." in answer["answer"]
 
 
+def test_chat_projection_recognizes_korean_outcome_keyword_with_sentence_ending() -> None:
+    result = _audited_result(_complete_provider_request(), auto_complete=False)
+
+    answer = expected_answer_projection(
+        provider_result=result,
+        question="왜 이 결과인가요?",
+        effective_disposition="human_review_required",
+    ).deterministic_wire("question_" + "4" * 64)
+
+    assert answer["status"] == "answered"
+    assert answer["answer"] == "현재 사전심사 상태는 human_review_required입니다."
+    assert answer["citations"][0]["kind"] == "outcome"
+
+
+@pytest.mark.parametrize("question", ["오늘 날씨는 어떤가요?", "weather forecast"])
+def test_chat_projection_preserves_explicit_out_of_scope_questions(question: str) -> None:
+    result = _audited_result(_complete_provider_request(), auto_complete=False)
+
+    answer = expected_answer_projection(
+        provider_result=result,
+        question=question,
+        effective_disposition="human_review_required",
+    ).deterministic_wire("question_" + "5" * 64)
+
+    assert answer == {
+        "question_id": "question_" + "5" * 64,
+        "answer": "이 질문은 현재 통관 Case와 인용된 근거의 범위를 벗어납니다.",
+        "status": "out_of_scope",
+        "citations": [],
+        "generation_mode": "deterministic_fallback",
+        "citation_verification": "passed",
+        "model_call": None,
+    }
+
+
+def test_chat_projection_does_not_substring_match_english_domain_keywords() -> None:
+    result = _audited_result(_complete_provider_request(), auto_complete=False)
+
+    answer = expected_answer_projection(
+        provider_result=result,
+        question="issueology",
+        effective_disposition="human_review_required",
+    ).deterministic_wire("question_" + "6" * 64)
+
+    assert answer["status"] == "out_of_scope"
+    assert answer["answer"] == ("이 질문은 현재 통관 Case의 문서·규정·심사 결과 범위를 벗어납니다.")
+
+
 @pytest.mark.parametrize(
     ("target", "expected"),
     [
