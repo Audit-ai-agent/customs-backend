@@ -132,11 +132,16 @@ manifest에 보존하되 Agent 분류 대상에서 제외한다. Backend→Agent
 - Object Store read처럼 Agent 호출 전 실패만 동일 고정 Run ID로 최대 3회 재시도한다.
   Agent `/reviews` 또는 `/revisions` 호출 직전 PostgreSQL call-once CAS가 닫힌 뒤에는
   timeout, 응답 유실, worker crash를 포함해 같은 Job을 절대 재호출하지
-  않는다. 도착 여부가 불명한 Job만 `delivery_uncertain`으로 격리한다. 응답을
-  받은 후 Schema/release/input 검증에 실패한 Job은
-  `response_received_rejected`로 종료하고 재조정하지 않는다. 새 호출은 Approver/Admin이
-  Agent 측 미처리를 입증하는 증거 hash로 명시적 재조정한 뒤에만 허용한다. 처리 여부가
-  확인되지 않으면 재조정하지 않고 격리를 유지한다.
+  않는다. 단, Agent가 submit 전 admission 거절임을 canonical 503 body, 단일
+  `X-Request-ID`, 단일 `X-Agent-Execution-State: not-started`로 함께 입증한 경우에만
+  Backend가 저장된 endpoint·request hash·lease를 CAS로 확인해 `not_started`로 되돌리고
+  60초 뒤 재전달한다. 총 전달은 3회이며 세 번째 거절은 terminal failed다. 전용
+  헤더가 없거나 중복·불일치한 503은 이 예외에 해당하지 않는다. 도착 여부가 불명한
+  Job만 `delivery_uncertain`으로 격리한다. 응답을 받은 후 Schema/release/input
+  검증에 실패한 Job은 `response_received_rejected`로 종료하고 재조정하지 않는다.
+  새 호출은 Approver/Admin이 Agent 측 미처리를 입증하는 증거 hash로 명시적
+  재조정한 뒤에만 허용한다. 처리 여부가 확인되지 않으면 재조정하지 않고 격리를
+  유지한다.
 - Run, HumanDecision, Audit는 직접 삭제하지 않는다.
 - migration owner도 append-only trigger를 우회하지 않는다. 변경이 필요하면 기존 행을
   고치지 말고 새 보정 이벤트/Run과 forward-only migration을 추가한다.

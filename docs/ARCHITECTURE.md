@@ -69,7 +69,11 @@ PostgreSQL sslmode, Qdrant HTTPS/API key, Neo4j verified encrypted URI를 다시
     기록한다. CAS 이후 timeout·connection 종료·process crash처럼 응답 도착 여부가
     불명하면 `delivery_uncertain`으로 격리한다. HTTP 응답을 받은 뒤 Schema·release·
     immutable input 결박이 실패하면 재전송 대상이 아닌
-    `response_received_rejected`로 종료한다. 최대 3회 재시도는 CAS 전 실패만 허용한다.
+    `response_received_rejected`로 종료한다. 예외적으로 Agent가 submit 전 admission
+    Gate에서만 발급하는 `503 dependency_unready`의 canonical body, 단일
+    `X-Request-ID`, 단일 `X-Agent-Execution-State: not-started`가 모두 정확히
+    일치하면 PostgreSQL CAS로 call state를 `not_started`로 되돌리고 60초 뒤
+    재전달한다. 이 증명이 없는 503은 재시도하지 않으며 총 Agent 전달은 최대 3회다.
 14. Agent 원본 결과와 model trace는 private 저장소에만 두고 public Run에는 명시적
     allowlist 결과와 Backend가 재평가한 disposition만 노출한다.
 15. 수정은 Maker proposal → 자신과 다른 Approver 결정 → immutable child Run 순서만

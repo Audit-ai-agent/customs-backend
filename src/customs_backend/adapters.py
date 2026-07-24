@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from collections.abc import Callable
 from typing import Any
 
@@ -15,7 +16,7 @@ from customs_backend.domain import (
     MAX_TEXT_DOCUMENT_UTF8_BYTES,
     canonical_json_bytes,
 )
-from customs_backend.ports import AgentResponseRejectedError
+from customs_backend.ports import AgentPreExecutionRetryableError, AgentResponseRejectedError
 
 
 class InMemoryObjectStore:
@@ -240,6 +241,16 @@ class HttpAgentClient:
             content=encoded,
             headers={"Content-Type": "application/json"},
         ) as response:
+            if response.status_code == 503:
+                error_response = self._decode_object(
+                    response,
+                    maximum_bytes=4_096,
+                    response_name="error response",
+                )
+                if self._is_proven_pre_execution_rejection(response, error_response):
+                    request_id = error_response["error"]["request_id"]
+                    raise AgentPreExecutionRetryableError(request_id=request_id)
+                raise AgentResponseRejectedError("Agent response returned HTTP 503")
             try:
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
@@ -251,6 +262,39 @@ class HttpAgentClient:
                 maximum_bytes=16_000_000,
                 response_name="response",
             )
+
+    @staticmethod
+    def _is_proven_pre_execution_rejection(
+        response: httpx.Response,
+        payload: dict[str, Any],
+    ) -> bool:
+        if set(payload) != {"error"}:
+            return False
+        error = payload["error"]
+        if not isinstance(error, dict) or set(error) != {
+            "code",
+            "message",
+            "request_id",
+            "retryable",
+        }:
+            return False
+        if error["code"] != "dependency_unready" or error["retryable"] is not True:
+            return False
+        message = error["message"]
+        request_id = error["request_id"]
+        if (
+            message != "A required service dependency is not ready."
+            or not isinstance(request_id, str)
+        ):
+            return False
+        try:
+            if str(uuid.UUID(request_id)) != request_id:
+                return False
+        except ValueError:
+            return False
+        response_request_ids = response.headers.get_list("X-Request-ID")
+        execution_states = response.headers.get_list("X-Agent-Execution-State")
+        return response_request_ids == [request_id] and execution_states == ["not-started"]
 
     def review(self, request: AgentReviewRequest) -> dict[str, Any]:
         return self._post("/internal/agent/v2/reviews", request.to_agent_wire())

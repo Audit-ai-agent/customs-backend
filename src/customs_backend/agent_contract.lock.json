@@ -6,6 +6,6 @@
   "review_result_v3_path": "contracts/agent/v3/review-result.schema.json",
   "review_result_v3_bytes": 89684,
   "review_result_v3_sha256": "72e70f901ef0bc7402159f4a1d1e25043effa02213f450ac017b611aaa37f912",
-  "service_openapi_sha256": "17199315855410ae9c5221259a492488d95ed58a21f46c89c11ec69030feccb6",
+  "service_openapi_sha256": "e0ac396417ddc37a20fce7ed9ba612db3db5d259a3a3393faadfb1ad95f6c64e",
   "service_api_version": "internal-agent-service/v2"
 }

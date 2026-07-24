@@ -33,11 +33,17 @@ from customs_backend.domain import (
     Principal,
     ReviewEnqueueRequest,
     Role,
+    StageEvent,
     TextDocumentCreate,
     canonical_digest,
     utc_now,
 )
-from customs_backend.ports import ConflictError, NotFoundError, QuotaExceededError
+from customs_backend.ports import (
+    AgentPreExecutionRetryableError,
+    ConflictError,
+    NotFoundError,
+    QuotaExceededError,
+)
 from customs_backend.repository import PostgresWorkbenchRepository
 from customs_backend.service import WorkbenchService
 
@@ -729,6 +735,278 @@ def test_postgres_migration_atomicity_persistence_and_isolation() -> None:
                     {"run_id": first_run.review_run_id},
                 )
         owner_engine.dispose()
+    engine.dispose()
+
+
+@pytest.mark.postgres_integration
+def test_postgres_pre_execution_retry_survives_restart_without_outbox_duplication() -> None:
+    dsn = os.environ.get("CUSTOMS_BACKEND_TEST_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("set CUSTOMS_BACKEND_TEST_POSTGRES_DSN to an ephemeral migrated database")
+
+    suffix = uuid.uuid4().hex
+    reviewer = Principal(
+        subject=f"preexec-retry-reviewer-{suffix}",
+        org_id=f"preexec-retry-org-{suffix}",
+        roles=frozenset({Role.reviewer}),
+    )
+    objects = InMemoryObjectStore()
+    publisher = InMemoryJobPublisher()
+    transport_attempts = 0
+    runtime_executions = 0
+
+    def review(request: AgentReviewRequest) -> dict:
+        nonlocal transport_attempts, runtime_executions
+        transport_attempts += 1
+        if transport_attempts == 1:
+            raise AgentPreExecutionRetryableError(
+                request_id="8a5dc01d-41f5-4e56-b9ba-a305f493af2a"
+            )
+        runtime_executions += 1
+        return _agent_result(request)
+
+    first_repository = PostgresWorkbenchRepository(dsn)
+    first_service = WorkbenchService(
+        repository=first_repository,
+        object_store=objects,
+        publisher=publisher,
+        agent=CallableAgentClient(review),
+        auto_completion_enabled=False,
+    )
+    case = first_service.create_case(
+        reviewer,
+        CaseCreate(title="PostgreSQL pre-execution retry"),
+    )
+    first_service.add_document(
+        reviewer,
+        case.case_id,
+        TextDocumentCreate(
+            document_type="CI",
+            filename="invoice.txt",
+            content_text="INVOICE\nHS CODE: 0303540000",
+        ),
+    )
+    job, created = first_service.enqueue_review(
+        reviewer,
+        case.case_id,
+        ReviewEnqueueRequest(),
+        f"postgres-pre-execution-retry-{suffix}",
+    )
+    assert created
+
+    with pytest.raises(AgentPreExecutionRetryableError):
+        first_service.execute_job(org_id=reviewer.org_id, job_id=job.job_id)
+    retryable = first_repository.get_job(reviewer.org_id, job.job_id)
+    assert retryable is not None
+    assert retryable.status.value == "queued"
+    assert retryable.agent_call_state.value == "not_started"
+    assert retryable.attempt_count == 1
+    assert retryable.agent_call_endpoint is None
+    assert retryable.agent_call_request_sha256 is None
+    assert retryable.agent_call_started_at is None
+
+    engine = create_engine(dsn)
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT status, agent_call_state, agent_call_endpoint, "
+                "agent_call_request_sha256, agent_call_started_at, attempt_count "
+                "FROM operations.product_jobs WHERE org_id=:org_id AND job_id=:job_id"
+            ),
+            {"org_id": reviewer.org_id, "job_id": job.job_id},
+        ).one()
+    assert tuple(row) == ("queued", "not_started", None, None, None, 1)
+
+    restarted_repository = PostgresWorkbenchRepository(dsn)
+    restarted_service = WorkbenchService(
+        repository=restarted_repository,
+        object_store=objects,
+        publisher=publisher,
+        agent=CallableAgentClient(review),
+        auto_completion_enabled=False,
+    )
+    run = restarted_service.execute_job(org_id=reviewer.org_id, job_id=job.job_id)
+    succeeded = restarted_repository.get_job(reviewer.org_id, job.job_id)
+    assert succeeded is not None
+    assert succeeded.status.value == "succeeded"
+    assert succeeded.agent_call_state.value == "completed"
+    assert succeeded.attempt_count == 2
+    assert succeeded.error_code is None
+    assert run.review_run_id == job.review_run_id
+    assert transport_attempts == 2
+    assert runtime_executions == 1
+    assert len(restarted_repository.list_runs(reviewer.org_id, case.case_id)) == 1
+
+    with engine.connect() as connection:
+        outbox_count = connection.scalar(
+            text(
+                "SELECT count(*) FROM operations.product_outbox "
+                "WHERE org_id=:org_id AND aggregate_id=:job_id"
+            ),
+            {"org_id": reviewer.org_id, "job_id": job.job_id},
+        )
+    assert outbox_count == 1
+    events = restarted_repository.list_stage_events(reviewer.org_id, job.job_id)
+    scheduled = [
+        event
+        for event in events
+        if event.message_code == "review.agent_pre_execution_retry_scheduled"
+    ]
+    assert len(scheduled) == 1
+    assert scheduled[0].detail["agent_request_id"] == (
+        "8a5dc01d-41f5-4e56-b9ba-a305f493af2a"
+    )
+
+    cas_case = restarted_service.create_case(
+        reviewer,
+        CaseCreate(title="PostgreSQL pre-execution CAS race"),
+    )
+    restarted_service.add_document(
+        reviewer,
+        cas_case.case_id,
+        TextDocumentCreate(
+            document_type="CI",
+            filename="cas-invoice.txt",
+            content_text="INVOICE\nHS CODE: 0303540000",
+        ),
+    )
+    cas_job, cas_created = restarted_service.enqueue_review(
+        reviewer,
+        cas_case.case_id,
+        ReviewEnqueueRequest(),
+        f"postgres-pre-execution-cas-{suffix}",
+    )
+    assert cas_created
+    lease_id = f"preexec-cas-lease-{suffix}"
+    sequence = len(
+        restarted_repository.list_stage_events(reviewer.org_id, cas_job.job_id)
+    ) + 1
+    claimed = restarted_repository.claim_job(
+        org_id=reviewer.org_id,
+        job_id=cas_job.job_id,
+        lease_id=lease_id,
+        lease_expires_at=utc_now() + timedelta(minutes=5),
+        event=StageEvent(
+            event_id=f"preexec-cas-claim-event-{suffix}",
+            job_id=cas_job.job_id,
+            sequence=sequence,
+            stage="document_analysis",
+            state="started",
+            message_code="agent.started",
+            occurred_at=utc_now(),
+        ),
+        audit=AuditRecord(
+            audit_id=f"preexec-cas-claim-audit-{suffix}",
+            org_id=reviewer.org_id,
+            case_id=cas_case.case_id,
+            actor_id="system:test",
+            action="review.started",
+            created_at=utc_now(),
+        ),
+    )
+    assert claimed is not None
+    request_sha256 = "a" * 64
+    restarted_repository.start_agent_call_once(
+        org_id=reviewer.org_id,
+        job_id=cas_job.job_id,
+        expected_lease_id=lease_id,
+        endpoint="review",
+        request_sha256=request_sha256,
+        audit=AuditRecord(
+            audit_id=f"preexec-cas-start-audit-{suffix}",
+            org_id=reviewer.org_id,
+            case_id=cas_case.case_id,
+            actor_id="system:test",
+            action="agent_call.started",
+            created_at=utc_now(),
+        ),
+    )
+    event_count_before = len(
+        restarted_repository.list_stage_events(reviewer.org_id, cas_job.job_id)
+    )
+    audit_count_before = len(
+        restarted_repository.list_audit(reviewer.org_id, cas_case.case_id)
+    )
+    with engine.connect() as connection:
+        outbox_count_before = connection.scalar(
+            text(
+                "SELECT count(*) FROM operations.product_outbox "
+                "WHERE org_id=:org_id AND aggregate_id=:job_id"
+            ),
+            {"org_id": reviewer.org_id, "job_id": cas_job.job_id},
+        )
+    assert outbox_count_before == 1
+    writers = [PostgresWorkbenchRepository(dsn), PostgresWorkbenchRepository(dsn)]
+
+    def reset_started_call(index: int):
+        return writers[index].mark_agent_pre_execution_retryable(
+            org_id=reviewer.org_id,
+            job_id=cas_job.job_id,
+            expected_lease_id=lease_id,
+            expected_endpoint="review",
+            expected_request_sha256=request_sha256,
+            error_code="dependency_unready",
+            terminal=False,
+            event=StageEvent(
+                event_id=f"preexec-cas-race-event-{suffix}-{index}",
+                job_id=cas_job.job_id,
+                sequence=sequence + 1,
+                stage="failed",
+                state="failed",
+                message_code="review.agent_pre_execution_retry_scheduled",
+                occurred_at=utc_now(),
+                detail={
+                    "error_code": "dependency_unready",
+                    "agent_request_id": f"race-request-{index}",
+                },
+            ),
+            audit=AuditRecord(
+                audit_id=f"preexec-cas-race-audit-{suffix}-{index}",
+                org_id=reviewer.org_id,
+                case_id=cas_case.case_id,
+                actor_id="system:test",
+                action="job.agent_pre_execution_retry_scheduled",
+                detail={
+                    "error_code": "dependency_unready",
+                    "agent_request_id": f"race-request-{index}",
+                },
+                created_at=utc_now(),
+            ),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(reset_started_call, index) for index in range(2)]
+    successes = []
+    conflicts = []
+    for future in futures:
+        try:
+            successes.append(future.result(timeout=10))
+        except ConflictError as exc:
+            conflicts.append(exc)
+    assert len(successes) == 1
+    assert len(conflicts) == 1
+    cas_reset = restarted_repository.get_job(reviewer.org_id, cas_job.job_id)
+    assert cas_reset is not None
+    assert cas_reset.status.value == "queued"
+    assert cas_reset.agent_call_state.value == "not_started"
+    assert cas_reset.attempt_count == 1
+    assert (
+        len(restarted_repository.list_stage_events(reviewer.org_id, cas_job.job_id))
+        == event_count_before + 1
+    )
+    assert (
+        len(restarted_repository.list_audit(reviewer.org_id, cas_case.case_id))
+        == audit_count_before + 1
+    )
+    with engine.connect() as connection:
+        outbox_count_after = connection.scalar(
+            text(
+                "SELECT count(*) FROM operations.product_outbox "
+                "WHERE org_id=:org_id AND aggregate_id=:job_id"
+            ),
+            {"org_id": reviewer.org_id, "job_id": cas_job.job_id},
+        )
+    assert outbox_count_after == outbox_count_before == 1
     engine.dispose()
 
 

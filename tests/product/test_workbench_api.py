@@ -8,6 +8,7 @@ from threading import Event
 from types import SimpleNamespace
 
 import jwt
+import httpx
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
@@ -16,6 +17,7 @@ from tests.product.agent_v3_fixture import build_agent_v3_result
 from customs_backend.agent_chat_semantics import expected_answer_projection
 from customs_backend.adapters import (
     CallableAgentClient,
+    HttpAgentClient,
     InMemoryJobPublisher,
     InMemoryObjectStore,
 )
@@ -24,12 +26,22 @@ from customs_backend.auth import OidcJwtVerifier, StaticTokenVerifier
 from customs_backend.domain import (
     AgentAnswerResponse,
     AgentReviewRequest,
+    AuditRecord,
     HumanDecisionCreate,
     Principal,
     Role,
+    StageEvent,
     canonical_digest,
+    utc_now,
 )
-from customs_backend.ports import AuthorizationError, ConflictError
+from customs_backend.ports import (
+    AgentPreExecutionRetriesExhaustedError,
+    AgentPreExecutionRetryableError,
+    AgentResponseRejectedError,
+    AuthorizationError,
+    ConflictError,
+    JobExecutionNotRunnableError,
+)
 from customs_backend.repository import InMemoryWorkbenchRepository
 from customs_backend.service import WorkbenchService
 from customs_backend.settings import Settings
@@ -49,6 +61,17 @@ def _agent_result(
     result["result_sha256"] = "0" * 64
     result["result_sha256"] = canonical_digest(result)
     return result
+
+
+def _dependency_unready_payload_for_service_test() -> dict:
+    return {
+        "error": {
+            "code": "dependency_unready",
+            "message": "A required service dependency is not ready.",
+            "request_id": "8a5dc01d-41f5-4e56-b9ba-a305f493af2a",
+            "retryable": True,
+        }
+    }
 
 
 def _rehash_agent_result(result: dict) -> dict:
@@ -2114,6 +2137,376 @@ def test_pre_delivery_failure_can_retry_without_recalling_agent(workbench):
         assert stored.agent_call_state.value == "not_started"
     container.service.execute_job(org_id="org-a", job_id=job["job_id"])
     assert calls == 1
+
+
+def test_proven_pre_execution_503_retries_same_job_then_executes_runtime_once(workbench):
+    client, container = workbench
+    case, _document = _create_case_and_document(client)
+    transport_attempts = 0
+    runtime_executions = 0
+
+    def review(request: AgentReviewRequest) -> dict:
+        nonlocal transport_attempts, runtime_executions
+        transport_attempts += 1
+        if transport_attempts == 1:
+            raise AgentPreExecutionRetryableError(
+                request_id="8a5dc01d-41f5-4e56-b9ba-a305f493af2a"
+            )
+        runtime_executions += 1
+        return _agent_result(request)
+
+    container.service.agent = CallableAgentClient(review)
+    job = client.post(
+        f"/api/v1/cases/{case['case_id']}/reviews",
+        json={},
+        headers={**_auth(), "Idempotency-Key": "agent-pre-execution-retry-success"},
+    ).json()["job"]
+    outbox_before = container.repository.list_pending_outbox()
+    assert len(outbox_before) == 1
+
+    with pytest.raises(AgentPreExecutionRetryableError):
+        container.service.execute_job(org_id="org-a", job_id=job["job_id"])
+    retryable = container.repository.get_job("org-a", job["job_id"])
+    assert retryable is not None
+    assert retryable.status.value == "queued"
+    assert retryable.agent_call_state.value == "not_started"
+    assert retryable.attempt_count == 1
+    assert retryable.lease_id is None
+    assert retryable.lease_expires_at is None
+    assert retryable.agent_call_endpoint is None
+    assert retryable.agent_call_request_sha256 is None
+    assert retryable.agent_call_started_at is None
+    assert container.repository.get_provider_result("org-a", job["review_run_id"]) is None
+    assert container.repository.list_runs("org-a", case["case_id"]) == []
+
+    run = container.service.execute_job(org_id="org-a", job_id=job["job_id"])
+    succeeded = container.repository.get_job("org-a", job["job_id"])
+    assert succeeded is not None
+    assert succeeded.status.value == "succeeded"
+    assert succeeded.agent_call_state.value == "completed"
+    assert succeeded.attempt_count == 2
+    assert succeeded.error_code is None
+    assert run.review_run_id == job["review_run_id"]
+    assert transport_attempts == 2
+    assert runtime_executions == 1
+    outbox_after = container.repository.list_pending_outbox()
+    assert len(outbox_after) == 1
+    assert outbox_after[0] == outbox_before[0]
+    events = container.repository.list_stage_events("org-a", job["job_id"])
+    scheduled = [
+        event
+        for event in events
+        if event.message_code == "review.agent_pre_execution_retry_scheduled"
+    ]
+    assert len(scheduled) == 1
+    assert scheduled[0].detail["agent_request_id"] == (
+        "8a5dc01d-41f5-4e56-b9ba-a305f493af2a"
+    )
+    scheduled_audits = [
+        audit
+        for audit in container.repository.list_audit("org-a", case["case_id"])
+        if audit.action == "job.agent_pre_execution_retry_scheduled"
+    ]
+    assert len(scheduled_audits) == 1
+    assert scheduled_audits[0].detail["agent_request_id"] == (
+        "8a5dc01d-41f5-4e56-b9ba-a305f493af2a"
+    )
+
+
+def test_proven_pre_execution_503_exhausts_at_three_and_never_calls_fourth(workbench):
+    client, container = workbench
+    case, _document = _create_case_and_document(client)
+    calls = 0
+
+    def unavailable(_request: AgentReviewRequest) -> dict:
+        nonlocal calls
+        calls += 1
+        raise AgentPreExecutionRetryableError(
+            request_id="8a5dc01d-41f5-4e56-b9ba-a305f493af2a"
+        )
+
+    container.service.agent = CallableAgentClient(unavailable)
+    job = client.post(
+        f"/api/v1/cases/{case['case_id']}/reviews",
+        json={},
+        headers={**_auth(), "Idempotency-Key": "agent-pre-execution-retry-exhausted"},
+    ).json()["job"]
+
+    for expected_attempt in (1, 2):
+        with pytest.raises(AgentPreExecutionRetryableError):
+            container.service.execute_job(org_id="org-a", job_id=job["job_id"])
+        retryable = container.repository.get_job("org-a", job["job_id"])
+        assert retryable is not None
+        assert retryable.status.value == "queued"
+        assert retryable.agent_call_state.value == "not_started"
+        assert retryable.attempt_count == expected_attempt
+
+    with pytest.raises(AgentPreExecutionRetriesExhaustedError):
+        container.service.execute_job(org_id="org-a", job_id=job["job_id"])
+    exhausted = container.repository.get_job("org-a", job["job_id"])
+    assert exhausted is not None
+    assert exhausted.status.value == "failed"
+    assert exhausted.agent_call_state.value == "not_started"
+    assert exhausted.attempt_count == 3
+    assert exhausted.agent_call_endpoint is None
+    assert exhausted.agent_call_request_sha256 is None
+    assert exhausted.agent_call_started_at is None
+    assert exhausted.lease_id is None
+    assert exhausted.lease_expires_at is None
+
+    with pytest.raises(JobExecutionNotRunnableError):
+        container.service.execute_job(org_id="org-a", job_id=job["job_id"])
+    assert calls == 3
+    assert container.repository.get_provider_result("org-a", job["review_run_id"]) is None
+    assert container.repository.list_runs("org-a", case["case_id"]) == []
+    events = container.repository.list_stage_events("org-a", job["job_id"])
+    assert (
+        sum(
+            event.message_code == "review.agent_pre_execution_retry_scheduled"
+            for event in events
+        )
+        == 2
+    )
+    exhausted_events = [
+        event
+        for event in events
+        if event.message_code == "review.agent_pre_execution_retry_exhausted"
+    ]
+    assert len(exhausted_events) == 1
+    assert exhausted_events[0].detail["agent_request_id"] == (
+        "8a5dc01d-41f5-4e56-b9ba-a305f493af2a"
+    )
+    exhausted_audits = [
+        audit
+        for audit in container.repository.list_audit("org-a", case["case_id"])
+        if audit.action == "job.agent_pre_execution_retry_exhausted"
+    ]
+    assert len(exhausted_audits) == 1
+    assert exhausted_audits[0].detail["agent_request_id"] == (
+        "8a5dc01d-41f5-4e56-b9ba-a305f493af2a"
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_exception", "expected_status", "expected_call_state"),
+    [
+        ("timeout", httpx.ReadTimeout, "delivery_uncertain", "delivery_uncertain"),
+        (
+            "http-502",
+            AgentResponseRejectedError,
+            "response_received_rejected",
+            "response_received_rejected",
+        ),
+        (
+            "http-504",
+            AgentResponseRejectedError,
+            "response_received_rejected",
+            "response_received_rejected",
+        ),
+        (
+            "headerless-503",
+            AgentResponseRejectedError,
+            "response_received_rejected",
+            "response_received_rejected",
+        ),
+    ],
+)
+def test_unproven_agent_failure_never_reopens_call_once_barrier(
+    workbench,
+    failure: str,
+    expected_exception: type[Exception],
+    expected_status: str,
+    expected_call_state: str,
+) -> None:
+    client, container = workbench
+    case, _document = _create_case_and_document(client)
+    attempts = 0
+
+    def fail(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if failure == "timeout":
+            raise httpx.ReadTimeout("Agent response timed out", request=request)
+        status = int(failure.rsplit("-", 1)[-1])
+        return httpx.Response(
+            status,
+            json=_dependency_unready_payload_for_service_test(),
+            headers={"X-Request-ID": "8a5dc01d-41f5-4e56-b9ba-a305f493af2a"},
+            request=request,
+        )
+
+    http_agent = HttpAgentClient(
+        base_url="http://agent.test",
+        service_token="test-token",
+        transport=httpx.MockTransport(fail),
+    )
+    container.service.agent = http_agent
+    job = client.post(
+        f"/api/v1/cases/{case['case_id']}/reviews",
+        json={},
+        headers={**_auth(), "Idempotency-Key": f"unproven-agent-failure-{failure}"},
+    ).json()["job"]
+    try:
+        with pytest.raises(expected_exception):
+            container.service.execute_job(org_id="org-a", job_id=job["job_id"])
+        stored = container.repository.get_job("org-a", job["job_id"])
+        assert stored is not None
+        assert stored.status.value == expected_status
+        assert stored.agent_call_state.value == expected_call_state
+        assert stored.attempt_count == 1
+        with pytest.raises(JobExecutionNotRunnableError):
+            container.service.execute_job(org_id="org-a", job_id=job["job_id"])
+        assert attempts == 1
+    finally:
+        http_agent.close()
+
+
+def test_pre_execution_retry_transition_is_exact_cas_and_concurrent_once(workbench):
+    client, container = workbench
+    case, _document = _create_case_and_document(client)
+    job = client.post(
+        f"/api/v1/cases/{case['case_id']}/reviews",
+        json={},
+        headers={**_auth(), "Idempotency-Key": "pre-execution-exact-cas"},
+    ).json()["job"]
+    repository = container.repository
+    lease_id = "lease-pre-execution-cas"
+    sequence = len(repository.list_stage_events("org-a", job["job_id"])) + 1
+    claimed = repository.claim_job(
+        org_id="org-a",
+        job_id=job["job_id"],
+        lease_id=lease_id,
+        lease_expires_at=utc_now() + timedelta(minutes=5),
+        event=StageEvent(
+            event_id="event-pre-execution-cas-claim",
+            job_id=job["job_id"],
+            sequence=sequence,
+            stage="document_analysis",
+            state="started",
+            message_code="agent.started",
+            occurred_at=utc_now(),
+        ),
+        audit=AuditRecord(
+            audit_id="audit-pre-execution-cas-claim",
+            org_id="org-a",
+            case_id=case["case_id"],
+            actor_id="system:test",
+            action="review.started",
+            created_at=utc_now(),
+        ),
+    )
+    assert claimed is not None
+    request_sha256 = "a" * 64
+    repository.start_agent_call_once(
+        org_id="org-a",
+        job_id=job["job_id"],
+        expected_lease_id=lease_id,
+        endpoint="review",
+        request_sha256=request_sha256,
+        audit=AuditRecord(
+            audit_id="audit-pre-execution-cas-start",
+            org_id="org-a",
+            case_id=case["case_id"],
+            actor_id="system:test",
+            action="agent_call.started",
+            created_at=utc_now(),
+        ),
+    )
+    before = repository.get_job("org-a", job["job_id"])
+    before_event_count = len(repository.list_stage_events("org-a", job["job_id"]))
+    before_audit_count = len(repository.list_audit("org-a", case["case_id"]))
+    assert before is not None
+
+    for index, overrides in enumerate(
+        (
+            {"expected_lease_id": "wrong-lease"},
+            {"expected_endpoint": "revision"},
+            {"expected_request_sha256": "b" * 64},
+        )
+    ):
+        arguments = {
+            "org_id": "org-a",
+            "job_id": job["job_id"],
+            "expected_lease_id": lease_id,
+            "expected_endpoint": "review",
+            "expected_request_sha256": request_sha256,
+            "error_code": "dependency_unready",
+            "terminal": False,
+            "event": StageEvent(
+                event_id=f"event-pre-execution-cas-wrong-{index}",
+                job_id=job["job_id"],
+                sequence=sequence + 1,
+                stage="failed",
+                state="failed",
+                message_code="review.agent_pre_execution_retry_scheduled",
+                occurred_at=utc_now(),
+            ),
+            "audit": AuditRecord(
+                audit_id=f"audit-pre-execution-cas-wrong-{index}",
+                org_id="org-a",
+                case_id=case["case_id"],
+                actor_id="system:test",
+                action="job.agent_pre_execution_retry_scheduled",
+                created_at=utc_now(),
+            ),
+        }
+        arguments.update(overrides)
+        with pytest.raises(ConflictError):
+            repository.mark_agent_pre_execution_retryable(**arguments)
+        assert repository.get_job("org-a", job["job_id"]) == before
+        assert (
+            len(repository.list_stage_events("org-a", job["job_id"])) == before_event_count
+        )
+        assert len(repository.list_audit("org-a", case["case_id"])) == before_audit_count
+
+    def transition(index: int):
+        return repository.mark_agent_pre_execution_retryable(
+            org_id="org-a",
+            job_id=job["job_id"],
+            expected_lease_id=lease_id,
+            expected_endpoint="review",
+            expected_request_sha256=request_sha256,
+            error_code="dependency_unready",
+            terminal=False,
+            event=StageEvent(
+                event_id=f"event-pre-execution-cas-race-{index}",
+                job_id=job["job_id"],
+                sequence=sequence + 1,
+                stage="failed",
+                state="failed",
+                message_code="review.agent_pre_execution_retry_scheduled",
+                occurred_at=utc_now(),
+            ),
+            audit=AuditRecord(
+                audit_id=f"audit-pre-execution-cas-race-{index}",
+                org_id="org-a",
+                case_id=case["case_id"],
+                actor_id="system:test",
+                action="job.agent_pre_execution_retry_scheduled",
+                created_at=utc_now(),
+            ),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(transition, index) for index in range(2)]
+    successes = []
+    conflicts = []
+    for future in futures:
+        try:
+            successes.append(future.result())
+        except ConflictError as exc:
+            conflicts.append(exc)
+    assert len(successes) == 1
+    assert len(conflicts) == 1
+    reset = repository.get_job("org-a", job["job_id"])
+    assert reset is not None
+    assert reset.status.value == "queued"
+    assert reset.agent_call_state.value == "not_started"
+    assert reset.attempt_count == 1
+    assert reset.agent_call_endpoint is None
+    assert reset.agent_call_request_sha256 is None
+    assert reset.agent_call_started_at is None
+    assert len(repository.list_pending_outbox()) == 1
 
 
 def test_enqueue_resolves_review_date_and_binds_complete_atomic_snapshot(workbench):

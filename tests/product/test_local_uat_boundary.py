@@ -363,6 +363,11 @@ def test_review_worker_registers_the_configured_hard_time_limit(
     monkeypatch.setattr(settings_module, "get_settings", lambda: settings)
     monkeypatch.setattr(api_module, "build_container", lambda _settings: fake_container)
     sys.modules.pop("customs_backend.worker", None)
+    import dramatiq
+
+    broker = dramatiq.get_broker()
+    broker.actors.pop("customs_backend.execute_review_job", None)
+    broker.actors.pop("customs_backend.dispatch_pending_outbox", None)
 
     try:
         worker_module = importlib.import_module("customs_backend.worker")
@@ -372,8 +377,80 @@ def test_review_worker_registers_the_configured_hard_time_limit(
             == settings.review_actor_time_limit_milliseconds
             == 540_000
         )
+        assert worker_module.execute_review_job.options["max_retries"] == 2
     finally:
         sys.modules.pop("customs_backend.worker", None)
+        broker.actors.pop("customs_backend.execute_review_job", None)
+        broker.actors.pop("customs_backend.dispatch_pending_outbox", None)
+
+
+def test_review_worker_delays_only_proven_pre_execution_retry_and_swallows_terminal_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dramatiq
+
+    from customs_backend import api as api_module
+    from customs_backend import settings as settings_module
+    from customs_backend.ports import (
+        AgentPreExecutionRetriesExhaustedError,
+        AgentPreExecutionRetryableError,
+        JobExecutionNotRunnableError,
+    )
+
+    settings = Settings(
+        **_local_uat_values(agent_pre_execution_retry_delay_seconds=60)
+    )
+
+    class FakeService:
+        error: Exception
+
+        def execute_job(self, *, org_id: str, job_id: str) -> None:
+            assert (org_id, job_id) == ("org-a", "job-a")
+            raise self.error
+
+    service = FakeService()
+    fake_container = SimpleNamespace(service=service)
+    monkeypatch.setattr(settings_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(api_module, "build_container", lambda _settings: fake_container)
+    sys.modules.pop("customs_backend.worker", None)
+    broker = dramatiq.get_broker()
+    broker.actors.pop("customs_backend.execute_review_job", None)
+    broker.actors.pop("customs_backend.dispatch_pending_outbox", None)
+
+    try:
+        worker_module = importlib.import_module("customs_backend.worker")
+        service.error = AgentPreExecutionRetryableError(
+            request_id="8a5dc01d-41f5-4e56-b9ba-a305f493af2a"
+        )
+        with pytest.raises(dramatiq.Retry) as retry:
+            worker_module.execute_review_job.fn("org-a", "job-a", "outbox-a")
+        assert retry.value.delay == 60_000
+
+        for terminal in (
+            AgentPreExecutionRetriesExhaustedError("exhausted"),
+            JobExecutionNotRunnableError("terminal"),
+        ):
+            service.error = terminal
+            assert worker_module.execute_review_job.fn("org-a", "job-a", "outbox-a") is None
+
+        service.error = TimeoutError("delivery unknown")
+        with pytest.raises(TimeoutError, match="delivery unknown"):
+            worker_module.execute_review_job.fn("org-a", "job-a", "outbox-a")
+    finally:
+        sys.modules.pop("customs_backend.worker", None)
+        broker.actors.pop("customs_backend.execute_review_job", None)
+        broker.actors.pop("customs_backend.dispatch_pending_outbox", None)
+
+
+def test_pre_execution_retry_delay_has_a_bounded_readiness_safe_floor() -> None:
+    assert Settings(agent_pre_execution_retry_delay_seconds=60).agent_pre_execution_retry_delay_seconds == 60
+    assert (
+        Settings(agent_pre_execution_retry_delay_seconds=300).agent_pre_execution_retry_delay_seconds
+        == 300
+    )
+    for value in (59, 301):
+        with pytest.raises(ValueError):
+            Settings(agent_pre_execution_retry_delay_seconds=value)
 
 
 def test_synthetic_local_uat_retains_the_existing_timeout_and_lease_defaults() -> None:

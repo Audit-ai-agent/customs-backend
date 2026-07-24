@@ -80,8 +80,11 @@ from customs_backend.domain import (
 )
 from customs_backend.ports import (
     AgentClient,
+    AgentPreExecutionRetriesExhaustedError,
+    AgentPreExecutionRetryableError,
     AgentResponseRejectedError,
     ConflictError,
+    JobExecutionNotRunnableError,
     JobPublisher,
     NotFoundError,
     ObjectStore,
@@ -1946,12 +1949,12 @@ class WorkbenchService:
             JobStatus.response_received_rejected,
             JobStatus.response_persistence_uncertain,
         }:
-            raise ConflictError("job cannot be executed from its current state")
+            raise JobExecutionNotRunnableError("job cannot be executed from its current state")
         system = Principal(subject="system:review-worker", org_id=org_id, roles=frozenset())
         sequence = len(self.repository.list_stage_events(org_id, job_id)) + 1
         if job.agent_call_state == AgentCallState.started:
             if job.lease_expires_at is not None and job.lease_expires_at > utc_now():
-                raise ConflictError("job is already claimed by another worker")
+                raise JobExecutionNotRunnableError("job is already claimed by another worker")
             self.repository.mark_agent_delivery_uncertain(
                 org_id=org_id,
                 job_id=job_id,
@@ -1974,7 +1977,9 @@ class WorkbenchService:
                     detail={"job_id": job_id, "error_code": "agent_call_interrupted"},
                 ),
             )
-            raise ConflictError("Agent delivery state is uncertain; human recovery is required")
+            raise JobExecutionNotRunnableError(
+                "Agent delivery state is uncertain; human recovery is required"
+            )
         lease_id = _id("joblease")
         running = self.repository.claim_job(
             org_id=org_id,
@@ -2003,7 +2008,7 @@ class WorkbenchService:
                 completed = self.repository.get_run(org_id, current.review_run_id)
                 if completed is not None:
                     return completed
-            raise ConflictError("job is already claimed by another worker")
+            raise JobExecutionNotRunnableError("job is already claimed by another worker")
         call_started = False
         response_received = False
         response_validated = False
@@ -2152,6 +2157,60 @@ class WorkbenchService:
                 ),
                 expected_lease_id=lease_id,
             )
+        except AgentPreExecutionRetryableError as exc:
+            if not call_started:
+                raise
+            endpoint = running.agent_call_endpoint
+            request_sha256 = running.agent_call_request_sha256
+            if endpoint is None or request_sha256 is None:
+                raise ConflictError("Agent call binding was lost before safe retry") from exc
+            terminal_failure = running.attempt_count >= self.job_max_attempts
+            self.repository.mark_agent_pre_execution_retryable(
+                org_id=org_id,
+                job_id=job_id,
+                expected_lease_id=lease_id,
+                expected_endpoint=endpoint,
+                expected_request_sha256=request_sha256,
+                error_code=exc.error_code,
+                terminal=terminal_failure,
+                event=StageEvent(
+                    event_id=_id("event"),
+                    job_id=job_id,
+                    sequence=sequence + 1,
+                    stage="failed",
+                    state="failed",
+                    message_code=(
+                        "review.agent_pre_execution_retry_exhausted"
+                        if terminal_failure
+                        else "review.agent_pre_execution_retry_scheduled"
+                    ),
+                    occurred_at=utc_now(),
+                    detail={
+                        "error_code": exc.error_code,
+                        "agent_request_id": exc.request_id,
+                    },
+                ),
+                audit=self._audit(
+                    system,
+                    (
+                        "job.agent_pre_execution_retry_exhausted"
+                        if terminal_failure
+                        else "job.agent_pre_execution_retry_scheduled"
+                    ),
+                    case_id=job.case_id,
+                    detail={
+                        "job_id": job_id,
+                        "error_code": exc.error_code,
+                        "agent_request_id": exc.request_id,
+                        "attempt": running.attempt_count,
+                    },
+                ),
+            )
+            if terminal_failure:
+                raise AgentPreExecutionRetriesExhaustedError(
+                    "Agent remained unready for all bounded pre-execution attempts"
+                ) from exc
+            raise
         except Exception as exc:
             if call_started:
                 if response_received and response_validated:

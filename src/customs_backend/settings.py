@@ -127,6 +127,7 @@ class Settings(BaseSettings):
     review_actor_time_limit_seconds: int = Field(default=240, ge=60, le=1800)
     job_lease_seconds: int = Field(default=300, ge=60, le=1800)
     job_max_attempts: int = Field(default=3, ge=1, le=3)
+    agent_pre_execution_retry_delay_seconds: int = Field(default=60, ge=60, le=300)
     outbox_lease_seconds: int = Field(default=30, ge=5, le=300)
     uat_evidence_profile: Literal[
         "synthetic-v3",

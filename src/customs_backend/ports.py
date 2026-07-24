@@ -30,6 +30,10 @@ class ConflictError(RuntimeError):
     """A caller supplied stale state or reused an idempotency key incorrectly."""
 
 
+class JobExecutionNotRunnableError(ConflictError):
+    """A duplicate worker delivery found a Job that must not be executed again."""
+
+
 class NotFoundError(RuntimeError):
     pass
 
@@ -40,6 +44,19 @@ class AuthorizationError(RuntimeError):
 
 class AgentResponseRejectedError(RuntimeError):
     """The Agent definitely returned a response, but it was unsafe to consume."""
+
+
+class AgentPreExecutionRetryableError(RuntimeError):
+    """The Agent proved that it rejected the request before beginning execution."""
+
+    def __init__(self, *, request_id: str) -> None:
+        super().__init__("Agent dependency was not ready before execution")
+        self.request_id = request_id
+        self.error_code = "dependency_unready"
+
+
+class AgentPreExecutionRetriesExhaustedError(RuntimeError):
+    """The bounded safe retry budget was exhausted without Agent execution."""
 
 
 class QuotaExceededError(RuntimeError):
@@ -141,6 +158,19 @@ class WorkbenchRepository(Protocol):
         job_id: str,
         expected_lease_id: str,
         error_code: str,
+        event: StageEvent,
+        audit: AuditRecord,
+    ) -> JobRecord: ...
+    def mark_agent_pre_execution_retryable(
+        self,
+        *,
+        org_id: str,
+        job_id: str,
+        expected_lease_id: str,
+        expected_endpoint: str,
+        expected_request_sha256: str,
+        error_code: str,
+        terminal: bool,
         event: StageEvent,
         audit: AuditRecord,
     ) -> JobRecord: ...

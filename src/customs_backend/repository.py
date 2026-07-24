@@ -388,6 +388,7 @@ class InMemoryWorkbenchRepository:
             claimed = record.model_copy(
                 update={
                     "status": JobStatus.running,
+                    "error_code": None,
                     "lease_id": lease_id,
                     "lease_expires_at": lease_expires_at,
                     "attempt_count": record.attempt_count + 1,
@@ -501,6 +502,49 @@ class InMemoryWorkbenchRepository:
             self._events.setdefault(job_id, []).append(self._copy(event))
             self._audits[audit.audit_id] = self._copy(audit)
             return self._copy(rejected)
+
+    def mark_agent_pre_execution_retryable(
+        self,
+        *,
+        org_id: str,
+        job_id: str,
+        expected_lease_id: str,
+        expected_endpoint: str,
+        expected_request_sha256: str,
+        error_code: str,
+        terminal: bool,
+        event: StageEvent,
+        audit: AuditRecord,
+    ) -> JobRecord:
+        with self._lock:
+            record = self._jobs.get(job_id)
+            if (
+                record is None
+                or record.org_id != org_id
+                or record.status != JobStatus.running
+                or record.agent_call_state != AgentCallState.started
+                or record.lease_id != expected_lease_id
+                or record.agent_call_endpoint != expected_endpoint
+                or record.agent_call_request_sha256 != expected_request_sha256
+            ):
+                raise ConflictError("Agent pre-execution retry binding is stale")
+            retry_state = record.model_copy(
+                update={
+                    "status": JobStatus.failed if terminal else JobStatus.queued,
+                    "agent_call_state": AgentCallState.not_started,
+                    "agent_call_endpoint": None,
+                    "agent_call_request_sha256": None,
+                    "agent_call_started_at": None,
+                    "error_code": error_code,
+                    "lease_id": None,
+                    "lease_expires_at": None,
+                    "updated_at": utc_now(),
+                }
+            )
+            self._jobs[job_id] = self._copy(retry_state)
+            self._events.setdefault(job_id, []).append(self._copy(event))
+            self._audits[audit.audit_id] = self._copy(audit)
+            return self._copy(retry_state)
 
     def mark_agent_response_persistence_uncertain(
         self,
@@ -1870,6 +1914,7 @@ class PostgresWorkbenchRepository:
             claimed = record.model_copy(
                 update={
                     "status": JobStatus.running,
+                    "error_code": None,
                     "lease_id": lease_id,
                     "lease_expires_at": lease_expires_at,
                     "attempt_count": record.attempt_count + 1,
@@ -2039,6 +2084,70 @@ class PostgresWorkbenchRepository:
             )
             self._audit(session, audit)
         return rejected
+
+    def mark_agent_pre_execution_retryable(
+        self,
+        *,
+        org_id: str,
+        job_id: str,
+        expected_lease_id: str,
+        expected_endpoint: str,
+        expected_request_sha256: str,
+        error_code: str,
+        terminal: bool,
+        event: StageEvent,
+        audit: AuditRecord,
+    ) -> JobRecord:
+        with Session(self._engine) as session, session.begin():
+            row = session.scalar(
+                select(_JobRow)
+                .where(_JobRow.org_id == org_id, _JobRow.job_id == job_id)
+                .with_for_update()
+            )
+            if row is None:
+                raise ConflictError("job does not exist")
+            record = JobRecord.model_validate(row.record_json)
+            if (
+                record.status != JobStatus.running
+                or record.agent_call_state != AgentCallState.started
+                or record.lease_id != expected_lease_id
+                or record.agent_call_endpoint != expected_endpoint
+                or record.agent_call_request_sha256 != expected_request_sha256
+            ):
+                raise ConflictError("Agent pre-execution retry binding is stale")
+            retry_state = record.model_copy(
+                update={
+                    "status": JobStatus.failed if terminal else JobStatus.queued,
+                    "agent_call_state": AgentCallState.not_started,
+                    "agent_call_endpoint": None,
+                    "agent_call_request_sha256": None,
+                    "agent_call_started_at": None,
+                    "error_code": error_code,
+                    "lease_id": None,
+                    "lease_expires_at": None,
+                    "updated_at": utc_now(),
+                }
+            )
+            row.status = retry_state.status.value
+            row.lease_id = None
+            row.lease_expires_at = None
+            row.agent_call_state = retry_state.agent_call_state.value
+            row.agent_call_endpoint = None
+            row.agent_call_request_sha256 = None
+            row.agent_call_started_at = None
+            row.attempt_count = retry_state.attempt_count
+            row.record_json = self._dump(retry_state)
+            session.add(
+                _StageEventRow(
+                    event_id=event.event_id,
+                    job_id=event.job_id,
+                    org_id=org_id,
+                    sequence=event.sequence,
+                    record_json=self._dump(event),
+                )
+            )
+            self._audit(session, audit)
+        return retry_state
 
     def mark_agent_response_persistence_uncertain(
         self,
