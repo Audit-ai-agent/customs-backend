@@ -754,6 +754,12 @@ def test_worker_restart_preserves_job_and_forces_auto_completion_gate(workbench)
         "unmet_reason_codes": [],
     }
     provenance = run.result_detail["evidence_provenance"]
+    stored_provider_result = container.repository.get_provider_result(
+        "org-a",
+        run.review_run_id,
+    )
+    assert stored_provider_result is not None
+    assert provenance["request_id"] == stored_provider_result["retrieval_request"]["request_id"]
     assert provenance["query_intent"] == "required_import_documents"
     assert provenance["items"] == [
         {

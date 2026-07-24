@@ -109,6 +109,7 @@ _SAFE_EVIDENCE_SOURCE_TYPES = frozenset(
     {"law_article", "customs_requirement", "hsk_entry", "notice"}
 )
 _SHA256 = re.compile(r"^[a-f0-9]{64}$")
+_EVIDENCE_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 def _bounded_provenance_text(
@@ -187,6 +188,13 @@ def _safe_evidence_provenance(envelope: AgentReviewResultV3) -> dict[str, Any]:
         }
     if not isinstance(request, dict):
         raise ConflictError("Agent retrieval request is malformed")
+    request_id = _bounded_provenance_text(
+        request.get("request_id"),
+        field="retrieval request ID",
+        maximum=128,
+    )
+    if request_id is None or _EVIDENCE_REQUEST_ID.fullmatch(request_id) is None:
+        raise ConflictError("Agent retrieval request ID is invalid")
     query_intent = _bounded_provenance_text(
         request.get("query_intent"),
         field="retrieval query intent",
@@ -374,6 +382,7 @@ def _safe_evidence_provenance(envelope: AgentReviewResultV3) -> dict[str, Any]:
     ):
         raise ConflictError("Agent ranked Evidence differs from public Evidence")
     return {
+        "request_id": request_id,
         "query_intent": query_intent,
         "items": query_items,
         "ranked_evidence": ranked_evidence,

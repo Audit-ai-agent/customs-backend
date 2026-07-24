@@ -131,11 +131,18 @@ class Settings(BaseSettings):
     uat_evidence_profile: Literal[
         "synthetic-v3",
         "preserved-3law-v3-diagnostic",
+        "preserved-3law-v3-scenario-eval",
         "unknown",
     ] = "unknown"
     uat_evidence_data_source: Literal[
         "SYNTHETIC_V3_NO_RAG_QUALITY",
         "ACTUAL_POSTGRESQL_QDRANT_NEO4J_READ_ONLY",
+        "UNKNOWN",
+    ] = "UNKNOWN"
+    uat_evidence_policy_mode: Literal[
+        "SYNTHETIC_FIXTURE",
+        "ACTUAL_CODES_HUMAN_ONLY",
+        "SEALED_TEST_ONLY_ACTUAL_CCCT_HUMAN_ONLY",
         "UNKNOWN",
     ] = "UNKNOWN"
     uat_evidence_expected_production_law_count: int = Field(default=58, ge=1, le=10_000)
@@ -146,6 +153,21 @@ class Settings(BaseSettings):
     uat_evidence_rag_quality_evaluated: Literal[False] = False
     uat_planner_mode: Literal["shadow", "diagnostic_active"] = "shadow"
     uat_claude_mode: Literal["actual"] = "actual"
+    uat_assertion_signing_key_registry_path: str | None = Field(default=None, repr=False)
+    uat_assertion_trust_store_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9]{64}$",
+    )
+    uat_requirement_policy_fixture_path: str | None = Field(default=None, repr=False)
+    uat_requirement_policy_fixture_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9]{64}$",
+    )
+    uat_evidence_runtime_v3_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9]{64}$",
+    )
+    uat_evidence_trace_path: str | None = Field(default=None, repr=False)
 
     @field_validator("agent_base_url", "public_base_url")
     @classmethod
@@ -165,6 +187,29 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def production_is_fail_closed(self) -> "Settings":
+        local_uat_assertion_fixture = {
+            "uat_assertion_signing_key_registry_path": (
+                self.uat_assertion_signing_key_registry_path
+            ),
+            "uat_assertion_trust_store_sha256": self.uat_assertion_trust_store_sha256,
+            "uat_requirement_policy_fixture_path": self.uat_requirement_policy_fixture_path,
+            "uat_requirement_policy_fixture_sha256": (self.uat_requirement_policy_fixture_sha256),
+            "uat_evidence_runtime_v3_sha256": self.uat_evidence_runtime_v3_sha256,
+        }
+        configured_local_uat_assertion_fixture = sorted(
+            name for name, value in local_uat_assertion_fixture.items() if value is not None
+        )
+        if (
+            self.environment != "local_uat" or self.process_role != "runtime"
+        ) and self.uat_evidence_trace_path is not None:
+            raise ValueError("local UAT Evidence trace configuration is runtime-only")
+        if (
+            self.environment != "local_uat" or self.process_role != "runtime"
+        ) and configured_local_uat_assertion_fixture:
+            raise ValueError(
+                "local UAT assertion fixture configuration is runtime-only: "
+                + ", ".join(configured_local_uat_assertion_fixture)
+            )
         if self.process_role == "runtime":
             if self.review_actor_time_limit_seconds <= self.agent_timeout_seconds:
                 raise ValueError(
@@ -238,7 +283,10 @@ class Settings(BaseSettings):
             )
             if self.uat_evidence_expected_production_law_count != 58:
                 raise ValueError("local_uat Evidence scope requires expected Production count 58")
-            if self.uat_evidence_profile == "preserved-3law-v3-diagnostic":
+            if self.uat_evidence_profile in {
+                "preserved-3law-v3-diagnostic",
+                "preserved-3law-v3-scenario-eval",
+            }:
                 # The Agent owns a 420-second run budget. Keep 15 seconds outside
                 # that budget so Backend can receive the terminal HTTP response.
                 if self.agent_timeout_seconds < 435:
@@ -246,26 +294,72 @@ class Settings(BaseSettings):
                         "preserved 3-law UAT requires agent_timeout_seconds >= 435 "
                         "to exceed the Agent service run budget"
                     )
-                if (
-                    self.uat_evidence_data_source != "ACTUAL_POSTGRESQL_QDRANT_NEO4J_READ_ONLY"
-                    or self.uat_evidence_observed_law_count != 3
-                    or self.uat_evidence_observed_article_count <= 0
-                    or self.uat_evidence_qdrant_point_count
-                    != self.uat_evidence_observed_article_count
-                    or self.uat_evidence_neo4j_article_count
-                    != self.uat_evidence_observed_article_count
-                ):
+                actual_store_counts_match = (
+                    self.uat_evidence_data_source == "ACTUAL_POSTGRESQL_QDRANT_NEO4J_READ_ONLY"
+                    and self.uat_evidence_observed_law_count == 3
+                    and self.uat_evidence_observed_article_count > 0
+                    and self.uat_evidence_qdrant_point_count
+                    == self.uat_evidence_observed_article_count
+                    and self.uat_evidence_neo4j_article_count
+                    == self.uat_evidence_observed_article_count
+                )
+                if not actual_store_counts_match:
                     raise ValueError(
                         "preserved 3-law UAT requires corroborated 3/58 "
                         "PostgreSQL/Qdrant/Neo4j counts"
                     )
+                if self.uat_evidence_profile == "preserved-3law-v3-diagnostic":
+                    if self.uat_evidence_policy_mode != "ACTUAL_CODES_HUMAN_ONLY":
+                        raise ValueError(
+                            "preserved 3-law diagnostic UAT requires "
+                            "evidence_policy_mode=ACTUAL_CODES_HUMAN_ONLY"
+                        )
+                elif self.uat_evidence_policy_mode != "SEALED_TEST_ONLY_ACTUAL_CCCT_HUMAN_ONLY":
+                    raise ValueError(
+                        "preserved 3-law scenario-eval UAT requires "
+                        "evidence_policy_mode=SEALED_TEST_ONLY_ACTUAL_CCCT_HUMAN_ONLY"
+                    )
+                elif self.uat_evidence_observed_article_count != 1007:
+                    raise ValueError(
+                        "preserved 3-law scenario-eval UAT requires exact "
+                        "PostgreSQL/Qdrant/Neo4j count 1007"
+                    )
+                if self.uat_evidence_profile == "preserved-3law-v3-scenario-eval":
+                    missing_fixture = sorted(
+                        name for name, value in local_uat_assertion_fixture.items() if value is None
+                    )
+                    if missing_fixture:
+                        raise ValueError(
+                            "preserved 3-law scenario-eval UAT requires the complete "
+                            "test-only assertion fixture: " + ", ".join(missing_fixture)
+                        )
+                    if self.uat_evidence_trace_path is None:
+                        raise ValueError(
+                            "preserved 3-law scenario-eval UAT requires uat_evidence_trace_path"
+                        )
             elif self.uat_evidence_profile == "synthetic-v3":
-                if self.uat_evidence_data_source != "SYNTHETIC_V3_NO_RAG_QUALITY" or any(
-                    observed_counts
+                if (
+                    self.uat_evidence_data_source != "SYNTHETIC_V3_NO_RAG_QUALITY"
+                    or self.uat_evidence_policy_mode != "SYNTHETIC_FIXTURE"
+                    or any(observed_counts)
                 ):
                     raise ValueError("synthetic UAT requires zero actual-store observations")
-            elif self.uat_evidence_data_source != "UNKNOWN" or any(observed_counts):
+            elif (
+                self.uat_evidence_data_source != "UNKNOWN"
+                or self.uat_evidence_policy_mode != "UNKNOWN"
+                or any(observed_counts)
+            ):
                 raise ValueError("unknown UAT Evidence profile cannot assert Data observations")
+            if (
+                self.uat_evidence_profile != "preserved-3law-v3-scenario-eval"
+                and configured_local_uat_assertion_fixture
+            ):
+                raise ValueError("local UAT assertion fixture is allowed only for scenario-eval")
+            if (
+                self.uat_evidence_profile != "preserved-3law-v3-scenario-eval"
+                and self.uat_evidence_trace_path is not None
+            ):
+                raise ValueError("local UAT Evidence trace is allowed only for scenario-eval")
             required = {
                 "oidc_issuer": self.oidc_issuer,
                 "oidc_audience": self.oidc_audience,

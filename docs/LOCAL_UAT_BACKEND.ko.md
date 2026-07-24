@@ -19,7 +19,9 @@
   일치할 때만 200이다. 이후 각 review 요청도 Agent가 Evidence readiness를
   다시 fail-closed로 검사한다.
 - `/api/v1/uat/metadata`는 검증된 V3 Evidence identity에서 가져온
-  `supported_review_as_of`를 포함한 UI 표시용 metadata만 반환한다.
+  `supported_review_as_of`와 명시적인 `evidence_profile`, `evidence_scope`,
+  `evidence_data_source`, `evidence_policy_mode`를 포함한 UI 표시용 metadata만
+  반환한다.
   Agent metadata가 없거나 identity/date/digest가 잘못되면 503으로 닫힌다.
 - Review Run의 `result_detail.model_execution_summary`는 Anthropic provider,
   model ID, text-only 여부, 호출 수, 토큰 합계, prompt/schema hash
@@ -36,6 +38,11 @@
   조회하는 process-level 실행 프로필이다. 화면에는
   `ACTUAL_3_LAW_RAG_3_OF_58`로 표시하며 법적 coverage나 Production readiness로
   해석하지 않는다.
+- `preserved-3law-v3-scenario-eval`: 동일한 read-only 3법령 Knowledge
+  snapshot을 9개 사용자 시나리오에서 실제 조회한다. 화면에는
+  `ACTUAL_3_LAW_RAG_SCENARIO_EVAL_3_OF_58`로 표시하고 정책 모드는
+  `SEALED_TEST_ONLY_ACTUAL_CCCT_HUMAN_ONLY`로 고정한다. 이는 실제 법적 승인이나
+  Production 자동완료 승인이 아니라 서명 검증된 UAT fixture identity다.
 - `unknown`: 원천을 확인하지 못한 안전한 기본값. UAT 결과를 증거로
   채택하기 전에 명시적인 profile로 다시 실행한다.
 
@@ -45,6 +52,29 @@ Backend는 Harness가 봉인된 Data 진단 manifest에서 주입한
 모두 결박되고 세 저장소 수가 일치해야 시작된다. `/api/v1/uat/metadata`는
 이 안전한 개수와 `rag_quality_evaluated=false`를 공개하지만 Data URL,
 DSN, token, 원본 manifest 경로는 공개하지 않는다.
+
+Scenario-eval 프로필은 세 Store 모두 정확히 `1,007`건이어야 하며,
+Backend→Agent timeout은 실제 Agent 실행 budget보다 큰 `435`초 이상이어야 한다.
+프로필·Data source·정책 모드·개수 중 하나라도 다른 조합은 Settings 검증에서
+시작을 거절한다. 기존 진단 프로필은 `ACTUAL_CODES_HUMAN_ONLY`, 합성 프로필은
+`SYNTHETIC_FIXTURE` 정책 모드를 계속 사용한다.
+
+Scenario-eval에서 사람 승인 assertion을 만드는 경우에만 Harness가 `_secrets`
+밖으로 노출되지 않는 private Ed25519 registry와 Agent용 public trust store를
+생성한다. Backend는 `uat-approver`의 exact authority, active 한 개 key,
+public trust SHA를 시작 시 결박한다. 정책 fixture도 exact CCCT
+`CCCT_DOC_46E819BB87B27371`, `human_only`, Data runtime SHA,
+`test-only-three-law-scenario-eval-human-only.v1` release와 source SHA를
+독립 검증한다. unknown code에는 assertion 정책을 적용하지 않는다. 이 경로,
+private key, Data URL과 credential은 health, OpenAPI, 로그에 공개하지 않는다.
+
+인증된 UI는 scenario-eval에서만
+`GET /api/v1/uat/review-runs/{review_run_id}/evidence-trace`를 호출할 수 있다.
+Backend는 해당 조직의 Review Run과 그 결과에 저장된 Evidence request ID,
+Knowledge snapshot을 먼저 확인한 뒤 외부 JSONL의 exact 한 행만 결박한다.
+응답은 Structured/Dense/BM25/Graph의 시도·성공, 결과 수, Top-K 수, 소요시간만
+포함한다. provider identity, trace 경로, query·문서 원문, Data URL·token은
+반환하지 않는다. Production과 다른 profile에서는 이 endpoint가 404다.
 
 ## 설정 소유권
 

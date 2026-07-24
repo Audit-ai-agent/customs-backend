@@ -22,7 +22,12 @@ from customs_backend.adapters import (
     MinioObjectStore,
 )
 from customs_backend.assertion_signing import (
+    LocalUatRequirementPolicyIdentityResolver,
+    RequirementPolicyIdentityResolver,
+    SupportingAssertionSigner,
     load_assertion_signer,
+    load_local_uat_assertion_signer,
+    load_local_uat_requirement_policy_resolver,
     load_requirement_policy_resolver,
 )
 from customs_backend.auth import OidcJwtVerifier, principal_dependency, require_roles
@@ -72,6 +77,11 @@ from customs_backend.release import (
 from customs_backend.repository import InMemoryWorkbenchRepository, PostgresWorkbenchRepository
 from customs_backend.service import WorkbenchService
 from customs_backend.settings import Settings, get_settings
+from customs_backend.uat_evidence_trace import (
+    UatEvidenceTraceError,
+    UatEvidenceTraceReader,
+    UatEvidenceTraceResponse,
+)
 
 IdempotencyKey = Annotated[
     str,
@@ -273,17 +283,93 @@ class UatMetadataResponse(BaseModel):
     evidence_profile: Literal[
         "synthetic-v3",
         "preserved-3law-v3-diagnostic",
+        "preserved-3law-v3-scenario-eval",
         "unknown",
+    ]
+    evidence_scope: Literal[
+        "TEST_ONLY_V3",
+        "ACTUAL_3_LAW_RAG_3_OF_58",
+        "ACTUAL_3_LAW_RAG_SCENARIO_EVAL_3_OF_58",
+        "UNKNOWN",
     ]
     evidence_scope_label: Literal[
         "TEST_ONLY_V3",
         "ACTUAL_3_LAW_RAG_3_OF_58",
+        "ACTUAL_3_LAW_RAG_SCENARIO_EVAL_3_OF_58",
+        "UNKNOWN",
+    ]
+    evidence_data_source: Literal[
+        "SYNTHETIC_V3_NO_RAG_QUALITY",
+        "ACTUAL_POSTGRESQL_QDRANT_NEO4J_READ_ONLY",
+        "UNKNOWN",
+    ]
+    evidence_policy_mode: Literal[
+        "SYNTHETIC_FIXTURE",
+        "ACTUAL_CODES_HUMAN_ONLY",
+        "SEALED_TEST_ONLY_ACTUAL_CCCT_HUMAN_ONLY",
         "UNKNOWN",
     ]
     evidence_dataset: UatEvidenceDatasetResponse
     supported_review_as_of: date
     planner_mode: Literal["shadow", "diagnostic_active"]
     production_release: Literal[False] = False
+
+
+@dataclass(frozen=True, slots=True)
+class _UatEvidencePolicyIdentityPin:
+    requirement_policy_release: str
+    requirement_policy_manifest_sha256: str
+    coverage_matrix_sha256: str
+    reviewer_trust_store_sha256: str | None = None
+
+
+_UAT_EVIDENCE_POLICY_IDENTITY_PINS: Mapping[str, _UatEvidencePolicyIdentityPin] = {
+    "synthetic-v3": _UatEvidencePolicyIdentityPin(
+        requirement_policy_release="test-only-conformance.no-production-policy.v1",
+        requirement_policy_manifest_sha256=(
+            "882d18df864cf19149589705c27e9d94b8441e80c8d6bef397a7507cf67a9c90"
+        ),
+        coverage_matrix_sha256=("a47fd7e683b7e0a270c5d4b76365034b2f24a0b4f2a52ba1c69421480c1f5263"),
+    ),
+    "preserved-3law-v3-diagnostic": _UatEvidencePolicyIdentityPin(
+        requirement_policy_release="test-only-conformance.no-production-policy.v1",
+        requirement_policy_manifest_sha256=(
+            "54aa31a0baed9a8eeeea57f9c436a78b8d687e244538491a46e34af46238cf7a"
+        ),
+        coverage_matrix_sha256=("a47fd7e683b7e0a270c5d4b76365034b2f24a0b4f2a52ba1c69421480c1f5263"),
+    ),
+    "preserved-3law-v3-scenario-eval": _UatEvidencePolicyIdentityPin(
+        requirement_policy_release="test-only-three-law-scenario-eval-human-only.v1",
+        requirement_policy_manifest_sha256=(
+            "2467226fe64c84f8fdc0b41a8ab44ebaba04e6ba7280cd3e4bd56bd2e9c38c95"
+        ),
+        coverage_matrix_sha256=("21012116b4fddf0ae0e0bb12343558aca472373480d32d535e6b59875800c444"),
+        reviewer_trust_store_sha256=(
+            "7864482157b701b44c457bd35c7721b31ffc31564ea43d83948aa27e08233637"
+        ),
+    ),
+}
+
+
+def _validate_uat_evidence_policy_identity(
+    profile: str,
+    identity: EvidenceRuntimeReleaseIdentityV3,
+) -> None:
+    """Independently bind Agent-reported V3 policy bytes to the Backend profile."""
+
+    pin = _UAT_EVIDENCE_POLICY_IDENTITY_PINS.get(profile)
+    if pin is None or (
+        identity.requirement_policy_release != pin.requirement_policy_release
+        or identity.requirement_policy_manifest_sha256 != pin.requirement_policy_manifest_sha256
+        or identity.coverage_matrix_sha256 != pin.coverage_matrix_sha256
+        or (
+            pin.reviewer_trust_store_sha256 is not None
+            and identity.reviewer_trust_store_sha256 != pin.reviewer_trust_store_sha256
+        )
+    ):
+        raise ReleaseConfigurationError(
+            "Agent UAT Evidence policy identity differs from the selected profile"
+        )
 
 
 @dataclass
@@ -295,6 +381,7 @@ class Container:
     agent: AgentClient
     token_verifier: TokenVerifier
     service: WorkbenchService
+    uat_evidence_trace_reader: UatEvidenceTraceReader | None = None
 
 
 def build_container(settings: Settings) -> Container:
@@ -457,6 +544,50 @@ def build_container(settings: Settings) -> Container:
                 service_token=settings.agent_service_token.get_secret_value(),
                 timeout_seconds=settings.agent_timeout_seconds,
             )
+    assertion_signer: SupportingAssertionSigner
+    requirement_policy_resolver: RequirementPolicyIdentityResolver
+    uat_evidence_trace_reader: UatEvidenceTraceReader | None = None
+    if (
+        settings.environment == "local_uat"
+        and settings.uat_evidence_profile == "preserved-3law-v3-scenario-eval"
+    ):
+        if (
+            settings.uat_assertion_signing_key_registry_path is None
+            or settings.uat_assertion_trust_store_sha256 is None
+            or settings.uat_requirement_policy_fixture_path is None
+            or settings.uat_requirement_policy_fixture_sha256 is None
+            or settings.uat_evidence_runtime_v3_sha256 is None
+        ):
+            raise ReleaseConfigurationError("local UAT scenario assertion fixture is incomplete")
+        assertion_signer = load_local_uat_assertion_signer(
+            settings.uat_assertion_signing_key_registry_path,
+            expected_trust_store_sha256=settings.uat_assertion_trust_store_sha256,
+        )
+        requirement_policy_resolver = load_local_uat_requirement_policy_resolver(
+            settings.uat_requirement_policy_fixture_path,
+            expected_fixture_sha256=settings.uat_requirement_policy_fixture_sha256,
+            expected_runtime_v3_sha256=settings.uat_evidence_runtime_v3_sha256,
+        )
+        if settings.uat_evidence_trace_path is None:
+            raise ReleaseConfigurationError("local UAT scenario Evidence trace is incomplete")
+        uat_evidence_trace_reader = UatEvidenceTraceReader(
+            settings.uat_evidence_trace_path,
+            expected_runtime_v3_sha256=settings.uat_evidence_runtime_v3_sha256,
+        )
+    else:
+        assertion_signer = load_assertion_signer(
+            settings.assertion_signing_key_registry_path,
+            expected_trust_store_sha256=(
+                settings.agent_expected_assertion_trust_store_sha256
+                or "ccad11713d4c18b4f19246f32fc68cbd4faba2d66889f9c037845fdf66db3b13"
+            ),
+        )
+        requirement_policy_resolver = load_requirement_policy_resolver(
+            policy_path=settings.requirement_policy_release_path,
+            trust_store_path=settings.requirement_policy_trust_store_path,
+            runtime_v3_path=settings.evidence_runtime_v3_release_path,
+            expected_runtime_v3_sha256=settings.agent_expected_evidence_runtime_v3_sha256,
+        )
     service = WorkbenchService(
         repository=repository,
         object_store=object_store,
@@ -468,24 +599,22 @@ def build_container(settings: Settings) -> Container:
         release_pin=release_pin,
         auto_completion_approval=approval,
         human_decision_policy_release=settings.human_decision_policy_release,
-        assertion_signer=load_assertion_signer(
-            settings.assertion_signing_key_registry_path,
-            expected_trust_store_sha256=(
-                settings.agent_expected_assertion_trust_store_sha256
-                or "ccad11713d4c18b4f19246f32fc68cbd4faba2d66889f9c037845fdf66db3b13"
-            ),
-        ),
-        requirement_policy_resolver=load_requirement_policy_resolver(
-            policy_path=settings.requirement_policy_release_path,
-            trust_store_path=settings.requirement_policy_trust_store_path,
-            runtime_v3_path=settings.evidence_runtime_v3_release_path,
-            expected_runtime_v3_sha256=settings.agent_expected_evidence_runtime_v3_sha256,
-        ),
+        assertion_signer=assertion_signer,
+        requirement_policy_resolver=requirement_policy_resolver,
         job_lease_seconds=settings.job_lease_seconds,
         job_max_attempts=settings.job_max_attempts,
         outbox_lease_seconds=settings.outbox_lease_seconds,
     )
-    return Container(settings, repository, object_store, publisher, agent, verifier, service)
+    return Container(
+        settings,
+        repository,
+        object_store,
+        publisher,
+        agent,
+        verifier,
+        service,
+        uat_evidence_trace_reader,
+    )
 
 
 class _UnavailableAgentClient:
@@ -683,6 +812,9 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         agentic_limits = agent_metadata.get("agentic_limits")
         model_identity = agent_metadata.get("model")
         evidence_release = agent_metadata.get("evidence_runtime_release_v3")
+        evidence_profile_metadata = (
+            uat_identity.get("evidence_profile") if isinstance(uat_identity, dict) else None
+        )
         expected_planner_mode = {
             "shadow": "shadow",
             "diagnostic_active": "active",
@@ -703,16 +835,24 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             or uat_identity.get("diagnostic_only") is not True
             or uat_identity.get("mock_fallback_allowed") is not False
             or uat_identity.get("auto_completion_allowed") is not False
+            or not isinstance(evidence_profile_metadata, dict)
+            or evidence_profile_metadata.get("direct_database_access") is not False
+            or evidence_profile_metadata.get("mock_fallback_allowed") is not False
+            or evidence_profile_metadata.get("release_eligible") is not False
             or not isinstance(evidence_release, dict)
             or set(evidence_release) != {"release_state", "identity"}
             or evidence_release.get("release_state") != "diagnostic"
         ):
             raise ReleaseConfigurationError("Agent is not local UAT diagnostic-ready")
         expected_evidence_mode = actual_container.settings.uat_evidence_profile
-        if expected_evidence_mode != "unknown" and (
+        expected_policy_mode = actual_container.settings.uat_evidence_policy_mode
+        if (
             uat_identity.get("evidence_mode") != expected_evidence_mode
+            or evidence_profile_metadata.get("profile_id") != expected_evidence_mode
         ):
             raise ReleaseConfigurationError("Agent UAT Evidence profile differs")
+        if uat_identity.get("evidence_policy_mode") != expected_policy_mode:
+            raise ReleaseConfigurationError("Agent UAT Evidence policy mode differs")
         try:
             evidence_identity = EvidenceRuntimeReleaseIdentityV3.model_validate(
                 evidence_release["identity"]
@@ -723,18 +863,55 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             mode="json"
         ):
             raise ReleaseConfigurationError("Agent UAT Evidence identity is not consistently bound")
+        _validate_uat_evidence_policy_identity(expected_evidence_mode, evidence_identity)
+        scenario_eval = expected_evidence_mode == "preserved-3law-v3-scenario-eval"
+        resolver = actual_container.service.requirement_policy_resolver
+        if scenario_eval:
+            if (
+                actual_container.settings.uat_assertion_trust_store_sha256 is None
+                or actual_container.settings.uat_evidence_runtime_v3_sha256 is None
+                or uat_identity.get("assertion_fixture_mode") != "LOOPBACK_TEST_ONLY_HUMAN_APPROVER"
+                or uat_identity.get("trusted_assertion_verifier_configured") is not True
+                or uat_identity.get("assertion_trust_store_sha256")
+                != actual_container.settings.uat_assertion_trust_store_sha256
+                or evidence_identity.runtime_release_v3_sha256
+                != actual_container.settings.uat_evidence_runtime_v3_sha256
+                or not actual_container.service.assertion_signer.ready
+                or actual_container.service.assertion_signer.trust_store_sha256
+                != actual_container.settings.uat_assertion_trust_store_sha256
+                or not isinstance(resolver, LocalUatRequirementPolicyIdentityResolver)
+                or resolver.evidence_runtime_v3_sha256
+                != evidence_identity.runtime_release_v3_sha256
+                or resolver.policy_release != evidence_identity.requirement_policy_release
+            ):
+                raise ReleaseConfigurationError("Agent UAT assertion fixture identity differs")
+        elif (
+            uat_identity.get("assertion_fixture_mode") != "DISABLED"
+            or uat_identity.get("trusted_assertion_verifier_configured") is not False
+            or uat_identity.get("assertion_trust_store_sha256") is not None
+            or actual_container.service.assertion_signer.ready
+            or actual_container.service.requirement_policy_resolver.ready
+        ):
+            raise ReleaseConfigurationError(
+                "Agent UAT assertion fixture is forbidden for this profile"
+            )
         if actual_container.service.service_pin is not None:
             actual_container.service.service_pin.validate_local_uat_metadata(agent_metadata)
         return agent_metadata, evidence_identity
 
     def local_uat_evidence_scope() -> Literal[
-        "TEST_ONLY_V3", "ACTUAL_3_LAW_RAG_3_OF_58", "UNKNOWN"
+        "TEST_ONLY_V3",
+        "ACTUAL_3_LAW_RAG_3_OF_58",
+        "ACTUAL_3_LAW_RAG_SCENARIO_EVAL_3_OF_58",
+        "UNKNOWN",
     ]:
         profile = actual_container.settings.uat_evidence_profile
         if profile == "synthetic-v3":
             return "TEST_ONLY_V3"
         if profile == "preserved-3law-v3-diagnostic":
             return "ACTUAL_3_LAW_RAG_3_OF_58"
+        if profile == "preserved-3law-v3-scenario-eval":
+            return "ACTUAL_3_LAW_RAG_SCENARIO_EVAL_3_OF_58"
         return "UNKNOWN"
 
     def local_uat_evidence_dataset() -> UatEvidenceDatasetResponse:
@@ -772,7 +949,7 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             except Exception:
                 dependency_status[name] = False
         try:
-            agent_metadata, _evidence_identity = validated_local_uat_agent_metadata()
+            agent_metadata, evidence_identity = validated_local_uat_agent_metadata()
             agent_uat_readiness = actual_container.agent.uat_readiness()
             if (
                 agent_uat_readiness.get("status") != "uat-ready"
@@ -783,10 +960,29 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             ):
                 raise ReleaseConfigurationError("Agent is not local UAT diagnostic-ready")
             expected_evidence_mode = actual_container.settings.uat_evidence_profile
-            if expected_evidence_mode != "unknown" and (
-                agent_uat_readiness.get("evidence_mode") != expected_evidence_mode
-            ):
+            expected_policy_mode = actual_container.settings.uat_evidence_policy_mode
+            if agent_uat_readiness.get("evidence_mode") != expected_evidence_mode:
                 raise ReleaseConfigurationError("Agent UAT Evidence profile differs")
+            if agent_uat_readiness.get("evidence_policy_mode") != expected_policy_mode:
+                raise ReleaseConfigurationError("Agent UAT Evidence policy mode differs")
+            scenario_eval = expected_evidence_mode == "preserved-3law-v3-scenario-eval"
+            if scenario_eval:
+                if (
+                    agent_uat_readiness.get("assertion_fixture_mode")
+                    != "LOOPBACK_TEST_ONLY_HUMAN_APPROVER"
+                    or agent_uat_readiness.get("trusted_assertion_verifier_configured") is not True
+                    or agent_uat_readiness.get("assertion_trust_store_sha256")
+                    != actual_container.settings.uat_assertion_trust_store_sha256
+                ):
+                    raise ReleaseConfigurationError(
+                        "Agent UAT assertion readiness identity differs"
+                    )
+            elif (
+                agent_uat_readiness.get("assertion_fixture_mode") != "DISABLED"
+                or agent_uat_readiness.get("trusted_assertion_verifier_configured") is not False
+                or agent_uat_readiness.get("assertion_trust_store_sha256") is not None
+            ):
+                raise ReleaseConfigurationError("Agent UAT assertion readiness is invalid")
             agent_ready = True
         except Exception:
             agent_metadata = {"status": "unavailable"}
@@ -807,10 +1003,14 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             "auto_completion_enabled": False,
             "production_release": False,
             "evidence_profile": actual_container.settings.uat_evidence_profile,
+            "evidence_scope": local_uat_evidence_scope(),
             "evidence_scope_label": local_uat_evidence_scope(),
+            "evidence_data_source": actual_container.settings.uat_evidence_data_source,
+            "evidence_policy_mode": actual_container.settings.uat_evidence_policy_mode,
             "evidence_dataset": local_uat_evidence_dataset().model_dump(mode="json"),
-            "agent": agent_metadata,
-            "agent_uat": agent_uat_readiness,
+            "evidence_runtime_v3_sha256": evidence_identity.runtime_release_v3_sha256,
+            "agent_status": agent_metadata["status"],
+            "agent_uat_status": agent_uat_readiness["status"],
             "dependencies": dependency_status,
         }
 
@@ -827,7 +1027,10 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             ) from None
         return UatMetadataResponse(
             evidence_profile=actual_container.settings.uat_evidence_profile,
+            evidence_scope=local_uat_evidence_scope(),
             evidence_scope_label=local_uat_evidence_scope(),
+            evidence_data_source=actual_container.settings.uat_evidence_data_source,
+            evidence_policy_mode=actual_container.settings.uat_evidence_policy_mode,
             evidence_dataset=local_uat_evidence_dataset(),
             supported_review_as_of=evidence_identity.base_runtime_release.supported_review_as_of,
             planner_mode=actual_container.settings.uat_planner_mode,
@@ -1093,6 +1296,40 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         service: WorkbenchService = Depends(_service),
     ) -> ReviewRunRecord:
         return service.get_run(principal, review_run_id)
+
+    @app.get(
+        "/api/v1/uat/review-runs/{review_run_id}/evidence-trace",
+        response_model=UatEvidenceTraceResponse,
+    )
+    def get_uat_evidence_trace_endpoint(
+        review_run_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> UatEvidenceTraceResponse:
+        reader = actual_container.uat_evidence_trace_reader
+        if (
+            actual_container.settings.environment != "local_uat"
+            or actual_container.settings.uat_evidence_profile != "preserved-3law-v3-scenario-eval"
+            or reader is None
+        ):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        run = service.get_run(principal, review_run_id)
+        provenance = run.result_detail.get("evidence_provenance")
+        request_id = provenance.get("request_id") if isinstance(provenance, dict) else None
+        knowledge_snapshot_id = run.result_detail.get("knowledge_snapshot_id")
+        if (
+            not isinstance(request_id, str)
+            or not isinstance(knowledge_snapshot_id, str)
+            or run.release_identity.get("evidence_snapshot_id") != knowledge_snapshot_id
+        ):
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+        try:
+            return reader.projection(
+                request_id=request_id,
+                knowledge_snapshot_id=knowledge_snapshot_id,
+            )
+        except UatEvidenceTraceError:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE) from None
 
     @app.post(
         "/api/v1/review-runs/{review_run_id}/correction-proposals",

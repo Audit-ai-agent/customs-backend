@@ -28,6 +28,14 @@ ASSERTION_TRUST_DOMAIN = "customs-ai-agent/supporting-document-verification/v1"
 _SIGNATURE_PREFIX = ASSERTION_TRUST_DOMAIN.encode("ascii") + b"\x00"
 _MAX_REGISTRY_BYTES = 1024 * 1024
 _POLICY_SIGNATURE_PREFIX = b"customs-evidence/requirement-policy-approval/v1\x00"
+_UAT_APPROVER_AUTHORITY_ID = (
+    "backend:principal-sha256:6cc4551495f1ec8da505fdeaa4f34c17eeb8c234bcaeb6ca184f92a0cdd6318d"
+)
+_UAT_REQUIRED_DOCUMENT_CODE = "CCCT_DOC_46E819BB87B27371"
+_UAT_REQUIREMENT_POLICY_RELEASE = "test-only-three-law-scenario-eval-human-only.v1"
+_UAT_REQUIREMENT_POLICY_SOURCE_SHA256 = (
+    "8d57414b0b0352a78856d57ebaf5b69050b584ec6e9d94ff630d8d093a585dde"
+)
 
 
 class AssertionSigningConfigurationError(RuntimeError):
@@ -44,6 +52,33 @@ class RequirementPolicyIdentity(BaseModel):
     evidence_runtime_v3_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
 
 
+class LocalUatRequirementPolicyFixtureV1(BaseModel):
+    """Hash-pinned projection of Data's test-only, exact-code scenario policy."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["customs-backend-local-uat-requirement-policy/v1"]
+    test_only: Literal[True]
+    production_eligible: Literal[False]
+    evidence_profile: Literal["preserved-3law-v3-scenario-eval"]
+    evidence_policy_mode: Literal["SEALED_TEST_ONLY_ACTUAL_CCCT_HUMAN_ONLY"]
+    evidence_runtime_v3_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    required_document_code: Literal["CCCT_DOC_46E819BB87B27371"]
+    verification_policy: Literal["human_only"]
+    policy_source_sha256: Literal[
+        "8d57414b0b0352a78856d57ebaf5b69050b584ec6e9d94ff630d8d093a585dde"
+    ]
+    policy_release: Literal["test-only-three-law-scenario-eval-human-only.v1"]
+    fixture_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+    @model_validator(mode="after")
+    def canonical_fixture_digest_matches(self) -> "LocalUatRequirementPolicyFixtureV1":
+        expected = _canonical_sha256(self.model_dump(mode="json", exclude={"fixture_sha256"}))
+        if self.fixture_sha256 != expected:
+            raise ValueError("local UAT requirement policy fixture digest mismatch")
+        return self
+
+
 class RequirementPolicyIdentityResolver(Protocol):
     @property
     def ready(self) -> bool: ...
@@ -58,6 +93,36 @@ class UnavailableRequirementPolicyIdentityResolver:
 
     def resolve(self, document: SupportingDocumentRecord) -> None:
         return None
+
+
+class LocalUatRequirementPolicyIdentityResolver:
+    """Scenario-only resolver over a Data-derived, hash-pinned public fixture."""
+
+    def __init__(self, fixture: LocalUatRequirementPolicyFixtureV1) -> None:
+        self.fixture = LocalUatRequirementPolicyFixtureV1.model_validate(
+            fixture.model_dump(mode="python")
+        )
+
+    @property
+    def ready(self) -> bool:
+        return True
+
+    @property
+    def evidence_runtime_v3_sha256(self) -> str:
+        return self.fixture.evidence_runtime_v3_sha256
+
+    @property
+    def policy_release(self) -> str:
+        return self.fixture.policy_release
+
+    def resolve(self, document: SupportingDocumentRecord) -> RequirementPolicyIdentity | None:
+        if document.document_code != self.fixture.required_document_code:
+            return None
+        return RequirementPolicyIdentity(
+            policy_source_sha256=self.fixture.policy_source_sha256,
+            policy_release=self.fixture.policy_release,
+            evidence_runtime_v3_sha256=self.fixture.evidence_runtime_v3_sha256,
+        )
 
 
 class _PolicyEntry(BaseModel):
@@ -418,6 +483,30 @@ class AssertionSigningKeyRegistryV1(BaseModel):
         return self
 
 
+class LocalUatAssertionSigningKeyRegistryV1(BaseModel):
+    """Private registry accepted only by the local-UAT scenario composition."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["customs-backend-local-uat-assertion-signing-keys/v1"]
+    test_only: Literal[True]
+    production_eligible: Literal[False]
+    loopback_only: Literal[True]
+    trust_domain: Literal["customs-ai-agent/supporting-document-verification/v1"]
+    agent_trust_store_release_state: Literal["active"]
+    agent_trust_store_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    keys: list[AssertionSigningKeyV1] = Field(min_length=1, max_length=1)
+
+    @model_validator(mode="after")
+    def exact_uat_approver_key(self) -> "LocalUatAssertionSigningKeyRegistryV1":
+        key = self.keys[0]
+        if key.authority_id != _UAT_APPROVER_AUTHORITY_ID or not key.key_id.startswith(
+            "local-uat-"
+        ):
+            raise ValueError("local UAT assertion key authority is invalid")
+        return self
+
+
 class SupportingAssertionSigner(Protocol):
     @property
     def ready(self) -> bool: ...
@@ -569,10 +658,89 @@ def load_assertion_signer(
     return RegistrySupportingAssertionSigner(registry)
 
 
+def _assert_local_uat_external_path(path: str | Path) -> Path:
+    unresolved = Path(path).expanduser()
+    if not unresolved.is_absolute() or unresolved.is_symlink():
+        raise AssertionSigningConfigurationError("local UAT fixture path is invalid")
+    try:
+        resolved = unresolved.resolve(strict=True)
+    except OSError:
+        raise AssertionSigningConfigurationError("local UAT fixture is unavailable") from None
+    parts = tuple(part.casefold() for part in resolved.parts)
+    in_workspace_secrets = "_secrets" in parts
+    in_runtime_secrets = any(
+        parts[index : index + 2] == ("run", "secrets") for index in range(max(0, len(parts) - 1))
+    )
+    if not resolved.is_file() or not (in_workspace_secrets or in_runtime_secrets):
+        raise AssertionSigningConfigurationError("local UAT fixture path is invalid")
+    return resolved
+
+
+def load_local_uat_assertion_signer(
+    path: str | Path,
+    *,
+    expected_trust_store_sha256: str,
+    today: date | None = None,
+) -> SupportingAssertionSigner:
+    """Load a private, explicitly test-only key registry outside Production paths."""
+
+    resolved = _assert_local_uat_external_path(path)
+    model = _strict_json(resolved, LocalUatAssertionSigningKeyRegistryV1)
+    if not isinstance(model, LocalUatAssertionSigningKeyRegistryV1):
+        raise AssertionSigningConfigurationError("local UAT assertion registry type mismatch")
+    effective = today or date.today()
+    key = model.keys[0]
+    if (
+        model.agent_trust_store_sha256 != expected_trust_store_sha256
+        or not key.valid_from <= effective <= key.valid_until
+    ):
+        raise AssertionSigningConfigurationError(
+            "local UAT assertion registry is not bound to active Agent trust"
+        )
+    registry = AssertionSigningKeyRegistryV1(
+        schema_version="customs-backend-assertion-signing-keys/v1",
+        trust_domain=model.trust_domain,
+        agent_trust_store_release_state=model.agent_trust_store_release_state,
+        agent_trust_store_sha256=model.agent_trust_store_sha256,
+        keys=model.keys,
+    )
+    return RegistrySupportingAssertionSigner(registry)
+
+
+def load_local_uat_requirement_policy_resolver(
+    path: str | Path,
+    *,
+    expected_fixture_sha256: str,
+    expected_runtime_v3_sha256: str,
+) -> LocalUatRequirementPolicyIdentityResolver:
+    """Load the hash-pinned Data projection used only for scenario-eval receipts."""
+
+    resolved = _assert_local_uat_external_path(path)
+    model = _strict_json(resolved, LocalUatRequirementPolicyFixtureV1)
+    if not isinstance(model, LocalUatRequirementPolicyFixtureV1):
+        raise AssertionSigningConfigurationError(
+            "local UAT requirement policy fixture type mismatch"
+        )
+    if (
+        model.fixture_sha256 != expected_fixture_sha256
+        or model.evidence_runtime_v3_sha256 != expected_runtime_v3_sha256
+        or model.required_document_code != _UAT_REQUIRED_DOCUMENT_CODE
+        or model.policy_source_sha256 != _UAT_REQUIREMENT_POLICY_SOURCE_SHA256
+        or model.policy_release != _UAT_REQUIREMENT_POLICY_RELEASE
+    ):
+        raise AssertionSigningConfigurationError(
+            "local UAT requirement policy fixture identity mismatch"
+        )
+    return LocalUatRequirementPolicyIdentityResolver(model)
+
+
 __all__ = [
     "ASSERTION_TRUST_DOMAIN",
     "AssertionSigningConfigurationError",
     "AssertionSigningKeyRegistryV1",
+    "LocalUatAssertionSigningKeyRegistryV1",
+    "LocalUatRequirementPolicyFixtureV1",
+    "LocalUatRequirementPolicyIdentityResolver",
     "RegistrySupportingAssertionSigner",
     "ReleasedRequirementPolicyIdentityResolver",
     "RequirementPolicyIdentity",
@@ -581,5 +749,7 @@ __all__ = [
     "UnavailableRequirementPolicyIdentityResolver",
     "UnavailableSupportingAssertionSigner",
     "load_assertion_signer",
+    "load_local_uat_assertion_signer",
+    "load_local_uat_requirement_policy_resolver",
     "load_requirement_policy_resolver",
 ]

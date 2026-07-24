@@ -18,6 +18,7 @@ from customs_backend.assertion_signing import (
     RegistrySupportingAssertionSigner,
     RequirementPolicyIdentity,
     AssertionSigningConfigurationError,
+    load_local_uat_assertion_signer,
     load_requirement_policy_resolver,
 )
 from customs_backend.api import build_container
@@ -38,6 +39,92 @@ from customs_backend.settings import Settings
 
 def _b64(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def _write_local_uat_signer_registry(
+    root: Path,
+    *,
+    authority_id: str = (
+        "backend:principal-sha256:6cc4551495f1ec8da505fdeaa4f34c17eeb8c234bcaeb6ca184f92a0cdd6318d"
+    ),
+    valid_from: str = "2026-01-01",
+    valid_until: str = "2027-12-31",
+) -> tuple[Path, str]:
+    private = Ed25519PrivateKey.generate()
+    private_bytes = private.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_bytes = private.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    trust_sha256 = "d" * 64
+    payload = {
+        "schema_version": "customs-backend-local-uat-assertion-signing-keys/v1",
+        "test_only": True,
+        "production_eligible": False,
+        "loopback_only": True,
+        "trust_domain": ASSERTION_TRUST_DOMAIN,
+        "agent_trust_store_release_state": "active",
+        "agent_trust_store_sha256": trust_sha256,
+        "keys": [
+            {
+                "authority_id": authority_id,
+                "authority_release": "backend-human-decision-policy/v1",
+                "key_id": "local-uat-approver-key-v1",
+                "private_key_base64url": _b64(private_bytes),
+                "public_key_base64url": _b64(public_bytes),
+                "valid_from": valid_from,
+                "valid_until": valid_until,
+                "receipt_ttl_seconds": 86_400,
+            }
+        ],
+    }
+    path = root / "_secrets" / "uat" / "assertion-signing-key-registry.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path, trust_sha256
+
+
+def test_local_uat_signer_loader_accepts_only_the_exact_active_uat_approver(
+    tmp_path: Path,
+) -> None:
+    path, trust_sha256 = _write_local_uat_signer_registry(tmp_path)
+    signer = load_local_uat_assertion_signer(
+        path,
+        expected_trust_store_sha256=trust_sha256,
+        today=date(2026, 7, 24),
+    )
+    assert signer.ready is True
+    assert signer.trust_store_sha256 == trust_sha256
+
+    wrong_path, _ = _write_local_uat_signer_registry(
+        tmp_path / "wrong",
+        authority_id=(
+            "backend:principal-sha256:" + hashlib.sha256(b"not-uat-approver").hexdigest()
+        ),
+    )
+    with pytest.raises(
+        AssertionSigningConfigurationError,
+        match="release artifact is invalid",
+    ):
+        load_local_uat_assertion_signer(
+            wrong_path,
+            expected_trust_store_sha256=trust_sha256,
+            today=date(2026, 7, 24),
+        )
+
+    with pytest.raises(
+        AssertionSigningConfigurationError,
+        match="active Agent trust",
+    ):
+        load_local_uat_assertion_signer(
+            path,
+            expected_trust_store_sha256=trust_sha256,
+            today=date(2028, 1, 1),
+        )
 
 
 class _PinnedPolicyResolver:
