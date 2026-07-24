@@ -118,6 +118,40 @@ def test_complete_bound_agent_content_passes_the_backend_independent_gate() -> N
     assert _reasons(envelope, manifest) == set()
 
 
+def _prompt_injection_result(*, assessment: str) -> dict:
+    result = _audited_result(_complete_provider_request(), auto_complete=False)
+    result["completion_eligibility"]["unmet_reason_codes"].append(
+        "untrusted_document_prompt_injection_pattern_detected"
+    )
+    result["assessment"] = assessment
+    _rehash_result(result)
+    return result
+
+
+def test_consumer_accepts_prompt_injection_as_fail_closed_indeterminate() -> None:
+    validated = AgentReviewResultV3.model_validate(
+        _prompt_injection_result(assessment="indeterminate")
+    )
+
+    assert validated.assessment.value == "indeterminate"
+    assert validated.review_disposition.value == "human_review_required"
+    assert validated.completion_eligibility.eligible is False
+
+
+def test_consumer_rejects_prompt_injection_downgraded_to_no_issue() -> None:
+    with pytest.raises(ValidationError, match="assessment is not derived"):
+        AgentReviewResultV3.model_validate(_prompt_injection_result(assessment="no_issue_detected"))
+
+
+def test_consumer_rejects_indeterminate_without_prompt_injection_reason() -> None:
+    result = _audited_result(_complete_provider_request(), auto_complete=False)
+    result["assessment"] = "indeterminate"
+    _rehash_result(result)
+
+    with pytest.raises(ValidationError, match="assessment is not derived"):
+        AgentReviewResultV3.model_validate(result)
+
+
 def test_case_chat_uses_exact_current_fact_order_without_label_prefix_heuristics() -> None:
     request = _complete_provider_request()
     documents = [

@@ -33,6 +33,7 @@ def canonical_digest(value: Any) -> str:
 MAX_TEXT_DOCUMENT_CHARACTERS = 200_000
 MAX_TEXT_DOCUMENT_UTF8_BYTES = MAX_TEXT_DOCUMENT_CHARACTERS * 4
 MAX_SUPPORTING_DOCUMENTS_PER_CASE = 100
+_PROMPT_INJECTION_UNMET_REASON_CODE = "untrusted_document_prompt_injection_pattern_detected"
 DocumentType = Literal["CI", "PL", "BL", "CO", "SUPPORTING", "UNKNOWN"]
 
 
@@ -1102,18 +1103,30 @@ class AgentReviewResultV3(BaseModel):
                 or item.get("output_tokens") != 0
             ):
                 raise ValueError("deterministic explanation trace cannot claim model execution")
+        prompt_injection_detected = (
+            _PROMPT_INJECTION_UNMET_REASON_CODE in self.completion_eligibility.unmet_reason_codes
+        )
+        # A detected instruction embedded in an untrusted trade document is a
+        # safety ambiguity, even when retrieval itself completed and no
+        # deterministic mismatch was found.  Mirror the provider-owned V3
+        # derivation exactly so the Backend accepts that fail-closed result,
+        # while still rejecting arbitrary ``indeterminate`` assessments.
         expected_assessment = (
-            Assessment.issues_detected
-            if self.validation_issues or self.regulatory_findings
+            Assessment.indeterminate
+            if prompt_injection_detected
             else (
-                Assessment.no_issue_detected
-                if self.retrieval_status == "ok"
-                and self.retrieval_coverage == "complete"
-                and any(
-                    isinstance(item, dict) and item.get("eligibility") != "blocked"
-                    for item in self.rag_evidence
+                Assessment.issues_detected
+                if self.validation_issues or self.regulatory_findings
+                else (
+                    Assessment.no_issue_detected
+                    if self.retrieval_status == "ok"
+                    and self.retrieval_coverage == "complete"
+                    and any(
+                        isinstance(item, dict) and item.get("eligibility") != "blocked"
+                        for item in self.rag_evidence
+                    )
+                    else Assessment.indeterminate
                 )
-                else Assessment.indeterminate
             )
         )
         if self.assessment != expected_assessment:
