@@ -1905,6 +1905,10 @@
           "stage": {
             "enum": [
               "queued",
+              "input_validation",
+              "agent_analysis",
+              "result_validation",
+              "persistence",
               "document_analysis",
               "normalization",
               "validation",

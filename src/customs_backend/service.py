@@ -238,7 +238,12 @@ def _safe_evidence_provenance(envelope: AgentReviewResultV3) -> dict[str, Any]:
         request_item_ids.add(item_id)
         result = result_by_item.get(item_id)
         if result is None:
-            raise ConflictError("Agent retrieval query/result items differ")
+            # V2/V3 explicitly permits a partial or failed retrieval response to
+            # contain only the request items for which the Provider produced a
+            # typed result.  Do not fabricate an ``unknown`` item here: the
+            # top-level status/coverage already carries the incomplete outcome,
+            # and the browser projection must only describe observed results.
+            continue
         hs_resolution = _bounded_provenance_text(
             result.get("hs_resolution"),
             field="HS resolution",
@@ -285,9 +290,11 @@ def _safe_evidence_provenance(envelope: AgentReviewResultV3) -> dict[str, Any]:
                 "requirements_found": requirements_found,
             }
         )
-    if set(result_by_item) != request_item_ids:
+    result_item_ids = set(result_by_item)
+    if not result_item_ids.issubset(request_item_ids):
         raise ConflictError("Agent retrieval query/result items differ")
-
+    if envelope.retrieval_status == "ok" and result_item_ids != request_item_ids:
+        raise ConflictError("Agent ok retrieval does not cover every query item")
     ranked_evidence: list[dict[str, Any]] = []
     seen_evidence_ids: set[str] = set()
     for item in query_items:
@@ -869,6 +876,7 @@ class WorkbenchService:
         ),
         assertion_signer: SupportingAssertionSigner | None = None,
         requirement_policy_resolver: RequirementPolicyIdentityResolver | None = None,
+        expected_evidence_runtime_v3_sha256: str | None = None,
         job_lease_seconds: int = 300,
         job_max_attempts: int = 3,
         outbox_lease_seconds: int = 30,
@@ -887,6 +895,12 @@ class WorkbenchService:
         self.requirement_policy_resolver = (
             requirement_policy_resolver or UnavailableRequirementPolicyIdentityResolver()
         )
+        if (
+            expected_evidence_runtime_v3_sha256 is not None
+            and _SHA256.fullmatch(expected_evidence_runtime_v3_sha256) is None
+        ):
+            raise ValueError("expected Evidence runtime V3 identity must be a SHA-256 digest")
+        self.expected_evidence_runtime_v3_sha256 = expected_evidence_runtime_v3_sha256
         self.job_lease_seconds = job_lease_seconds
         self.job_max_attempts = job_max_attempts
         self.outbox_lease_seconds = outbox_lease_seconds
@@ -1981,7 +1995,7 @@ class WorkbenchService:
                 "Agent delivery state is uncertain; human recovery is required"
             )
         lease_id = _id("joblease")
-        running = self.repository.claim_job(
+        claimed = self.repository.claim_job(
             org_id=org_id,
             job_id=job_id,
             lease_id=lease_id,
@@ -1990,9 +2004,9 @@ class WorkbenchService:
                 event_id=_id("event"),
                 job_id=job_id,
                 sequence=sequence,
-                stage="document_analysis",
+                stage="input_validation",
                 state="started",
-                message_code="agent.started",
+                message_code="review.input_validation_started",
                 occurred_at=utc_now(),
             ),
             audit=self._audit(
@@ -2002,13 +2016,50 @@ class WorkbenchService:
                 detail={"job_id": job_id, "attempt": job.attempt_count + 1},
             ),
         )
-        if running is None:
+        if claimed is None:
             current = self.repository.get_job(org_id, job_id)
             if current is not None and current.status == JobStatus.succeeded:
                 completed = self.repository.get_run(org_id, current.review_run_id)
                 if completed is not None:
                     return completed
             raise JobExecutionNotRunnableError("job is already claimed by another worker")
+        running: JobRecord = claimed
+        next_sequence = sequence + 1
+
+        def emit_progress(
+            stage: Literal[
+                "input_validation",
+                "agent_analysis",
+                "result_validation",
+                "persistence",
+            ],
+            message_code: str,
+            *,
+            state: Literal["started", "progress", "completed"] = "started",
+        ) -> None:
+            nonlocal running, next_sequence
+            running = self.repository.update_job(
+                running,
+                StageEvent(
+                    event_id=_id("event"),
+                    job_id=job_id,
+                    sequence=next_sequence,
+                    stage=stage,
+                    state=state,
+                    message_code=message_code,
+                    occurred_at=utc_now(),
+                ),
+                self._audit(
+                    system,
+                    "review.progress",
+                    case_id=running.case_id,
+                    review_run_id=running.review_run_id,
+                    detail={"job_id": job_id, "stage": stage},
+                ),
+                expected_lease_id=lease_id,
+            )
+            next_sequence += 1
+
         call_started = False
         response_received = False
         response_validated = False
@@ -2063,6 +2114,11 @@ class WorkbenchService:
                 revision_request_wire = revision_request.to_agent_wire()
                 if len(canonical_json_bytes(revision_request_wire)) > MAX_AGENT_REQUEST_BODY_BYTES:
                     raise ConflictError("Agent revision request exceeds the 2 MiB transport limit")
+                emit_progress(
+                    "input_validation",
+                    "review.input_validation_completed",
+                    state="completed",
+                )
                 running = self.repository.start_agent_call_once(
                     org_id=org_id,
                     job_id=job_id,
@@ -2077,8 +2133,15 @@ class WorkbenchService:
                     ),
                 )
                 call_started = True
+                emit_progress("agent_analysis", "agent.analysis_started")
                 raw_revision_response = self.agent.revise(revision_request)
                 response_received = True
+                emit_progress(
+                    "agent_analysis",
+                    "agent.analysis_completed",
+                    state="completed",
+                )
+                emit_progress("result_validation", "agent.response_validation_started")
                 try:
                     revision_response = AgentRevisionResult.model_validate(raw_revision_response)
                 except ValidationError as exc:
@@ -2093,6 +2156,11 @@ class WorkbenchService:
                     raise ConflictError("Agent revision response is not bound to its approval")
                 result = revision_response.child_result.model_dump(mode="json")
             else:
+                emit_progress(
+                    "input_validation",
+                    "review.input_validation_completed",
+                    state="completed",
+                )
                 running = self.repository.start_agent_call_once(
                     org_id=org_id,
                     job_id=job_id,
@@ -2107,8 +2175,15 @@ class WorkbenchService:
                     ),
                 )
                 call_started = True
+                emit_progress("agent_analysis", "agent.analysis_started")
                 result = self.agent.review(agent_request)
                 response_received = True
+                emit_progress(
+                    "agent_analysis",
+                    "agent.analysis_completed",
+                    state="completed",
+                )
+                emit_progress("result_validation", "agent.response_validation_started")
             run = self._run_from_agent(
                 system,
                 job=running,
@@ -2117,6 +2192,12 @@ class WorkbenchService:
                 expected_agent_input_sha256=agent_input_manifest_sha256,
             )
             response_validated = True
+            emit_progress(
+                "result_validation",
+                "agent.response_validation_completed",
+                state="completed",
+            )
+            emit_progress("persistence", "review.persistence_started")
             succeeded = running.model_copy(
                 update={
                     "status": JobStatus.succeeded,
@@ -2134,7 +2215,7 @@ class WorkbenchService:
                 event=StageEvent(
                     event_id=_id("event"),
                     job_id=job_id,
-                    sequence=sequence + 1,
+                    sequence=next_sequence,
                     stage="completed",
                     state="completed",
                     message_code="review.completed",
@@ -2176,9 +2257,9 @@ class WorkbenchService:
                 event=StageEvent(
                     event_id=_id("event"),
                     job_id=job_id,
-                    sequence=sequence + 1,
-                    stage="failed",
-                    state="failed",
+                    sequence=next_sequence,
+                    stage="failed" if terminal_failure else "agent_analysis",
+                    state="failed" if terminal_failure else "progress",
                     message_code=(
                         "review.agent_pre_execution_retry_exhausted"
                         if terminal_failure
@@ -2224,7 +2305,7 @@ class WorkbenchService:
                             event=StageEvent(
                                 event_id=_id("event"),
                                 job_id=job_id,
-                                sequence=sequence + 1,
+                                sequence=next_sequence,
                                 stage="failed",
                                 state="failed",
                                 message_code="review.response_persistence_uncertain",
@@ -2258,7 +2339,7 @@ class WorkbenchService:
                             event=StageEvent(
                                 event_id=_id("event"),
                                 job_id=job_id,
-                                sequence=sequence + 1,
+                                sequence=next_sequence,
                                 stage="failed",
                                 state="failed",
                                 message_code="review.response_received_rejected",
@@ -2286,7 +2367,7 @@ class WorkbenchService:
                     event=StageEvent(
                         event_id=_id("event"),
                         job_id=job_id,
-                        sequence=sequence + 1,
+                        sequence=next_sequence,
                         stage="failed",
                         state="failed",
                         message_code="review.delivery_uncertain",
@@ -2316,7 +2397,7 @@ class WorkbenchService:
                 StageEvent(
                     event_id=_id("event"),
                     job_id=job_id,
-                    sequence=sequence + 1,
+                    sequence=next_sequence,
                     stage="failed",
                     state="failed",
                     message_code=(
@@ -2351,6 +2432,14 @@ class WorkbenchService:
             raise ConflictError(
                 "Agent result violates the trusted Backend policy boundary"
             ) from exc
+        if (
+            self.expected_evidence_runtime_v3_sha256 is not None
+            and envelope.runtime_release.evidence_runtime_v3_sha256
+            != self.expected_evidence_runtime_v3_sha256
+        ):
+            raise ConflictError(
+                "Agent result Evidence runtime identity differs from the Backend pin"
+            )
         try:
             expected_review_as_of = date.fromisoformat(str(job.request["review_as_of"]))
             expected_trade_type = str(job.request["trade_type"])

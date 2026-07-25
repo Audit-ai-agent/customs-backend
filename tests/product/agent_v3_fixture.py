@@ -278,23 +278,33 @@ def build_agent_v3_result(
 
     outcome_citation = [{"kind": "outcome", "reference_id": outcome_reference}]
     summary_claim = _claim(
-        "현재 검토 범위에서 문서 불일치와 미충족 규정 요건이 발견되지 않았습니다.",
+        (
+            "사전심사 결론: 현재 검토 범위에서는 문서 불일치나 미충족 규정 요건이 "
+            "확인되지 않았습니다."
+        ),
         outcome_citation,
     )
     document_claim = _claim(
-        "결정론적 문서 교차검증에서 불일치가 발견되지 않았습니다.",
+        "문서 검토 결과: 결정론적 문서 교차검증에서 불일치가 확인되지 않았습니다.",
         outcome_citation,
     )
     regulation_claim = _claim(
-        "조회된 규정 근거 범위에서 별도의 미충족 요건 Finding이 생성되지 않았습니다.",
-        [{"kind": "evidence", "reference_id": evidence_id}],
+        (
+            "규정 검토 결과: 실제 조회된 규정 Evidence 범위에서는 "
+            "별도의 미충족 요건이 확인되지 않았습니다."
+        ),
+        [{"kind": "evidence", "reference_id": evidence_id}, *outcome_citation],
     )
     action_claims = [
         _claim(
             (
-                "승인된 자동완료 범위에서 추가 조치가 필요한 항목이 없습니다."
+                "다음 조치: 승인된 자동완료 범위에서는 추가 확인이 필요하지 않습니다."
                 if auto_complete
-                else "담당자는 근거와 추출값을 확인한 뒤 수정 또는 승인을 기록해야 합니다."
+                else (
+                    "다음 조치: 현재 결과가 담당자 검토를 요구하므로, 담당자는 관련 원문, "
+                    "추출값, 규정 Evidence를 확인한 뒤 필요한 수정 또는 승인 결정을 "
+                    "기록해야 합니다."
+                )
             ),
             outcome_citation,
         )
@@ -302,7 +312,10 @@ def build_agent_v3_result(
     if blocked:
         action_claims.append(
             _claim(
-                "차단 원인을 해소한 뒤 새로운 Review Run으로 다시 실행해야 합니다.",
+                (
+                    "다음 조치: 표시된 차단 원인을 먼저 해소한 뒤 새로운 Review Run으로 "
+                    "다시 실행해야 합니다."
+                ),
                 outcome_citation,
             )
         )

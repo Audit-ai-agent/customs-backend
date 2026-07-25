@@ -734,7 +734,13 @@ class InMemoryWorkbenchRepository:
                 for item in self._runs.values()
                 if item.org_id == org_id and item.case_id == case_id
             ]
-            return self._copy(sorted(values, key=lambda item: item.created_at, reverse=True))
+            return self._copy(
+                sorted(
+                    values,
+                    key=lambda item: (item.created_at, item.review_run_id),
+                    reverse=True,
+                )
+            )
 
     def save_run_decision(
         self,
@@ -2458,7 +2464,12 @@ class PostgresWorkbenchRepository:
             rows = session.scalars(
                 select(_RunRow).where(_RunRow.org_id == org_id, _RunRow.case_id == case_id)
             ).all()
-            return [ReviewRunRecord.model_validate(row.record_json) for row in rows]
+            values = [ReviewRunRecord.model_validate(row.record_json) for row in rows]
+            return sorted(
+                values,
+                key=lambda item: (item.created_at, item.review_run_id),
+                reverse=True,
+            )
 
     def save_run_decision(
         self,

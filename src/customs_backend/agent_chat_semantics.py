@@ -17,6 +17,11 @@ _ISSUE_KEYWORDS = frozenset({"문제", "오류", "불일치", "위험", "finding
 _REGULATION_KEYWORDS = frozenset({"법령", "규정", "요건", "서류", "근거", "evidence"})
 _OUTCOME_KEYWORDS = frozenset({"결과", "상태", "완료", "심사", "outcome", "status"})
 _FIELD_KEYWORDS = frozenset({"문서", "금액", "수량", "원산지", "송장", "선하", "품목", "hsk", "hs"})
+_EXPLANATION_KEYWORDS = frozenset({"왜", "이유", "원인", "의미", "설명", "해석", "영향"})
+_ACTION_KEYWORDS = frozenset({"조치", "해야", "해결", "수정", "확인", "다음", "대응"})
+_FOLLOW_UP_KEYWORDS = frozenset({"그럼", "그러면", "그것", "그게", "이것", "이게", "앞서", "방금"})
+_MAX_EVIDENCE_CLAIMS = 5
+_MAX_EVIDENCE_EXCERPT_CHARS = 360
 _ANSWER_PREFIXES = ("", "확인된 Case 근거에 따르면, ", "근거 확인 결과: ")
 
 
@@ -80,6 +85,38 @@ def _bounded_claims(claims: list[_Claim]) -> tuple[_Claim, ...]:
         selected.append(claim)
         rendered_size += additional
     return tuple(selected)
+
+
+def _evidence_excerpt(text: str) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= _MAX_EVIDENCE_EXCERPT_CHARS:
+        return compact
+    return f"{compact[: _MAX_EVIDENCE_EXCERPT_CHARS - 1].rstrip()}…"
+
+
+def _review_disposition_text(disposition: str) -> str:
+    values = {
+        "auto_review_complete": "자동 사전심사가 완료된 상태",
+        "human_review_required": "담당자 검토가 필요한 상태",
+        "blocked": "실행 또는 근거 조건 때문에 심사가 차단된 상태",
+    }
+    try:
+        return values[disposition]
+    except KeyError as exc:
+        raise ValueError("effective review disposition is invalid") from exc
+
+
+def _citable_regulatory_evidence_ids(provider_result: dict[str, Any]) -> tuple[str, ...]:
+    identifiers: list[str] = []
+    for value in provider_result.get("rag_evidence", []):
+        if not isinstance(value, dict):
+            raise ValueError("RAG Evidence is malformed")
+        evidence_id = value.get("evidence_id")
+        if not isinstance(evidence_id, str):
+            raise ValueError("RAG Evidence identity is malformed")
+        if value.get("eligibility") in {"supporting", "finding"}:
+            identifiers.append(evidence_id)
+    return tuple(identifiers)
 
 
 def _matches_intent(
@@ -147,7 +184,32 @@ def expected_answer_projection(
         tokens,
         keywords=_FIELD_KEYWORDS,
     )
-    if not (issue_intent or regulation_intent or outcome_intent or field_intent):
+    explanation_intent = (
+        _matches_intent(
+            tokens,
+            keywords=_EXPLANATION_KEYWORDS,
+        )
+        or "왜" in question
+    )
+    action_intent = _matches_intent(
+        tokens,
+        keywords=_ACTION_KEYWORDS,
+    )
+    follow_up_intent = _matches_intent(
+        tokens,
+        keywords=_FOLLOW_UP_KEYWORDS,
+    )
+    core_case_intent = issue_intent or regulation_intent or outcome_intent or field_intent
+    bare_why_intent = "왜" in question and tokens.issubset(
+        _EXPLANATION_KEYWORDS | _FOLLOW_UP_KEYWORDS
+    )
+    case_intent = (
+        core_case_intent
+        or action_intent
+        or bare_why_intent
+        or (explanation_intent and follow_up_intent)
+    )
+    if not case_intent:
         return ExpectedAnswerProjection(
             status="out_of_scope",
             refusal_text="이 질문은 현재 통관 Case의 문서·규정·심사 결과 범위를 벗어납니다.",
@@ -157,16 +219,50 @@ def expected_answer_projection(
     # filter is not safe here because ``investigation_input:`` is also a valid
     # document-id prefix; retained historical facts are excluded by identity,
     # not by text.
-    ledger_entries, _current_references = reconstruct_current_agent_facts(provider_result)
+    ledger_entries, current_references = reconstruct_current_agent_facts(provider_result)
     ledger_by_kind: dict[str, dict[str, dict[str, Any]]] = {}
+    ledger_by_reference: dict[str, dict[str, Any]] = {}
     for entry in ledger_entries:
         kind = entry.get("kind")
         reference_id = entry.get("reference_id")
         if isinstance(kind, str) and isinstance(reference_id, str):
             ledger_by_kind.setdefault(kind, {})[reference_id] = entry
+            ledger_by_reference[reference_id] = entry
+
+    outcome_reference = current_references.get("outcome")
+    if not isinstance(outcome_reference, str):
+        raise ValueError("current outcome Fact is missing or ambiguous")
 
     claims: list[_Claim] = []
-    if issue_intent:
+
+    def append_claim(text: str, citations: tuple[dict[str, str], ...]) -> None:
+        claim = _Claim(text=_normalize_claim_text(text), citations=citations)
+        if claim not in claims:
+            claims.append(claim)
+
+    def citations_for(reference_ids: list[Any]) -> tuple[dict[str, str], ...]:
+        citations: list[dict[str, str]] = []
+        for reference_id in reference_ids:
+            if not isinstance(reference_id, str):
+                raise ValueError("required action source reference is malformed")
+            fact = ledger_by_reference.get(reference_id)
+            if fact is not None:
+                kind = fact.get("kind")
+                if not isinstance(kind, str):
+                    raise ValueError("current Fact kind is malformed")
+                citations.append(_citation(kind, reference_id))
+        return tuple(citations)
+
+    detailed_explanation = explanation_intent and (
+        core_case_intent or follow_up_intent or "왜" in question
+    )
+    if outcome_intent or detailed_explanation or action_intent or follow_up_intent:
+        append_claim(
+            f"결론 — 현재 사전심사 결과는 {_review_disposition_text(effective_disposition)}입니다.",
+            (_citation("outcome", outcome_reference),),
+        )
+
+    if issue_intent or detailed_explanation:
         for index, finding_value in enumerate(provider_result.get("regulatory_findings", [])):
             if not isinstance(finding_value, dict):
                 raise ValueError("regulatory finding is malformed")
@@ -178,57 +274,95 @@ def expected_answer_projection(
                 not isinstance(value, str) for value in evidence_ids
             ):
                 raise ValueError("regulatory finding Evidence IDs are malformed")
-            claims.append(
-                _Claim(
-                    text=_normalize_claim_text(
-                        f"{finding_value['finding_code']}: {finding_value['message']}"
-                    ),
-                    citations=(
-                        _citation("finding", reference_id),
-                        *(_citation("evidence", value) for value in evidence_ids),
-                    ),
-                )
+            append_claim(
+                (
+                    f"원인 — 규정 검토에서 {finding_value['message']} "
+                    f"({finding_value['finding_code']})"
+                ),
+                (
+                    _citation("finding", reference_id),
+                    *(_citation("evidence", value) for value in evidence_ids),
+                ),
             )
         for index, issue_value in enumerate(provider_result.get("validation_issues", [])):
             if not isinstance(issue_value, dict):
                 raise ValueError("validation issue is malformed")
             reference_id = f"issue_{canonical_digest({'index': index, 'issue': issue_value})}"
             if reference_id in ledger_by_kind.get("issue", {}):
-                claims.append(
-                    _Claim(
-                        text=_normalize_claim_text(
-                            f"{issue_value['issue_code']}: {issue_value['message']}"
-                        ),
-                        citations=(_citation("issue", reference_id),),
-                    )
+                append_claim(
+                    (
+                        f"원인 — 문서 교차검증에서 {issue_value['message']} "
+                        f"({issue_value['issue_code']})"
+                    ),
+                    (_citation("issue", reference_id),),
                 )
-    elif regulation_intent and provider_result.get("rag_evidence"):
+
+    validation_issues = provider_result.get("validation_issues", [])
+    regulatory_findings = provider_result.get("regulatory_findings", [])
+    if not isinstance(validation_issues, list) or not isinstance(regulatory_findings, list):
+        raise ValueError("review issue or finding collection is malformed")
+    citable_evidence_ids = _citable_regulatory_evidence_ids(provider_result)
+    if (issue_intent or detailed_explanation) and not validation_issues and not regulatory_findings:
+        no_issue_citations = [_citation("outcome", outcome_reference)]
+        if citable_evidence_ids:
+            no_issue_citations.append(_citation("evidence", citable_evidence_ids[0]))
+        append_claim(
+            (
+                "원인 — 결정론적 문서 교차검증과 현재 인용 가능한 규정 Evidence 범위에서 "
+                "별도의 불일치 또는 미충족 요건이 확인되지 않았습니다."
+            ),
+            tuple(no_issue_citations),
+        )
+
+    if regulation_intent or detailed_explanation:
+        citable_evidence_id_set = set(citable_evidence_ids)
+        evidence_claim_count = 0
         for evidence_value in provider_result["rag_evidence"]:
             if not isinstance(evidence_value, dict):
                 raise ValueError("RAG Evidence is malformed")
-            claims.append(
-                _Claim(
-                    text=_normalize_claim_text(
-                        f"{evidence_value['title']}: {str(evidence_value['text'])[:1000]}"
-                    ),
-                    citations=(_citation("evidence", str(evidence_value["evidence_id"])),),
-                )
+            evidence_id = str(evidence_value["evidence_id"])
+            if evidence_id not in citable_evidence_id_set:
+                continue
+            append_claim(
+                (
+                    f"근거 — {evidence_value['title']}: "
+                    f"{_evidence_excerpt(str(evidence_value['text']))}"
+                ),
+                (_citation("evidence", evidence_id),),
             )
-    elif outcome_intent:
-        current_outcomes = [
-            entry
-            for entry in ledger_entries
-            if entry.get("kind") == "outcome" and entry.get("label") == "deterministic_outcome"
-        ]
-        if len(current_outcomes) != 1:
-            raise ValueError("current outcome Fact is missing or ambiguous")
-        claims.append(
-            _Claim(
-                text=_normalize_claim_text(f"현재 사전심사 상태는 {effective_disposition}입니다."),
-                citations=(_citation("outcome", str(current_outcomes[0]["reference_id"])),),
-            )
+            evidence_claim_count += 1
+            if evidence_claim_count >= _MAX_EVIDENCE_CLAIMS:
+                break
+
+    if detailed_explanation and (validation_issues or regulatory_findings):
+        append_claim(
+            (
+                "영향 — 확인된 문서 불일치 또는 규정 요건이 해결되기 전에는 "
+                "현재 사전심사를 자동으로 완료할 수 없습니다."
+            ),
+            (_citation("outcome", outcome_reference),),
         )
-    elif field_intent:
+
+    if action_intent or detailed_explanation:
+        required_actions = provider_result.get("required_actions", [])
+        if not isinstance(required_actions, list):
+            raise ValueError("required action collection is malformed")
+        for action_value in required_actions:
+            if not isinstance(action_value, dict):
+                raise ValueError("required action is malformed")
+            source_reference_ids = action_value.get("source_reference_ids")
+            if not isinstance(source_reference_ids, list):
+                raise ValueError("required action source references are malformed")
+            citations = citations_for(source_reference_ids)
+            if citations:
+                append_claim(f"조치 — {action_value['message']}", citations)
+        if not required_actions:
+            append_claim(
+                "조치 — 현재 ReviewResult에 필수 후속 조치가 기록되어 있지 않습니다.",
+                (_citation("outcome", outcome_reference),),
+            )
+
+    if field_intent:
         specific_tokens = tokens.difference({"문서", "품목", "송장", "선하", "hsk", "hs"})
         matching = [
             entry
@@ -242,14 +376,14 @@ def expected_answer_projection(
                 )
             )
         ]
-        if not matching:
+        if not matching and not claims:
             return ExpectedAnswerProjection(
                 status="insufficient_evidence",
                 refusal_text="현재 Review Result에 질문과 직접 연결되는 문서 필드 근거가 없습니다.",
             )
         claims.extend(
             _Claim(
-                text=_normalize_claim_text(f"{entry['label']}: {entry['value']}"),
+                text=_normalize_claim_text(f"문서 근거 — {entry['label']}: {entry['value']}"),
                 citations=(_citation("field_source", str(entry["reference_id"])),),
             )
             for entry in matching
@@ -264,7 +398,13 @@ def expected_answer_projection(
     return ExpectedAnswerProjection(
         status="answered",
         claims=selected,
-        backend_owned_outcome=(outcome_intent and not issue_intent and not regulation_intent),
+        backend_owned_outcome=(
+            (outcome_intent and not issue_intent and not regulation_intent and not field_intent)
+            or (
+                effective_disposition != provider_result.get("review_disposition")
+                and (outcome_intent or detailed_explanation or action_intent or follow_up_intent)
+            )
+        ),
     )
 
 

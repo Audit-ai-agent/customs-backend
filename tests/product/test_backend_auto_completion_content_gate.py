@@ -175,7 +175,9 @@ def test_case_chat_uses_exact_current_fact_order_without_label_prefix_heuristics
     assert [claim.citations[0]["reference_id"] for claim in projection.claims] == (
         expected_field_references
     )
-    assert all(claim.text.startswith("investigation_input:") for claim in projection.claims)
+    assert all(
+        claim.text.startswith("문서 근거 — investigation_input:") for claim in projection.claims
+    )
 
 
 def test_stage_trace_accepts_bounded_revision_rerun_events() -> None:
@@ -705,11 +707,90 @@ def test_chat_projection_recognizes_korean_outcome_keyword_with_sentence_ending(
     ).deterministic_wire("question_" + "4" * 64)
 
     assert answer["status"] == "answered"
-    assert answer["answer"] == "현재 사전심사 상태는 human_review_required입니다."
+    lines = answer["answer"].splitlines()
+    assert lines[0] == "결론 — 현재 사전심사 결과는 담당자 검토가 필요한 상태입니다."
+    assert any(line.startswith("원인 — ") for line in lines)
+    assert any(line.startswith("근거 — ") for line in lines)
+    assert any(line.startswith("조치 — ") for line in lines)
     assert answer["citations"][0]["kind"] == "outcome"
 
 
-@pytest.mark.parametrize("question", ["오늘 날씨는 어떤가요?", "weather forecast"])
+def test_chat_projection_answers_no_issue_question_from_the_bound_result() -> None:
+    result = _audited_result(_complete_provider_request(), auto_complete=False)
+
+    answer = expected_answer_projection(
+        provider_result=result,
+        question="문제가 있나요?",
+        effective_disposition="human_review_required",
+    ).deterministic_wire("question_" + "7" * 64)
+
+    assert answer["status"] == "answered"
+    assert answer["answer"].startswith("원인 — 결정론적 문서 교차검증")
+    assert {citation["kind"] for citation in answer["citations"]} == {
+        "outcome",
+        "evidence",
+    }
+
+
+def test_chat_projection_supports_same_run_action_follow_up() -> None:
+    result = _audited_result(_complete_provider_request(), auto_complete=False)
+
+    answer = expected_answer_projection(
+        provider_result=result,
+        question="그럼 다음에 무엇을 해야 하나요?",
+        effective_disposition="human_review_required",
+    ).deterministic_wire("question_" + "8" * 64)
+
+    assert answer["status"] == "answered"
+    assert answer["answer"].splitlines()[0].startswith("결론 — ")
+    assert any(line.startswith("조치 — ") for line in answer["answer"].splitlines())
+    assert all(
+        citation["reference_id"]
+        in {entry["reference_id"] for entry in result["fact_ledger"]["entries"]}
+        for citation in answer["citations"]
+    )
+
+
+def test_chat_projection_supports_same_run_explanation_follow_up() -> None:
+    result = _audited_result(_complete_provider_request(), auto_complete=False)
+
+    answer = expected_answer_projection(
+        provider_result=result,
+        question="그게 무슨 의미인가요?",
+        effective_disposition="human_review_required",
+    ).deterministic_wire("question_" + "a" * 64)
+
+    assert answer["status"] == "answered"
+    lines = answer["answer"].splitlines()
+    assert lines[0].startswith("결론 — ")
+    assert any(line.startswith("원인 — ") for line in lines)
+    assert all(
+        citation["reference_id"]
+        in {entry["reference_id"] for entry in result["fact_ledger"]["entries"]}
+        for citation in answer["citations"]
+    )
+
+
+def test_chat_projection_keeps_existing_explanation_when_field_filter_has_no_match() -> None:
+    result = _audited_result(_complete_provider_request(), auto_complete=False)
+
+    answer = expected_answer_projection(
+        provider_result=result,
+        question="수정 후 현재 문서 문제의 원인과 다음 조치를 설명해 주세요.",
+        effective_disposition="human_review_required",
+    ).deterministic_wire("question_" + "9" * 64)
+
+    assert answer["status"] == "answered"
+    lines = answer["answer"].splitlines()
+    assert any(line.startswith("원인 — ") for line in lines)
+    assert any(line.startswith("조치 — ") for line in lines)
+    assert not any(line.startswith("문서 근거 — ") for line in lines)
+
+
+@pytest.mark.parametrize(
+    "question",
+    ["오늘 날씨는 어떤가요?", "그럼 오늘 날씨와 점심 메뉴는?", "weather forecast"],
+)
 def test_chat_projection_preserves_explicit_out_of_scope_questions(question: str) -> None:
     result = _audited_result(_complete_provider_request(), auto_complete=False)
 

@@ -300,19 +300,28 @@ def _agent_result_with_bound_issue_and_finding(
         {
             "summary": [
                 claim(
-                    "문서 또는 규정 검토에서 담당자 확인이 필요한 항목이 발견되었습니다.",
+                    (
+                        "사전심사 결론: 확인이 필요한 문서 불일치 또는 미충족 규정 요건이 "
+                        "있어 담당자 검토가 필요합니다."
+                    ),
                     outcome_citation,
                 )
             ],
             "document_consistency": [
                 claim(
-                    f"{issue['issue_code']}: {issue['message']}",
+                    (
+                        f"문서 검토 원인({issue['issue_code']}): {issue['message']} "
+                        "이 검증 문제가 해결되기 전에는 관련 문서의 정합성을 확정할 수 없습니다."
+                    ),
                     [{"kind": "issue", "reference_id": issue_reference}],
                 )
             ],
             "regulatory_review": [
                 claim(
-                    f"{finding['finding_code']}: {finding['message']}",
+                    (
+                        f"규정 검토 원인({finding['finding_code']}): {finding['message']} "
+                        "이 요건이 충족되기 전에는 규정 검토를 완료할 수 없습니다."
+                    ),
                     [
                         {"kind": "finding", "reference_id": finding_reference},
                         {"kind": "evidence", "reference_id": evidence_id},
@@ -321,7 +330,11 @@ def _agent_result_with_bound_issue_and_finding(
             ],
             "required_actions": [
                 claim(
-                    "담당자는 근거와 추출값을 확인한 뒤 수정 또는 승인을 기록해야 합니다.",
+                    (
+                        "다음 조치: 현재 결과가 담당자 검토를 요구하므로, 담당자는 관련 원문, "
+                        "추출값, 규정 Evidence를 확인한 뒤 필요한 수정 또는 승인 결정을 "
+                        "기록해야 합니다."
+                    ),
                     outcome_citation,
                 )
             ],
@@ -720,6 +733,31 @@ def test_durable_outbox_recovers_after_publish_failure(workbench, monkeypatch):
     assert container.repository.list_pending_outbox() == []
 
 
+def test_result_persistence_rejects_evidence_runtime_identity_drift(workbench):
+    client, container = workbench
+    case, _document = _create_case_and_document(client)
+    queued = client.post(
+        f"/api/v1/cases/{case['case_id']}/reviews",
+        json={"trade_type": "import"},
+        headers={**_auth(), "Idempotency-Key": "review-runtime-drift"},
+    ).json()["job"]
+    container.service.expected_evidence_runtime_v3_sha256 = "0" * 64
+
+    with pytest.raises(ConflictError, match="Evidence runtime identity differs"):
+        container.service.execute_job(org_id="org-a", job_id=queued["job_id"])
+
+    rejected = container.repository.get_job("org-a", queued["job_id"])
+    assert rejected is not None
+    assert rejected.status.value == "response_received_rejected"
+    assert rejected.agent_call_state.value == "response_received_rejected"
+    assert container.repository.get_run("org-a", queued["review_run_id"]) is None
+    assert container.repository.get_provider_result("org-a", queued["review_run_id"]) is None
+    rejected_events = container.repository.list_stage_events("org-a", queued["job_id"])
+    assert [event.sequence for event in rejected_events] == list(range(1, len(rejected_events) + 1))
+    assert rejected_events[-1].stage == "failed"
+    assert rejected_events[-1].message_code == "review.response_received_rejected"
+
+
 def test_worker_restart_preserves_job_and_forces_auto_completion_gate(workbench):
     client, container = workbench
     case, _document = _create_case_and_document(client)
@@ -816,6 +854,23 @@ def test_worker_restart_preserves_job_and_forces_auto_completion_gate(workbench)
         restarted.execute_job(org_id="org-a", job_id=queued["job_id"]).result_digest
         == run.result_digest
     )
+    progress_events = container.repository.list_stage_events("org-a", queued["job_id"])
+    assert [event.sequence for event in progress_events] == list(range(1, len(progress_events) + 1))
+    assert [(event.stage, event.state, event.message_code) for event in progress_events] == [
+        ("queued", "completed", "review.queued"),
+        ("input_validation", "started", "review.input_validation_started"),
+        ("input_validation", "completed", "review.input_validation_completed"),
+        ("agent_analysis", "started", "agent.analysis_started"),
+        ("agent_analysis", "completed", "agent.analysis_completed"),
+        ("result_validation", "started", "agent.response_validation_started"),
+        (
+            "result_validation",
+            "completed",
+            "agent.response_validation_completed",
+        ),
+        ("persistence", "started", "review.persistence_started"),
+        ("completed", "completed", "review.completed"),
+    ]
     response = client.get(f"/api/v1/jobs/{queued['job_id']}/events/stream", headers=_auth())
     assert response.status_code == 200
     assert "event: review-stage" in response.text
@@ -966,6 +1021,9 @@ def test_revision_staleness_forbidden_targets_decision_and_chat_binding(workbenc
     assert replayed_approval.json() == approval.json()
     child = container.service.execute_job(org_id="org-a", job_id=revision_job["job_id"])
     assert child.parent_run_id == parent.review_run_id
+    assert [
+        item.review_run_id for item in container.repository.list_runs("org-a", case["case_id"])
+    ] == [child.review_run_id, parent.review_run_id]
     decisions = client.get(
         f"/api/v1/review-runs/{parent.review_run_id}/decisions",
         headers=_auth("approver-token"),
@@ -1167,7 +1225,9 @@ def test_case_chat_outcome_is_derived_from_backend_effective_state(workbench):
         headers={**_auth(), "Idempotency-Key": "chat-effective-answer"},
     )
     assert response.status_code == 201, response.text
-    assert response.json()["answer"] == ("현재 사전심사 상태는 human_review_required입니다.")
+    assert response.json()["answer"] == (
+        "결론 — 현재 사전심사 결과는 담당자 검토가 필요한 상태입니다."
+    )
     assert response.json()["generation_mode"] == "deterministic_fallback"
     assert calls == 0
 
@@ -2149,9 +2209,7 @@ def test_proven_pre_execution_503_retries_same_job_then_executes_runtime_once(wo
         nonlocal transport_attempts, runtime_executions
         transport_attempts += 1
         if transport_attempts == 1:
-            raise AgentPreExecutionRetryableError(
-                request_id="8a5dc01d-41f5-4e56-b9ba-a305f493af2a"
-            )
+            raise AgentPreExecutionRetryableError(request_id="8a5dc01d-41f5-4e56-b9ba-a305f493af2a")
         runtime_executions += 1
         return _agent_result(request)
 
@@ -2199,9 +2257,9 @@ def test_proven_pre_execution_503_retries_same_job_then_executes_runtime_once(wo
         if event.message_code == "review.agent_pre_execution_retry_scheduled"
     ]
     assert len(scheduled) == 1
-    assert scheduled[0].detail["agent_request_id"] == (
-        "8a5dc01d-41f5-4e56-b9ba-a305f493af2a"
-    )
+    assert scheduled[0].stage == "agent_analysis"
+    assert scheduled[0].state == "progress"
+    assert scheduled[0].detail["agent_request_id"] == ("8a5dc01d-41f5-4e56-b9ba-a305f493af2a")
     scheduled_audits = [
         audit
         for audit in container.repository.list_audit("org-a", case["case_id"])
@@ -2221,9 +2279,7 @@ def test_proven_pre_execution_503_exhausts_at_three_and_never_calls_fourth(workb
     def unavailable(_request: AgentReviewRequest) -> dict:
         nonlocal calls
         calls += 1
-        raise AgentPreExecutionRetryableError(
-            request_id="8a5dc01d-41f5-4e56-b9ba-a305f493af2a"
-        )
+        raise AgentPreExecutionRetryableError(request_id="8a5dc01d-41f5-4e56-b9ba-a305f493af2a")
 
     container.service.agent = CallableAgentClient(unavailable)
     job = client.post(
@@ -2261,10 +2317,7 @@ def test_proven_pre_execution_503_exhausts_at_three_and_never_calls_fourth(workb
     assert container.repository.list_runs("org-a", case["case_id"]) == []
     events = container.repository.list_stage_events("org-a", job["job_id"])
     assert (
-        sum(
-            event.message_code == "review.agent_pre_execution_retry_scheduled"
-            for event in events
-        )
+        sum(event.message_code == "review.agent_pre_execution_retry_scheduled" for event in events)
         == 2
     )
     exhausted_events = [
@@ -2273,6 +2326,8 @@ def test_proven_pre_execution_503_exhausts_at_three_and_never_calls_fourth(workb
         if event.message_code == "review.agent_pre_execution_retry_exhausted"
     ]
     assert len(exhausted_events) == 1
+    assert exhausted_events[0].stage == "failed"
+    assert exhausted_events[0].state == "failed"
     assert exhausted_events[0].detail["agent_request_id"] == (
         "8a5dc01d-41f5-4e56-b9ba-a305f493af2a"
     )
@@ -2454,9 +2509,7 @@ def test_pre_execution_retry_transition_is_exact_cas_and_concurrent_once(workben
         with pytest.raises(ConflictError):
             repository.mark_agent_pre_execution_retryable(**arguments)
         assert repository.get_job("org-a", job["job_id"]) == before
-        assert (
-            len(repository.list_stage_events("org-a", job["job_id"])) == before_event_count
-        )
+        assert len(repository.list_stage_events("org-a", job["job_id"])) == before_event_count
         assert len(repository.list_audit("org-a", case["case_id"])) == before_audit_count
 
     def transition(index: int):
@@ -2889,7 +2942,7 @@ def test_case_chat_has_a_durable_single_call_barrier_under_concurrency(workbench
 
     container.service.agent = CallableAgentClient(_agent_result, answer=answer)
     url = f"/api/v1/review-runs/{run.review_run_id}/answers"
-    payload = {"question": "근거를 설명해 주세요.", "bound_result_digest": run.result_digest}
+    payload = {"question": "규정 근거", "bound_result_digest": run.result_digest}
     headers = {**_auth(), "Idempotency-Key": "chat-call-once"}
     with ThreadPoolExecutor(max_workers=2) as executor:
         first = executor.submit(client.post, url, json=payload, headers=headers)
@@ -2930,7 +2983,7 @@ def test_case_chat_response_persistence_failure_closes_the_call_barrier(workbenc
         lambda **_kwargs: (_ for _ in ()).throw(OSError("chat commit unavailable")),
     )
     url = f"/api/v1/review-runs/{run.review_run_id}/answers"
-    payload = {"question": "영속화 경계를 확인합니다.", "bound_result_digest": run.result_digest}
+    payload = {"question": "규정 근거", "bound_result_digest": run.result_digest}
     headers = {**_auth(), "Idempotency-Key": "chat-persistence-once"}
     with pytest.raises(OSError, match="chat commit unavailable"):
         client.post(url, json=payload, headers=headers)

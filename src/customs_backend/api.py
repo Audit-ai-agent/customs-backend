@@ -601,6 +601,10 @@ def build_container(settings: Settings) -> Container:
         human_decision_policy_release=settings.human_decision_policy_release,
         assertion_signer=assertion_signer,
         requirement_policy_resolver=requirement_policy_resolver,
+        expected_evidence_runtime_v3_sha256=(
+            settings.agent_expected_evidence_runtime_v3_sha256
+            or settings.uat_evidence_runtime_v3_sha256
+        ),
         job_lease_seconds=settings.job_lease_seconds,
         job_max_attempts=settings.job_max_attempts,
         outbox_lease_seconds=settings.outbox_lease_seconds,

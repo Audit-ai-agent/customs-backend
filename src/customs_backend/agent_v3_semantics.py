@@ -286,7 +286,7 @@ def _expected_narrative(
     citable_evidence = [
         _require_dict(item, "RAG evidence")
         for item in evidence
-        if _require_dict(item, "RAG evidence").get("eligibility") != "blocked"
+        if _require_dict(item, "RAG evidence").get("eligibility") in {"supporting", "finding"}
     ]
     outcome_reference = references["outcome"]
     if not isinstance(outcome_reference, str):
@@ -294,15 +294,24 @@ def _expected_narrative(
     outcome_citation = [{"kind": "outcome", "reference_id": outcome_reference}]
 
     if issues or findings:
-        summary_text = "문서 또는 규정 검토에서 담당자 확인이 필요한 항목이 발견되었습니다."
+        summary_text = (
+            "사전심사 결론: 확인이 필요한 문서 불일치 또는 미충족 규정 요건이 있어 "
+            "담당자 검토가 필요합니다."
+        )
     elif (
         payload.get("retrieval_status") == "ok"
         and payload.get("retrieval_coverage") == "complete"
         and citable_evidence
     ):
-        summary_text = "현재 검토 범위에서 문서 불일치와 미충족 규정 요건이 발견되지 않았습니다."
+        summary_text = (
+            "사전심사 결론: 현재 검토 범위에서는 문서 불일치나 미충족 규정 요건이 "
+            "확인되지 않았습니다."
+        )
     else:
-        summary_text = "규정 근거가 완전하지 않아 자동 사전심사를 확정할 수 없습니다."
+        summary_text = (
+            "사전심사 결론: 규정 근거가 충분하지 않아 결과를 확정할 수 없으며 "
+            "담당자 검토가 필요합니다."
+        )
 
     issue_references = references["issues"]
     finding_references = references["findings"]
@@ -315,7 +324,10 @@ def _expected_narrative(
 
     document_consistency = [
         {
-            "text": f"{issue['issue_code']}: {issue['message']}",
+            "text": (
+                f"문서 검토 원인({issue['issue_code']}): {issue['message']} "
+                "이 검증 문제가 해결되기 전에는 관련 문서의 정합성을 확정할 수 없습니다."
+            ),
             "citations": [{"kind": "issue", "reference_id": reference_id}],
         }
         for issue, reference_id in zip(issues, issue_references, strict=True)
@@ -323,7 +335,9 @@ def _expected_narrative(
     if not document_consistency:
         document_consistency.append(
             {
-                "text": "결정론적 문서 교차검증에서 불일치가 발견되지 않았습니다.",
+                "text": (
+                    "문서 검토 결과: 결정론적 문서 교차검증에서 불일치가 확인되지 않았습니다."
+                ),
                 "citations": outcome_citation,
             }
         )
@@ -337,7 +351,10 @@ def _expected_narrative(
             raise ValueError("regulatory finding evidence_ids are malformed")
         regulatory_review.append(
             {
-                "text": f"{finding['finding_code']}: {finding['message']}",
+                "text": (
+                    f"규정 검토 원인({finding['finding_code']}): {finding['message']} "
+                    "이 요건이 충족되기 전에는 규정 검토를 완료할 수 없습니다."
+                ),
                 "citations": [
                     {"kind": "finding", "reference_id": reference_id},
                     *[
@@ -351,19 +368,25 @@ def _expected_narrative(
         if citable_evidence:
             regulatory_review.append(
                 {
-                    "text": "조회된 규정 근거 범위에서 별도의 미충족 요건 Finding이 생성되지 않았습니다.",
+                    "text": (
+                        "규정 검토 결과: 실제 조회된 규정 Evidence 범위에서는 "
+                        "별도의 미충족 요건이 확인되지 않았습니다."
+                    ),
                     "citations": [
                         {
                             "kind": "evidence",
                             "reference_id": citable_evidence[0]["evidence_id"],
-                        }
+                        },
+                        *outcome_citation,
                     ],
                 }
             )
         else:
             regulatory_review.append(
                 {
-                    "text": "인용 가능한 규정 근거가 없어 규정 판단을 보류합니다.",
+                    "text": (
+                        "규정 검토 결과: 인용 가능한 규정 근거가 없어 규정 판단을 보류합니다."
+                    ),
                     "citations": outcome_citation,
                 }
             )
@@ -372,14 +395,21 @@ def _expected_narrative(
     if payload.get("requires_human_review") is True:
         required_actions.append(
             {
-                "text": "담당자는 근거와 추출값을 확인한 뒤 수정 또는 승인을 기록해야 합니다.",
+                "text": (
+                    "다음 조치: 현재 결과가 담당자 검토를 요구하므로, 담당자는 관련 원문, "
+                    "추출값, 규정 Evidence를 확인한 뒤 필요한 수정 또는 승인 결정을 "
+                    "기록해야 합니다."
+                ),
                 "citations": outcome_citation,
             }
         )
     if payload.get("status") == "blocked":
         required_actions.append(
             {
-                "text": "차단 원인을 해소한 뒤 새로운 Review Run으로 다시 실행해야 합니다.",
+                "text": (
+                    "다음 조치: 표시된 차단 원인을 먼저 해소한 뒤 새로운 Review Run으로 "
+                    "다시 실행해야 합니다."
+                ),
                 "citations": outcome_citation,
             }
         )
@@ -395,9 +425,12 @@ def _expected_narrative(
         required_actions.append(
             {
                 "text": (
-                    "승인된 자동완료 범위에서 추가 조치가 필요한 항목이 없습니다."
+                    "다음 조치: 승인된 자동완료 범위에서는 추가 확인이 필요하지 않습니다."
                     if release_approved
-                    else "현재 결과는 Release Gate 승인 전까지 자동완료에 사용할 수 없습니다."
+                    else (
+                        "다음 조치: 현재 결과는 Release Gate 승인 전까지 자동완료에 "
+                        "사용할 수 없으므로 담당자가 최종 확인해야 합니다."
+                    )
                 ),
                 "citations": outcome_citation,
             }

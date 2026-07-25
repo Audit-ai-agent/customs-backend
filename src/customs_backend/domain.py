@@ -1699,6 +1699,10 @@ class StageEvent(BaseModel):
     sequence: int = Field(ge=1)
     stage: Literal[
         "queued",
+        "input_validation",
+        "agent_analysis",
+        "result_validation",
+        "persistence",
         "document_analysis",
         "normalization",
         "validation",

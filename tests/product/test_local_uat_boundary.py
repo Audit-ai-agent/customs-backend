@@ -397,9 +397,7 @@ def test_review_worker_delays_only_proven_pre_execution_retry_and_swallows_termi
         JobExecutionNotRunnableError,
     )
 
-    settings = Settings(
-        **_local_uat_values(agent_pre_execution_retry_delay_seconds=60)
-    )
+    settings = Settings(**_local_uat_values(agent_pre_execution_retry_delay_seconds=60))
 
     class FakeService:
         error: Exception
@@ -443,9 +441,14 @@ def test_review_worker_delays_only_proven_pre_execution_retry_and_swallows_termi
 
 
 def test_pre_execution_retry_delay_has_a_bounded_readiness_safe_floor() -> None:
-    assert Settings(agent_pre_execution_retry_delay_seconds=60).agent_pre_execution_retry_delay_seconds == 60
     assert (
-        Settings(agent_pre_execution_retry_delay_seconds=300).agent_pre_execution_retry_delay_seconds
+        Settings(agent_pre_execution_retry_delay_seconds=60).agent_pre_execution_retry_delay_seconds
+        == 60
+    )
+    assert (
+        Settings(
+            agent_pre_execution_retry_delay_seconds=300
+        ).agent_pre_execution_retry_delay_seconds
         == 300
     )
     for value in (59, 301):
@@ -659,6 +662,10 @@ def test_local_uat_container_selects_only_real_boundary_adapters(monkeypatch) ->
     assert isinstance(container.agent, FakeHttpAgent)
     assert container.agent.values["timeout_seconds"] == 435
     assert container.service.auto_completion_enabled is False
+    assert (
+        container.service.expected_evidence_runtime_v3_sha256
+        == _diagnostic_evidence_identity()["runtime_release_v3_sha256"]
+    )
 
     development_container = build_container(
         Settings(
@@ -742,6 +749,9 @@ def _local_uat_app(*, agent_status: str = "ready") -> TestClient:
         auto_completion_enabled=False,
         assertion_signer=_ReadyUatAssertionSigner(),
         requirement_policy_resolver=_uat_policy_resolver(),
+        expected_evidence_runtime_v3_sha256=(
+            _diagnostic_evidence_identity()["runtime_release_v3_sha256"]
+        ),
     )
     container = Container(
         settings=settings,
