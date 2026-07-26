@@ -59,12 +59,13 @@ uv run --locked --extra unit pytest packages/operational_db/tests tests/unit tes
 GitHub Gate는 exact action SHA와 uv `0.11.28`을 사용한다. ephemeral PostgreSQL에서
 migration `003 → 004 → 005 → 006 → 007`, runtime/migrator 권한·append-only 변조 방지,
 JUnit skip 0, OpenAPI byte drift, Docker build, Gitleaks/Bandit, hash가 포함된
-`uv.lock` 전체 dependency audit를 검사한다. Cross-repository Gate는 조직 변수의
-exact Agent commit/wheel SHA를 사용한다. PR에는 cross-repository credential을
-무조건 전달하지 않는다. 보호된 `trusted-cross-repository` Environment의 사람
-승인을 받은 PR 또는 `main` push에서만 repository-scoped GitHub App 단기 token을
-발급하며, 승인 전에는 Job이 대기/실패해 exact wheel의 metadata/review/revision
-HTTP 검증을 우회할 수 없다.
+`uv.lock` 전체 dependency audit를 검사한다. Cross-repository Gate는
+`trusted-cross-repository` Environment의 exact Agent commit/wheel SHA와 Agent
+저장소 하나에만 적용되는 read-only deploy key를 사용한다. 변수·키가 없거나
+identity가 다르면 Job은 fail-closed하여 exact wheel의 metadata/review/revision
+HTTP 검증을 우회할 수 없다. Free private 저장소에서는 Environment 승인과
+branch protection을 GitHub가 강제하지 않으므로 PR head·전체 CI 성공·사람 승인을
+병합 절차에서 수동으로 확인한다.
 
 OpenAPI v1을 재생성하려면:
 

@@ -334,10 +334,9 @@ jobs:
   cross-repository-system:
     name: Exact Agent wheel and service-contract system gate
     needs: [quality-product-contract, security]
-    # This must be a required, reviewable PR check. The protected Environment
-    # controls access to the repository-scoped GitHub App secret; a PR without
-    # approval or exact release variables fails closed instead of silently
-    # deferring interoperability until after merge.
+    # The Environment holds an Agent-repository read-only deploy key and exact
+    # release variables. Missing credentials or identity pins fail closed
+    # instead of silently deferring interoperability until after merge.
     if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     environment: trusted-cross-repository
     runs-on: ubuntu-latest
@@ -364,21 +363,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Mint repository-scoped short-lived GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
-        with:
-          app-id: ${{ secrets.CUSTOMS_CI_APP_ID }}
-          private-key: ${{ secrets.CUSTOMS_CI_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: customs-ai-agent
-
       - name: Checkout exact private Agent commit
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: ${{ github.repository_owner }}/customs-ai-agent
           ref: ${{ vars.CUSTOMS_AI_AGENT_REF }}
-          token: ${{ steps.app-token.outputs.token }}
+          ssh-key: ${{ secrets.CUSTOMS_AI_AGENT_DEPLOY_KEY }}
           path: ${{ env.AGENT_CHECKOUT }}
           fetch-depth: 1
           persist-credentials: false
