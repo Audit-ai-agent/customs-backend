@@ -24,9 +24,7 @@ from customs_backend.release import load_agent_contract_lock
 
 
 _AGENT_REQUEST_ID = "8a5dc01d-41f5-4e56-b9ba-a305f493af2a"
-_AGENT_SERVICE_OPENAPI_SHA256 = (
-    "e0ac396417ddc37a20fce7ed9ba612db3db5d259a3a3393faadfb1ad95f6c64e"
-)
+_AGENT_SERVICE_OPENAPI_SHA256 = "e0ac396417ddc37a20fce7ed9ba612db3db5d259a3a3393faadfb1ad95f6c64e"
 
 
 def _review_request() -> AgentReviewRequest:

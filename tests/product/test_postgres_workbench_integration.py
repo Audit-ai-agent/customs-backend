@@ -759,9 +759,7 @@ def test_postgres_pre_execution_retry_survives_restart_without_outbox_duplicatio
         nonlocal transport_attempts, runtime_executions
         transport_attempts += 1
         if transport_attempts == 1:
-            raise AgentPreExecutionRetryableError(
-                request_id="8a5dc01d-41f5-4e56-b9ba-a305f493af2a"
-            )
+            raise AgentPreExecutionRetryableError(request_id="8a5dc01d-41f5-4e56-b9ba-a305f493af2a")
         runtime_executions += 1
         return _agent_result(request)
 
@@ -853,9 +851,7 @@ def test_postgres_pre_execution_retry_survives_restart_without_outbox_duplicatio
         if event.message_code == "review.agent_pre_execution_retry_scheduled"
     ]
     assert len(scheduled) == 1
-    assert scheduled[0].detail["agent_request_id"] == (
-        "8a5dc01d-41f5-4e56-b9ba-a305f493af2a"
-    )
+    assert scheduled[0].detail["agent_request_id"] == ("8a5dc01d-41f5-4e56-b9ba-a305f493af2a")
 
     cas_case = restarted_service.create_case(
         reviewer,
@@ -878,9 +874,7 @@ def test_postgres_pre_execution_retry_survives_restart_without_outbox_duplicatio
     )
     assert cas_created
     lease_id = f"preexec-cas-lease-{suffix}"
-    sequence = len(
-        restarted_repository.list_stage_events(reviewer.org_id, cas_job.job_id)
-    ) + 1
+    sequence = len(restarted_repository.list_stage_events(reviewer.org_id, cas_job.job_id)) + 1
     claimed = restarted_repository.claim_job(
         org_id=reviewer.org_id,
         job_id=cas_job.job_id,
@@ -924,9 +918,7 @@ def test_postgres_pre_execution_retry_survives_restart_without_outbox_duplicatio
     event_count_before = len(
         restarted_repository.list_stage_events(reviewer.org_id, cas_job.job_id)
     )
-    audit_count_before = len(
-        restarted_repository.list_audit(reviewer.org_id, cas_case.case_id)
-    )
+    audit_count_before = len(restarted_repository.list_audit(reviewer.org_id, cas_case.case_id))
     with engine.connect() as connection:
         outbox_count_before = connection.scalar(
             text(

@@ -282,9 +282,8 @@ class HttpAgentClient:
             return False
         message = error["message"]
         request_id = error["request_id"]
-        if (
-            message != "A required service dependency is not ready."
-            or not isinstance(request_id, str)
+        if message != "A required service dependency is not ready." or not isinstance(
+            request_id, str
         ):
             return False
         try:
