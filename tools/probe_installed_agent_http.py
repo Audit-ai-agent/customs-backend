@@ -10,6 +10,7 @@ not labelled as live Claude or Production Data conformance.
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import subprocess  # nosec B404 - fixed local interpreter and argv only
 import time
@@ -20,6 +21,16 @@ from typing import Any
 
 
 TOKEN = "BackendCrossRepositoryProbe-0123456789-._~+/=Token"  # nosec B105
+
+
+def _agent_python_executable(path: Path) -> Path:
+    # A POSIX virtualenv's ``bin/python`` is commonly a symlink. Resolving that
+    # symlink selects the base interpreter and silently drops the virtualenv's
+    # installed packages, so only make the caller-provided path absolute.
+    executable = Path(os.path.abspath(os.fspath(path)))
+    if not executable.is_file():
+        raise RuntimeError("installed Agent Python executable is unavailable")
+    return executable
 
 
 def _field(name: str, value: str, source_quote: str | None = None) -> dict[str, str]:
@@ -205,7 +216,7 @@ def _probe(
         port = int(reservation.getsockname()[1])
     process = subprocess.Popen(  # nosec B603
         [
-            str(agent_python.resolve(strict=True)),
+            str(_agent_python_executable(agent_python)),
             "-I",
             str(Path(__file__).resolve()),
             "--serve",
