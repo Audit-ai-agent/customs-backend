@@ -327,7 +327,7 @@ def test_deployment_input_verifier_rejects_floating_images_and_plaintext_stores(
         validate_environment(environment, plaintext)
 
 
-def test_cross_repository_pr_gate_uses_a_protected_short_lived_app_token() -> None:
+def test_cross_repository_pr_gate_uses_an_environment_scoped_deploy_key() -> None:
     workflow = (ROOT / ".github/workflows/unit.yml").read_text(encoding="utf-8")
     cross = workflow.split("\n  cross-repository-system:\n", 1)[1]
     assert "CUSTOMS_CROSS_REPO_READ_TOKEN" not in workflow
@@ -337,8 +337,10 @@ def test_cross_repository_pr_gate_uses_a_protected_short_lived_app_token() -> No
         "(github.event_name == 'push' && github.ref == 'refs/heads/main')"
     ) in cross
     assert "environment: trusted-cross-repository" in cross
-    assert "actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349" in cross
-    assert "token: ${{ steps.app-token.outputs.token }}" in cross
+    assert "actions/create-github-app-token@" not in cross
+    assert "repository: ${{ github.repository_owner }}/customs-ai-agent" in cross
+    assert "ssh-key: ${{ secrets.CUSTOMS_AI_AGENT_DEPLOY_KEY }}" in cross
+    assert "persist-credentials: false" in cross
     assert "verify_production_deployment_inputs.py" in workflow
     assert "Negative production input checks fail closed" in workflow
 
