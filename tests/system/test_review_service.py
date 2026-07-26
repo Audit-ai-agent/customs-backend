@@ -67,9 +67,7 @@ def test_execute_review_runs_agent_persists_and_verifies_readback():
     repository = InMemoryOperationalRepository()
     retriever = CompleteNoRequirementRetriever()
 
-    execution = execute_review(
-        _command(), repository=repository, retriever=retriever
-    )
+    execution = execute_review(_command(), repository=repository, retriever=retriever)
     payload = execution.to_api_dict()
 
     assert len(retriever.requests) == 1
@@ -234,9 +232,7 @@ def test_readiness_sends_service_token_in_header_only(monkeypatch):
 
     monkeypatch.setattr(service, "urlopen", fake_urlopen)
 
-    payload = service.fetch_readiness(
-        "http://127.0.0.1:8010", service_token="header-only-token"
-    )
+    payload = service.fetch_readiness("http://127.0.0.1:8010", service_token="header-only-token")
 
     request = captured["request"]
     assert payload["status"] == "ready"

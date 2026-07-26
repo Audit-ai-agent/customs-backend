@@ -1,0 +1,8 @@
+title = "customs-backend secret scanning"
+
+[extend]
+useDefault = true
+
+# Deliberately no path-, rule-, commit-, or regex-wide allowlist. A proven
+# false positive may be suppressed only by one reviewed fingerprint in
+# .gitleaksignore so nearby real credentials remain detectable.

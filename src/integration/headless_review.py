@@ -76,9 +76,7 @@ def run(args: argparse.Namespace) -> dict:
         "knowledge_snapshot_id": snapshot.knowledge_snapshot_id,
         "evidence_count": len(snapshot.evidence),
         "finding_count": len(snapshot.regulatory_findings),
-        "finding_codes": [
-            finding.get("finding_code") for finding in snapshot.regulatory_findings
-        ],
+        "finding_codes": [finding.get("finding_code") for finding in snapshot.regulatory_findings],
         "stored": execution.stored,
         "reused": execution.reused,
         "persistence_verified": execution.persistence_verified,

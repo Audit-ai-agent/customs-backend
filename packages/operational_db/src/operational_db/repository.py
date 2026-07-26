@@ -25,7 +25,11 @@ class InMemoryOperationalRepository:
         self._runs: dict[str, tuple[str, dict[str, Any]]] = {}
 
     def save_run(self, snapshot: ReviewRunSnapshot | dict[str, Any]) -> ReviewRunSnapshot:
-        parsed = snapshot if isinstance(snapshot, ReviewRunSnapshot) else ReviewRunSnapshot.model_validate(snapshot)
+        parsed = (
+            snapshot
+            if isinstance(snapshot, ReviewRunSnapshot)
+            else ReviewRunSnapshot.model_validate(snapshot)
+        )
         digest = parsed.canonical_hash()
         previous = self._runs.get(parsed.review_run_id)
         if previous:
@@ -35,7 +39,9 @@ class InMemoryOperationalRepository:
                 )
             return ReviewRunSnapshot.model_validate(deepcopy(previous[1]))
         if parsed.parent_run_id and parsed.parent_run_id not in self._runs:
-            raise OperationalIntegrityError("parent_run_id must reference an existing immutable run")
+            raise OperationalIntegrityError(
+                "parent_run_id must reference an existing immutable run"
+            )
         payload = parsed.model_dump(mode="json")
         self._runs[parsed.review_run_id] = (digest, deepcopy(payload))
         return ReviewRunSnapshot.model_validate(payload)
@@ -58,7 +64,11 @@ class PostgresOperationalRepository:
         )
 
     def save_run(self, snapshot: ReviewRunSnapshot | dict[str, Any]) -> ReviewRunSnapshot:
-        parsed = snapshot if isinstance(snapshot, ReviewRunSnapshot) else ReviewRunSnapshot.model_validate(snapshot)
+        parsed = (
+            snapshot
+            if isinstance(snapshot, ReviewRunSnapshot)
+            else ReviewRunSnapshot.model_validate(snapshot)
+        )
         try:
             import psycopg
             from psycopg.rows import dict_row
@@ -74,7 +84,9 @@ class PostgresOperationalRepository:
             if existing:
                 stored = ReviewRunSnapshot.model_validate(existing["result_json"])
                 if stored.canonical_hash() != parsed.canonical_hash():
-                    raise OperationalIntegrityError("review_run_id already contains a different snapshot")
+                    raise OperationalIntegrityError(
+                        "review_run_id already contains a different snapshot"
+                    )
                 return stored
 
             if parsed.parent_run_id:
@@ -268,8 +280,7 @@ class PostgresOperationalRepository:
     @staticmethod
     def _extracted_fields(extracted: dict[str, Any]) -> list[tuple[str, Any]]:
         rows = [
-            (f"fields.{name}", value)
-            for name, value in (extracted.get("fields") or {}).items()
+            (f"fields.{name}", value) for name, value in (extracted.get("fields") or {}).items()
         ]
         for index, item in enumerate(extracted.get("line_items") or []):
             item_key = item.get("item_id") or str(index)
