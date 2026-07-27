@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum
 from typing import Any, Literal, cast
@@ -46,6 +47,122 @@ _SAFE_SUGGESTED_QUESTIONS = [
     "담당자가 먼저 확인할 항목은 무엇입니까?",
     "연결된 법령 근거가 이 심사 건에서 어떤 의미입니까?",
 ]
+_PRESENTATION_ROLE_PREFIXES: dict[str, tuple[str, ...]] = {
+    "conclusion": ("", "검토 결과를 먼저 말씀드리면, "),
+    "observation": ("", "확인 결과, "),
+    "reason": ("", "그 이유를 설명드리면, "),
+    "evidence": ("", "법령 근거를 확인한 결과, "),
+    "impact": ("", "업무상 의미를 말씀드리면, "),
+    "action": ("", "담당자가 다음으로 할 일은, "),
+    "limitation": ("", "검토 범위를 함께 안내드리면, "),
+}
+_ANSWER_AREA_PREFIXES: dict[str, tuple[str, ...]] = {
+    "direct_answer": ("", "질문에 바로 답변드리면, "),
+    "explanation": ("", "확인된 내용을 설명드리면, "),
+    "evidence_meaning": ("", "법령 근거를 기준으로 보면, "),
+    "impact": ("", "업무상 영향은 다음과 같습니다. "),
+    "next_steps": ("", "다음 조치는 다음과 같습니다. "),
+}
+_ANSWER_AREA_ROLES: dict[str, frozenset[str]] = {
+    "direct_answer": frozenset(
+        {"conclusion", "observation", "reason", "evidence", "impact", "action", "limitation"}
+    ),
+    "explanation": frozenset({"conclusion", "observation", "reason", "limitation"}),
+    "evidence_meaning": frozenset({"evidence", "limitation"}),
+    "impact": frozenset({"impact"}),
+    "next_steps": frozenset({"action"}),
+}
+_CASE_LIMITATION = "답변은 현재 심사 회차와 연결된 문서·법령 근거 범위에 한정됩니다."
+_GENERAL_GUIDANCE_LIMITATION = (
+    "위 내용은 일반 통관 안내이며 현재 심사 건의 판정이나 법적 의무를 뜻하지 않습니다."
+)
+_DOCUMENT_TYPE_LABELS = {
+    "invoice": "상업송장(CI)",
+    "packing_list": "포장명세서(PL)",
+    "bill_of_lading": "선하증권(B/L)",
+    "certificate_of_origin": "원산지증명서(C/O)",
+    "unknown": "제출 문서",
+}
+_FIELD_LABELS = {
+    "invoice_no": "송장번호",
+    "invoice_number": "송장번호",
+    "invoice_date": "송장 발행일",
+    "packing_no": "포장명세서 번호",
+    "bl_no": "선하증권 번호",
+    "certificate_no": "원산지증명서 번호",
+    "seller": "판매자",
+    "buyer": "구매자",
+    "exporter": "수출자",
+    "importer": "수입자",
+    "shipper": "송하인",
+    "consignee": "수하인",
+    "notify_party": "착하통지처",
+    "vessel": "선박명",
+    "voyage_no": "항차",
+    "port_of_loading": "선적항",
+    "port_of_discharge": "양륙항",
+    "departure_date": "출항일",
+    "country_of_origin": "원산지",
+    "origin_country": "원산지",
+    "hs_code": "품목분류번호(HSK)",
+    "description": "품명",
+    "goods_description": "물품 설명",
+    "quantity": "수량",
+    "unit_price": "단가",
+    "line_amount": "품목 금액",
+    "total_amount": "총금액",
+    "currency": "통화",
+    "packages": "포장 수량",
+    "gross_weight_kg": "총중량",
+    "total_gross_weight_kg": "전체 총중량",
+    "net_weight_kg": "순중량",
+    "measurement_cbm": "용적",
+    "container_numbers": "컨테이너 번호",
+    "seal_numbers": "봉인 번호",
+    "shipping_marks": "화인",
+}
+_FIELD_PRIORITY = {
+    name: index
+    for index, name in enumerate(
+        (
+            "invoice_no",
+            "invoice_number",
+            "invoice_date",
+            "packing_no",
+            "bl_no",
+            "certificate_no",
+            "hs_code",
+            "description",
+            "goods_description",
+            "quantity",
+            "unit_price",
+            "line_amount",
+            "total_amount",
+            "currency",
+            "country_of_origin",
+            "origin_country",
+            "seller",
+            "buyer",
+            "exporter",
+            "importer",
+            "shipper",
+            "consignee",
+            "vessel",
+            "voyage_no",
+            "port_of_loading",
+            "port_of_discharge",
+            "departure_date",
+            "packages",
+            "gross_weight_kg",
+            "total_gross_weight_kg",
+            "net_weight_kg",
+            "measurement_cbm",
+            "container_numbers",
+            "seal_numbers",
+            "shipping_marks",
+        )
+    )
+}
 _SAFE_STAGE_COUNT_KEYS = frozenset(
     {
         "documents",
@@ -60,11 +177,108 @@ _SAFE_STAGE_COUNT_KEYS = frozenset(
 _PRESENTATION_TASK_ID = "customs_experience_report"
 _CHAT_TASK_ID = "customs_case_answer_v2"
 _CITATION_KINDS = frozenset({"field_source", "issue", "finding", "evidence", "outcome"})
-_PROTECTED_LITERAL_PATTERNS = (
-    re.compile(r"(?<!\d)\d{10}(?!\d)"),
-    re.compile(r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)"),
-    re.compile(r"(?<![A-Za-z0-9])[A-Z]{2,10}[-/][A-Z0-9][A-Z0-9._/-]{2,63}"),
+_GROUNDED_ATOM_PATTERNS = (
+    (
+        "date",
+        re.compile(r"(?<!\d)(?:\d{4}-\d{1,2}-\d{1,2}|\d{4}년\s*\d{1,2}월\s*\d{1,2}일)(?!\d)"),
+    ),
+    (
+        "law_reference",
+        re.compile(
+            r"제\s*\d+\s*조(?:의\s*\d+)?(?:\s*제?\s*\d+\s*항)?"
+            r"(?:\s*제?\s*\d+\s*호)?"
+        ),
+    ),
+    (
+        "hsk",
+        re.compile(
+            r"(?:HSK?|품목분류(?:코드)?|품목번호)\s*[:#]?\s*"
+            r"\d(?:[\d.\s-]{2,18}\d)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "percentage",
+        re.compile(r"(?<![\w])\d+(?:\.\d+)?\s*(?:%|퍼센트)(?![\w])", re.IGNORECASE),
+    ),
+    (
+        "money",
+        re.compile(
+            r"(?<![\w])(?:(?:USD|KRW|EUR|JPY|\$|₩)\s*"
+            r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|"
+            r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?\s*"
+            r"(?:원|달러|유로|엔))(?![\w])",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "measure",
+        re.compile(
+            r"(?<![\w])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?\s*"
+            r"(?:개|건|장|매|상자|박스|포|kg|㎏|g|톤|t|L|리터|"
+            r"일|주|개월|년|시간|분|초|회|종)(?![\w])",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "identifier",
+        re.compile(r"(?<![A-Za-z0-9])[A-Z]{2,10}[-/][A-Z0-9][A-Z0-9._/-]{2,63}"),
+    ),
 )
+_GROUNDED_PROPOSITION_PATTERNS = {
+    "customs_approval_asserted": re.compile(
+        r"(?:통관|수입|수출).{0,16}(?:승인|허가)(?:되|됐|완료|가능)",
+    ),
+    "customs_rejection_asserted": re.compile(
+        r"(?:통관|수입|수출).{0,16}(?:거절|불허|금지|반려)",
+    ),
+    "human_review_not_required": re.compile(
+        r"(?:담당자|사람|인적).{0,16}(?:검토|확인).{0,16}"
+        r"(?:필요하지\s*않|불필요|생략|없이)",
+    ),
+    "human_review_required": re.compile(
+        r"(?:(?:담당자|사람|인적).{0,16}(?:검토|확인).{0,16}"
+        r"(?:필요|요구|해야|하여야)|(?:검토|확인).{0,16}(?:담당자|사람).{0,8}(?:필요|요구))",
+    ),
+    "processing_without_review_allowed": re.compile(
+        r"(?:별도|담당자|사람|인적).{0,16}(?:검토|확인).{0,16}"
+        r"(?:없이|생략).{0,16}(?:처리|진행|완료|승인)",
+    ),
+    "auto_completion_allowed": re.compile(
+        r"(?:자동\s*(?:처리|완료)|자동완료).{0,16}(?:가능|허용|활성|완료)",
+    ),
+    "auto_completion_blocked": re.compile(
+        r"(?:자동\s*(?:처리|완료)|자동완료).{0,16}"
+        r"(?:불가|차단|꺼짐|비활성|허용되지\s*않)",
+    ),
+    "no_issue_asserted": re.compile(
+        r"(?:문제|불일치|누락|위반).{0,12}(?:없|발견되지\s*않|확인하지\s*못)",
+    ),
+    "issue_asserted": re.compile(
+        r"(?:문제|불일치|누락|위반).{0,12}(?:있|발견|확인되|발생)",
+    ),
+    "legal_obligation_asserted": re.compile(
+        r"(?:필수|의무|반드시|제출해야|제출하여야|준수해야|준수하여야)",
+    ),
+    "legal_exemption_asserted": re.compile(
+        r"(?:면세|감면|면제|의무가\s*없|제출할\s*필요가\s*없)",
+    ),
+    "requirements_satisfied_asserted": re.compile(
+        r"(?:모든|전체).{0,12}(?:요건|의무).{0,12}(?:충족|완료)",
+    ),
+    "no_further_action_required": re.compile(
+        r"(?:추가|별도).{0,12}(?:조치|보완|확인).{0,12}(?:없|불필요|필요하지)",
+    ),
+}
+
+
+@dataclass(frozen=True)
+class GroundedAtomicClaim:
+    """A deterministic value or high-risk proposition that must be source-bound."""
+
+    kind: str
+    value: str
+
 
 PresentationSectionCode = Literal[
     "conclusion",
@@ -135,7 +349,16 @@ class AnswerScopeClassificationAuditV1(BaseModel):
             "bill_of_lading",
             "certificate_of_origin",
             "hsk",
+            "hs_hsk_comparison",
             "customs_review",
+            "import_declaration",
+            "customs_valuation",
+            "duties_and_taxes",
+            "free_trade_agreement",
+            "import_requirements",
+            "inspection_and_supplement",
+            "document_correction",
+            "customs_broker",
         ]
     ] = Field(default_factory=list, max_length=3)
 
@@ -191,14 +414,23 @@ class ExperienceVerificationAuditV1(BaseModel):
     verifier_model_id: str | None = Field(default=None, min_length=1, max_length=128)
     verifier_prompt_sha256: str = Field(pattern=_SHA256_PATTERN)
     verifier_schema_sha256: str = Field(pattern=_SHA256_PATTERN)
+    verifier_context_sha256: str | None = Field(
+        default=None,
+        pattern=_SHA256_PATTERN,
+    )
     checked_statement_count: int = Field(ge=0, le=1000)
     verified_content_sha256: str = Field(pattern=_SHA256_PATTERN)
     reason_codes: list[str] = Field(default_factory=list, max_length=100)
 
     @model_validator(mode="after")
     def verifier_identity_is_consistent(self) -> "ExperienceVerificationAuditV1":
-        if (self.entailment_verifier == "claude") != (self.verifier_model_id is not None):
+        claude = self.entailment_verifier == "claude"
+        if claude != (
+            self.verifier_model_id is not None and self.verifier_context_sha256 is not None
+        ):
             raise ValueError("entailment verifier identity is incomplete")
+        if not claude and self.verifier_context_sha256 is not None:
+            raise ValueError("a non-model verifier cannot claim a context identity")
         if self.status == "passed" and (not self.deterministic_checks_passed or self.reason_codes):
             raise ValueError("passed verification cannot contain blockers")
         if self.status == "fallback" and not self.reason_codes:
@@ -282,6 +514,96 @@ def _canonical_claim(
         citation_references=deduplicated,
         material=True,
     )
+
+
+def _framed_texts(text: str, prefixes: tuple[str, ...]) -> frozenset[str]:
+    canonical = " ".join(text.split())
+    return frozenset(f"{prefix}{canonical}" for prefix in prefixes)
+
+
+def _presentation_renderings(
+    claims: list[CanonicalExperienceClaimV1],
+) -> frozenset[str]:
+    if not claims:
+        return frozenset()
+    canonical = " ".join(item.canonical_text for item in claims)
+    return _framed_texts(canonical, _PRESENTATION_ROLE_PREFIXES[claims[0].role])
+
+
+def _answer_renderings(
+    claim: CanonicalExperienceClaimV1,
+    area: str,
+) -> frozenset[str]:
+    if claim.role not in _ANSWER_AREA_ROLES[area]:
+        return frozenset()
+    return _framed_texts(claim.canonical_text, _ANSWER_AREA_PREFIXES[area])
+
+
+def _guidance_renderings(text: str, area: str) -> frozenset[str]:
+    if area not in {"direct_answer", "explanation"}:
+        return frozenset()
+    return _framed_texts(text, _ANSWER_AREA_PREFIXES[area])
+
+
+def _field_fact_claims(
+    result: AgentReviewResultV3,
+) -> list[CanonicalExperienceClaimV1]:
+    document_types = {
+        item.get("document_id"): _DOCUMENT_TYPE_LABELS.get(
+            str(item.get("document_type")),
+            "제출 문서",
+        )
+        for item in result.document_results
+        if isinstance(item, dict) and isinstance(item.get("document_id"), str)
+    }
+    candidates = [
+        item
+        for item in result.fact_ledger.get("entries", [])
+        if isinstance(item, dict)
+        and item.get("kind") == "field_source"
+        and isinstance(item.get("reference_id"), str)
+        and isinstance(item.get("label"), str)
+        and isinstance(item.get("value"), str)
+        and item["value"].strip().casefold() not in {"", "null", "none", "[]", "{}"}
+    ]
+
+    def sort_key(item: dict[str, Any]) -> tuple[int, str, str]:
+        field_name = item["label"].rsplit(".", 1)[-1]
+        return (
+            _FIELD_PRIORITY.get(field_name, len(_FIELD_PRIORITY) + 1),
+            str(item.get("document_id") or ""),
+            item["reference_id"],
+        )
+
+    claims: list[CanonicalExperienceClaimV1] = []
+    for entry in sorted(candidates, key=sort_key)[:80]:
+        field_name = entry["label"].rsplit(".", 1)[-1]
+        field_label = _FIELD_LABELS.get(field_name, "문서 기재 항목")
+        document_label = document_types.get(entry.get("document_id"), "제출 문서")
+        value = " ".join(entry["value"].split())[:1_000]
+        claims.append(
+            _canonical_claim(
+                "document_comparison",
+                "observation",
+                f"{document_label}에서 {field_label}의 기록값은 “{value}”로 확인되었습니다.",
+                [
+                    CitationReferenceV1(
+                        kind="field_source",
+                        reference_id=entry["reference_id"],
+                    )
+                ],
+            )
+        )
+    return claims
+
+
+def build_answer_experience_claim_catalog(
+    result: AgentReviewResultV3,
+) -> list[CanonicalExperienceClaimV1]:
+    return [
+        *build_canonical_experience_claim_catalog(result),
+        *_field_fact_claims(result),
+    ]
 
 
 def build_canonical_experience_claim_catalog(
@@ -1002,6 +1324,56 @@ class CaseConversationRequestV2(BaseModel):
         return self
 
 
+_ANSWER_VERIFIED_CONTENT_FIELDS = (
+    "request_sha256",
+    "answer_scope",
+    "status",
+    "direct_answer",
+    "explanation",
+    "evidence_meaning",
+    "impact",
+    "next_steps",
+    "limitations",
+    "claim_selections",
+    "citations",
+    "suggested_questions",
+    "used_context_message_ids",
+)
+
+
+def assistant_answer_verified_content_sha256(values: dict[str, Any]) -> str:
+    """Hash all user-visible and lineage-bearing answer values."""
+
+    return canonical_digest({field: values[field] for field in _ANSWER_VERIFIED_CONTENT_FIELDS})
+
+
+class AnswerClaimSelectionsV1(BaseModel):
+    """Canonical claim IDs selected for each user-visible answer area."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    direct_answer: list[str] = Field(default_factory=list, max_length=20)
+    explanation: list[str] = Field(default_factory=list, max_length=40)
+    evidence_meaning: list[str] = Field(default_factory=list, max_length=40)
+    impact: list[str] = Field(default_factory=list, max_length=40)
+    next_steps: list[str] = Field(default_factory=list, max_length=40)
+
+    @field_validator(
+        "direct_answer",
+        "explanation",
+        "evidence_meaning",
+        "impact",
+        "next_steps",
+    )
+    @classmethod
+    def claim_ids_are_unique_and_typed(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)) or any(
+            re.fullmatch(r"experience_claim_[a-f0-9]{64}", item) is None for item in value
+        ):
+            raise ValueError("answer claim selections contain an invalid claim ID")
+        return value
+
+
 class AssistantAnswerV2(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1021,6 +1393,7 @@ class AssistantAnswerV2(BaseModel):
     impact: list[str] = Field(default_factory=list, max_length=20)
     next_steps: list[str] = Field(default_factory=list, max_length=20)
     limitations: list[str] = Field(default_factory=list, max_length=20)
+    claim_selections: AnswerClaimSelectionsV1 = Field(default_factory=AnswerClaimSelectionsV1)
     citations: list[CitationReferenceV1] = Field(default_factory=list, max_length=100)
     suggested_questions: list[str] = Field(default_factory=list, max_length=3)
     used_context_message_ids: list[str] = Field(default_factory=list, max_length=8)
@@ -1052,6 +1425,12 @@ class AssistantAnswerV2(BaseModel):
             raise ValueError("case and Evidence answers require citations")
         if self.status in {"clarification_needed", "out_of_scope"} and self.citations:
             raise ValueError("clarification and out-of-scope answers cannot claim citations")
+        values = self.model_dump(mode="json")
+        if (
+            self.verification_audit.verified_content_sha256
+            != assistant_answer_verified_content_sha256(values)
+        ):
+            raise ValueError("assistant verifier receipt is not bound to its visible content")
         payload = self.model_dump(mode="json", exclude={"answer_sha256"})
         if self.answer_sha256 != canonical_digest(payload):
             raise ValueError("assistant answer SHA-256 does not bind its contents")
@@ -1247,13 +1626,31 @@ def claim_catalog(result: AgentReviewResultV3) -> tuple[set[str], set[tuple[str,
     return claim_ids, references
 
 
-def protected_literals(value: Any) -> set[str]:
+def grounded_atomic_claims(value: Any) -> set[GroundedAtomicClaim]:
+    """Extract independently checkable literals and high-risk proposition polarity.
+
+    Claude's verifier is useful evidence, but it is not an independent Backend
+    trust boundary. A material sentence may only introduce quantities, dates,
+    legal references, identifiers, or safety-critical conclusions already
+    represented by its bound canonical claims.
+    """
+
     text = value if isinstance(value, str) else str(value)
-    return {
-        match.group(0)
-        for pattern in _PROTECTED_LITERAL_PATTERNS
-        for match in pattern.finditer(text)
-    }
+    atoms: set[GroundedAtomicClaim] = set()
+    for kind, pattern in _GROUNDED_ATOM_PATTERNS:
+        for match in pattern.finditer(text):
+            normalized = re.sub(r"[\s,]+", "", match.group(0)).upper()
+            atoms.add(GroundedAtomicClaim(kind=kind, value=normalized))
+    for proposition, pattern in _GROUNDED_PROPOSITION_PATTERNS.items():
+        if pattern.search(text):
+            atoms.add(GroundedAtomicClaim(kind="proposition", value=proposition))
+    return atoms
+
+
+def protected_literals(value: Any) -> set[str]:
+    """Compatibility projection used by the existing validation call sites."""
+
+    return {f"{atom.kind}:{atom.value}" for atom in grounded_atomic_claims(value)}
 
 
 def _expected_presentation_headline(result: AgentReviewResultV3) -> str:
@@ -1338,6 +1735,17 @@ def _validate_presentation_audit(
             "sections": [section.model_dump(mode="json") for section in presentation.sections],
         }
     )
+    canonical_claims = build_canonical_experience_claim_catalog(envelope.canonical_result)
+    verifier_context_sha256 = canonical_digest(
+        {
+            "canonical_claims": [claim.model_dump(mode="json") for claim in canonical_claims],
+            "candidate_statements": [
+                statement.model_dump(mode="json")
+                for section in presentation.sections
+                for statement in section.statements
+            ],
+        }
+    )
     if (
         generation.task_id != _PRESENTATION_TASK_ID
         or generation.prompt_sha256 != prompts["presentation"]
@@ -1355,6 +1763,7 @@ def _validate_presentation_audit(
             or verification.status != "passed"
             or verification.entailment_verifier != "claude"
             or verification.verifier_model_id != envelope.capability_attestation.model_id
+            or verification.verifier_context_sha256 != verifier_context_sha256
             or verification.reason_codes
         ):
             raise ValueError("Claude presentation audit is incomplete")
@@ -1363,6 +1772,7 @@ def _validate_presentation_audit(
         or verification.status != "fallback"
         or verification.entailment_verifier != "not_run"
         or verification.verifier_model_id is not None
+        or verification.verifier_context_sha256 is not None
         or not verification.reason_codes
     ):
         raise ValueError("deterministic presentation fallback audit is inconsistent")
@@ -1389,8 +1799,10 @@ def validate_presentation_against_result(envelope: ReviewExperienceEnvelopeV1) -
         raise ValueError("experience capability does not bind the canonical runtime")
     _result_claim_ids, references = claim_catalog(result)
     source_text = str(result.model_dump(mode="json"))
-    source_literals = protected_literals(source_text)
     expected_claims = build_canonical_experience_claim_catalog(result)
+    source_literals = protected_literals(
+        " ".join([source_text, *(claim.canonical_text for claim in expected_claims)])
+    )
     claim_index = {item.claim_id: item for item in expected_claims}
     statement_count = sum(
         len(section.statements) for section in envelope.user_presentation.sections
@@ -1522,6 +1934,7 @@ def build_deterministic_review_experience(
             "verifier_model_id": None,
             "verifier_prompt_sha256": lock.prompt_identities["entailment"],
             "verifier_schema_sha256": lock.output_schema_identities["entailment"],
+            "verifier_context_sha256": None,
             "checked_statement_count": sum(len(section.statements) for section in sections),
             "verified_content_sha256": verified_content_sha256,
             "reason_codes": [reason_code],
@@ -1562,7 +1975,7 @@ def _expected_fallback_answer_fields(
     if classification is None:
         raise ValueError("assistant fallback omitted scope-classification audit")
     scope = answer.answer_scope
-    claims = build_canonical_experience_claim_catalog(result)
+    claims = build_answer_experience_claim_catalog(result)
     guidance: dict[str, str] = {}
     if scope == "evidence_grounded":
         claims = [item for item in claims if item.section_code == "regulatory_meaning"]
@@ -1579,14 +1992,15 @@ def _expected_fallback_answer_fields(
         claims = []
     else:
         claims = []
-    claims = claims[:40]
-    citations = list(
-        {
-            (citation.kind, citation.reference_id): citation
-            for claim in claims
-            for citation in claim.citation_references
-        }.values()
-    )
+    claims = claims[:100]
+    selected_claims: list[CanonicalExperienceClaimV1] = []
+    claim_selections: dict[str, list[str]] = {
+        "direct_answer": [],
+        "explanation": [],
+        "evidence_meaning": [],
+        "impact": [],
+        "next_steps": [],
+    }
     if scope == "out_of_scope":
         status = "out_of_scope"
         direct = (
@@ -1619,29 +2033,46 @@ def _expected_fallback_answer_fields(
         if not claims:
             raise ValueError("assistant Case fallback has no canonical claim")
         status = "answered"
-        direct = claims[0].canonical_text
-        explanation = [item.canonical_text for item in claims[1:6]]
-    evidence_meaning = (
-        [item.canonical_text for item in claims if item.role == "evidence"][:5]
-        if status == "answered"
+        direct_claim = claims[0]
+        explanation_claims = [
+            item for item in claims[1:] if item.role in _ANSWER_AREA_ROLES["explanation"]
+        ][:5]
+        direct = direct_claim.canonical_text
+        explanation = [item.canonical_text for item in explanation_claims]
+        claim_selections["direct_answer"] = [direct_claim.claim_id]
+        claim_selections["explanation"] = [item.claim_id for item in explanation_claims]
+        selected_claims.extend([direct_claim, *explanation_claims])
+    evidence_claims = (
+        [item for item in claims if item.role in _ANSWER_AREA_ROLES["evidence_meaning"]][:5]
+        if status == "answered" and scope != "general_customs_guidance"
         else []
     )
-    impact = (
-        [item.canonical_text for item in claims if item.role == "impact"][:5]
-        if status == "answered"
+    impact_claims = (
+        [item for item in claims if item.role in _ANSWER_AREA_ROLES["impact"]][:5]
+        if status == "answered" and scope != "general_customs_guidance"
         else []
     )
-    next_steps = (
-        [item.canonical_text for item in claims if item.role == "action"][:5]
-        if status == "answered"
+    action_claims = (
+        [item for item in claims if item.role in _ANSWER_AREA_ROLES["next_steps"]][:5]
+        if status == "answered" and scope != "general_customs_guidance"
         else []
+    )
+    selected_claims.extend([*evidence_claims, *impact_claims, *action_claims])
+    claim_selections["evidence_meaning"] = [item.claim_id for item in evidence_claims]
+    claim_selections["impact"] = [item.claim_id for item in impact_claims]
+    claim_selections["next_steps"] = [item.claim_id for item in action_claims]
+    evidence_meaning = [item.canonical_text for item in evidence_claims]
+    impact = [item.canonical_text for item in impact_claims]
+    next_steps = [item.canonical_text for item in action_claims]
+    citations = list(
+        {
+            (citation.kind, citation.reference_id): citation
+            for claim in selected_claims
+            for citation in claim.citation_references
+        }.values()
     )
     limitations = [
-        (
-            "위 내용은 일반 통관 안내이며 현재 심사 건의 판정이나 법적 의무를 뜻하지 않습니다."
-            if scope == "general_customs_guidance"
-            else "답변은 현재 심사 회차와 연결된 문서·법령 근거 범위에 한정됩니다."
-        )
+        (_GENERAL_GUIDANCE_LIMITATION if scope == "general_customs_guidance" else _CASE_LIMITATION)
     ]
     return {
         "status": status,
@@ -1651,6 +2082,7 @@ def _expected_fallback_answer_fields(
         "impact": impact,
         "next_steps": next_steps,
         "limitations": limitations,
+        "claim_selections": AnswerClaimSelectionsV1.model_validate(claim_selections),
         "citations": citations if status == "answered" else [],
         "suggested_questions": _SAFE_SUGGESTED_QUESTIONS,
         "used_context_message_ids": expected_context_message_ids,
@@ -1660,10 +2092,11 @@ def _expected_fallback_answer_fields(
 def validate_answer_against_context(
     *,
     answer: AssistantAnswerV2,
-    result: AgentReviewResultV3,
-    expected_context_message_ids: list[str],
-    expected_request_sha256: str,
+    request: CaseConversationRequestV2,
 ) -> None:
+    result = request.review_result
+    expected_context_message_ids = [item.message_id for item in request.recent_turns]
+    expected_request_sha256 = canonical_digest(request.model_dump(mode="json"))
     permitted_context_message_ids = set(expected_context_message_ids)
     _claim_ids, references = claim_catalog(result)
     if not set(answer.used_context_message_ids).issubset(permitted_context_message_ids):
@@ -1676,22 +2109,6 @@ def validate_answer_against_context(
     material_scopes = {"case_grounded", "evidence_grounded"}
     if answer.answer_scope in material_scopes and not answer.citations:
         raise ValueError("case or Evidence answer requires canonical citations")
-    if answer.answer_scope in material_scopes:
-        source_literals = protected_literals(result.model_dump(mode="json"))
-        answer_literals = protected_literals(
-            " ".join(
-                [
-                    answer.direct_answer,
-                    *answer.explanation,
-                    *answer.evidence_meaning,
-                    *answer.impact,
-                    *answer.next_steps,
-                    *answer.limitations,
-                ]
-            )
-        )
-        if not answer_literals.issubset(source_literals):
-            raise ValueError("assistant answer introduced a protected literal absent from sources")
     lock = validate_agent_experience_contract_bundle().lock
     prompts = lock.prompt_identities
     schemas = lock.output_schema_identities
@@ -1725,6 +2142,7 @@ def validate_answer_against_context(
             "impact": answer.impact,
             "next_steps": answer.next_steps,
             "limitations": answer.limitations,
+            "claim_selections": answer.claim_selections.model_dump(mode="json"),
             "citations": [citation.model_dump(mode="json") for citation in answer.citations],
             "suggested_questions": answer.suggested_questions,
             "used_context_message_ids": answer.used_context_message_ids,
@@ -1746,6 +2164,103 @@ def validate_answer_against_context(
         or not verification.deterministic_checks_passed
     ):
         raise ValueError("assistant generation or verification identity is not pinned")
+    answer_areas = {
+        "direct_answer": [answer.direct_answer],
+        "explanation": answer.explanation,
+        "evidence_meaning": answer.evidence_meaning,
+        "impact": answer.impact,
+        "next_steps": answer.next_steps,
+    }
+    answer_claims = build_answer_experience_claim_catalog(result)
+    if answer.answer_scope == "evidence_grounded":
+        answer_claims = [
+            claim for claim in answer_claims if claim.section_code == "regulatory_meaning"
+        ]
+    elif answer.answer_scope != "case_grounded":
+        answer_claims = []
+    answer_claims = answer_claims[:100]
+    guidance: dict[str, str] = {}
+    if answer.answer_scope == "general_customs_guidance":
+        catalog = provider_meaning_catalog()
+        try:
+            guidance = {
+                topic: catalog.general_guidance[topic] for topic in classification.guidance_topics
+            }
+        except KeyError as exc:
+            raise ValueError("assistant guidance topic is outside the provider catalog") from exc
+
+    if answer.answer_scope in material_scopes:
+        claim_index = {claim.claim_id: claim for claim in answer_claims}
+        selected_claims: dict[str, CanonicalExperienceClaimV1] = {}
+        claim_selections = answer.claim_selections.model_dump(mode="json")
+        for area, texts in answer_areas.items():
+            claim_ids = claim_selections[area]
+            claims = [claim_index.get(claim_id) for claim_id in claim_ids]
+            if any(claim is None for claim in claims):
+                raise ValueError(f"material assistant {area} selected an unknown claim")
+            typed_claims = [claim for claim in claims if claim is not None]
+            if any(claim.role not in _ANSWER_AREA_ROLES[area] for claim in typed_claims):
+                raise ValueError(f"material assistant {area} selected a claim with wrong role")
+            if bool(texts) != bool(typed_claims):
+                raise ValueError(f"material assistant {area} claim coverage is inconsistent")
+            if texts and not protected_literals(" ".join(texts)).issubset(
+                protected_literals(" ".join(claim.canonical_text for claim in typed_claims))
+            ):
+                raise ValueError(
+                    f"material assistant {area} introduced an atom absent from selected claims"
+                )
+            for claim in typed_claims:
+                selected_claims[claim.claim_id] = claim
+        if not answer.direct_answer or not answer.claim_selections.direct_answer:
+            raise ValueError("material assistant direct answer has no selected claim")
+        if answer.limitations != [_CASE_LIMITATION]:
+            raise ValueError("material assistant limitation differs from the safe template")
+        expected_citations = {
+            (citation.kind, citation.reference_id)
+            for claim in selected_claims.values()
+            for citation in claim.citation_references
+        }
+        observed_citations = {
+            (citation.kind, citation.reference_id) for citation in answer.citations
+        }
+        if expected_citations != observed_citations:
+            raise ValueError("assistant claim citation binding differs from selected claims")
+    elif answer.answer_scope == "general_customs_guidance":
+        if (
+            any(answer.claim_selections.model_dump(mode="json").values())
+            or not answer.direct_answer
+            or not protected_literals(
+                " ".join(text for texts in answer_areas.values() for text in texts)
+            ).issubset(protected_literals(" ".join(guidance.values())))
+            or answer.limitations != [_GENERAL_GUIDANCE_LIMITATION]
+            or answer.citations
+        ):
+            raise ValueError("general customs guidance differs from the pinned safe catalog")
+    elif any(answer.claim_selections.model_dump(mode="json").values()):
+        raise ValueError("non-grounded assistant answer cannot select canonical claims")
+
+    candidate_answer = {
+        "direct_answer": answer.direct_answer,
+        "explanation": answer.explanation,
+        "evidence_meaning": answer.evidence_meaning,
+        "impact": answer.impact,
+        "next_steps": answer.next_steps,
+        "limitations": answer.limitations,
+        "claim_selections": answer.claim_selections.model_dump(mode="json"),
+        "citation_references": [citation.model_dump(mode="json") for citation in answer.citations],
+        "suggested_questions": answer.suggested_questions,
+        "used_context_message_ids": answer.used_context_message_ids,
+    }
+    verifier_context_sha256 = canonical_digest(
+        {
+            "question": request.question,
+            "recent_turns": [turn.model_dump(mode="json") for turn in request.recent_turns],
+            "answer_scope": answer.answer_scope,
+            "allowed_claims": [claim.model_dump(mode="json") for claim in answer_claims],
+            "general_guidance": guidance,
+            "candidate_answer": candidate_answer,
+        }
+    )
     if classification.mode == "claude":
         if classification.model_id != result.runtime_release.model_id:
             raise ValueError("assistant scope classifier model identity differs")
@@ -1757,6 +2272,7 @@ def validate_answer_against_context(
             or verification.status != "passed"
             or verification.entailment_verifier != "claude"
             or verification.verifier_model_id != result.runtime_release.model_id
+            or verification.verifier_context_sha256 != verifier_context_sha256
             or verification.checked_statement_count != expected_claude_count
             or verification.reason_codes
         ):
@@ -1767,6 +2283,7 @@ def validate_answer_against_context(
             or verification.status != "fallback"
             or verification.entailment_verifier != "not_run"
             or verification.verifier_model_id is not None
+            or verification.verifier_context_sha256 is not None
             or verification.checked_statement_count != expected_fallback_count
             or not verification.reason_codes
         ):
@@ -1786,6 +2303,7 @@ def validate_answer_against_context(
                 "impact",
                 "next_steps",
                 "limitations",
+                "claim_selections",
                 "citations",
                 "suggested_questions",
                 "used_context_message_ids",

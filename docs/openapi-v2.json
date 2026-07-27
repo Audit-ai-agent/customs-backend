@@ -151,6 +151,54 @@
         "title": "AgentUatCapabilityAttestationV1",
         "type": "object"
       },
+      "AnswerClaimSelectionsV1": {
+        "additionalProperties": false,
+        "description": "Canonical claim IDs selected for each user-visible answer area.",
+        "properties": {
+          "direct_answer": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 20,
+            "title": "Direct Answer",
+            "type": "array"
+          },
+          "evidence_meaning": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 40,
+            "title": "Evidence Meaning",
+            "type": "array"
+          },
+          "explanation": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 40,
+            "title": "Explanation",
+            "type": "array"
+          },
+          "impact": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 40,
+            "title": "Impact",
+            "type": "array"
+          },
+          "next_steps": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 40,
+            "title": "Next Steps",
+            "type": "array"
+          }
+        },
+        "title": "AnswerClaimSelectionsV1",
+        "type": "object"
+      },
       "AnswerScopeClassificationAuditV1": {
         "additionalProperties": false,
         "properties": {
@@ -174,7 +222,16 @@
                 "bill_of_lading",
                 "certificate_of_origin",
                 "hsk",
-                "customs_review"
+                "hs_hsk_comparison",
+                "customs_review",
+                "import_declaration",
+                "customs_valuation",
+                "duties_and_taxes",
+                "free_trade_agreement",
+                "import_requirements",
+                "inspection_and_supplement",
+                "document_correction",
+                "customs_broker"
               ],
               "type": "string"
             },
@@ -298,6 +355,9 @@
             "maxItems": 100,
             "title": "Citations",
             "type": "array"
+          },
+          "claim_selections": {
+            "$ref": "#/components/schemas/AnswerClaimSelectionsV1"
           },
           "direct_answer": {
             "maxLength": 4000,
@@ -1899,6 +1959,18 @@
             "pattern": "^[a-f0-9]{64}$",
             "title": "Verified Content Sha256",
             "type": "string"
+          },
+          "verifier_context_sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Verifier Context Sha256"
           },
           "verifier_model_id": {
             "anyOf": [

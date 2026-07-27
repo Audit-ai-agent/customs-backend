@@ -86,7 +86,7 @@ class MeaningCatalogEntryV1(BaseModel):
 class MeaningCatalogV1(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    version: Literal["customs-user-meaning-catalog/v1"]
+    version: Literal["customs-user-meaning-catalog/v2"]
     issues: dict[str, MeaningCatalogEntryV1]
     findings: dict[str, MeaningCatalogEntryV1]
     actions: dict[str, str]
@@ -223,17 +223,27 @@ def validate_agent_experience_contract_bundle() -> ExperienceContractBundle:
     if asset_manifest.get("schema_version") != "customs-agent-experience-asset-manifest/v1":
         raise RuntimeError("Agent experience asset manifest version drifted")
     raw_assets = asset_manifest.get("assets")
-    if not isinstance(raw_assets, dict) or set(raw_assets) != {"meaning-catalog-v1.json"}:
+    expected_assets = {"meaning-catalog-v1.json", "meaning-catalog-v2.json"}
+    if not isinstance(raw_assets, dict) or set(raw_assets) != expected_assets:
         raise RuntimeError("Agent experience provider asset inventory is incomplete")
-    catalog_identity = ExperienceAssetIdentity.model_validate(raw_assets["meaning-catalog-v1.json"])
+    asset_identities = {
+        name: ExperienceAssetIdentity.model_validate(raw_assets[name])
+        for name in sorted(expected_assets)
+    }
+    for name, asset_identity in asset_identities.items():
+        asset_bytes = _resource_bytes(f"{_RESOURCE_DIRECTORY}/{name}")
+        if _sha256(asset_bytes) != asset_identity.file_sha256:
+            raise RuntimeError(f"Agent experience asset bytes drifted: {name}")
+        asset_object = _decode_object(asset_bytes, name=f"Agent experience asset {name}")
+        if _sha256(canonical_json_bytes(asset_object)) != asset_identity.canonical_sha256:
+            raise RuntimeError(f"Agent canonical experience asset drifted: {name}")
+    catalog_identity = asset_identities["meaning-catalog-v2.json"]
     if (
         catalog_identity.canonical_sha256 != lock.meaning_catalog_sha256
         or catalog_identity.file_sha256 != lock.meaning_catalog_file_sha256
     ):
         raise RuntimeError("Agent meaning catalog identity differs from the consumer lock")
-    catalog_bytes = _resource_bytes(f"{_RESOURCE_DIRECTORY}/meaning-catalog-v1.json")
-    if _sha256(catalog_bytes) != catalog_identity.file_sha256:
-        raise RuntimeError("Agent meaning catalog bytes drifted")
+    catalog_bytes = _resource_bytes(f"{_RESOURCE_DIRECTORY}/meaning-catalog-v2.json")
     catalog_object = _decode_object(catalog_bytes, name="Agent meaning catalog")
     if _sha256(canonical_json_bytes(catalog_object)) != catalog_identity.canonical_sha256:
         raise RuntimeError("Agent canonical meaning catalog drifted")

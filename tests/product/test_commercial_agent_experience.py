@@ -26,11 +26,13 @@ from customs_backend.domain import (
 from customs_backend.experience import (
     AgentUatCapabilityAttestationV1,
     AssistantAnswerV2,
+    CaseConversationRequestV2,
     GroundedPresentationV1,
     PresentationSection,
     PresentationStatement,
     ReviewExperienceEnvelopeV1,
     AgentReviewStageEventV1,
+    build_answer_experience_claim_catalog,
     build_canonical_experience_claim_catalog,
     validate_answer_against_context,
     validate_presentation_against_result,
@@ -196,6 +198,16 @@ def _experience(request: AgentReviewRequest) -> dict[str, Any]:
             "sections": [item.model_dump(mode="json") for item in sections],
         }
     )
+    verifier_context_sha256 = canonical_digest(
+        {
+            "canonical_claims": [item.model_dump(mode="json") for item in claims],
+            "candidate_statements": [
+                statement.model_dump(mode="json")
+                for section in sections
+                for statement in section.statements
+            ],
+        }
+    )
     presentation_payload = {
         "schema_version": "1.0",
         "headline": headline,
@@ -219,6 +231,7 @@ def _experience(request: AgentReviewRequest) -> dict[str, Any]:
             "verifier_model_id": result["runtime_release"]["model_id"],
             "verifier_prompt_sha256": lock.prompt_identities["entailment"],
             "verifier_schema_sha256": lock.output_schema_identities["entailment"],
+            "verifier_context_sha256": verifier_context_sha256,
             "checked_statement_count": len(claims),
             "verified_content_sha256": verified_content_sha256,
             "reason_codes": [],
@@ -289,25 +302,56 @@ def _experience(request: AgentReviewRequest) -> dict[str, Any]:
 
 def _answer(payload: dict[str, Any]) -> dict[str, Any]:
     lock = validate_agent_experience_contract_bundle().lock
-    outcome = next(
-        item
-        for item in payload["review_result"]["fact_ledger"]["entries"]
-        if item["kind"] == "outcome"
+    normalized_request = CaseConversationRequestV2.model_validate(payload).model_dump(mode="json")
+    request_sha256 = canonical_digest(normalized_request)
+    claims = build_answer_experience_claim_catalog(
+        AgentReviewResultV3.model_validate(payload["review_result"])
     )
-    request_sha256 = canonical_digest(payload)
+    direct_claim = claims[0]
+    explanation_claims = [
+        item
+        for item in claims[1:]
+        if item.role in {"conclusion", "observation", "reason", "limitation"}
+    ][:5]
+    evidence_claims = [item for item in claims if item.role == "evidence"][:5]
+    impact_claims = [item for item in claims if item.role == "impact"][:5]
+    action_claims = [item for item in claims if item.role == "action"][:5]
+    selected_claims = [
+        direct_claim,
+        *explanation_claims,
+        *evidence_claims,
+        *impact_claims,
+        *action_claims,
+    ]
+    citations = list(
+        {
+            (citation.kind, citation.reference_id): citation
+            for claim in selected_claims
+            for citation in claim.citation_references
+        }.values()
+    )
     answer_content = {
         "request_sha256": request_sha256,
         "answer_scope": "case_grounded",
         "status": "answered",
-        "direct_answer": "현재 심사 결과는 담당자 확인이 필요합니다.",
-        "explanation": ["자동 처리 조건이 충족되지 않아 사람 검토로 연결됐습니다."],
-        "evidence_meaning": ["인용된 결과 근거가 현재 처리 상태를 설명합니다."],
-        "impact": ["담당자가 원문과 추출값을 확인해야 합니다."],
-        "next_steps": ["심사 결과와 법령 근거를 차례로 확인합니다."],
-        "limitations": ["이 답변은 현재 심사 회차에만 적용됩니다."],
-        "citations": [{"kind": "outcome", "reference_id": outcome["reference_id"]}],
+        "direct_answer": direct_claim.canonical_text,
+        "explanation": [item.canonical_text for item in explanation_claims],
+        "evidence_meaning": [item.canonical_text for item in evidence_claims],
+        "impact": [item.canonical_text for item in impact_claims],
+        "next_steps": [item.canonical_text for item in action_claims],
+        "limitations": ["답변은 현재 심사 회차와 연결된 문서·법령 근거 범위에 한정됩니다."],
+        "claim_selections": {
+            "direct_answer": [direct_claim.claim_id],
+            "explanation": [item.claim_id for item in explanation_claims],
+            "evidence_meaning": [item.claim_id for item in evidence_claims],
+            "impact": [item.claim_id for item in impact_claims],
+            "next_steps": [item.claim_id for item in action_claims],
+        },
+        "citations": [item.model_dump(mode="json") for item in citations],
         "suggested_questions": _SAFE_SUGGESTED_QUESTIONS,
-        "used_context_message_ids": [item["message_id"] for item in payload["recent_turns"]],
+        "used_context_message_ids": [
+            item["message_id"] for item in normalized_request["recent_turns"]
+        ],
     }
     answer_payload = {
         "schema_version": "2.0",
@@ -346,7 +390,35 @@ def _answer(payload: dict[str, Any]) -> dict[str, Any]:
             "verifier_model_id": payload["review_result"]["runtime_release"]["model_id"],
             "verifier_prompt_sha256": lock.prompt_identities["chat_verifier"],
             "verifier_schema_sha256": lock.output_schema_identities["chat_verifier"],
-            "checked_statement_count": 6,
+            "verifier_context_sha256": canonical_digest(
+                {
+                    "question": normalized_request["question"],
+                    "recent_turns": normalized_request["recent_turns"],
+                    "answer_scope": "case_grounded",
+                    "allowed_claims": [item.model_dump(mode="json") for item in claims[:100]],
+                    "general_guidance": {},
+                    "candidate_answer": {
+                        "direct_answer": answer_content["direct_answer"],
+                        "explanation": answer_content["explanation"],
+                        "evidence_meaning": answer_content["evidence_meaning"],
+                        "impact": answer_content["impact"],
+                        "next_steps": answer_content["next_steps"],
+                        "limitations": answer_content["limitations"],
+                        "claim_selections": answer_content["claim_selections"],
+                        "citation_references": answer_content["citations"],
+                        "suggested_questions": answer_content["suggested_questions"],
+                        "used_context_message_ids": answer_content["used_context_message_ids"],
+                    },
+                }
+            ),
+            "checked_statement_count": (
+                1
+                + len(answer_content["explanation"])
+                + len(answer_content["evidence_meaning"])
+                + len(answer_content["impact"])
+                + len(answer_content["next_steps"])
+                + len(answer_content["limitations"])
+            ),
             "verified_content_sha256": canonical_digest(answer_content),
             "reason_codes": [],
         },
@@ -355,6 +427,72 @@ def _answer(payload: dict[str, Any]) -> dict[str, Any]:
         **answer_payload,
         answer_sha256=canonical_digest(answer_payload),
     ).model_dump(mode="json")
+
+
+def _rehash_answer(
+    raw: dict[str, Any],
+    request_payload: dict[str, Any],
+    *,
+    refresh_verifier_context: bool = True,
+) -> None:
+    normalized_request = CaseConversationRequestV2.model_validate(request_payload).model_dump(
+        mode="json"
+    )
+    answer_content_keys = (
+        "request_sha256",
+        "answer_scope",
+        "status",
+        "direct_answer",
+        "explanation",
+        "evidence_meaning",
+        "impact",
+        "next_steps",
+        "limitations",
+        "claim_selections",
+        "citations",
+        "suggested_questions",
+        "used_context_message_ids",
+    )
+    answer_content = {key: raw[key] for key in answer_content_keys}
+    raw["verification_audit"]["verified_content_sha256"] = canonical_digest(answer_content)
+    if refresh_verifier_context and raw["verification_audit"]["entailment_verifier"] == "claude":
+        result = AgentReviewResultV3.model_validate(request_payload["review_result"])
+        claims = build_answer_experience_claim_catalog(result)
+        scope = raw["answer_scope"]
+        if scope == "evidence_grounded":
+            claims = [item for item in claims if item.section_code == "regulatory_meaning"]
+        elif scope != "case_grounded":
+            claims = []
+        guidance: dict[str, str] = {}
+        if scope == "general_customs_guidance":
+            catalog = provider_meaning_catalog()
+            guidance = {
+                topic: catalog.general_guidance[topic]
+                for topic in raw["generation_audit"]["scope_classification"]["guidance_topics"]
+            }
+        raw["verification_audit"]["verifier_context_sha256"] = canonical_digest(
+            {
+                "question": normalized_request["question"],
+                "recent_turns": normalized_request["recent_turns"],
+                "answer_scope": scope,
+                "allowed_claims": [item.model_dump(mode="json") for item in claims[:100]],
+                "general_guidance": guidance,
+                "candidate_answer": {
+                    "direct_answer": raw["direct_answer"],
+                    "explanation": raw["explanation"],
+                    "evidence_meaning": raw["evidence_meaning"],
+                    "impact": raw["impact"],
+                    "next_steps": raw["next_steps"],
+                    "limitations": raw["limitations"],
+                    "claim_selections": raw["claim_selections"],
+                    "citation_references": raw["citations"],
+                    "suggested_questions": raw["suggested_questions"],
+                    "used_context_message_ids": raw["used_context_message_ids"],
+                },
+            }
+        )
+    answer_payload = {key: value for key, value in raw.items() if key != "answer_sha256"}
+    raw["answer_sha256"] = canonical_digest(answer_payload)
 
 
 @pytest.fixture
@@ -588,7 +726,7 @@ def test_v2_review_experience_and_multiturn_assistant_are_end_to_end_bound(
     assert messages.status_code == 200
     items = messages.json()["items"]
     assert [item["role"] for item in items] == ["user", "assistant"]
-    assert items[-1]["structured_answer"]["direct_answer"].startswith("현재 심사 결과")
+    assert items[-1]["structured_answer"]["direct_answer"]
     assert observed_answer_requests[0]["recent_turns"] == []
 
     follow_up = client.post(
@@ -637,6 +775,226 @@ def test_presentation_text_cannot_reuse_a_stale_verifier_digest() -> None:
     typed = ReviewExperienceEnvelopeV1.model_validate(raw)
     with pytest.raises(ValueError, match="verification identity"):
         validate_presentation_against_result(typed)
+
+
+@pytest.mark.parametrize(
+    "unsupported_text",
+    [
+        "현재 확인 결과 이 건의 관세율은 50%이며 3일 이내 제출해야 합니다.",
+        "이 심사 건은 통관이 승인되었으며 담당자 검토가 필요하지 않습니다.",
+        "이 심사 건은 별도 확인 없이 즉시 처리해도 됩니다.",
+        "이 자료만으로 모든 요건이 충족됐으므로 추가 조치는 없습니다.",
+    ],
+)
+def test_presentation_rejects_unsupported_atomic_or_contradictory_claim_even_with_fresh_audit(
+    unsupported_text: str,
+) -> None:
+    raw = deepcopy(_experience(_review_request()))
+    statement = raw["user_presentation"]["sections"][0]["statements"][0]
+    statement["text"] = unsupported_text
+    statement_payload = {key: value for key, value in statement.items() if key != "statement_id"}
+    statement["statement_id"] = f"statement_{canonical_digest(statement_payload)}"
+    canonical_claims = build_canonical_experience_claim_catalog(
+        AgentReviewResultV3.model_validate(raw["canonical_result"])
+    )
+    raw["user_presentation"]["verification_audit"]["verifier_context_sha256"] = canonical_digest(
+        {
+            "canonical_claims": [item.model_dump(mode="json") for item in canonical_claims],
+            "candidate_statements": [
+                item
+                for section in raw["user_presentation"]["sections"]
+                for item in section["statements"]
+            ],
+        }
+    )
+    raw["user_presentation"]["verification_audit"]["verified_content_sha256"] = canonical_digest(
+        {
+            "headline": raw["user_presentation"]["headline"],
+            "sections": raw["user_presentation"]["sections"],
+        }
+    )
+    presentation_payload = {
+        key: value
+        for key, value in raw["user_presentation"].items()
+        if key != "presentation_sha256"
+    }
+    raw["user_presentation"]["presentation_sha256"] = canonical_digest(presentation_payload)
+    envelope_payload = {key: value for key, value in raw.items() if key != "envelope_sha256"}
+    raw["envelope_sha256"] = canonical_digest(envelope_payload)
+
+    typed = ReviewExperienceEnvelopeV1.model_validate(raw)
+    with pytest.raises(
+        ValueError, match="literal absent|canonical claim|grounded claim|atom absent"
+    ):
+        validate_presentation_against_result(typed)
+
+
+@pytest.mark.parametrize(
+    "unsupported_text",
+    [
+        "현재 심사 결과 이 건의 관세율은 50%이며 3일 이내 제출해야 합니다.",
+        "이 심사 건은 통관이 승인되었으며 담당자 검토가 필요하지 않습니다.",
+        "이 심사 건은 별도 확인 없이 즉시 처리해도 됩니다.",
+        "이 자료만으로 모든 요건이 충족됐으므로 추가 조치는 없습니다.",
+    ],
+)
+def test_assistant_rejects_unsupported_atomic_or_contradictory_claim_even_with_fresh_audit(
+    unsupported_text: str,
+) -> None:
+    result = _experience(_review_request())["canonical_result"]
+    request = {
+        "conversation_id": "conversation-grounding-attack",
+        "parent_message_id": None,
+        "question": "현재 심사 결과를 설명해 주십시오.",
+        "bound_result_sha256": result["result_sha256"],
+        "conversation_context_sha256": canonical_digest([]),
+        "recent_turns": [],
+        "review_result": result,
+        "locale": "ko-KR",
+    }
+    raw = _answer(request)
+    raw["direct_answer"] = unsupported_text
+    _rehash_answer(raw, request)
+
+    typed = AssistantAnswerV2.model_validate(raw)
+    with pytest.raises(
+        ValueError, match="literal absent|canonical claim|grounded claim|atom absent"
+    ):
+        validate_answer_against_context(
+            answer=typed,
+            request=CaseConversationRequestV2.model_validate(request),
+        )
+
+
+def test_assistant_requires_each_canonical_claims_own_citation() -> None:
+    result = _experience(_review_request())["canonical_result"]
+    request = {
+        "conversation_id": "conversation-citation-binding",
+        "parent_message_id": None,
+        "question": "품목번호를 설명해 주십시오.",
+        "bound_result_sha256": result["result_sha256"],
+        "conversation_context_sha256": canonical_digest([]),
+        "recent_turns": [],
+        "review_result": result,
+        "locale": "ko-KR",
+    }
+    raw = _answer(request)
+    claims = build_answer_experience_claim_catalog(AgentReviewResultV3.model_validate(result))
+    field_claim = next(
+        claim
+        for claim in claims
+        if any(citation.kind == "field_source" for citation in claim.citation_references)
+    )
+    outcome = next(item for item in result["fact_ledger"]["entries"] if item["kind"] == "outcome")
+    raw["direct_answer"] = field_claim.canonical_text
+    raw["explanation"] = []
+    raw["evidence_meaning"] = []
+    raw["impact"] = []
+    raw["next_steps"] = []
+    raw["claim_selections"] = {
+        "direct_answer": [field_claim.claim_id],
+        "explanation": [],
+        "evidence_meaning": [],
+        "impact": [],
+        "next_steps": [],
+    }
+    raw["citations"] = [{"kind": "outcome", "reference_id": outcome["reference_id"]}]
+    raw["verification_audit"]["checked_statement_count"] = 2
+    _rehash_answer(raw, request)
+
+    typed = AssistantAnswerV2.model_validate(raw)
+    with pytest.raises(ValueError, match="citation binding"):
+        validate_answer_against_context(
+            answer=typed,
+            request=CaseConversationRequestV2.model_validate(request),
+        )
+
+
+def test_assistant_accepts_code_owned_korean_frame_for_exact_field_fact() -> None:
+    result = _experience(_review_request())["canonical_result"]
+    request = {
+        "conversation_id": "conversation-field-frame",
+        "parent_message_id": None,
+        "question": "송장번호는 무엇입니까?",
+        "bound_result_sha256": result["result_sha256"],
+        "conversation_context_sha256": canonical_digest([]),
+        "recent_turns": [],
+        "review_result": result,
+        "locale": "ko-KR",
+    }
+    raw = _answer(request)
+    field_claim = next(
+        claim
+        for claim in build_answer_experience_claim_catalog(
+            AgentReviewResultV3.model_validate(result)
+        )
+        if "송장번호" in claim.canonical_text
+    )
+    raw["direct_answer"] = f"질문에 바로 답변드리면, {field_claim.canonical_text}"
+    raw["explanation"] = []
+    raw["evidence_meaning"] = []
+    raw["impact"] = []
+    raw["next_steps"] = []
+    raw["claim_selections"] = {
+        "direct_answer": [field_claim.claim_id],
+        "explanation": [],
+        "evidence_meaning": [],
+        "impact": [],
+        "next_steps": [],
+    }
+    raw["citations"] = [item.model_dump(mode="json") for item in field_claim.citation_references]
+    raw["verification_audit"]["checked_statement_count"] = 2
+    _rehash_answer(raw, request)
+
+    validate_answer_against_context(
+        answer=AssistantAnswerV2.model_validate(raw),
+        request=CaseConversationRequestV2.model_validate(request),
+    )
+
+
+def test_assistant_accepts_fluent_korean_when_claims_citations_and_verifier_are_bound() -> None:
+    result = _experience(_review_request())["canonical_result"]
+    request = {
+        "conversation_id": "conversation-fluent-answer",
+        "parent_message_id": None,
+        "question": "현재 심사 결과를 이해하기 쉽게 설명해 주십시오.",
+        "bound_result_sha256": result["result_sha256"],
+        "conversation_context_sha256": canonical_digest([]),
+        "recent_turns": [],
+        "review_result": result,
+        "locale": "ko-KR",
+    }
+    raw = _answer(request)
+    raw["direct_answer"] = "검토한 제출 자료에서는 특별히 바로잡아야 할 내용이 확인되지 않았습니다."
+    _rehash_answer(raw, request)
+
+    validate_answer_against_context(
+        answer=AssistantAnswerV2.model_validate(raw),
+        request=CaseConversationRequestV2.model_validate(request),
+    )
+
+
+def test_assistant_rejects_a_verifier_receipt_from_another_question_context() -> None:
+    result = _experience(_review_request())["canonical_result"]
+    request = {
+        "conversation_id": "conversation-verifier-replay",
+        "parent_message_id": None,
+        "question": "현재 심사 결과를 설명해 주십시오.",
+        "bound_result_sha256": result["result_sha256"],
+        "conversation_context_sha256": canonical_digest([]),
+        "recent_turns": [],
+        "review_result": result,
+        "locale": "ko-KR",
+    }
+    raw = _answer(request)
+    raw["verification_audit"]["verifier_context_sha256"] = "f" * 64
+    _rehash_answer(raw, request, refresh_verifier_context=False)
+
+    with pytest.raises(ValueError, match="Claude assistant answer audit"):
+        validate_answer_against_context(
+            answer=AssistantAnswerV2.model_validate(raw),
+            request=CaseConversationRequestV2.model_validate(request),
+        )
 
 
 @pytest.mark.parametrize(
@@ -694,7 +1052,7 @@ def test_assistant_answer_cannot_be_replayed_for_another_question() -> None:
         "parent_message_id": None,
         "question": "이 심사 결과의 이유는 무엇입니까?",
         "bound_result_sha256": result["result_sha256"],
-        "conversation_context_sha256": "1" * 64,
+        "conversation_context_sha256": canonical_digest([]),
         "recent_turns": [],
         "review_result": result,
         "locale": "ko-KR",
@@ -703,9 +1061,9 @@ def test_assistant_answer_cannot_be_replayed_for_another_question() -> None:
     with pytest.raises(ValueError, match="request binding"):
         validate_answer_against_context(
             answer=answer,
-            result=AgentReviewResultV3.model_validate(result),
-            expected_context_message_ids=[],
-            expected_request_sha256=canonical_digest({**payload, "question": "다른 질문입니다."}),
+            request=CaseConversationRequestV2.model_validate(
+                {**payload, "question": "다른 질문입니다."}
+            ),
         )
 
 
@@ -730,7 +1088,7 @@ def test_assistant_scope_requires_one_exact_status(
         "parent_message_id": None,
         "question": "현재 심사 결과를 설명해 주십시오.",
         "bound_result_sha256": result["result_sha256"],
-        "conversation_context_sha256": "1" * 64,
+        "conversation_context_sha256": canonical_digest([]),
         "recent_turns": [],
         "review_result": result,
         "locale": "ko-KR",

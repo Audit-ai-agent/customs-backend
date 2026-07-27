@@ -3979,9 +3979,7 @@ class WorkbenchService:
                 answer = AssistantAnswerV2.model_validate(raw_answer)
                 validate_answer_against_context(
                     answer=answer,
-                    result=request.review_result,
-                    expected_context_message_ids=[item.message_id for item in request.recent_turns],
-                    expected_request_sha256=canonical_digest(request.model_dump(mode="json")),
+                    request=request,
                 )
             except (ValidationError, ValueError) as exc:
                 raise ConflictError(

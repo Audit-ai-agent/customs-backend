@@ -37,6 +37,7 @@ EXPERIENCE_SCHEMA_PATHS = (
     EXPERIENCE_SCHEMA_DIRECTORY / "manifest.json",
     EXPERIENCE_SCHEMA_DIRECTORY / "asset-manifest.json",
     EXPERIENCE_SCHEMA_DIRECTORY / "meaning-catalog-v1.json",
+    EXPERIENCE_SCHEMA_DIRECTORY / "meaning-catalog-v2.json",
     EXPERIENCE_SCHEMA_DIRECTORY / "openapi.lock.json",
     EXPERIENCE_SCHEMA_DIRECTORY / "agent-uat-capability-v1.schema.json",
     EXPERIENCE_SCHEMA_DIRECTORY / "assistant-answer-v2.schema.json",

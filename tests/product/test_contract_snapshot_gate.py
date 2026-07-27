@@ -32,6 +32,7 @@ def _repository(tmp_path: Path) -> tuple[Path, bytes]:
         "manifest.json",
         "asset-manifest.json",
         "meaning-catalog-v1.json",
+        "meaning-catalog-v2.json",
         "openapi.lock.json",
         "agent-uat-capability-v1.schema.json",
         "assistant-answer-v2.schema.json",
