@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum
 from typing import Any, Literal, cast
@@ -177,109 +176,6 @@ _SAFE_STAGE_COUNT_KEYS = frozenset(
 _PRESENTATION_TASK_ID = "customs_experience_report"
 _CHAT_TASK_ID = "customs_case_answer_v2"
 _CITATION_KINDS = frozenset({"field_source", "issue", "finding", "evidence", "outcome"})
-_GROUNDED_ATOM_PATTERNS = (
-    (
-        "date",
-        re.compile(r"(?<!\d)(?:\d{4}-\d{1,2}-\d{1,2}|\d{4}년\s*\d{1,2}월\s*\d{1,2}일)(?!\d)"),
-    ),
-    (
-        "law_reference",
-        re.compile(
-            r"제\s*\d+\s*조(?:의\s*\d+)?(?:\s*제?\s*\d+\s*항)?"
-            r"(?:\s*제?\s*\d+\s*호)?"
-        ),
-    ),
-    (
-        "hsk",
-        re.compile(
-            r"(?:HSK?|품목분류(?:코드)?|품목번호)\s*[:#]?\s*"
-            r"\d(?:[\d.\s-]{2,18}\d)",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "percentage",
-        re.compile(r"(?<![\w])\d+(?:\.\d+)?\s*(?:%|퍼센트)(?![\w])", re.IGNORECASE),
-    ),
-    (
-        "money",
-        re.compile(
-            r"(?<![\w])(?:(?:USD|KRW|EUR|JPY|\$|₩)\s*"
-            r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|"
-            r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?\s*"
-            r"(?:원|달러|유로|엔))(?![\w])",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "measure",
-        re.compile(
-            r"(?<![\w])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?\s*"
-            r"(?:개|건|장|매|상자|박스|포|kg|㎏|g|톤|t|L|리터|"
-            r"일|주|개월|년|시간|분|초|회|종)(?![\w])",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "identifier",
-        re.compile(r"(?<![A-Za-z0-9])[A-Z]{2,10}[-/][A-Z0-9][A-Z0-9._/-]{2,63}"),
-    ),
-)
-_GROUNDED_PROPOSITION_PATTERNS = {
-    "customs_approval_asserted": re.compile(
-        r"(?:통관|수입|수출).{0,16}(?:승인|허가)(?:되|됐|완료|가능)",
-    ),
-    "customs_rejection_asserted": re.compile(
-        r"(?:통관|수입|수출).{0,16}(?:거절|불허|금지|반려)",
-    ),
-    "human_review_not_required": re.compile(
-        r"(?:담당자|사람|인적).{0,16}(?:검토|확인).{0,16}"
-        r"(?:필요하지\s*않|불필요|생략|없이)",
-    ),
-    "human_review_required": re.compile(
-        r"(?:(?:담당자|사람|인적).{0,16}(?:검토|확인).{0,16}"
-        r"(?:필요|요구|해야|하여야)|(?:검토|확인).{0,16}(?:담당자|사람).{0,8}(?:필요|요구))",
-    ),
-    "processing_without_review_allowed": re.compile(
-        r"(?:별도|담당자|사람|인적).{0,16}(?:검토|확인).{0,16}"
-        r"(?:없이|생략).{0,16}(?:처리|진행|완료|승인)",
-    ),
-    "auto_completion_allowed": re.compile(
-        r"(?:자동\s*(?:처리|완료)|자동완료).{0,16}(?:가능|허용|활성|완료)",
-    ),
-    "auto_completion_blocked": re.compile(
-        r"(?:자동\s*(?:처리|완료)|자동완료).{0,16}"
-        r"(?:불가|차단|꺼짐|비활성|허용되지\s*않)",
-    ),
-    "no_issue_asserted": re.compile(
-        r"(?:문제|불일치|누락|위반).{0,12}(?:없|발견되지\s*않|확인하지\s*못)",
-    ),
-    "issue_asserted": re.compile(
-        r"(?:문제|불일치|누락|위반).{0,12}(?:있|발견|확인되|발생)",
-    ),
-    "legal_obligation_asserted": re.compile(
-        r"(?:필수|의무|반드시|제출해야|제출하여야|준수해야|준수하여야)",
-    ),
-    "legal_exemption_asserted": re.compile(
-        r"(?:면세|감면|면제|의무가\s*없|제출할\s*필요가\s*없)",
-    ),
-    "requirements_satisfied_asserted": re.compile(
-        r"(?:모든|전체).{0,12}(?:요건|의무).{0,12}(?:충족|완료)",
-    ),
-    "no_further_action_required": re.compile(
-        r"(?:추가|별도).{0,12}(?:조치|보완|확인).{0,12}(?:없|불필요|필요하지)",
-    ),
-}
-
-
-@dataclass(frozen=True)
-class GroundedAtomicClaim:
-    """A deterministic value or high-risk proposition that must be source-bound."""
-
-    kind: str
-    value: str
-
-
 PresentationSectionCode = Literal[
     "conclusion",
     "process",
@@ -376,6 +272,8 @@ class AnswerScopeClassificationAuditV1(BaseModel):
         if self.classified_scope == "general_customs_guidance":
             if not self.guidance_topics:
                 raise ValueError("general guidance classification requires a topic")
+            if len(self.guidance_topics) != len(set(self.guidance_topics)):
+                raise ValueError("general guidance topics must be unique")
         elif self.guidance_topics:
             raise ValueError("guidance topics are allowed only for general guidance")
         return self
@@ -516,9 +414,16 @@ def _canonical_claim(
     )
 
 
-def _framed_texts(text: str, prefixes: tuple[str, ...]) -> frozenset[str]:
+def _framed_texts(
+    text: str,
+    prefixes: tuple[str, ...],
+    *,
+    max_length: int,
+) -> frozenset[str]:
     canonical = " ".join(text.split())
-    return frozenset(f"{prefix}{canonical}" for prefix in prefixes)
+    return frozenset(
+        rendered for prefix in prefixes if len(rendered := f"{prefix}{canonical}") <= max_length
+    )
 
 
 def _presentation_renderings(
@@ -527,7 +432,136 @@ def _presentation_renderings(
     if not claims:
         return frozenset()
     canonical = " ".join(item.canonical_text for item in claims)
-    return _framed_texts(canonical, _PRESENTATION_ROLE_PREFIXES[claims[0].role])
+    return _framed_texts(
+        canonical,
+        _PRESENTATION_ROLE_PREFIXES[claims[0].role],
+        max_length=4_000,
+    )
+
+
+def _presentation_statement_options(
+    claims: list[CanonicalExperienceClaimV1],
+) -> dict[tuple[str, ...], frozenset[str]]:
+    """Reconstruct the provider's finite, non-overlapping statement menu."""
+
+    groups: dict[tuple[str, str], list[CanonicalExperienceClaimV1]] = {}
+    for claim in claims:
+        groups.setdefault((claim.section_code, claim.role), []).append(claim)
+    options: dict[tuple[str, ...], frozenset[str]] = {}
+    for grouped in groups.values():
+        chunks: list[list[CanonicalExperienceClaimV1]] = []
+        current: list[CanonicalExperienceClaimV1] = []
+        current_citations: set[tuple[str, str]] = set()
+        for claim in grouped:
+            claim_citations = {
+                (str(citation.kind), citation.reference_id)
+                for citation in claim.citation_references
+            }
+            candidate = [*current, claim]
+            candidate_citations = current_citations | claim_citations
+            if current and (
+                len(candidate) > 20
+                or len(candidate_citations) > 100
+                or not _presentation_renderings(candidate)
+            ):
+                chunks.append(current)
+                current = [claim]
+                current_citations = claim_citations
+            else:
+                current = candidate
+                current_citations = candidate_citations
+        if current:
+            chunks.append(current)
+        for chunk in chunks:
+            renderings = _presentation_renderings(chunk)
+            if not renderings:
+                raise ValueError("canonical claim cannot be rendered within presentation limits")
+            options[tuple(claim.claim_id for claim in chunk)] = renderings
+    return options
+
+
+def build_controlled_presentation_sections(
+    claims: list[CanonicalExperienceClaimV1],
+) -> list[PresentationSection]:
+    """Build the Claude-provider-equivalent plain rendering for each finite option."""
+
+    claim_index = {claim.claim_id: claim for claim in claims}
+    options = _presentation_statement_options(claims)
+    statements_by_section: dict[str, list[PresentationStatement]] = {
+        section_code: [] for section_code in _SECTION_ORDER
+    }
+    for claim_ids, renderings in options.items():
+        bound_claims = [claim_index[claim_id] for claim_id in claim_ids]
+        first = bound_claims[0]
+        canonical_text = " ".join(claim.canonical_text for claim in bound_claims)
+        if canonical_text not in renderings:
+            raise ValueError("plain canonical presentation rendering is unavailable")
+        citations = list(
+            {
+                (citation.kind, citation.reference_id): citation
+                for claim in bound_claims
+                for citation in claim.citation_references
+            }.values()
+        )
+        payload = {
+            "role": first.role,
+            "text": canonical_text,
+            "source_claim_ids": list(claim_ids),
+            "citation_references": [citation.model_dump(mode="json") for citation in citations],
+            "material": any(claim.material for claim in bound_claims),
+        }
+        statements_by_section[first.section_code].append(
+            PresentationStatement.model_validate(
+                {
+                    "statement_id": f"statement_{canonical_digest(payload)}",
+                    **payload,
+                }
+            )
+        )
+    return [
+        PresentationSection(
+            section_code=cast(PresentationSectionCode, section_code),
+            title=_SECTION_TITLES[section_code],
+            statements=statements_by_section[section_code],
+        )
+        for section_code in _SECTION_ORDER
+    ]
+
+
+def _build_deterministic_fallback_sections(
+    claims: list[CanonicalExperienceClaimV1],
+) -> list[PresentationSection]:
+    """Mirror the Agent fallback: one canonical Claim per statement."""
+
+    sections: list[PresentationSection] = []
+    for section_code in _SECTION_ORDER:
+        statements: list[PresentationStatement] = []
+        for claim in (item for item in claims if item.section_code == section_code):
+            payload = {
+                "role": claim.role,
+                "text": claim.canonical_text,
+                "source_claim_ids": [claim.claim_id],
+                "citation_references": [
+                    item.model_dump(mode="json") for item in claim.citation_references
+                ],
+                "material": claim.material,
+            }
+            statements.append(
+                PresentationStatement.model_validate(
+                    {
+                        "statement_id": f"statement_{canonical_digest(payload)}",
+                        **payload,
+                    }
+                )
+            )
+        sections.append(
+            PresentationSection(
+                section_code=cast(PresentationSectionCode, section_code),
+                title=_SECTION_TITLES[section_code],
+                statements=statements,
+            )
+        )
+    return sections
 
 
 def _answer_renderings(
@@ -536,13 +570,21 @@ def _answer_renderings(
 ) -> frozenset[str]:
     if claim.role not in _ANSWER_AREA_ROLES[area]:
         return frozenset()
-    return _framed_texts(claim.canonical_text, _ANSWER_AREA_PREFIXES[area])
+    return _framed_texts(
+        claim.canonical_text,
+        _ANSWER_AREA_PREFIXES[area],
+        max_length=(4_000 if area == "direct_answer" else 2_000),
+    )
 
 
 def _guidance_renderings(text: str, area: str) -> frozenset[str]:
     if area not in {"direct_answer", "explanation"}:
         return frozenset()
-    return _framed_texts(text, _ANSWER_AREA_PREFIXES[area])
+    return _framed_texts(
+        text,
+        _ANSWER_AREA_PREFIXES[area],
+        max_length=(4_000 if area == "direct_answer" else 2_000),
+    )
 
 
 def _field_fact_claims(
@@ -1352,7 +1394,7 @@ class AnswerClaimSelectionsV1(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    direct_answer: list[str] = Field(default_factory=list, max_length=20)
+    direct_answer: list[str] = Field(default_factory=list, max_length=1)
     explanation: list[str] = Field(default_factory=list, max_length=40)
     evidence_meaning: list[str] = Field(default_factory=list, max_length=40)
     impact: list[str] = Field(default_factory=list, max_length=40)
@@ -1626,33 +1668,6 @@ def claim_catalog(result: AgentReviewResultV3) -> tuple[set[str], set[tuple[str,
     return claim_ids, references
 
 
-def grounded_atomic_claims(value: Any) -> set[GroundedAtomicClaim]:
-    """Extract independently checkable literals and high-risk proposition polarity.
-
-    Claude's verifier is useful evidence, but it is not an independent Backend
-    trust boundary. A material sentence may only introduce quantities, dates,
-    legal references, identifiers, or safety-critical conclusions already
-    represented by its bound canonical claims.
-    """
-
-    text = value if isinstance(value, str) else str(value)
-    atoms: set[GroundedAtomicClaim] = set()
-    for kind, pattern in _GROUNDED_ATOM_PATTERNS:
-        for match in pattern.finditer(text):
-            normalized = re.sub(r"[\s,]+", "", match.group(0)).upper()
-            atoms.add(GroundedAtomicClaim(kind=kind, value=normalized))
-    for proposition, pattern in _GROUNDED_PROPOSITION_PATTERNS.items():
-        if pattern.search(text):
-            atoms.add(GroundedAtomicClaim(kind="proposition", value=proposition))
-    return atoms
-
-
-def protected_literals(value: Any) -> set[str]:
-    """Compatibility projection used by the existing validation call sites."""
-
-    return {f"{atom.kind}:{atom.value}" for atom in grounded_atomic_claims(value)}
-
-
 def _expected_presentation_headline(result: AgentReviewResultV3) -> str:
     if result.assessment.value == "no_issue_detected":
         return "문서와 법령 근거 범위에서 별도의 문제를 확인하지 못했습니다"
@@ -1798,12 +1813,9 @@ def validate_presentation_against_result(envelope: ReviewExperienceEnvelopeV1) -
     ):
         raise ValueError("experience capability does not bind the canonical runtime")
     _result_claim_ids, references = claim_catalog(result)
-    source_text = str(result.model_dump(mode="json"))
     expected_claims = build_canonical_experience_claim_catalog(result)
-    source_literals = protected_literals(
-        " ".join([source_text, *(claim.canonical_text for claim in expected_claims)])
-    )
     claim_index = {item.claim_id: item for item in expected_claims}
+    presentation_options = _presentation_statement_options(expected_claims)
     statement_count = sum(
         len(section.statements) for section in envelope.user_presentation.sections
     )
@@ -1841,17 +1853,16 @@ def validate_presentation_against_result(envelope: ReviewExperienceEnvelopeV1) -
                     raise ValueError("presentation citation kind is unsupported")
                 if (citation.kind, citation.reference_id) not in references:
                     raise ValueError("presentation citation is outside the canonical FactLedger")
-            claim_literals = protected_literals(
-                " ".join(claim.canonical_text for claim in bound_claims)
-            )
-            if not protected_literals(statement.text).issubset(claim_literals):
-                raise ValueError("presentation introduced a literal absent from its claims")
-            if not protected_literals(statement.text).issubset(source_literals):
-                raise ValueError("presentation introduced a protected literal absent from sources")
-            if envelope.user_presentation.generation_audit.mode == "deterministic_fallback" and (
-                len(bound_claims) != 1 or statement.text != bound_claims[0].canonical_text
+            if envelope.user_presentation.generation_audit.mode == "deterministic_fallback":
+                if len(bound_claims) != 1 or statement.text != bound_claims[0].canonical_text:
+                    raise ValueError("deterministic presentation fallback differs from its claim")
+            elif statement.text not in presentation_options.get(
+                tuple(statement.source_claim_ids),
+                frozenset(),
             ):
-                raise ValueError("deterministic presentation fallback differs from its claim")
+                raise ValueError(
+                    "presentation text is outside the Backend-verifiable controlled language"
+                )
     if used_claims != set(claim_index):
         raise ValueError("presentation canonical claim coverage is incomplete")
     allowed_action_sources = _result_claim_ids | {
@@ -1875,34 +1886,7 @@ def build_deterministic_review_experience(
     """Create a grounded fallback presentation for an approved child revision."""
 
     claims = build_canonical_experience_claim_catalog(result)
-    sections: list[PresentationSection] = []
-    for section_code in _SECTION_ORDER:
-        statements: list[PresentationStatement] = []
-        for claim in (item for item in claims if item.section_code == section_code):
-            payload = {
-                "role": claim.role,
-                "text": claim.canonical_text,
-                "source_claim_ids": [claim.claim_id],
-                "citation_references": [
-                    item.model_dump(mode="json") for item in claim.citation_references
-                ],
-                "material": claim.material,
-            }
-            statements.append(
-                PresentationStatement.model_validate(
-                    {
-                        "statement_id": f"statement_{canonical_digest(payload)}",
-                        **payload,
-                    }
-                )
-            )
-        sections.append(
-            PresentationSection(
-                section_code=cast(PresentationSectionCode, section_code),
-                title=_SECTION_TITLES[section_code],
-                statements=statements,
-            )
-        )
+    sections = _build_deterministic_fallback_sections(claims)
     lock = validate_agent_experience_contract_bundle().lock
     headline = _expected_presentation_headline(result)
     verified_content_sha256 = canonical_digest(
@@ -2201,13 +2185,15 @@ def validate_answer_against_context(
             typed_claims = [claim for claim in claims if claim is not None]
             if any(claim.role not in _ANSWER_AREA_ROLES[area] for claim in typed_claims):
                 raise ValueError(f"material assistant {area} selected a claim with wrong role")
-            if bool(texts) != bool(typed_claims):
+            if len(texts) != len(typed_claims):
                 raise ValueError(f"material assistant {area} claim coverage is inconsistent")
-            if texts and not protected_literals(" ".join(texts)).issubset(
-                protected_literals(" ".join(claim.canonical_text for claim in typed_claims))
+            if any(
+                text not in _answer_renderings(claim, area)
+                for text, claim in zip(texts, typed_claims, strict=True)
             ):
                 raise ValueError(
-                    f"material assistant {area} introduced an atom absent from selected claims"
+                    f"material assistant {area} text is outside the "
+                    "Backend-verifiable controlled language"
                 )
             for claim in typed_claims:
                 selected_claims[claim.claim_id] = claim
@@ -2226,16 +2212,31 @@ def validate_answer_against_context(
         if expected_citations != observed_citations:
             raise ValueError("assistant claim citation binding differs from selected claims")
     elif answer.answer_scope == "general_customs_guidance":
+        guidance_values = list(guidance.values())
         if (
             any(answer.claim_selections.model_dump(mode="json").values())
-            or not answer.direct_answer
-            or not protected_literals(
-                " ".join(text for texts in answer_areas.values() for text in texts)
-            ).issubset(protected_literals(" ".join(guidance.values())))
+            or not guidance_values
+            or len(answer_areas["direct_answer"]) != 1
+            or len(answer_areas["explanation"]) != max(0, len(guidance_values) - 1)
+            or any(answer_areas[area] for area in ("evidence_meaning", "impact", "next_steps"))
             or answer.limitations != [_GENERAL_GUIDANCE_LIMITATION]
             or answer.citations
         ):
             raise ValueError("general customs guidance differs from the pinned safe catalog")
+        if answer_areas["direct_answer"][0] not in _guidance_renderings(
+            guidance_values[0],
+            "direct_answer",
+        ) or any(
+            text not in _guidance_renderings(guidance_text, "explanation")
+            for text, guidance_text in zip(
+                answer_areas["explanation"],
+                guidance_values[1:],
+                strict=True,
+            )
+        ):
+            raise ValueError(
+                "general customs guidance is outside the Backend-verifiable controlled language"
+            )
     elif any(answer.claim_selections.model_dump(mode="json").values()):
         raise ValueError("non-grounded assistant answer cannot select canonical claims")
 

@@ -28,12 +28,11 @@ from customs_backend.experience import (
     AssistantAnswerV2,
     CaseConversationRequestV2,
     GroundedPresentationV1,
-    PresentationSection,
-    PresentationStatement,
     ReviewExperienceEnvelopeV1,
     AgentReviewStageEventV1,
     build_answer_experience_claim_catalog,
     build_canonical_experience_claim_catalog,
+    build_controlled_presentation_sections,
     validate_answer_against_context,
     validate_presentation_against_result,
 )
@@ -150,43 +149,7 @@ def _experience(request: AgentReviewRequest) -> dict[str, Any]:
     _rehash_result(result)
     typed_result = AgentReviewResultV3.model_validate(result)
     claims = build_canonical_experience_claim_catalog(typed_result)
-    sections: list[PresentationSection] = []
-    for section_code in (
-        "conclusion",
-        "process",
-        "document_comparison",
-        "issues_and_causes",
-        "regulatory_meaning",
-        "business_impact",
-        "next_actions",
-        "scope_and_limits",
-    ):
-        statements: list[PresentationStatement] = []
-        for claim in claims:
-            if claim.section_code != section_code:
-                continue
-            statement_payload = {
-                "role": claim.role,
-                "text": claim.canonical_text,
-                "source_claim_ids": [claim.claim_id],
-                "citation_references": [
-                    item.model_dump(mode="json") for item in claim.citation_references
-                ],
-                "material": claim.material,
-            }
-            statements.append(
-                PresentationStatement(
-                    statement_id=f"statement_{canonical_digest(statement_payload)}",
-                    **statement_payload,
-                )
-            )
-        sections.append(
-            PresentationSection(
-                section_code=section_code,
-                title=_SECTION_TITLES[section_code],
-                statements=statements,
-            )
-        )
+    sections = build_controlled_presentation_sections(claims)
     headline = {
         "no_issue_detected": "문서와 법령 근거 범위에서 별도의 문제를 확인하지 못했습니다",
         "issues_detected": "담당자가 확인하고 보완해야 할 사항이 발견되었습니다",
@@ -232,7 +195,7 @@ def _experience(request: AgentReviewRequest) -> dict[str, Any]:
             "verifier_prompt_sha256": lock.prompt_identities["entailment"],
             "verifier_schema_sha256": lock.output_schema_identities["entailment"],
             "verifier_context_sha256": verifier_context_sha256,
-            "checked_statement_count": len(claims),
+            "checked_statement_count": sum(len(section.statements) for section in sections),
             "verified_content_sha256": verified_content_sha256,
             "reason_codes": [],
         },
@@ -784,6 +747,7 @@ def test_presentation_text_cannot_reuse_a_stale_verifier_digest() -> None:
         "이 심사 건은 통관이 승인되었으며 담당자 검토가 필요하지 않습니다.",
         "이 심사 건은 별도 확인 없이 즉시 처리해도 됩니다.",
         "이 자료만으로 모든 요건이 충족됐으므로 추가 조치는 없습니다.",
+        "담당자 판단을 기다리지 않아도 바로 후속 절차를 진행할 수 있습니다.",
     ],
 )
 def test_presentation_rejects_unsupported_atomic_or_contradictory_claim_even_with_fresh_audit(
@@ -824,7 +788,8 @@ def test_presentation_rejects_unsupported_atomic_or_contradictory_claim_even_wit
 
     typed = ReviewExperienceEnvelopeV1.model_validate(raw)
     with pytest.raises(
-        ValueError, match="literal absent|canonical claim|grounded claim|atom absent"
+        ValueError,
+        match="literal absent|canonical claim|grounded claim|atom absent|controlled language",
     ):
         validate_presentation_against_result(typed)
 
@@ -836,6 +801,7 @@ def test_presentation_rejects_unsupported_atomic_or_contradictory_claim_even_wit
         "이 심사 건은 통관이 승인되었으며 담당자 검토가 필요하지 않습니다.",
         "이 심사 건은 별도 확인 없이 즉시 처리해도 됩니다.",
         "이 자료만으로 모든 요건이 충족됐으므로 추가 조치는 없습니다.",
+        "담당자 판단을 기다리지 않아도 바로 후속 절차를 진행할 수 있습니다.",
     ],
 )
 def test_assistant_rejects_unsupported_atomic_or_contradictory_claim_even_with_fresh_audit(
@@ -858,7 +824,8 @@ def test_assistant_rejects_unsupported_atomic_or_contradictory_claim_even_with_f
 
     typed = AssistantAnswerV2.model_validate(raw)
     with pytest.raises(
-        ValueError, match="literal absent|canonical claim|grounded claim|atom absent"
+        ValueError,
+        match="literal absent|canonical claim|grounded claim|atom absent|controlled language",
     ):
         validate_answer_against_context(
             answer=typed,
@@ -952,7 +919,7 @@ def test_assistant_accepts_code_owned_korean_frame_for_exact_field_fact() -> Non
     )
 
 
-def test_assistant_accepts_fluent_korean_when_claims_citations_and_verifier_are_bound() -> None:
+def test_assistant_rejects_free_prose_even_when_claims_citations_and_verifier_are_bound() -> None:
     result = _experience(_review_request())["canonical_result"]
     request = {
         "conversation_id": "conversation-fluent-answer",
@@ -968,10 +935,143 @@ def test_assistant_accepts_fluent_korean_when_claims_citations_and_verifier_are_
     raw["direct_answer"] = "검토한 제출 자료에서는 특별히 바로잡아야 할 내용이 확인되지 않았습니다."
     _rehash_answer(raw, request)
 
+    with pytest.raises(ValueError, match="controlled language"):
+        validate_answer_against_context(
+            answer=AssistantAnswerV2.model_validate(raw),
+            request=CaseConversationRequestV2.model_validate(request),
+        )
+
+
+def test_general_guidance_rejects_case_outcome_prose_with_fresh_hashes() -> None:
+    result = _experience(_review_request())["canonical_result"]
+    request = {
+        "conversation_id": "conversation-guidance-grounding-attack",
+        "parent_message_id": None,
+        "question": "HSK가 무엇입니까?",
+        "bound_result_sha256": result["result_sha256"],
+        "conversation_context_sha256": canonical_digest([]),
+        "recent_turns": [],
+        "review_result": result,
+        "locale": "ko-KR",
+    }
+    raw = _answer(request)
+    raw["answer_scope"] = "general_customs_guidance"
+    raw["status"] = "answered"
+    raw["direct_answer"] = "담당자 판단을 기다리지 않아도 바로 후속 절차를 진행할 수 있습니다."
+    raw["explanation"] = []
+    raw["evidence_meaning"] = []
+    raw["impact"] = []
+    raw["next_steps"] = []
+    raw["limitations"] = [
+        "위 내용은 일반 통관 안내이며 현재 심사 건의 판정이나 법적 의무를 뜻하지 않습니다."
+    ]
+    raw["claim_selections"] = {
+        "direct_answer": [],
+        "explanation": [],
+        "evidence_meaning": [],
+        "impact": [],
+        "next_steps": [],
+    }
+    raw["citations"] = []
+    raw["generation_audit"]["scope_classification"]["classified_scope"] = "general_customs_guidance"
+    raw["generation_audit"]["scope_classification"]["guidance_topics"] = ["hsk"]
+    raw["verification_audit"]["checked_statement_count"] = 2
+    _rehash_answer(raw, request)
+
+    with pytest.raises(ValueError, match="controlled language"):
+        validate_answer_against_context(
+            answer=AssistantAnswerV2.model_validate(raw),
+            request=CaseConversationRequestV2.model_validate(request),
+        )
+
+
+def test_general_guidance_accepts_only_the_selected_catalog_rendering() -> None:
+    result = _experience(_review_request())["canonical_result"]
+    request = {
+        "conversation_id": "conversation-guidance-controlled-language",
+        "parent_message_id": None,
+        "question": "HSK가 무엇입니까?",
+        "bound_result_sha256": result["result_sha256"],
+        "conversation_context_sha256": canonical_digest([]),
+        "recent_turns": [],
+        "review_result": result,
+        "locale": "ko-KR",
+    }
+    raw = _answer(request)
+    raw["answer_scope"] = "general_customs_guidance"
+    raw["status"] = "answered"
+    raw["direct_answer"] = provider_meaning_catalog().general_guidance["hsk"]
+    raw["explanation"] = []
+    raw["evidence_meaning"] = []
+    raw["impact"] = []
+    raw["next_steps"] = []
+    raw["limitations"] = [
+        "위 내용은 일반 통관 안내이며 현재 심사 건의 판정이나 법적 의무를 뜻하지 않습니다."
+    ]
+    raw["claim_selections"] = {
+        "direct_answer": [],
+        "explanation": [],
+        "evidence_meaning": [],
+        "impact": [],
+        "next_steps": [],
+    }
+    raw["citations"] = []
+    raw["generation_audit"]["scope_classification"]["classified_scope"] = "general_customs_guidance"
+    raw["generation_audit"]["scope_classification"]["guidance_topics"] = ["hsk"]
+    raw["verification_audit"]["checked_statement_count"] = 2
+    _rehash_answer(raw, request)
+
     validate_answer_against_context(
         answer=AssistantAnswerV2.model_validate(raw),
         request=CaseConversationRequestV2.model_validate(request),
     )
+
+
+def test_general_guidance_rejects_reordered_catalog_topics_with_fresh_hashes() -> None:
+    result = _experience(_review_request())["canonical_result"]
+    request = {
+        "conversation_id": "conversation-guidance-reordered",
+        "parent_message_id": None,
+        "question": "HSK와 상업송장을 함께 설명해 주십시오.",
+        "bound_result_sha256": result["result_sha256"],
+        "conversation_context_sha256": canonical_digest([]),
+        "recent_turns": [],
+        "review_result": result,
+        "locale": "ko-KR",
+    }
+    catalog = provider_meaning_catalog().general_guidance
+    raw = _answer(request)
+    raw["answer_scope"] = "general_customs_guidance"
+    raw["status"] = "answered"
+    raw["direct_answer"] = catalog["invoice"]
+    raw["explanation"] = [catalog["hsk"]]
+    raw["evidence_meaning"] = []
+    raw["impact"] = []
+    raw["next_steps"] = []
+    raw["limitations"] = [
+        "위 내용은 일반 통관 안내이며 현재 심사 건의 판정이나 법적 의무를 뜻하지 않습니다."
+    ]
+    raw["claim_selections"] = {
+        "direct_answer": [],
+        "explanation": [],
+        "evidence_meaning": [],
+        "impact": [],
+        "next_steps": [],
+    }
+    raw["citations"] = []
+    raw["generation_audit"]["scope_classification"]["classified_scope"] = "general_customs_guidance"
+    raw["generation_audit"]["scope_classification"]["guidance_topics"] = [
+        "hsk",
+        "invoice",
+    ]
+    raw["verification_audit"]["checked_statement_count"] = 3
+    _rehash_answer(raw, request)
+
+    with pytest.raises(ValueError, match="controlled language"):
+        validate_answer_against_context(
+            answer=AssistantAnswerV2.model_validate(raw),
+            request=CaseConversationRequestV2.model_validate(request),
+        )
 
 
 def test_assistant_rejects_a_verifier_receipt_from_another_question_context() -> None:
