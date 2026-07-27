@@ -1,13 +1,13 @@
 {
   "meaning_catalog_sha256": "239d0365e5567394218f007a5ec815b4aa4ffa385cdd8cb999286c85b350a98a",
   "meaning_catalog_file_sha256": "9e0780102be719d3be11949bf90a4568b74547616c6a7c34d67d2520d63b5b6f",
-  "experience_prompt_bundle_sha256": "496e04c9d71a0e31776b57fabd18ada18a3c85eb071084a3740ee981971d6c83",
+  "experience_prompt_bundle_sha256": "4942cc1db50756c14fe1b6d57e75e2567636e14c76e858ff094c53c61148f763",
   "experience_schema_bundle_sha256": "41f9b701e0a50335779cf4869d175196faa1d66d3a873f06193105423da8f020",
   "experience_prompt_sha256": {
-    "chat": "df2ee8104bd3879edda1a956b9fdf9aeb91f4002098ac5899ca1d7aab3954d78",
-    "chat_verifier": "388d4480c1e4d062172b8dddaa18c2cc63ece737669c641ea8c1c5a92ab84452",
-    "entailment": "da5f68866a1b6a711eee52aa346c189c8379b93eeb7bb7a690af23719b069396",
-    "presentation": "dd90ad6709feadc33f318bab21f6e51436bcf3ce786e64748d2afbbeed660ebe",
+    "chat": "f27e5ef17b9b9b04388a3685e9c92680fb39c49064f9b0f30335de60ea45de87",
+    "chat_verifier": "2533d4888ff732fd1a28adec8a2aeb2a0215774654c98fef8fcac62221bef0aa",
+    "entailment": "3117334d7ec92db065bb12418a5acf468e1b50bc1ee2d58ab7154ffcd91c6b15",
+    "presentation": "1aa77e9a9e491900a7178fc0e9ebc06c97114942eaf5dc42a4ad0a3ebb71dbe6",
     "scope_classifier": "9db8f95d4b46bf9d8ea9734e45fa45b178df4de85328adb10788a9dbaff83798"
   },
   "experience_output_schema_sha256": {
@@ -18,7 +18,7 @@
     "scope_classifier": "9889573adc91c99989b8ed8eeb65b1c2c277332b7cd20c4eff8a9f3ff32f686d",
     "scope_classifier_semantic": "cff8825cc0413de58b9b8dfbbf3d53538e1f0da6f0cb24f16878304ab063623a"
   },
-  "provider_commit": "a04a0d8a918145b3d1a1083c805596be18d08e08",
+  "provider_commit": "445647f9739548c451c049346cc505481e2df774",
   "provider_asset_manifest_sha256": "a7ee9dd86fdf6a6ea0d669556fd5cdae7b2d9b62c669245378551c1bc8947361",
   "provider_manifest_sha256": "b04b23afc0d04b7d8d2c87990fd59bad592dd67adabcc81831bf94619e1bcd20",
   "provider_openapi_lock_file_sha256": "8a1d143f816b37a405aaa568f3f28a88e086be3db81518333e0130ecf99627e3",

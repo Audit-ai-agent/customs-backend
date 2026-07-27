@@ -208,14 +208,14 @@ def test_environment_example_pins_the_reviewed_data_provider_build() -> None:
 def test_environment_example_pins_the_final_agent_candidate_contracts() -> None:
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
     for expected in (
-        "CUSTOMS_BACKEND_AGENT_EXPECTED_BUILD_SHA=a04a0d8a918145b3d1a1083c805596be18d08e08",
+        "CUSTOMS_BACKEND_AGENT_EXPECTED_BUILD_SHA=445647f9739548c451c049346cc505481e2df774",
         "CUSTOMS_BACKEND_AGENT_EXPECTED_WHEEL_SHA256="
-        "241ee8740a7a1bb1f6244d8f04441e0efcc979253a1a11537115dbaca4ea92e7",
+        "1be35669f6149eb67a11facc2047edddfb7ec734d1c672554c95a60bcdc545be",
         "CUSTOMS_BACKEND_AGENT_EXPECTED_SOURCE_SNAPSHOT_SHA256="
-        "e9e1c439177eef0ff89e40b7c9bdef6d0edbe31764ac2bbdc970074bd40db3f9",
+        "c087df73216ad140ff88cc7cf73ea7595fb1fca8d9e85970e35db3cd93d417c3",
         "CUSTOMS_BACKEND_AGENT_EXPECTED_PACKAGE_VERSION=0.3.0",
         "CUSTOMS_BACKEND_AGENT_EXPECTED_CODE_SNAPSHOT_SHA256="
-        "fe87b34490d6805797ed381d721d8162023d8cf7ea6edca99b49993e4766cb18",
+        "3549a52300807223c9d32fc70fa42729eb06d20964ada162176a6b757f62f1d5",
         "CUSTOMS_BACKEND_AGENT_EXPECTED_MODEL_ID=claude-sonnet-5",
         "CUSTOMS_BACKEND_AGENT_EXPECTED_EXTRACTION_PROMPT_SHA256="
         "93c7ba900a631f82473c9d480360404c2f93442ecfd2e48a110a1519f0262cb5",
@@ -250,8 +250,8 @@ def test_readme_distinguishes_current_agent_pin_from_legacy_pilot() -> None:
     ]
     legacy_section = readme.split("legacy/historical pilot 전용", 1)[1]
     assert "customs-ai-agent==0.3.0" in current_section
-    assert "a04a0d8a918145b3d1a1083c805596be18d08e08" in current_section
-    assert "241ee8740a7a1bb1f6244d8f04441e0efcc979253a1a11537115dbaca4ea92e7" in (current_section)
+    assert "445647f9739548c451c049346cc505481e2df774" in current_section
+    assert "1be35669f6149eb67a11facc2047edddfb7ec734d1c672554c95a60bcdc545be" in (current_section)
     assert "customs-ai-agent==0.1.0" not in current_section
     assert "Agent 0.1.0" in legacy_section
 
