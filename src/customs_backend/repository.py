@@ -78,6 +78,16 @@ def _review_stage_duration_sample(events: list[StageEvent]) -> dict[str, int]:
     return sample
 
 
+def _review_total_duration_ms(events: list[StageEvent]) -> int | None:
+    durations: list[int] = []
+    for event in events:
+        duration = event.detail.get("duration_ms")
+        if isinstance(duration, bool) or not isinstance(duration, int) or duration < 0:
+            continue
+        durations.append(duration)
+    return sum(durations) if durations else None
+
+
 def _updated_assistant_job(
     record: AssistantJobRecord,
     **updates: Any,
@@ -713,6 +723,9 @@ class InMemoryWorkbenchRepository:
         document_count: int,
         limit: int = 30,
     ) -> list[int]:
+        bounded_limit = max(0, min(limit, 30))
+        if bounded_limit == 0:
+            return []
         with self._lock:
             jobs = sorted(
                 (
@@ -724,18 +737,17 @@ class InMemoryWorkbenchRepository:
                     and item.request.get("evidence_profile") == evidence_profile
                     and item.request.get("document_count") == document_count
                 ),
-                key=lambda item: item.updated_at,
+                key=lambda item: (
+                    item.agent_call_started_at or item.updated_at,
+                    item.job_id,
+                ),
                 reverse=True,
-            )[:limit]
+            )[:bounded_limit]
             values: list[int] = []
             for job in jobs:
-                durations: list[int] = []
-                for event in self._events.get(job.job_id, []):
-                    duration = event.detail.get("duration_ms")
-                    if isinstance(duration, int) and duration >= 0:
-                        durations.append(duration)
-                if durations:
-                    values.append(sum(durations))
+                duration = _review_total_duration_ms(self._events.get(job.job_id, []))
+                if duration is not None:
+                    values.append(duration)
             return values
 
     def recent_review_stage_durations_ms(
@@ -2847,34 +2859,42 @@ class PostgresWorkbenchRepository:
         document_count: int,
         limit: int = 30,
     ) -> list[int]:
+        bounded_limit = max(0, min(limit, 30))
+        if bounded_limit == 0:
+            return []
         with Session(self._engine) as session:
-            rows = session.scalars(
+            jobs = session.scalars(
                 select(_JobRow)
-                .where(_JobRow.org_id == org_id, _JobRow.status == "succeeded")
-                .order_by(_JobRow.agent_call_started_at.desc())
-                .limit(200)
+                .where(
+                    _JobRow.org_id == org_id,
+                    _JobRow.status == JobStatus.succeeded.value,
+                    _JobRow.record_json["request"]["experience_api_version"].as_string() == "3.0",
+                    _JobRow.record_json["request"]["evidence_profile"].as_string()
+                    == evidence_profile,
+                    _JobRow.record_json["request"]["document_count"].as_integer() == document_count,
+                )
+                .order_by(_JobRow.agent_call_started_at.desc(), _JobRow.job_id.desc())
+                .limit(bounded_limit)
             ).all()
+            if not jobs:
+                return []
+            job_ids = [row.job_id for row in jobs]
+            event_rows = session.scalars(
+                select(_StageEventRow)
+                .where(
+                    _StageEventRow.org_id == org_id,
+                    _StageEventRow.job_id.in_(job_ids),
+                )
+                .order_by(_StageEventRow.job_id, _StageEventRow.sequence)
+            ).all()
+            events_by_job: dict[str, list[StageEvent]] = {job_id: [] for job_id in job_ids}
+            for row in event_rows:
+                events_by_job[row.job_id].append(StageEvent.model_validate(row.record_json))
             values: list[int] = []
-            for row in rows:
-                job = JobRecord.model_validate(row.record_json)
-                if (
-                    job.request.get("experience_api_version") != "3.0"
-                    or job.request.get("evidence_profile") != evidence_profile
-                    or job.request.get("document_count") != document_count
-                ):
-                    continue
-                event_rows = session.scalars(
-                    select(_StageEventRow).where(_StageEventRow.job_id == job.job_id)
-                ).all()
-                durations: list[int] = []
-                for event in (StageEvent.model_validate(item.record_json) for item in event_rows):
-                    duration = event.detail.get("duration_ms")
-                    if isinstance(duration, int) and duration >= 0:
-                        durations.append(duration)
-                if durations:
-                    values.append(sum(durations))
-                if len(values) >= limit:
-                    break
+            for job_id in job_ids:
+                duration = _review_total_duration_ms(events_by_job[job_id])
+                if duration is not None:
+                    values.append(duration)
             return values
 
     def recent_review_stage_durations_ms(

@@ -57,7 +57,7 @@ from customs_backend.experience import (
     AssistantMessageCreateV2,
     ConversationCreateV2,
 )
-from customs_backend.repository import PostgresWorkbenchRepository
+from customs_backend.repository import PostgresWorkbenchRepository, _JobRow
 from customs_backend.service import WorkbenchService
 
 
@@ -710,6 +710,72 @@ def test_postgres_migration_atomicity_persistence_and_isolation() -> None:
     assert timing_samples[0]["request_validation"] == 10
     assert timing_samples[0]["document_analysis"] == 10
     assert set(timing_samples[0]) == set(_REVIEW_STAGES) - {"completed"}
+    overall_samples = restarted_repository.recent_review_durations_ms(
+        org_id=reviewer_a.org_id,
+        evidence_profile="preserved-3law-v3-scenario-eval",
+        document_count=int(experience_job.request["document_count"]),
+        limit=30,
+    )
+    assert overall_samples
+
+    # More than 200 newer successful Jobs from another profile must not hide
+    # this profile's valid history. Filtering must happen before LIMIT in SQL.
+    completed_experience_job = restarted_repository.get_job(
+        reviewer_a.org_id,
+        experience_job.job_id,
+    )
+    assert completed_experience_job is not None
+    noise_rows = []
+    for index in range(201):
+        timestamp = utc_now() + timedelta(days=1, seconds=index)
+        noise_request = dict(completed_experience_job.request)
+        noise_request["evidence_profile"] = "unrelated-profile"
+        noise_job = completed_experience_job.model_copy(
+            update={
+                "job_id": f"job-stage-eta-noise-{index}",
+                "idempotency_key": f"stage-eta-noise-{index}",
+                "idempotency_request_digest": hashlib.sha256(
+                    f"idempotency-{index}".encode()
+                ).hexdigest(),
+                "request_digest": hashlib.sha256(f"request-{index}".encode()).hexdigest(),
+                "logical_request_sha256": hashlib.sha256(f"logical-{index}".encode()).hexdigest(),
+                "request": noise_request,
+                "agent_call_started_at": timestamp,
+                "updated_at": timestamp,
+            }
+        )
+        noise_rows.append(
+            {
+                "job_id": noise_job.job_id,
+                "case_id": noise_job.case_id,
+                "org_id": noise_job.org_id,
+                "idempotency_key": noise_job.idempotency_key,
+                "request_digest": noise_job.request_digest,
+                "case_revision": noise_job.case_revision,
+                "logical_request_sha256": noise_job.logical_request_sha256,
+                "status": noise_job.status.value,
+                "kind": noise_job.kind,
+                "lease_id": noise_job.lease_id,
+                "lease_expires_at": noise_job.lease_expires_at,
+                "attempt_count": noise_job.attempt_count,
+                "agent_call_state": noise_job.agent_call_state.value,
+                "agent_call_endpoint": noise_job.agent_call_endpoint,
+                "agent_call_request_sha256": noise_job.agent_call_request_sha256,
+                "agent_call_started_at": noise_job.agent_call_started_at,
+                "record_json": noise_job.model_dump(mode="json"),
+            }
+        )
+    with engine.begin() as connection:
+        connection.execute(_JobRow.__table__.insert(), noise_rows)
+    assert (
+        restarted_repository.recent_review_durations_ms(
+            org_id=reviewer_a.org_id,
+            evidence_profile="preserved-3law-v3-scenario-eval",
+            document_count=int(experience_job.request["document_count"]),
+            limit=30,
+        )
+        == overall_samples
+    )
 
     conversation = enhanced_service.create_assistant_conversation(
         reviewer_a,

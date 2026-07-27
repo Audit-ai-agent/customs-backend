@@ -675,8 +675,24 @@ def test_stage_eta_uses_one_sample_per_successful_run_and_sums_stage_retries(
         4_000,
         5_000,
     ]
+    assert sorted(
+        container.repository.recent_review_durations_ms(
+            org_id="org-a",
+            evidence_profile="preserved-3law-v3-scenario-eval",
+            document_count=1,
+            limit=100,
+        )
+    ) == [1_100, 2_100, 3_100, 4_100, 5_100]
     assert (
         container.repository.recent_review_stage_durations_ms(
+            org_id="org-a",
+            evidence_profile="another-profile",
+            document_count=1,
+        )
+        == []
+    )
+    assert (
+        container.repository.recent_review_durations_ms(
             org_id="org-a",
             evidence_profile="another-profile",
             document_count=1,
