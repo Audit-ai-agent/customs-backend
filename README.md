@@ -92,10 +92,10 @@ AI Agent는 형제 폴더가 아닌 exact-commit wheel로 설치한다. 이 저�
 고정 계약을 소비한다. 현재 제품 Backend candidate의 exact pin은 다음과 같다.
 
 - package: `customs-ai-agent==0.3.0`
-- Agent commit: `ea7e8881a822309889d9f676c6c4cb9b9f8d4c6e`
-- wheel SHA-256: `9baae13a45d7ef7ffa67712d0d37f5043b3b9f08ca7f457e58caa5fdfa4ec7bf`
-- source snapshot SHA-256: `1e481d3e9dfc383c7134ccccda5cb6225407f307398c18920b17756610003e29`
-- code snapshot SHA-256: `e13e89663a26ce03c73afc40eb3166d83778ee9d23e360bf47bc285bc04fc073`
+- Agent commit: `a04a0d8a918145b3d1a1083c805596be18d08e08`
+- wheel SHA-256: `241ee8740a7a1bb1f6244d8f04441e0efcc979253a1a11537115dbaca4ea92e7`
+- source snapshot SHA-256: `e9e1c439177eef0ff89e40b7c9bdef6d0edbe31764ac2bbdc970074bd40db3f9`
+- code snapshot SHA-256: `fe87b34490d6805797ed381d721d8162023d8cf7ea6edca99b49993e4766cb18`
 
 Backend는 위 identity와 packaged V3 Schema·OpenAPI·prompt·policy·tool registry
 identity가 모두 일치할 때만 Agent 응답을 소비한다. 현재 assertion

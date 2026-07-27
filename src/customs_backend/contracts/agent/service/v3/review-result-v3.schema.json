@@ -106,7 +106,6 @@
             "evidence.retrieve/v3",
             "human.request/v1",
             "explanation.compose/v1",
-            "explanation.compose/v2",
             "case.answer/v1"
           ],
           "title": "Tool Name",
@@ -1478,7 +1477,6 @@
             "evidence.retrieve/v3",
             "human.request/v1",
             "explanation.compose/v1",
-            "explanation.compose/v2",
             "case.answer/v1"
           ],
           "title": "Tool Name",
@@ -2647,7 +2645,6 @@
             "evidence.retrieve/v3",
             "human.request/v1",
             "explanation.compose/v1",
-            "explanation.compose/v2",
             "case.answer/v1"
           ],
           "title": "Tool Name",

@@ -1,6 +1,6 @@
 {
-  "canonical_json_bytes": 448198,
-  "canonical_sha256": "53df8496404b5fa076c2abbb31c4717024f170148377582314af9dd57ae3053d",
+  "canonical_json_bytes": 447673,
+  "canonical_sha256": "2d551ab78b0f79cdc11bb7ac0cffb5c86a4065d4490435b83c7d0d855018b45b",
   "generator": {
     "fastapi": "0.139.2",
     "openapi": "3.1.0",

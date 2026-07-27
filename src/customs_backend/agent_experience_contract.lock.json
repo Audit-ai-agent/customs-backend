@@ -18,14 +18,14 @@
     "scope_classifier": "9889573adc91c99989b8ed8eeb65b1c2c277332b7cd20c4eff8a9f3ff32f686d",
     "scope_classifier_semantic": "cff8825cc0413de58b9b8dfbbf3d53538e1f0da6f0cb24f16878304ab063623a"
   },
-  "provider_commit": "ea7e8881a822309889d9f676c6c4cb9b9f8d4c6e",
+  "provider_commit": "a04a0d8a918145b3d1a1083c805596be18d08e08",
   "provider_asset_manifest_sha256": "a7ee9dd86fdf6a6ea0d669556fd5cdae7b2d9b62c669245378551c1bc8947361",
-  "provider_manifest_sha256": "0475009c76fd690e7bbc0550d8de8f4c400ff91c8c76dfe1175b50fc363452ee",
-  "provider_openapi_lock_file_sha256": "b4d3d1cce98ef31bd3463d5e3cfe375d71e24d0a109f74de82e16b63dc9ea6a4",
-  "provider_openapi_sha256": "53df8496404b5fa076c2abbb31c4717024f170148377582314af9dd57ae3053d",
+  "provider_manifest_sha256": "b04b23afc0d04b7d8d2c87990fd59bad592dd67adabcc81831bf94619e1bcd20",
+  "provider_openapi_lock_file_sha256": "8a1d143f816b37a405aaa568f3f28a88e086be3db81518333e0130ecf99627e3",
+  "provider_openapi_sha256": "2d551ab78b0f79cdc11bb7ac0cffb5c86a4065d4490435b83c7d0d855018b45b",
   "provider_review_result_v3": {
-    "canonical_sha256": "2f0dbfe140d7cc625c6823108318c8c3090c0c82eb3d3830940ee6690ebe1f9c",
-    "file_sha256": "7115a2ef8cea88c38974cad58df88c0ec1960a78d99a7f82d683633b29436c20"
+    "canonical_sha256": "63af4fe6a38ee1980e4829f5860ec806706466b7aefb1b49b5b2a0520b3526a5",
+    "file_sha256": "72e70f901ef0bc7402159f4a1d1e25043effa02213f450ac017b611aaa37f912"
   },
   "schema_version": "customs-backend-agent-experience-consumer-lock/v1",
   "uat_tool_registry_id": "customs-agent-tools/text-uat-v2",
@@ -40,12 +40,12 @@
       "file_sha256": "9aa8bb87096ab760bcb945cb4ebd3081dfce4dd0035f1cd54a054c8b118c5482"
     },
     "case-conversation-request-v2.schema.json": {
-      "canonical_sha256": "e0490142e62d885c6b706a6a56611bf540bed711f88678d1f6abe4047f3528dd",
-      "file_sha256": "f148b7f4ccf977c5347ac595d343f514f669fb444feb80be6b5623e27b96fa0e"
+      "canonical_sha256": "9596f795847e30d9db2fed7e5633735165968b8114c0600e0f0d3188cb446d29",
+      "file_sha256": "120aee4bd8340e63fe9059f68f1e25af2b24fc2ed2d98ad7a48f15e7046a33e8"
     },
     "review-experience-envelope-v1.schema.json": {
-      "canonical_sha256": "0365da391ff408301482be154b654c8950c76d108df5149cd7e1efcccc6489ee",
-      "file_sha256": "9b55f8c3ad321d8961b41e686d61a817fe7220c36db6287b1155733066c20a75"
+      "canonical_sha256": "662923e30b4f8002d64a441fe7acec6dad8e09b3d68bd2423ea2ade26d61d91f",
+      "file_sha256": "897da20bffa3b18fe41ea075d1ba1a70ab32aa6b55854d64309aa8a7803d2b90"
     },
     "review-stage-event-v1.schema.json": {
       "canonical_sha256": "165b8ad6ad01507cb17f82d555f7579883a7407fbf6442a1a5d0c724b30053f1",
