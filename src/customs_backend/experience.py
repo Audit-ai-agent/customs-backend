@@ -1764,7 +1764,10 @@ def _expected_presentation_headline(result: AgentReviewResultV3) -> str:
     return "현재 근거만으로 확정하기 어려워 담당자 확인이 필요합니다"
 
 
-def _expected_user_action_events(result: AgentReviewResultV3) -> list[UserActionEventV1]:
+def _expected_user_action_events(
+    result: AgentReviewResultV3,
+    presentation: GroundedPresentationV1,
+) -> list[UserActionEventV1]:
     catalog = provider_meaning_catalog()
     events: list[UserActionEventV1] = []
     for action in result.required_actions:
@@ -1818,6 +1821,32 @@ def _expected_user_action_events(result: AgentReviewResultV3) -> list[UserAction
                 }
             )
         )
+    statement_ids = sorted(
+        {
+            statement.statement_id
+            for section in presentation.sections
+            for statement in section.statements
+        }
+    )[:100]
+    payload = {
+        "schema_version": "1.0",
+        "action_code": "explanation.compose/v2",
+        "title": "사용자용 심사 설명을 작성했습니다",
+        "description": (
+            "검증된 심사 사실과 근거만 사용해 사용자용 설명을 작성하고 "
+            "근거 결박 검사를 완료했습니다."
+        ),
+        "status": "completed",
+        "source_reference_ids": statement_ids,
+    }
+    events.append(
+        UserActionEventV1.model_validate(
+            {
+                "event_id": f"user_action_{canonical_digest(payload)}",
+                **payload,
+            }
+        )
+    )
     return events
 
 
@@ -1981,15 +2010,24 @@ def validate_presentation_against_result(envelope: ReviewExperienceEnvelopeV1) -
             raise ValueError("Claude presentation is too short for the user experience contract")
         if _korean_letter_ratio(material_text) < _PRESENTATION_MIN_KOREAN_RATIO:
             raise ValueError("Claude presentation does not meet the Korean-language quality gate")
-    allowed_action_sources = _result_claim_ids | {
-        reference_id for _kind, reference_id in references
-    }
+    allowed_action_sources = (
+        _result_claim_ids
+        | {reference_id for _kind, reference_id in references}
+        | {
+            statement.statement_id
+            for section in envelope.user_presentation.sections
+            for statement in section.statements
+        }
+    )
     if any(
         not set(event.source_reference_ids).issubset(allowed_action_sources)
         for event in envelope.user_action_events
     ):
         raise ValueError("user action references are outside the canonical result")
-    if envelope.user_action_events != _expected_user_action_events(result):
+    if envelope.user_action_events != _expected_user_action_events(
+        result,
+        envelope.user_presentation,
+    ):
         raise ValueError("user action copy differs from the provider meaning catalog")
 
 
@@ -2052,7 +2090,8 @@ def build_deterministic_review_experience(
         "user_presentation": presentation.model_dump(mode="json"),
         "capability_attestation": capability_attestation.model_dump(mode="json"),
         "user_action_events": [
-            item.model_dump(mode="json") for item in _expected_user_action_events(result)
+            item.model_dump(mode="json")
+            for item in _expected_user_action_events(result, presentation)
         ],
     }
     envelope = ReviewExperienceEnvelopeV1.model_validate(

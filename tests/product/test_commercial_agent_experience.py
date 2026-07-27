@@ -267,6 +267,29 @@ def _experience(request: AgentReviewRequest) -> dict[str, Any]:
                 **action_payload,
             }
         )
+    explanation_action_payload = {
+        "schema_version": "1.0",
+        "action_code": "explanation.compose/v2",
+        "title": "사용자용 심사 설명을 작성했습니다",
+        "description": (
+            "검증된 심사 사실과 근거만 사용해 사용자용 설명을 작성하고 "
+            "근거 결박 검사를 완료했습니다."
+        ),
+        "status": "completed",
+        "source_reference_ids": sorted(
+            {
+                statement["statement_id"]
+                for section in presentation_payload["sections"]
+                for statement in section["statements"]
+            }
+        )[:100],
+    }
+    user_action_events.append(
+        {
+            "event_id": f"user_action_{canonical_digest(explanation_action_payload)}",
+            **explanation_action_payload,
+        }
+    )
     envelope_payload = {
         "schema_version": "1.0",
         "canonical_result": result,
@@ -761,6 +784,29 @@ def test_presentation_text_cannot_reuse_a_stale_verifier_digest() -> None:
     typed = ReviewExperienceEnvelopeV1.model_validate(raw)
     with pytest.raises(ValueError, match="verification identity"):
         validate_presentation_against_result(typed)
+
+
+def test_presentation_action_event_is_exactly_bound_to_current_statement_ids() -> None:
+    raw = deepcopy(_experience(_review_request()))
+    expected_statement_ids = sorted(
+        {
+            statement["statement_id"]
+            for section in raw["user_presentation"]["sections"]
+            for statement in section["statements"]
+        }
+    )[:100]
+    explanation_event = raw["user_action_events"][-1]
+    assert explanation_event["action_code"] == "explanation.compose/v2"
+    assert explanation_event["source_reference_ids"] == expected_statement_ids
+    validate_presentation_against_result(ReviewExperienceEnvelopeV1.model_validate(raw))
+
+    explanation_event["source_reference_ids"] = expected_statement_ids[:-1]
+    event_payload = {key: value for key, value in explanation_event.items() if key != "event_id"}
+    explanation_event["event_id"] = f"user_action_{canonical_digest(event_payload)}"
+    envelope_payload = {key: value for key, value in raw.items() if key != "envelope_sha256"}
+    raw["envelope_sha256"] = canonical_digest(envelope_payload)
+    with pytest.raises(ValueError, match="user action copy"):
+        validate_presentation_against_result(ReviewExperienceEnvelopeV1.model_validate(raw))
 
 
 @pytest.mark.parametrize(
