@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -30,6 +31,11 @@ from customs_backend.domain import (
     Role,
     SupportingDocumentRecord,
     canonical_digest,
+)
+from customs_backend.experience import AgentUatCapabilityAttestationV1
+from customs_backend.experience_contract import (
+    expected_meaning_catalog_sha256,
+    validate_agent_experience_contract_bundle,
 )
 from customs_backend.repository import InMemoryWorkbenchRepository
 from customs_backend.service import WorkbenchService
@@ -687,21 +693,170 @@ def test_local_uat_container_selects_only_real_boundary_adapters(monkeypatch) ->
     }
 
 
-def _local_uat_app(*, agent_status: str = "ready") -> TestClient:
-    settings = Settings(**_local_uat_values())
-    repository = InMemoryWorkbenchRepository()
-    object_store = InMemoryObjectStore()
-    publisher = InMemoryJobPublisher()
+def _actual_agent_active_metadata() -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    str,
+    str,
+]:
+    """Mirror the Local-UAT Agent's real v2/v3 metadata wire shape."""
+
+    contract = validate_agent_experience_contract_bundle().lock
+    issued_at = datetime.now(UTC)
+    capability_payload = {
+        "schema_version": "1.0",
+        "profile_id": "local-uat-capability-live-mode-regression",
+        "environment": "local_uat",
+        "evidence_profile": "preserved-3law-v3-scenario-eval",
+        "loopback_only": True,
+        "issued_at": issued_at.isoformat().replace("+00:00", "Z"),
+        "expires_at": (issued_at + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+        "agent_commit": contract.provider_commit,
+        "agent_code_snapshot_sha256": "a" * 64,
+        "model_id": "claude-sonnet-5",
+        "prompt_bundle_sha256": contract.experience_prompt_bundle_sha256,
+        "schema_bundle_sha256": contract.experience_schema_bundle_sha256,
+        "tool_registry_id": contract.uat_tool_registry_id,
+        "tool_registry_sha256": contract.uat_tool_registry_sha256,
+        "evidence_runtime_v3_sha256": (
+            _diagnostic_evidence_identity()["runtime_release_v3_sha256"]
+        ),
+        "max_cycles": 2,
+        "max_tool_calls": 6,
+        "max_rereads_per_field": 1,
+        "adaptive_active": True,
+        "auto_completion_enabled": False,
+    }
+    capability = AgentUatCapabilityAttestationV1(
+        **capability_payload,
+        capability_sha256=canonical_digest(capability_payload),
+    )
+    capability_wire = capability.model_dump(mode="json")
+    capability_file_sha256 = "f" * 64
     evidence_identity = _diagnostic_evidence_identity()
-    agent = CallableAgentClient(
-        lambda _request: {},
-        metadata={
+    agentic_limits = {
+        "max_cycles": 2,
+        "max_tool_calls": 6,
+        "ocr_enabled": False,
+        "planner_mode": "active",
+        "active_execution_authorized_by_release": False,
+        "active_tool_handlers_registered": True,
+        "trusted_assertion_verifier_configured": True,
+        "effective_execution_mode": "uat_active",
+        "uat_adaptive_active": True,
+    }
+    metadata = {
+        "status": "ready",
+        "service_api_version": "internal-agent-service/v2",
+        "service_mode": "local_user_uat_diagnostic",
+        "assurance_level": "diagnostic",
+        "transport_limits": {"text_only": True},
+        "agentic_limits": dict(agentic_limits),
+        "model": {"id": capability.model_id},
+        "schemas": {
+            "service_openapi_sha256": contract.provider_openapi_sha256,
+        },
+        "uat": {
+            "diagnostic_only": True,
+            "mock_fallback_allowed": False,
+            "auto_completion_allowed": False,
+            "evidence_mode": "preserved-3law-v3-scenario-eval",
+            "evidence_policy_mode": "SEALED_TEST_ONLY_ACTUAL_CCCT_HUMAN_ONLY",
+            "evidence_profile": {
+                "profile_id": "preserved-3law-v3-scenario-eval",
+                "direct_database_access": False,
+                "mock_fallback_allowed": False,
+                "release_eligible": False,
+            },
+            "evidence_runtime_identity": evidence_identity,
+            "assertion_fixture_mode": "LOOPBACK_TEST_ONLY_HUMAN_APPROVER",
+            "assertion_trust_store_sha256": "d" * 64,
+            "trusted_assertion_verifier_configured": True,
+        },
+        "evidence_runtime_release_v3": {
+            "release_state": "diagnostic",
+            "identity": evidence_identity,
+        },
+        "enhanced_experience_enabled": True,
+        "uat_capability_status": "valid",
+        "uat_capability_sha256": capability.capability_sha256,
+        "uat_capability_file_sha256": capability_file_sha256,
+        "uat_capability_expires_at": capability.expires_at.isoformat(),
+        "uat_capability_attestation": capability_wire,
+        "agent_commit": capability.agent_commit,
+    }
+    experience_metadata = {
+        **metadata,
+        "service_api_version": "internal-agent-service/v3",
+        "agentic_limits": dict(agentic_limits),
+        "enhanced_experience_enabled": True,
+        "uat_adaptive_active": True,
+        "auto_completion_enabled": False,
+        "meaning_catalog_sha256": expected_meaning_catalog_sha256(),
+        "experience_prompt_hashes": dict(contract.prompt_identities),
+        "experience_schema_hashes": dict(contract.output_schema_identities),
+    }
+    uat_readiness = {
+        "status": "uat-ready",
+        "diagnostic_only": True,
+        "text_only": True,
+        "mock_fallback_allowed": False,
+        "auto_completion_allowed": False,
+        "evidence_mode": "preserved-3law-v3-scenario-eval",
+        "evidence_policy_mode": "SEALED_TEST_ONLY_ACTUAL_CCCT_HUMAN_ONLY",
+        "assertion_fixture_mode": "LOOPBACK_TEST_ONLY_HUMAN_APPROVER",
+        "assertion_trust_store_sha256": "d" * 64,
+        "trusted_assertion_verifier_configured": True,
+        "enhanced_experience_enabled": True,
+        "uat_adaptive_active": True,
+        "uat_capability_status": "valid",
+        "uat_capability_sha256": capability.capability_sha256,
+        "uat_capability_file_sha256": capability_file_sha256,
+        "uat_capability_expires_at": capability.expires_at.isoformat(),
+        "uat_capability_attestation": capability_wire,
+        "agent_commit": capability.agent_commit,
+    }
+    return (
+        metadata,
+        experience_metadata,
+        uat_readiness,
+        capability.capability_sha256,
+        capability_file_sha256,
+    )
+
+
+def _local_uat_app(*, agent_status: str = "ready", enhanced: bool = False) -> TestClient:
+    settings_overrides: dict[str, Any] = {}
+    experience_metadata: dict[str, Any] | None = None
+    if enhanced:
+        (
+            metadata,
+            experience_metadata,
+            uat_readiness,
+            capability_sha256,
+            capability_file_sha256,
+        ) = _actual_agent_active_metadata()
+        settings_overrides = {
+            "agent_base_url": "http://127.0.0.1:18080",
+            "enhanced_agent_experience": True,
+            "uat_adaptive_active": True,
+            "uat_planner_mode": "diagnostic_active",
+            "uat_expected_capability_sha256": capability_sha256,
+            "uat_expected_capability_file_sha256": capability_file_sha256,
+        }
+    else:
+        evidence_identity = _diagnostic_evidence_identity()
+        metadata = {
             "status": agent_status,
             "service_api_version": "internal-agent-service/v2",
             "service_mode": "local_user_uat_diagnostic",
             "assurance_level": "diagnostic",
             "transport_limits": {"text_only": True},
-            "agentic_limits": {"effective_execution_mode": "shadow"},
+            "agentic_limits": {
+                "planner_mode": "shadow",
+                "effective_execution_mode": "shadow",
+            },
             "model": {"id": "claude-sonnet-5"},
             "uat": {
                 "diagnostic_only": True,
@@ -724,8 +879,8 @@ def _local_uat_app(*, agent_status: str = "ready") -> TestClient:
                 "release_state": "diagnostic",
                 "identity": evidence_identity,
             },
-        },
-        uat_readiness={
+        }
+        uat_readiness = {
             "status": "uat-ready" if agent_status == "ready" else "unavailable",
             "diagnostic_only": True,
             "text_only": True,
@@ -736,7 +891,16 @@ def _local_uat_app(*, agent_status: str = "ready") -> TestClient:
             "assertion_fixture_mode": "LOOPBACK_TEST_ONLY_HUMAN_APPROVER",
             "assertion_trust_store_sha256": "d" * 64,
             "trusted_assertion_verifier_configured": True,
-        },
+        }
+    settings = Settings(**_local_uat_values(**settings_overrides))
+    repository = InMemoryWorkbenchRepository()
+    object_store = InMemoryObjectStore()
+    publisher = InMemoryJobPublisher()
+    agent = CallableAgentClient(
+        lambda _request: {},
+        metadata=metadata,
+        experience_metadata=experience_metadata,
+        uat_readiness=uat_readiness,
     )
     verifier = OidcJwtVerifier(
         issuer=settings.oidc_issuer,
@@ -753,6 +917,12 @@ def _local_uat_app(*, agent_status: str = "ready") -> TestClient:
         requirement_policy_resolver=_uat_policy_resolver(),
         expected_evidence_runtime_v3_sha256=(
             _diagnostic_evidence_identity()["runtime_release_v3_sha256"]
+        ),
+        enhanced_agent_experience=enhanced,
+        uat_adaptive_active=enhanced,
+        evidence_profile=settings.uat_evidence_profile,
+        expected_uat_capability_sha256=(
+            settings.uat_expected_capability_sha256 if enhanced else None
         ),
     )
     container = Container(
@@ -876,6 +1046,59 @@ def test_local_uat_readiness_is_separate_from_strict_production_readiness(
             "assistant_api_version": "disabled",
             "actual_stage_streaming": False,
         }
+
+
+def test_local_uat_readiness_accepts_actual_agent_active_mode_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(OidcJwtVerifier, "health", lambda _self: True)
+    with _local_uat_app(enhanced=True) as client:
+        ready = client.get("/health/uat-ready")
+
+    assert ready.status_code == 200
+    assert ready.json()["enhanced_agent_experience"] is True
+    assert ready.json()["uat_adaptive_active"] is True
+    assert ready.json()["auto_completion_enabled"] is False
+
+
+@pytest.mark.parametrize(
+    ("metadata_version", "field", "value"),
+    [
+        ("v2", "planner_mode", "shadow"),
+        ("v2", "effective_execution_mode", "active"),
+        ("v3", "planner_mode", "shadow"),
+        ("v3", "effective_execution_mode", "active"),
+    ],
+)
+def test_local_uat_readiness_rejects_agent_active_mode_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_version: str,
+    field: str,
+    value: str,
+) -> None:
+    monkeypatch.setattr(OidcJwtVerifier, "health", lambda _self: True)
+    client = _local_uat_app(enhanced=True)
+    agent = client.app.state.container.agent
+    metadata = agent._metadata if metadata_version == "v2" else agent._experience_metadata
+    metadata["agentic_limits"][field] = value
+
+    with client:
+        assert client.get("/health/uat-ready").status_code == 503
+
+
+def test_local_uat_readiness_binds_nested_agent_openapi_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(OidcJwtVerifier, "health", lambda _self: True)
+    client = _local_uat_app(enhanced=True)
+    metadata = client.app.state.container.agent._experience_metadata
+    metadata["service_openapi_sha256"] = (
+        validate_agent_experience_contract_bundle().lock.provider_openapi_sha256
+    )
+    metadata["schemas"]["service_openapi_sha256"] = "0" * 64
+
+    with client:
+        assert client.get("/health/uat-ready").status_code == 503
 
 
 def test_local_uat_health_never_serializes_upstream_urls_secrets_or_raw_metadata(
