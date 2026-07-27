@@ -2314,6 +2314,10 @@
             "title": "Review Run Id",
             "type": "string"
           },
+          "stage_eta": {
+            "$ref": "#/components/schemas/ReviewStageEtaSet",
+            "description": "Per-stage observed timing; retry durations are summed within each successful run."
+          },
           "status": {
             "$ref": "#/components/schemas/JobStatus"
           },
@@ -2335,7 +2339,8 @@
           "created_at",
           "updated_at",
           "elapsed_seconds",
-          "eta"
+          "eta",
+          "stage_eta"
         ],
         "title": "JobExperienceView",
         "type": "object"
@@ -3222,6 +3227,110 @@
           "created_at"
         ],
         "title": "ReviewRunRecord",
+        "type": "object"
+      },
+      "ReviewStageEta": {
+        "additionalProperties": false,
+        "properties": {
+          "p50_seconds": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Observed stage median; null while fewer than five samples exist.",
+            "title": "P50 Seconds"
+          },
+          "p90_seconds": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Observed stage p90; null while fewer than five samples exist.",
+            "title": "P90 Seconds"
+          },
+          "sample_count": {
+            "description": "Successful runs containing a valid duration for this stage.",
+            "maximum": 30.0,
+            "minimum": 0.0,
+            "title": "Sample Count",
+            "type": "integer"
+          },
+          "source": {
+            "description": "Whether percentile values are backed by at least five comparable successful runs.",
+            "enum": [
+              "observed",
+              "insufficient_samples"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "stage_code": {
+            "enum": [
+              "request_validation",
+              "document_analysis",
+              "normalization",
+              "document_pairing",
+              "cross_validation",
+              "evidence_retrieval",
+              "compliance_review",
+              "adaptive_investigation",
+              "report_composition",
+              "grounding_verification",
+              "result_validation"
+            ],
+            "title": "Stage Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "stage_code",
+          "source",
+          "sample_count"
+        ],
+        "title": "ReviewStageEta",
+        "type": "object"
+      },
+      "ReviewStageEtaSet": {
+        "additionalProperties": false,
+        "properties": {
+          "insufficient_sample_behavior": {
+            "const": "no_stage_estimate_use_overall_eta",
+            "default": "no_stage_estimate_use_overall_eta",
+            "description": "Do not invent a per-stage default; use the existing overall ETA when unavailable.",
+            "title": "Insufficient Sample Behavior",
+            "type": "string"
+          },
+          "minimum_sample_count": {
+            "const": 5,
+            "default": 5,
+            "description": "Minimum samples required before a stage percentile is published.",
+            "title": "Minimum Sample Count",
+            "type": "integer"
+          },
+          "stages": {
+            "items": {
+              "$ref": "#/components/schemas/ReviewStageEta"
+            },
+            "maxItems": 11,
+            "minItems": 11,
+            "title": "Stages",
+            "type": "array"
+          }
+        },
+        "required": [
+          "stages"
+        ],
+        "title": "ReviewStageEtaSet",
         "type": "object"
       },
       "ReviewStageTraceEntry": {

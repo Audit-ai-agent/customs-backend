@@ -21,7 +21,9 @@ from customs_backend.domain import (
     AgentDocumentInput,
     Principal,
     Role,
+    StageEvent,
     canonical_digest,
+    utc_now,
 )
 from customs_backend.experience import (
     AgentUatCapabilityAttestationV1,
@@ -614,6 +616,99 @@ def _create_case(client: TestClient) -> dict[str, Any]:
     return case
 
 
+def test_stage_eta_uses_one_sample_per_successful_run_and_sums_stage_retries(
+    commercial_workbench,
+):
+    client, container, _observed_answer_requests = commercial_workbench
+    case = _create_case(client)
+    principal = Principal(
+        subject="system:test-history",
+        org_id="org-a",
+        roles=frozenset(),
+    )
+    retry_durations_ms = (990, 1_990, 2_990, 3_990, 4_990)
+    last_job_id = ""
+
+    for index, retry_duration_ms in enumerate(retry_durations_ms, start=1):
+        queued = client.post(
+            f"/api/v2/cases/{case['case_id']}/reviews",
+            json={},
+            headers={**_auth(), "Idempotency-Key": f"stage-eta-history-{index}"},
+        )
+        assert queued.status_code == 202, queued.text
+        last_job_id = queued.json()["job"]["job_id"]
+        pending = container.repository.get_job("org-a", last_job_id)
+        assert pending is not None
+        sequence = len(container.repository.list_stage_events("org-a", last_job_id)) + 1
+        container.repository.update_job(
+            pending.model_copy(update={"attempt_count": 1}),
+            StageEvent(
+                event_id=f"event-stage-retry-{index}",
+                job_id=last_job_id,
+                sequence=sequence,
+                stage="document_analysis",
+                state="failed",
+                message_code="review.document_analysis_retryable",
+                occurred_at=utc_now(),
+                detail={"attempt": 1, "duration_ms": retry_duration_ms},
+            ),
+            container.service._audit(
+                principal,
+                "review.stage_retry_recorded",
+                case_id=case["case_id"],
+                detail={"job_id": last_job_id, "attempt": 1},
+            ),
+        )
+        container.service.execute_job(org_id="org-a", job_id=last_job_id)
+
+    samples = container.repository.recent_review_stage_durations_ms(
+        org_id="org-a",
+        evidence_profile="preserved-3law-v3-scenario-eval",
+        document_count=1,
+        limit=100,
+    )
+    assert len(samples) == 5
+    assert sorted(sample["document_analysis"] for sample in samples) == [
+        1_000,
+        2_000,
+        3_000,
+        4_000,
+        5_000,
+    ]
+    assert (
+        container.repository.recent_review_stage_durations_ms(
+            org_id="org-a",
+            evidence_profile="another-profile",
+            document_count=1,
+        )
+        == []
+    )
+
+    response = client.get(f"/api/v2/jobs/{last_job_id}", headers=_auth())
+    assert response.status_code == 200, response.text
+    body = response.json()
+    document_analysis = next(
+        item for item in body["stage_eta"]["stages"] if item["stage_code"] == "document_analysis"
+    )
+    assert document_analysis == {
+        "stage_code": "document_analysis",
+        "source": "observed",
+        "sample_count": 5,
+        "p50_seconds": 3,
+        "p90_seconds": 5,
+    }
+    request_validation = next(
+        item for item in body["stage_eta"]["stages"] if item["stage_code"] == "request_validation"
+    )
+    assert request_validation == {
+        "stage_code": "request_validation",
+        "source": "observed",
+        "sample_count": 5,
+        "p50_seconds": 0,
+        "p90_seconds": 0,
+    }
+
+
 def test_v2_review_experience_and_multiturn_assistant_are_end_to_end_bound(
     commercial_workbench,
 ):
@@ -631,6 +726,13 @@ def test_v2_review_experience_and_multiturn_assistant_are_end_to_end_bound(
         240,
         420,
     )
+    assert job["stage_eta"]["minimum_sample_count"] == 5
+    assert job["stage_eta"]["insufficient_sample_behavior"] == "no_stage_estimate_use_overall_eta"
+    assert len(job["stage_eta"]["stages"]) == 11
+    assert {
+        (stage["source"], stage["sample_count"], stage["p50_seconds"], stage["p90_seconds"])
+        for stage in job["stage_eta"]["stages"]
+    } == {("insufficient_samples", 0, None, None)}
     run = container.service.execute_job(org_id="org-a", job_id=job["job_id"])
     experience = client.get(
         f"/api/v2/review-runs/{run.review_run_id}/experience",

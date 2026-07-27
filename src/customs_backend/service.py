@@ -91,6 +91,7 @@ from customs_backend.ports import (
     WorkbenchRepository,
 )
 from customs_backend.experience import (
+    REVIEW_TIMED_STAGE_CODES,
     AssistantAnswerV2,
     AgentAnswerStageEventV1,
     AssistantConversationRecord,
@@ -109,6 +110,8 @@ from customs_backend.experience import (
     ReviewEta,
     ReviewExperienceEnvelopeV1,
     ReviewPresentationRecord,
+    ReviewStageEta,
+    ReviewStageEtaSet,
     build_deterministic_review_experience,
     public_review_experience,
     validate_answer_against_context,
@@ -3395,6 +3398,43 @@ class WorkbenchService:
                 range_min_seconds=4 * 60,
                 range_max_seconds=7 * 60,
             )
+        stage_samples = self.repository.recent_review_stage_durations_ms(
+            org_id=principal.org_id,
+            evidence_profile=evidence_profile,
+            document_count=document_count,
+            limit=30,
+        )
+        stage_estimates: list[ReviewStageEta] = []
+        for stage_code in REVIEW_TIMED_STAGE_CODES:
+            stage_durations = sorted(
+                sample[stage_code] for sample in stage_samples if stage_code in sample
+            )
+            if len(stage_durations) >= 5:
+
+                def stage_percentile(fraction: float) -> int:
+                    index = min(
+                        len(stage_durations) - 1,
+                        int((len(stage_durations) - 1) * fraction + 0.5),
+                    )
+                    return max(0, stage_durations[index] // 1000)
+
+                stage_estimates.append(
+                    ReviewStageEta(
+                        stage_code=stage_code,
+                        source="observed",
+                        sample_count=len(stage_durations),
+                        p50_seconds=stage_percentile(0.5),
+                        p90_seconds=stage_percentile(0.9),
+                    )
+                )
+            else:
+                stage_estimates.append(
+                    ReviewStageEta(
+                        stage_code=stage_code,
+                        source="insufficient_samples",
+                        sample_count=len(stage_durations),
+                    )
+                )
         elapsed = max(0, int((utc_now() - job.created_at).total_seconds()))
         return JobExperienceView(
             job_id=job.job_id,
@@ -3411,6 +3451,7 @@ class WorkbenchService:
             updated_at=job.updated_at,
             elapsed_seconds=elapsed,
             eta=eta,
+            stage_eta=ReviewStageEtaSet(stages=stage_estimates),
         )
 
     def reconcile_delivery_uncertain(

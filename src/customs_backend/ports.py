@@ -218,6 +218,14 @@ class WorkbenchRepository(Protocol):
         document_count: int,
         limit: int = 30,
     ) -> list[int]: ...
+    def recent_review_stage_durations_ms(
+        self,
+        *,
+        org_id: str,
+        evidence_profile: str,
+        document_count: int,
+        limit: int = 30,
+    ) -> list[dict[str, int]]: ...
     def save_run(self, run: ReviewRunRecord, audit: AuditRecord) -> ReviewRunRecord: ...
     def get_provider_result(self, org_id: str, review_run_id: str) -> dict[str, Any] | None: ...
     def complete_job(

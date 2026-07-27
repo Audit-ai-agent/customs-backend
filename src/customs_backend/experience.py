@@ -262,6 +262,32 @@ AssistantStageCode = Literal[
     "completed",
     "failed",
 ]
+ReviewTimedStageCode = Literal[
+    "request_validation",
+    "document_analysis",
+    "normalization",
+    "document_pairing",
+    "cross_validation",
+    "evidence_retrieval",
+    "compliance_review",
+    "adaptive_investigation",
+    "report_composition",
+    "grounding_verification",
+    "result_validation",
+]
+REVIEW_TIMED_STAGE_CODES: tuple[ReviewTimedStageCode, ...] = (
+    "request_validation",
+    "document_analysis",
+    "normalization",
+    "document_pairing",
+    "cross_validation",
+    "evidence_retrieval",
+    "compliance_review",
+    "adaptive_investigation",
+    "report_composition",
+    "grounding_verification",
+    "result_validation",
+)
 
 
 class CitationReferenceV1(BaseModel):
@@ -1334,6 +1360,71 @@ class ReviewEta(BaseModel):
     range_max_seconds: int = Field(ge=0)
 
 
+class ReviewStageEta(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    stage_code: ReviewTimedStageCode
+    source: Literal["observed", "insufficient_samples"] = Field(
+        description=(
+            "Whether percentile values are backed by at least five comparable successful runs."
+        )
+    )
+    sample_count: int = Field(
+        ge=0,
+        le=30,
+        description="Successful runs containing a valid duration for this stage.",
+    )
+    p50_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        description="Observed stage median; null while fewer than five samples exist.",
+    )
+    p90_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        description="Observed stage p90; null while fewer than five samples exist.",
+    )
+
+    @model_validator(mode="after")
+    def availability_matches_sample_count(self) -> "ReviewStageEta":
+        if self.source == "observed":
+            if (
+                self.sample_count < 5
+                or self.p50_seconds is None
+                or self.p90_seconds is None
+                or self.p90_seconds < self.p50_seconds
+            ):
+                raise ValueError("observed stage ETA requires five samples and ordered percentiles")
+        elif self.sample_count >= 5 or self.p50_seconds is not None or self.p90_seconds is not None:
+            raise ValueError("insufficient stage ETA cannot publish percentile estimates")
+        return self
+
+
+class ReviewStageEtaSet(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    minimum_sample_count: Literal[5] = Field(
+        default=5,
+        description="Minimum samples required before a stage percentile is published.",
+    )
+    insufficient_sample_behavior: Literal["no_stage_estimate_use_overall_eta"] = Field(
+        default="no_stage_estimate_use_overall_eta",
+        description=(
+            "Do not invent a per-stage default; use the existing overall ETA when unavailable."
+        ),
+    )
+    stages: list[ReviewStageEta] = Field(
+        min_length=len(REVIEW_TIMED_STAGE_CODES),
+        max_length=len(REVIEW_TIMED_STAGE_CODES),
+    )
+
+    @model_validator(mode="after")
+    def stages_are_complete_and_ordered(self) -> "ReviewStageEtaSet":
+        if [item.stage_code for item in self.stages] != list(REVIEW_TIMED_STAGE_CODES):
+            raise ValueError("stage ETA must contain the complete ordered review stage catalog")
+        return self
+
+
 class JobExperienceView(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1351,6 +1442,11 @@ class JobExperienceView(BaseModel):
     updated_at: datetime
     elapsed_seconds: int = Field(ge=0)
     eta: ReviewEta
+    stage_eta: ReviewStageEtaSet = Field(
+        description=(
+            "Per-stage observed timing; retry durations are summed within each successful run."
+        )
+    )
 
 
 class ConversationCreateV2(BaseModel):

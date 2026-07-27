@@ -76,6 +76,24 @@ SSE 재연결 시 `Last-Event-ID` 다음 sequence부터 이미 저장된 이벤�
 표본이 5개 이상이면 p50/p90, 미만이면 검증된 기본 범위인 4~7분을 표시합니다.
 가짜 진행률은 만들지 않습니다.
 
+`GET /api/v2/jobs/{job_id}`와 심사 생성 응답의 `job`은 기존 전체 예상 시간인
+`eta`를 그대로 유지하고, 추가로 `stage_eta`를 제공합니다. 단계별 표본은 성공한
+심사 건 하나를 한 개로 계산합니다. 같은 심사 건에서 같은 단계가 재시도되면 각
+시도의 `duration_ms`를 먼저 합산하므로 재시도 횟수가 표본 수를 부풀리지 않습니다.
+
+- `stage_eta.stages[].source=observed`: 같은 Evidence profile·문서 수에서 유효한
+  성공 심사 표본이 5개 이상이며 `p50_seconds`, `p90_seconds`를 사용할 수 있습니다.
+- `stage_eta.stages[].source=insufficient_samples`: 해당 단계의 유효 표본이 5개
+  미만이며 단계별 p50/p90은 `null`입니다.
+- `stage_eta.insufficient_sample_behavior=no_stage_estimate_use_overall_eta`: 단계별
+  수치를 임의로 나누지 말고 전체 `eta`만 표시해야 한다는 뜻입니다. 전체 표본도
+  5개 미만이면 기존 `validated_default` 4~7분 범위를 사용합니다.
+
+Frontend는 `stage_eta.stages`의 순서를 실행 단계 표시 순서로 사용할 수 있습니다.
+다만 `insufficient_samples`인 단계에는 시간 숫자를 표시하지 않고 “표본 수집 중”으로
+표시하며, 전체 예상 범위는 계속 `eta.range_min_seconds`와
+`eta.range_max_seconds`를 사용해야 합니다.
+
 ## 영속화와 Rollback
 
 Migration `20260727_0008`은 다음 additive table만 생성합니다.

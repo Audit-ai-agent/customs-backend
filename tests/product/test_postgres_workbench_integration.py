@@ -700,6 +700,16 @@ def test_postgres_migration_atomicity_persistence_and_isolation() -> None:
         experience_job.job_id,
     )
     assert {event.stage for event in experience_stages} >= set(_REVIEW_STAGES)
+    timing_samples = restarted_repository.recent_review_stage_durations_ms(
+        org_id=reviewer_a.org_id,
+        evidence_profile="preserved-3law-v3-scenario-eval",
+        document_count=int(experience_job.request["document_count"]),
+        limit=30,
+    )
+    assert timing_samples
+    assert timing_samples[0]["request_validation"] == 10
+    assert timing_samples[0]["document_analysis"] == 10
+    assert set(timing_samples[0]) == set(_REVIEW_STAGES) - {"completed"}
 
     conversation = enhanced_service.create_assistant_conversation(
         reviewer_a,

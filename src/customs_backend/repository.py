@@ -42,6 +42,7 @@ from customs_backend.domain import (
     utc_now,
 )
 from customs_backend.experience import (
+    REVIEW_TIMED_STAGE_CODES,
     AssistantConversationRecord,
     AssistantJobRecord,
     AssistantJobState,
@@ -60,6 +61,21 @@ _ACTIVE_JOB_STATUSES = {
 _ACTIVE_JOB_STATUS_VALUES = tuple(item.value for item in _ACTIVE_JOB_STATUSES)
 _CHAT_QUOTA_STATES = frozenset(ChatInteractionState)
 _CHAT_QUOTA_STATE_VALUES = tuple(item.value for item in _CHAT_QUOTA_STATES)
+_REVIEW_TIMED_STAGE_CODE_SET = frozenset(REVIEW_TIMED_STAGE_CODES)
+
+
+def _review_stage_duration_sample(events: list[StageEvent]) -> dict[str, int]:
+    """Aggregate retries inside one successful review into one stage sample."""
+
+    sample: dict[str, int] = {}
+    for event in events:
+        if event.stage not in _REVIEW_TIMED_STAGE_CODE_SET:
+            continue
+        duration = event.detail.get("duration_ms")
+        if isinstance(duration, bool) or not isinstance(duration, int) or duration < 0:
+            continue
+        sample[event.stage] = sample.get(event.stage, 0) + duration
+    return sample
 
 
 def _updated_assistant_job(
@@ -721,6 +737,36 @@ class InMemoryWorkbenchRepository:
                 if durations:
                     values.append(sum(durations))
             return values
+
+    def recent_review_stage_durations_ms(
+        self,
+        *,
+        org_id: str,
+        evidence_profile: str,
+        document_count: int,
+        limit: int = 30,
+    ) -> list[dict[str, int]]:
+        bounded_limit = max(0, min(limit, 30))
+        if bounded_limit == 0:
+            return []
+        with self._lock:
+            jobs = sorted(
+                (
+                    item
+                    for item in self._jobs.values()
+                    if item.org_id == org_id
+                    and item.status == JobStatus.succeeded
+                    and item.request.get("experience_api_version") == "3.0"
+                    and item.request.get("evidence_profile") == evidence_profile
+                    and item.request.get("document_count") == document_count
+                ),
+                key=lambda item: (
+                    item.agent_call_started_at or item.updated_at,
+                    item.job_id,
+                ),
+                reverse=True,
+            )[:bounded_limit]
+            return [_review_stage_duration_sample(self._events.get(job.job_id, [])) for job in jobs]
 
     def save_run(self, run: ReviewRunRecord, audit: AuditRecord) -> ReviewRunRecord:
         with self._lock:
@@ -2830,6 +2876,47 @@ class PostgresWorkbenchRepository:
                 if len(values) >= limit:
                     break
             return values
+
+    def recent_review_stage_durations_ms(
+        self,
+        *,
+        org_id: str,
+        evidence_profile: str,
+        document_count: int,
+        limit: int = 30,
+    ) -> list[dict[str, int]]:
+        bounded_limit = max(0, min(limit, 30))
+        if bounded_limit == 0:
+            return []
+        with Session(self._engine) as session:
+            jobs = session.scalars(
+                select(_JobRow)
+                .where(
+                    _JobRow.org_id == org_id,
+                    _JobRow.status == JobStatus.succeeded.value,
+                    _JobRow.record_json["request"]["experience_api_version"].as_string() == "3.0",
+                    _JobRow.record_json["request"]["evidence_profile"].as_string()
+                    == evidence_profile,
+                    _JobRow.record_json["request"]["document_count"].as_integer() == document_count,
+                )
+                .order_by(_JobRow.agent_call_started_at.desc(), _JobRow.job_id.desc())
+                .limit(bounded_limit)
+            ).all()
+            if not jobs:
+                return []
+            job_ids = [row.job_id for row in jobs]
+            event_rows = session.scalars(
+                select(_StageEventRow)
+                .where(
+                    _StageEventRow.org_id == org_id,
+                    _StageEventRow.job_id.in_(job_ids),
+                )
+                .order_by(_StageEventRow.job_id, _StageEventRow.sequence)
+            ).all()
+            events_by_job: dict[str, list[StageEvent]] = {job_id: [] for job_id in job_ids}
+            for row in event_rows:
+                events_by_job[row.job_id].append(StageEvent.model_validate(row.record_json))
+            return [_review_stage_duration_sample(events_by_job[job_id]) for job_id in job_ids]
 
     def save_run(self, run: ReviewRunRecord, audit: AuditRecord) -> ReviewRunRecord:
         with Session(self._engine) as session, session.begin():
