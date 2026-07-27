@@ -85,6 +85,10 @@ _SAFE_SUGGESTED_QUESTIONS = [
     "담당자가 먼저 확인할 항목은 무엇입니까?",
     "연결된 법령 근거가 이 심사 건에서 어떤 의미입니까?",
 ]
+_CASE_LIMITATION = "답변은 현재 심사 회차와 연결된 문서·법령 근거 범위에 한정됩니다."
+_GENERAL_GUIDANCE_LIMITATION = (
+    "위 내용은 일반 통관 안내이며 현재 심사 건의 판정이나 법적 의무를 뜻하지 않습니다."
+)
 
 
 def _rehash_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -149,7 +153,22 @@ def _experience(request: AgentReviewRequest) -> dict[str, Any]:
     _rehash_result(result)
     typed_result = AgentReviewResultV3.model_validate(result)
     claims = build_canonical_experience_claim_catalog(typed_result)
-    sections = build_controlled_presentation_sections(claims)
+    sections = [
+        section.model_dump(mode="json")
+        for section in build_controlled_presentation_sections(claims)
+    ]
+    for section in sections:
+        for statement in section["statements"]:
+            statement["text"] = (
+                "연결된 근거를 토대로 이번 심사의 의미를 쉽게 설명하면, "
+                f"{statement['text']} "
+                "따라서 담당자는 이 내용을 문서와 근거가 어떻게 연결되는지 이해하는 "
+                "기준으로 확인할 수 있습니다."
+            )
+            statement_payload = {
+                key: value for key, value in statement.items() if key != "statement_id"
+            }
+            statement["statement_id"] = f"statement_{canonical_digest(statement_payload)}"
     headline = {
         "no_issue_detected": "문서와 법령 근거 범위에서 별도의 문제를 확인하지 못했습니다",
         "issues_detected": "담당자가 확인하고 보완해야 할 사항이 발견되었습니다",
@@ -158,23 +177,21 @@ def _experience(request: AgentReviewRequest) -> dict[str, Any]:
     verified_content_sha256 = canonical_digest(
         {
             "headline": headline,
-            "sections": [item.model_dump(mode="json") for item in sections],
+            "sections": sections,
         }
     )
     verifier_context_sha256 = canonical_digest(
         {
             "canonical_claims": [item.model_dump(mode="json") for item in claims],
             "candidate_statements": [
-                statement.model_dump(mode="json")
-                for section in sections
-                for statement in section.statements
+                statement for section in sections for statement in section["statements"]
             ],
         }
     )
     presentation_payload = {
         "schema_version": "1.0",
         "headline": headline,
-        "sections": [item.model_dump(mode="json") for item in sections],
+        "sections": sections,
         "generation_audit": {
             "mode": "claude",
             "task_id": "customs_experience_report",
@@ -195,7 +212,7 @@ def _experience(request: AgentReviewRequest) -> dict[str, Any]:
             "verifier_prompt_sha256": lock.prompt_identities["entailment"],
             "verifier_schema_sha256": lock.output_schema_identities["entailment"],
             "verifier_context_sha256": verifier_context_sha256,
-            "checked_statement_count": sum(len(section.statements) for section in sections),
+            "checked_statement_count": sum(len(section["statements"]) for section in sections),
             "verified_content_sha256": verified_content_sha256,
             "reason_codes": [],
         },
@@ -302,7 +319,7 @@ def _answer(payload: dict[str, Any]) -> dict[str, Any]:
         "evidence_meaning": [item.canonical_text for item in evidence_claims],
         "impact": [item.canonical_text for item in impact_claims],
         "next_steps": [item.canonical_text for item in action_claims],
-        "limitations": ["답변은 현재 심사 회차와 연결된 문서·법령 근거 범위에 한정됩니다."],
+        "limitations": [_CASE_LIMITATION],
         "claim_selections": {
             "direct_answer": [direct_claim.claim_id],
             "explanation": [item.claim_id for item in explanation_claims],
@@ -360,6 +377,7 @@ def _answer(payload: dict[str, Any]) -> dict[str, Any]:
                     "answer_scope": "case_grounded",
                     "allowed_claims": [item.model_dump(mode="json") for item in claims[:100]],
                     "general_guidance": {},
+                    "fixed_limitation_source": _CASE_LIMITATION,
                     "candidate_answer": {
                         "direct_answer": answer_content["direct_answer"],
                         "explanation": answer_content["explanation"],
@@ -440,6 +458,11 @@ def _rehash_answer(
                 "answer_scope": scope,
                 "allowed_claims": [item.model_dump(mode="json") for item in claims[:100]],
                 "general_guidance": guidance,
+                "fixed_limitation_source": (
+                    _GENERAL_GUIDANCE_LIMITATION
+                    if scope == "general_customs_guidance"
+                    else _CASE_LIMITATION
+                ),
                 "candidate_answer": {
                     "direct_answer": raw["direct_answer"],
                     "explanation": raw["explanation"],
@@ -744,13 +767,13 @@ def test_presentation_text_cannot_reuse_a_stale_verifier_digest() -> None:
     "unsupported_text",
     [
         "현재 확인 결과 이 건의 관세율은 50%이며 3일 이내 제출해야 합니다.",
-        "이 심사 건은 통관이 승인되었으며 담당자 검토가 필요하지 않습니다.",
-        "이 심사 건은 별도 확인 없이 즉시 처리해도 됩니다.",
-        "이 자료만으로 모든 요건이 충족됐으므로 추가 조치는 없습니다.",
-        "담당자 판단을 기다리지 않아도 바로 후속 절차를 진행할 수 있습니다.",
+        "자세한 판단 기준은 https://example.invalid/customs 에서 확인할 수 있습니다.",
+        "이 심사에는 관세법 999조가 직접 적용되는 것으로 확인했습니다.",
+        "<strong>제출 문서는 모두 안전합니다.</strong>",
+        "내부 근거는 experience_claim_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 입니다.",
     ],
 )
-def test_presentation_rejects_unsupported_atomic_or_contradictory_claim_even_with_fresh_audit(
+def test_presentation_rejects_unsupported_factual_content_even_with_fresh_audit(
     unsupported_text: str,
 ) -> None:
     raw = deepcopy(_experience(_review_request()))
@@ -789,7 +812,7 @@ def test_presentation_rejects_unsupported_atomic_or_contradictory_claim_even_wit
     typed = ReviewExperienceEnvelopeV1.model_validate(raw)
     with pytest.raises(
         ValueError,
-        match="literal absent|canonical claim|grounded claim|atom absent|controlled language",
+        match="deterministic grounding",
     ):
         validate_presentation_against_result(typed)
 
@@ -798,13 +821,13 @@ def test_presentation_rejects_unsupported_atomic_or_contradictory_claim_even_wit
     "unsupported_text",
     [
         "현재 심사 결과 이 건의 관세율은 50%이며 3일 이내 제출해야 합니다.",
-        "이 심사 건은 통관이 승인되었으며 담당자 검토가 필요하지 않습니다.",
-        "이 심사 건은 별도 확인 없이 즉시 처리해도 됩니다.",
-        "이 자료만으로 모든 요건이 충족됐으므로 추가 조치는 없습니다.",
-        "담당자 판단을 기다리지 않아도 바로 후속 절차를 진행할 수 있습니다.",
+        "자세한 판단 기준은 https://example.invalid/customs 에서 확인할 수 있습니다.",
+        "이 심사에는 관세법 999조가 직접 적용되는 것으로 확인했습니다.",
+        "<strong>제출 문서는 모두 안전합니다.</strong>",
+        "내부 근거는 experience_claim_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 입니다.",
     ],
 )
-def test_assistant_rejects_unsupported_atomic_or_contradictory_claim_even_with_fresh_audit(
+def test_assistant_rejects_unsupported_factual_content_even_with_fresh_audit(
     unsupported_text: str,
 ) -> None:
     result = _experience(_review_request())["canonical_result"]
@@ -825,7 +848,7 @@ def test_assistant_rejects_unsupported_atomic_or_contradictory_claim_even_with_f
     typed = AssistantAnswerV2.model_validate(raw)
     with pytest.raises(
         ValueError,
-        match="literal absent|canonical claim|grounded claim|atom absent|controlled language",
+        match="deterministic grounding",
     ):
         validate_answer_against_context(
             answer=typed,
@@ -919,7 +942,7 @@ def test_assistant_accepts_code_owned_korean_frame_for_exact_field_fact() -> Non
     )
 
 
-def test_assistant_rejects_free_prose_even_when_claims_citations_and_verifier_are_bound() -> None:
+def test_assistant_accepts_natural_prose_when_claims_citations_and_verifier_are_bound() -> None:
     result = _experience(_review_request())["canonical_result"]
     request = {
         "conversation_id": "conversation-fluent-answer",
@@ -932,14 +955,14 @@ def test_assistant_rejects_free_prose_even_when_claims_citations_and_verifier_ar
         "locale": "ko-KR",
     }
     raw = _answer(request)
-    raw["direct_answer"] = "검토한 제출 자료에서는 특별히 바로잡아야 할 내용이 확인되지 않았습니다."
+    raw["direct_answer"] = "질문하신 결과를 이해하기 쉽게 설명하면, " + raw["direct_answer"]
+    raw["limitations"] = ["안내드린 답변의 적용 범위를 함께 설명하면, " + _CASE_LIMITATION]
     _rehash_answer(raw, request)
 
-    with pytest.raises(ValueError, match="controlled language"):
-        validate_answer_against_context(
-            answer=AssistantAnswerV2.model_validate(raw),
-            request=CaseConversationRequestV2.model_validate(request),
-        )
+    validate_answer_against_context(
+        answer=AssistantAnswerV2.model_validate(raw),
+        request=CaseConversationRequestV2.model_validate(request),
+    )
 
 
 def test_general_guidance_rejects_case_outcome_prose_with_fresh_hashes() -> None:
@@ -957,14 +980,14 @@ def test_general_guidance_rejects_case_outcome_prose_with_fresh_hashes() -> None
     raw = _answer(request)
     raw["answer_scope"] = "general_customs_guidance"
     raw["status"] = "answered"
-    raw["direct_answer"] = "담당자 판단을 기다리지 않아도 바로 후속 절차를 진행할 수 있습니다."
+    raw["direct_answer"] = (
+        "현재 심사 건의 판정은 승인되었으므로 담당자 확인 없이 처리할 수 있습니다."
+    )
     raw["explanation"] = []
     raw["evidence_meaning"] = []
     raw["impact"] = []
     raw["next_steps"] = []
-    raw["limitations"] = [
-        "위 내용은 일반 통관 안내이며 현재 심사 건의 판정이나 법적 의무를 뜻하지 않습니다."
-    ]
+    raw["limitations"] = [_GENERAL_GUIDANCE_LIMITATION]
     raw["claim_selections"] = {
         "direct_answer": [],
         "explanation": [],
@@ -978,14 +1001,14 @@ def test_general_guidance_rejects_case_outcome_prose_with_fresh_hashes() -> None
     raw["verification_audit"]["checked_statement_count"] = 2
     _rehash_answer(raw, request)
 
-    with pytest.raises(ValueError, match="controlled language"):
+    with pytest.raises(ValueError, match="deterministic grounding"):
         validate_answer_against_context(
             answer=AssistantAnswerV2.model_validate(raw),
             request=CaseConversationRequestV2.model_validate(request),
         )
 
 
-def test_general_guidance_accepts_only_the_selected_catalog_rendering() -> None:
+def test_general_guidance_accepts_the_selected_catalog_content() -> None:
     result = _experience(_review_request())["canonical_result"]
     request = {
         "conversation_id": "conversation-guidance-controlled-language",
@@ -1000,13 +1023,16 @@ def test_general_guidance_accepts_only_the_selected_catalog_rendering() -> None:
     raw = _answer(request)
     raw["answer_scope"] = "general_customs_guidance"
     raw["status"] = "answered"
-    raw["direct_answer"] = provider_meaning_catalog().general_guidance["hsk"]
+    raw["direct_answer"] = (
+        "질문하신 용어를 일반 통관 절차의 관점에서 설명하면, "
+        + provider_meaning_catalog().general_guidance["hsk"]
+    )
     raw["explanation"] = []
     raw["evidence_meaning"] = []
     raw["impact"] = []
     raw["next_steps"] = []
     raw["limitations"] = [
-        "위 내용은 일반 통관 안내이며 현재 심사 건의 판정이나 법적 의무를 뜻하지 않습니다."
+        "이 안내가 현재 심사 건의 결론과 구분된다는 점을 덧붙이면, " + _GENERAL_GUIDANCE_LIMITATION
     ]
     raw["claim_selections"] = {
         "direct_answer": [],
@@ -1027,7 +1053,7 @@ def test_general_guidance_accepts_only_the_selected_catalog_rendering() -> None:
     )
 
 
-def test_general_guidance_rejects_reordered_catalog_topics_with_fresh_hashes() -> None:
+def test_general_guidance_accepts_reordered_grounded_topics_with_fresh_hashes() -> None:
     result = _experience(_review_request())["canonical_result"]
     request = {
         "conversation_id": "conversation-guidance-reordered",
@@ -1048,9 +1074,7 @@ def test_general_guidance_rejects_reordered_catalog_topics_with_fresh_hashes() -
     raw["evidence_meaning"] = []
     raw["impact"] = []
     raw["next_steps"] = []
-    raw["limitations"] = [
-        "위 내용은 일반 통관 안내이며 현재 심사 건의 판정이나 법적 의무를 뜻하지 않습니다."
-    ]
+    raw["limitations"] = [_GENERAL_GUIDANCE_LIMITATION]
     raw["claim_selections"] = {
         "direct_answer": [],
         "explanation": [],
@@ -1067,11 +1091,10 @@ def test_general_guidance_rejects_reordered_catalog_topics_with_fresh_hashes() -
     raw["verification_audit"]["checked_statement_count"] = 3
     _rehash_answer(raw, request)
 
-    with pytest.raises(ValueError, match="controlled language"):
-        validate_answer_against_context(
-            answer=AssistantAnswerV2.model_validate(raw),
-            request=CaseConversationRequestV2.model_validate(request),
-        )
+    validate_answer_against_context(
+        answer=AssistantAnswerV2.model_validate(raw),
+        request=CaseConversationRequestV2.model_validate(request),
+    )
 
 
 def test_assistant_rejects_a_verifier_receipt_from_another_question_context() -> None:

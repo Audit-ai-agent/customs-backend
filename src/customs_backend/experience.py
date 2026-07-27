@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from datetime import date, datetime
 from enum import Enum
 from typing import Any, Literal, cast
@@ -46,22 +47,6 @@ _SAFE_SUGGESTED_QUESTIONS = [
     "담당자가 먼저 확인할 항목은 무엇입니까?",
     "연결된 법령 근거가 이 심사 건에서 어떤 의미입니까?",
 ]
-_PRESENTATION_ROLE_PREFIXES: dict[str, tuple[str, ...]] = {
-    "conclusion": ("", "검토 결과를 먼저 말씀드리면, "),
-    "observation": ("", "확인 결과, "),
-    "reason": ("", "그 이유를 설명드리면, "),
-    "evidence": ("", "법령 근거를 확인한 결과, "),
-    "impact": ("", "업무상 의미를 말씀드리면, "),
-    "action": ("", "담당자가 다음으로 할 일은, "),
-    "limitation": ("", "검토 범위를 함께 안내드리면, "),
-}
-_ANSWER_AREA_PREFIXES: dict[str, tuple[str, ...]] = {
-    "direct_answer": ("", "질문에 바로 답변드리면, "),
-    "explanation": ("", "확인된 내용을 설명드리면, "),
-    "evidence_meaning": ("", "법령 근거를 기준으로 보면, "),
-    "impact": ("", "업무상 영향은 다음과 같습니다. "),
-    "next_steps": ("", "다음 조치는 다음과 같습니다. "),
-}
 _ANSWER_AREA_ROLES: dict[str, frozenset[str]] = {
     "direct_answer": frozenset(
         {"conclusion", "observation", "reason", "evidence", "impact", "action", "limitation"}
@@ -75,6 +60,75 @@ _CASE_LIMITATION = "답변은 현재 심사 회차와 연결된 문서·법령 �
 _GENERAL_GUIDANCE_LIMITATION = (
     "위 내용은 일반 통관 안내이며 현재 심사 건의 판정이나 법적 의무를 뜻하지 않습니다."
 )
+_URL_RE = re.compile(r"(?i)(?:https?://|www\.)\S+")
+_HTML_RE = re.compile(r"<\s*/?\s*[A-Za-z][^>]*>")
+_OPAQUE_INTERNAL_RE = re.compile(
+    r"(?i)(?:experience_claim|statement|fact|issue|finding|ev|outcome)_[a-f0-9]{32,}"
+    r"|(?<![A-Fa-f0-9])[A-Fa-f0-9]{64}(?![A-Fa-f0-9])"
+)
+_NUMBER_RE = re.compile(
+    r"(?<![0-9])(?P<number>\d+(?:,\d{3})*(?:\.\d+)?)"
+    r"\s*(?P<unit>%|원|달러|유로|엔|kg|㎏|g|톤|개|건|종|회|일|개월|년|월|조|항|호)?"
+    r"(?![0-9])",
+    re.IGNORECASE,
+)
+_ALPHANUMERIC_IDENTIFIER_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?=[A-Za-z0-9._:/-]{3,}(?![A-Za-z0-9._:/-]))"
+    r"(?=[A-Za-z0-9._:/-]*[A-Za-z])(?=[A-Za-z0-9._:/-]*\d)"
+    r"[A-Za-z0-9][A-Za-z0-9._:/-]*"
+)
+_UPPERCASE_IDENTIFIER_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:[A-Z]{2,}(?:[-_/][A-Z0-9]+)*)(?![A-Za-z0-9])"
+)
+_KOREAN_LAW_RE = re.compile(
+    r"(?<![가-힣])(?:[가-힣]{2,30}(?:시행규칙|시행령|법률|고시)|[가-힣]{2,30}법)"
+    r"(?=$|[\s.,;:!?()\[\]{}“”\"']|은|는|이|가|을|를|의|에|에서|으로|로|과|와|도|만)"
+)
+_NON_LAW_SUFFIXES = (
+    "방법",
+    "기법",
+    "해법",
+    "문법",
+    "어법",
+    "용법",
+    "화법",
+    "농법",
+    "공법",
+    "수법",
+    "비법",
+    "요법",
+)
+_KOREAN_INSTITUTION_RE = re.compile(
+    r"(?<![가-힣])(?:[가-힣]{2,24}\s*)"
+    r"(?:관세청|세관|주식회사|유한회사|법인|은행|항만공사|항만|공항)"
+    r"(?=$|[\s.,;:!?()\[\]{}“”\"']|은|는|이|가|을|를|의|에|에서|으로|로|과|와|도|만)"
+)
+_ASCII_ORGANIZATION_RE = re.compile(
+    r"(?<![A-Za-z])(?:[A-Z][A-Za-z&.-]*\s+){0,4}"
+    r"(?:CORP(?:ORATION)?|CO(?:MPANY)?|LTD|INC|LLC)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+_COUNTRY_RE = re.compile(
+    r"(?<![가-힣])(?:대한민국|한국|중국|일본|미국|독일|프랑스|영국|베트남|태국|"
+    r"인도네시아|인도|호주|캐나다|러시아|대만|홍콩|싱가포르|말레이시아|필리핀|"
+    r"네덜란드|이탈리아|스페인|브라질|멕시코)"
+    r"(?=$|[\s.,;:!?()\[\]{}“”\"']|은|는|이|가|을|를|의|에|에서|으로|로|과|와|도|만|산)"
+)
+_KOREAN_PORT_RE = re.compile(
+    r"(?<![가-힣])(?:[가-힣]{2,24}(?:항구|항))"
+    r"(?=$|[\s.,;:!?()\[\]{}“”\"']|은|는|이|가|을|를|의|에|에서|으로|로|과|와|도|만)"
+)
+_NON_PORT_SUFFIXES = ("사항", "문항", "조항", "항목")
+_GENERAL_GUIDANCE_CASE_ASSERTION_RE = re.compile(
+    r"(?:현재|이|해당)\s*(?:심사\s*건|건|case).{0,40}"
+    r"(?:판정|결과|의무|적용|승인|자동\s*완료|문제\s*(?:없|있))",
+    re.IGNORECASE,
+)
+_COUNT_UNITS = {"개": "count", "건": "count", "종": "count"}
+_PRESENTATION_MIN_TOTAL_MATERIAL_CHARS = 650
+_PRESENTATION_MIN_SECTION_CHARS = 28
+_PRESENTATION_MIN_MATERIAL_STATEMENT_CHARS = 18
+_PRESENTATION_MIN_KOREAN_RATIO = 0.65
 _DOCUMENT_TYPE_LABELS = {
     "invoice": "상업송장(CI)",
     "packing_list": "포장명세서(PL)",
@@ -414,40 +468,103 @@ def _canonical_claim(
     )
 
 
-def _framed_texts(
+def _normalized_atom(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value)
+    return re.sub(r"\s+", "", normalized).replace(",", "").casefold().strip(".,;:()[]{}“”\"'")
+
+
+def _factual_atoms(text: str) -> frozenset[str]:
+    """Extract values that may not be invented by a presentation model."""
+
+    text = unicodedata.normalize("NFKC", text)
+    atoms: set[str] = set()
+    for match in _NUMBER_RE.finditer(text):
+        number = match.group("number").replace(",", "")
+        atoms.add(f"number:{number}")
+        unit = (match.group("unit") or "").casefold()
+        if unit:
+            atoms.add(f"number-unit:{number}:{_COUNT_UNITS.get(unit, unit)}")
+    for pattern, prefix in (
+        (_ALPHANUMERIC_IDENTIFIER_RE, "identifier"),
+        (_UPPERCASE_IDENTIFIER_RE, "identifier"),
+        (_KOREAN_LAW_RE, "law"),
+        (_KOREAN_INSTITUTION_RE, "entity"),
+        (_ASCII_ORGANIZATION_RE, "entity"),
+        (_COUNTRY_RE, "entity"),
+        (_KOREAN_PORT_RE, "entity"),
+    ):
+        for match in pattern.finditer(text):
+            atom = _normalized_atom(match.group(0))
+            if prefix == "law" and atom.endswith(_NON_LAW_SUFFIXES):
+                continue
+            if pattern is _KOREAN_PORT_RE and atom.endswith(_NON_PORT_SUFFIXES):
+                continue
+            if atom:
+                atoms.add(f"{prefix}:{atom}")
+    for match in re.finditer(r"[“\"]([^“”\"\r\n]{1,80})[”\"]", text):
+        literal = _normalized_atom(match.group(1))
+        if literal:
+            atoms.add(f"value:{literal}")
+    labelled_value = re.compile(
+        r"(?:원산지|선적항|양륙항|도착항|출발항|선박명|통화|판매자|구매자|수출자|"
+        r"수입자|송하인|수하인)(?:은|는|이|가|:)?\s*[“\"]?"
+        r"([A-Za-z가-힣][A-Za-z가-힣0-9 .,&()/_-]{0,40}?)"
+        r"(?:[”\"]?(?:입니다|이며|이고|로 확인|으로 확인|로 기재|으로 기재))"
+    )
+    for match in labelled_value.finditer(text):
+        atom = _normalized_atom(match.group(1))
+        if atom:
+            atoms.add(f"value:{atom}")
+    return frozenset(atoms)
+
+
+def _grounded_prose_blockers(
     text: str,
-    prefixes: tuple[str, ...],
+    source_texts: list[str],
     *,
-    max_length: int,
-) -> frozenset[str]:
-    canonical = " ".join(text.split())
-    return frozenset(
-        rendered for prefix in prefixes if len(rendered := f"{prefix}{canonical}") <= max_length
+    prefix: str,
+    minimum_chars: int,
+) -> list[str]:
+    normalized = " ".join(unicodedata.normalize("NFKC", text).split())
+    source = "\n".join(
+        " ".join(unicodedata.normalize("NFKC", item).split()) for item in source_texts
     )
+    blockers: list[str] = []
+    if len(normalized) < minimum_chars:
+        blockers.append(f"{prefix}_too_short")
+    if any(
+        ord(character) < 32 and character not in "\t\n\r" for character in text
+    ) or _HTML_RE.search(normalized):
+        blockers.append(f"{prefix}_unsafe_markup")
+    if _URL_RE.search(normalized):
+        blockers.append(f"{prefix}_url_not_allowed")
+    if _OPAQUE_INTERNAL_RE.search(normalized):
+        blockers.append(f"{prefix}_internal_identifier_not_allowed")
+    if not _factual_atoms(normalized).issubset(_factual_atoms(source)):
+        blockers.append(f"{prefix}_unsupported_factual_atom")
+    if not normalized.endswith("니다."):
+        blockers.append(f"{prefix}_formal_style_required")
+    return blockers
 
 
-def _presentation_renderings(
-    claims: list[CanonicalExperienceClaimV1],
-) -> frozenset[str]:
-    if not claims:
-        return frozenset()
-    canonical = " ".join(item.canonical_text for item in claims)
-    return _framed_texts(
-        canonical,
-        _PRESENTATION_ROLE_PREFIXES[claims[0].role],
-        max_length=4_000,
+def _korean_letter_ratio(text: str) -> float:
+    hangul = sum("가" <= character <= "힣" for character in text)
+    latin = sum(
+        ("a" <= character.casefold() <= "z") for character in text if len(character.casefold()) == 1
     )
+    denominator = hangul + latin
+    return hangul / denominator if denominator else 0.0
 
 
 def _presentation_statement_options(
     claims: list[CanonicalExperienceClaimV1],
-) -> dict[tuple[str, ...], frozenset[str]]:
-    """Reconstruct the provider's finite, non-overlapping statement menu."""
+) -> dict[tuple[str, ...], list[CanonicalExperienceClaimV1]]:
+    """Reconstruct the provider's exact non-overlapping factual Claim groups."""
 
     groups: dict[tuple[str, str], list[CanonicalExperienceClaimV1]] = {}
     for claim in claims:
         groups.setdefault((claim.section_code, claim.role), []).append(claim)
-    options: dict[tuple[str, ...], frozenset[str]] = {}
+    options: dict[tuple[str, ...], list[CanonicalExperienceClaimV1]] = {}
     for grouped in groups.values():
         chunks: list[list[CanonicalExperienceClaimV1]] = []
         current: list[CanonicalExperienceClaimV1] = []
@@ -459,10 +576,11 @@ def _presentation_statement_options(
             }
             candidate = [*current, claim]
             candidate_citations = current_citations | claim_citations
+            candidate_source = " ".join(item.canonical_text for item in candidate)
             if current and (
                 len(candidate) > 20
                 or len(candidate_citations) > 100
-                or not _presentation_renderings(candidate)
+                or len(candidate_source) > 4_000
             ):
                 chunks.append(current)
                 current = [claim]
@@ -473,29 +591,22 @@ def _presentation_statement_options(
         if current:
             chunks.append(current)
         for chunk in chunks:
-            renderings = _presentation_renderings(chunk)
-            if not renderings:
-                raise ValueError("canonical claim cannot be rendered within presentation limits")
-            options[tuple(claim.claim_id for claim in chunk)] = renderings
+            options[tuple(claim.claim_id for claim in chunk)] = chunk
     return options
 
 
 def build_controlled_presentation_sections(
     claims: list[CanonicalExperienceClaimV1],
 ) -> list[PresentationSection]:
-    """Build the Claude-provider-equivalent plain rendering for each finite option."""
+    """Build a deterministic plain fixture for each provider Claim group."""
 
-    claim_index = {claim.claim_id: claim for claim in claims}
     options = _presentation_statement_options(claims)
     statements_by_section: dict[str, list[PresentationStatement]] = {
         section_code: [] for section_code in _SECTION_ORDER
     }
-    for claim_ids, renderings in options.items():
-        bound_claims = [claim_index[claim_id] for claim_id in claim_ids]
+    for claim_ids, bound_claims in options.items():
         first = bound_claims[0]
         canonical_text = " ".join(claim.canonical_text for claim in bound_claims)
-        if canonical_text not in renderings:
-            raise ValueError("plain canonical presentation rendering is unavailable")
         citations = list(
             {
                 (citation.kind, citation.reference_id): citation
@@ -562,29 +673,6 @@ def _build_deterministic_fallback_sections(
             )
         )
     return sections
-
-
-def _answer_renderings(
-    claim: CanonicalExperienceClaimV1,
-    area: str,
-) -> frozenset[str]:
-    if claim.role not in _ANSWER_AREA_ROLES[area]:
-        return frozenset()
-    return _framed_texts(
-        claim.canonical_text,
-        _ANSWER_AREA_PREFIXES[area],
-        max_length=(4_000 if area == "direct_answer" else 2_000),
-    )
-
-
-def _guidance_renderings(text: str, area: str) -> frozenset[str]:
-    if area not in {"direct_answer", "explanation"}:
-        return frozenset()
-    return _framed_texts(
-        text,
-        _ANSWER_AREA_PREFIXES[area],
-        max_length=(4_000 if area == "direct_answer" else 2_000),
-    )
 
 
 def _field_fact_claims(
@@ -1856,15 +1944,43 @@ def validate_presentation_against_result(envelope: ReviewExperienceEnvelopeV1) -
             if envelope.user_presentation.generation_audit.mode == "deterministic_fallback":
                 if len(bound_claims) != 1 or statement.text != bound_claims[0].canonical_text:
                     raise ValueError("deterministic presentation fallback differs from its claim")
-            elif statement.text not in presentation_options.get(
-                tuple(statement.source_claim_ids),
-                frozenset(),
-            ):
-                raise ValueError(
-                    "presentation text is outside the Backend-verifiable controlled language"
+            else:
+                expected_group = presentation_options.get(tuple(statement.source_claim_ids))
+                if expected_group is None:
+                    raise ValueError(
+                        "presentation Claim grouping differs from the provider contract"
+                    )
+                blockers = _grounded_prose_blockers(
+                    statement.text,
+                    [claim.canonical_text for claim in expected_group],
+                    prefix="presentation",
+                    minimum_chars=_PRESENTATION_MIN_MATERIAL_STATEMENT_CHARS,
                 )
+                if blockers:
+                    raise ValueError(
+                        "presentation prose failed deterministic grounding: " + ",".join(blockers)
+                    )
     if used_claims != set(claim_index):
         raise ValueError("presentation canonical claim coverage is incomplete")
+    if envelope.user_presentation.generation_audit.mode == "claude":
+        section_lengths = {
+            section.section_code: len(
+                " ".join(statement.text for statement in section.statements).strip()
+            )
+            for section in envelope.user_presentation.sections
+        }
+        if any(length < _PRESENTATION_MIN_SECTION_CHARS for length in section_lengths.values()):
+            raise ValueError("Claude presentation contains an underdeveloped section")
+        material_text = " ".join(
+            statement.text
+            for section in envelope.user_presentation.sections
+            for statement in section.statements
+            if statement.material
+        )
+        if len(material_text) < _PRESENTATION_MIN_TOTAL_MATERIAL_CHARS:
+            raise ValueError("Claude presentation is too short for the user experience contract")
+        if _korean_letter_ratio(material_text) < _PRESENTATION_MIN_KOREAN_RATIO:
+            raise ValueError("Claude presentation does not meet the Korean-language quality gate")
     allowed_action_sources = _result_claim_ids | {
         reference_id for _kind, reference_id in references
     }
@@ -2185,22 +2301,47 @@ def validate_answer_against_context(
             typed_claims = [claim for claim in claims if claim is not None]
             if any(claim.role not in _ANSWER_AREA_ROLES[area] for claim in typed_claims):
                 raise ValueError(f"material assistant {area} selected a claim with wrong role")
-            if len(texts) != len(typed_claims):
+            if bool(texts) != bool(typed_claims):
                 raise ValueError(f"material assistant {area} claim coverage is inconsistent")
-            if any(
-                text not in _answer_renderings(claim, area)
-                for text, claim in zip(texts, typed_claims, strict=True)
-            ):
-                raise ValueError(
-                    f"material assistant {area} text is outside the "
-                    "Backend-verifiable controlled language"
-                )
+            if generation.mode == "claude":
+                source_texts = [claim.canonical_text for claim in typed_claims]
+                blockers = [
+                    blocker
+                    for text in texts
+                    for blocker in _grounded_prose_blockers(
+                        text,
+                        source_texts,
+                        prefix=f"assistant_{area}",
+                        minimum_chars=_PRESENTATION_MIN_MATERIAL_STATEMENT_CHARS,
+                    )
+                ]
+                if blockers:
+                    raise ValueError(
+                        f"material assistant {area} prose failed deterministic grounding: "
+                        + ",".join(blockers)
+                    )
             for claim in typed_claims:
                 selected_claims[claim.claim_id] = claim
         if not answer.direct_answer or not answer.claim_selections.direct_answer:
             raise ValueError("material assistant direct answer has no selected claim")
-        if answer.limitations != [_CASE_LIMITATION]:
-            raise ValueError("material assistant limitation differs from the safe template")
+        if generation.mode == "claude":
+            if not answer.limitations:
+                raise ValueError("material assistant omitted the Case limitation")
+            limitation_blockers = [
+                blocker
+                for text in answer.limitations
+                for blocker in _grounded_prose_blockers(
+                    text,
+                    [_CASE_LIMITATION],
+                    prefix="assistant_limitation",
+                    minimum_chars=_PRESENTATION_MIN_MATERIAL_STATEMENT_CHARS,
+                )
+            ]
+            if limitation_blockers:
+                raise ValueError(
+                    "material assistant limitation failed deterministic grounding: "
+                    + ",".join(limitation_blockers)
+                )
         expected_citations = {
             (citation.kind, citation.reference_id)
             for claim in selected_claims.values()
@@ -2216,27 +2357,45 @@ def validate_answer_against_context(
         if (
             any(answer.claim_selections.model_dump(mode="json").values())
             or not guidance_values
-            or len(answer_areas["direct_answer"]) != 1
-            or len(answer_areas["explanation"]) != max(0, len(guidance_values) - 1)
+            or not answer.direct_answer
             or any(answer_areas[area] for area in ("evidence_meaning", "impact", "next_steps"))
-            or answer.limitations != [_GENERAL_GUIDANCE_LIMITATION]
             or answer.citations
         ):
             raise ValueError("general customs guidance differs from the pinned safe catalog")
-        if answer_areas["direct_answer"][0] not in _guidance_renderings(
-            guidance_values[0],
-            "direct_answer",
-        ) or any(
-            text not in _guidance_renderings(guidance_text, "explanation")
-            for text, guidance_text in zip(
-                answer_areas["explanation"],
-                guidance_values[1:],
-                strict=True,
-            )
-        ):
-            raise ValueError(
-                "general customs guidance is outside the Backend-verifiable controlled language"
-            )
+        if generation.mode == "claude":
+            guidance_texts = [
+                answer.direct_answer,
+                *answer.explanation,
+            ]
+            blockers = [
+                blocker
+                for text in guidance_texts
+                for blocker in _grounded_prose_blockers(
+                    text,
+                    guidance_values,
+                    prefix="assistant_general_guidance",
+                    minimum_chars=_PRESENTATION_MIN_MATERIAL_STATEMENT_CHARS,
+                )
+            ]
+            if any(_GENERAL_GUIDANCE_CASE_ASSERTION_RE.search(text) for text in guidance_texts):
+                blockers.append("assistant_general_guidance_case_assertion")
+            if not answer.limitations:
+                blockers.append("assistant_general_guidance_limitation_missing")
+            else:
+                blockers.extend(
+                    blocker
+                    for text in answer.limitations
+                    for blocker in _grounded_prose_blockers(
+                        text,
+                        [_GENERAL_GUIDANCE_LIMITATION],
+                        prefix="assistant_general_guidance_limitation",
+                        minimum_chars=_PRESENTATION_MIN_MATERIAL_STATEMENT_CHARS,
+                    )
+                )
+            if blockers:
+                raise ValueError(
+                    "general customs guidance failed deterministic grounding: " + ",".join(blockers)
+                )
     elif any(answer.claim_selections.model_dump(mode="json").values()):
         raise ValueError("non-grounded assistant answer cannot select canonical claims")
 
@@ -2259,6 +2418,11 @@ def validate_answer_against_context(
             "answer_scope": answer.answer_scope,
             "allowed_claims": [claim.model_dump(mode="json") for claim in answer_claims],
             "general_guidance": guidance,
+            "fixed_limitation_source": (
+                _GENERAL_GUIDANCE_LIMITATION
+                if answer.answer_scope == "general_customs_guidance"
+                else _CASE_LIMITATION
+            ),
             "candidate_answer": candidate_answer,
         }
     )
