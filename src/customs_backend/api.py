@@ -895,20 +895,11 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             "dependencies": dependency_status,
         }
 
-    def validate_enhanced_capability(
+    def validate_uat_capability_attestation(
         payload: dict[str, Any],
     ) -> AgentUatCapabilityAttestationV1:
         if not actual_container.settings.enhanced_agent_experience:
             raise ReleaseConfigurationError("enhanced Agent experience is disabled")
-        expected_keys = {
-            "service_api_version": "internal-agent-service/v3",
-            "enhanced_experience_enabled": True,
-            "uat_adaptive_active": actual_container.settings.uat_adaptive_active,
-            "auto_completion_enabled": False,
-            "uat_capability_status": "valid",
-        }
-        if any(payload.get(key) != value for key, value in expected_keys.items()):
-            raise ReleaseConfigurationError("Agent enhanced-experience mode differs")
         try:
             validate_agent_experience_payload(
                 "agent-uat-capability-v1",
@@ -925,7 +916,6 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             payload.get("uat_capability_sha256") != capability.capability_sha256
             or payload.get("uat_capability_sha256")
             != actual_container.settings.uat_expected_capability_sha256
-            or payload.get("meaning_catalog_sha256") != expected_meaning_catalog_sha256()
             or not isinstance(payload.get("uat_capability_file_sha256"), str)
             or any(
                 character not in "0123456789abcdef"
@@ -935,13 +925,13 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             or payload.get("uat_capability_file_sha256")
             != actual_container.settings.uat_expected_capability_file_sha256
             or payload.get("uat_capability_expires_at") != capability.expires_at.isoformat()
+            or payload.get("agent_commit") != capability.agent_commit
             or capability.expires_at <= capability_now
             or capability.issued_at > capability_now + timedelta(minutes=5)
             or capability.expires_at > capability_now + timedelta(hours=24, minutes=5)
             or capability.adaptive_active != actual_container.settings.uat_adaptive_active
             or capability.evidence_profile != actual_container.settings.uat_evidence_profile
             or capability.agent_commit != contract_lock.provider_commit
-            or payload.get("service_openapi_sha256") != contract_lock.provider_openapi_sha256
             or capability.prompt_bundle_sha256 != contract_lock.experience_prompt_bundle_sha256
             or capability.schema_bundle_sha256 != contract_lock.experience_schema_bundle_sha256
             or capability.tool_registry_id != contract_lock.uat_tool_registry_id
@@ -951,6 +941,27 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         ):
             raise ReleaseConfigurationError("Agent UAT capability identity differs")
         return capability
+
+    def validate_enhanced_capability(
+        payload: dict[str, Any],
+    ) -> AgentUatCapabilityAttestationV1:
+        expected_keys = {
+            "service_api_version": "internal-agent-service/v3",
+            "enhanced_experience_enabled": True,
+            "uat_adaptive_active": actual_container.settings.uat_adaptive_active,
+            "auto_completion_enabled": False,
+            "uat_capability_status": "valid",
+        }
+        schemas = payload.get("schemas")
+        contract_lock = validate_agent_experience_contract_bundle().lock
+        if (
+            any(payload.get(key) != value for key, value in expected_keys.items())
+            or payload.get("meaning_catalog_sha256") != expected_meaning_catalog_sha256()
+            or not isinstance(schemas, dict)
+            or schemas.get("service_openapi_sha256") != contract_lock.provider_openapi_sha256
+        ):
+            raise ReleaseConfigurationError("Agent enhanced-experience mode differs")
+        return validate_uat_capability_attestation(payload)
 
     def validated_local_uat_agent_metadata() -> tuple[
         dict[str, Any], EvidenceRuntimeReleaseIdentityV3
@@ -968,6 +979,10 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             "shadow": "shadow",
             "diagnostic_active": "active",
         }[actual_container.settings.uat_planner_mode]
+        expected_execution_mode = {
+            "shadow": "shadow",
+            "diagnostic_active": "uat_active",
+        }[actual_container.settings.uat_planner_mode]
         if (
             agent_metadata.get("status") != "ready"
             or agent_metadata.get("service_api_version") != "internal-agent-service/v2"
@@ -976,7 +991,8 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             or not isinstance(transport_limits, dict)
             or transport_limits.get("text_only") is not True
             or not isinstance(agentic_limits, dict)
-            or agentic_limits.get("effective_execution_mode") != expected_planner_mode
+            or agentic_limits.get("planner_mode") != expected_planner_mode
+            or agentic_limits.get("effective_execution_mode") != expected_execution_mode
             or not isinstance(model_identity, dict)
             or not isinstance(model_identity.get("id"), str)
             or not model_identity["id"]
@@ -1116,7 +1132,7 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             agent_metadata, evidence_identity = validated_local_uat_agent_metadata()
             agent_uat_readiness = actual_container.agent.uat_readiness()
             if actual_container.settings.enhanced_agent_experience:
-                readiness_capability = validate_enhanced_capability(agent_uat_readiness)
+                readiness_capability = validate_uat_capability_attestation(agent_uat_readiness)
                 metadata_capability = validate_enhanced_capability(
                     actual_container.agent.experience_metadata()
                 )
