@@ -822,9 +822,11 @@ def test_worker_restart_preserves_job_and_forces_auto_completion_gate(workbench)
     assert stored_provider_result is not None
     assert provenance["request_id"] == stored_provider_result["retrieval_request"]["request_id"]
     assert provenance["query_intent"] == "required_import_documents"
+    provider_item = stored_provider_result["retrieval_results"][0]
+    provider_evidence = stored_provider_result["rag_evidence"][0]
     assert provenance["items"] == [
         {
-            "item_id": run.result_detail["retrieval_results"][0]["item_id"],
+            "item_id": provider_item["item_id"],
             "query_description": "Synthetic no-requirement line item",
             "requested_hs_code": "0303540000",
             "hs_resolution": "exact",
@@ -835,10 +837,12 @@ def test_worker_restart_preserves_job_and_forces_auto_completion_gate(workbench)
     ]
     assert provenance["ranked_evidence"] == [
         {
-            "evidence_id": run.result_detail["rag_evidence"][0]["evidence_id"],
-            "item_id": run.result_detail["retrieval_results"][0]["item_id"],
+            "evidence_id": provider_evidence["evidence_id"],
+            "item_id": provider_item["item_id"],
             "rank": 1,
             "source_type": "hsk_entry",
+            "title": "Synthetic HSK classification evidence",
+            "excerpt": "The synthetic item is bound to HSK 0303540000 for contract testing.",
             "retrieval_methods": ["exact_hs"],
             "score": 1.0,
             "raw_scores": {"exact_hs": 1.0},
@@ -849,6 +853,8 @@ def test_worker_restart_preserves_job_and_forces_auto_completion_gate(workbench)
             "source_uri": "https://example.invalid/hsk/0303540000",
         }
     ]
+    assert "retrieval_results" not in run.result_detail
+    assert "rag_evidence" not in run.result_detail
     assert container.repository.get_provider_result("org-a", run.review_run_id) is not None
     assert (
         restarted.execute_job(org_id="org-a", job_id=queued["job_id"]).result_digest

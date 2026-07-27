@@ -15,6 +15,9 @@ AI Agent 내부 상태를 직접 저장하지 않고, 외부에 공개되는 `Re
   pairing 결과를 보존한다.
 - Evidence API request, item별 HS 후보/coverage/evidence, top-level/item error를
   `result_json`에 보존해 partial/failed 판단도 DB만으로 재현할 수 있다.
+- Migration `008`은 검증된 사용자 보고서와 멀티턴 심사 도우미의 conversation,
+  call-once job, message를 additive table에 저장한다. 기존 Run·Chat V1·HITL·Audit
+  row는 수정하지 않는다.
 
 PostgreSQL 적용:
 

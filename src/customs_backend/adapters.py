@@ -117,12 +117,16 @@ class MinioObjectStore:
 class InMemoryJobPublisher:
     def __init__(self) -> None:
         self.messages: list[tuple[str, str, str]] = []
+        self.assistant_messages: list[tuple[str, str, str]] = []
 
     def health(self) -> bool:
         return True
 
     def publish(self, *, org_id: str, job_id: str, outbox_id: str) -> None:
         self.messages.append((org_id, job_id, outbox_id))
+
+    def publish_assistant(self, *, org_id: str, assistant_job_id: str, outbox_id: str) -> None:
+        self.assistant_messages.append((org_id, assistant_job_id, outbox_id))
 
 
 class DramatiqJobPublisher:
@@ -148,6 +152,16 @@ class DramatiqJobPublisher:
             queue_name="customs-review",
             actor_name="customs_backend.execute_review_job",
             args=(org_id, job_id, outbox_id),
+            kwargs={},
+            options={},
+        )
+        self._broker.enqueue(message)
+
+    def publish_assistant(self, *, org_id: str, assistant_job_id: str, outbox_id: str) -> None:
+        message: Any = self._dramatiq.Message(
+            queue_name="customs-review",
+            actor_name="customs_backend.execute_assistant_job",
+            args=(org_id, assistant_job_id, outbox_id),
             kwargs={},
             options={},
         )
@@ -263,6 +277,139 @@ class HttpAgentClient:
                 response_name="response",
             )
 
+    def _post_ndjson(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        on_event: Callable[[dict[str, Any]], None],
+    ) -> dict[str, Any]:
+        encoded = canonical_json_bytes(payload)
+        if len(encoded) > 2 * 1024 * 1024:
+            raise ValueError("Agent request exceeds the 2 MiB transport limit")
+        with self._client.stream(
+            "POST",
+            path,
+            content=encoded,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/x-ndjson",
+            },
+        ) as response:
+            if response.status_code == 503:
+                error_response = self._decode_object(
+                    response,
+                    maximum_bytes=4_096,
+                    response_name="stream error response",
+                )
+                if self._is_proven_pre_execution_rejection(response, error_response):
+                    request_id = error_response["error"]["request_id"]
+                    raise AgentPreExecutionRetryableError(request_id=request_id)
+                raise AgentResponseRejectedError("Agent stream returned HTTP 503")
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise AgentResponseRejectedError(
+                    f"Agent stream returned HTTP {response.status_code}"
+                ) from exc
+            content_type = (
+                response.headers.get("content-type", "").split(";", 1)[0].strip().casefold()
+            )
+            if content_type != "application/x-ndjson":
+                raise AgentResponseRejectedError("Agent stream returned a non-NDJSON content type")
+            total_bytes = 0
+            terminal: dict[str, Any] | None = None
+            seen_terminal = False
+            pending = bytearray()
+
+            def consume_line(encoded_line: bytes) -> None:
+                nonlocal terminal
+                nonlocal seen_terminal
+                if encoded_line.endswith(b"\r"):
+                    encoded_line = encoded_line[:-1]
+                if len(encoded_line) > 4_000_000:
+                    raise AgentResponseRejectedError("Agent stream exceeds the consumer limit")
+                if not encoded_line:
+                    return
+
+                def pairs(values: list[tuple[str, Any]]) -> dict[str, Any]:
+                    decoded: dict[str, Any] = {}
+                    for key, value in values:
+                        if key in decoded:
+                            raise ValueError("duplicate JSON object key")
+                        decoded[key] = value
+                    return decoded
+
+                try:
+                    line = encoded_line.decode("utf-8")
+                    item = json.loads(
+                        line,
+                        object_pairs_hook=pairs,
+                        parse_constant=lambda value: (_ for _ in ()).throw(
+                            ValueError(f"non-finite JSON number: {value}")
+                        ),
+                    )
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                    raise AgentResponseRejectedError("Agent stream contains invalid JSON") from exc
+                if not isinstance(item, dict) or set(item) != {
+                    "type",
+                    (
+                        "event"
+                        if item.get("type") == "stage_event"
+                        else "result"
+                        if item.get("type") == "result"
+                        else "error"
+                        if item.get("type") == "error"
+                        else "invalid"
+                    ),
+                }:
+                    raise AgentResponseRejectedError("Agent stream item shape is unsupported")
+                item_type = item["type"]
+                if seen_terminal:
+                    raise AgentResponseRejectedError("Agent stream emitted data after its terminal")
+                if item_type == "stage_event":
+                    event = item["event"]
+                    if not isinstance(event, dict):
+                        raise AgentResponseRejectedError("Agent stream event is malformed")
+                    on_event(event)
+                    return
+                seen_terminal = True
+                if item_type == "error":
+                    error = item["error"]
+                    if (
+                        not isinstance(error, dict)
+                        or set(error) != {"code", "retryable"}
+                        or not isinstance(error["code"], str)
+                        or not isinstance(error["retryable"], bool)
+                    ):
+                        raise AgentResponseRejectedError("Agent stream error is malformed")
+                    raise AgentResponseRejectedError(f"Agent stream failed with {error['code']}")
+                terminal = item["result"]
+                if not isinstance(terminal, dict):
+                    raise AgentResponseRejectedError("Agent stream result is malformed")
+
+            for chunk in response.iter_bytes(chunk_size=65_536):
+                total_bytes += len(chunk)
+                if total_bytes > 16_000_000:
+                    raise AgentResponseRejectedError("Agent stream exceeds the consumer limit")
+                pending.extend(chunk)
+                while True:
+                    newline = pending.find(b"\n")
+                    if newline < 0:
+                        if len(pending) > 4_000_000:
+                            raise AgentResponseRejectedError(
+                                "Agent stream line exceeds the consumer limit"
+                            )
+                        break
+                    line_bytes = bytes(pending[:newline])
+                    del pending[: newline + 1]
+                    consume_line(line_bytes)
+            if pending:
+                consume_line(bytes(pending))
+            if terminal is None:
+                raise AgentResponseRejectedError("Agent stream ended without one result")
+            return terminal
+
     @staticmethod
     def _is_proven_pre_execution_rejection(
         response: httpx.Response,
@@ -298,6 +445,21 @@ class HttpAgentClient:
     def review(self, request: AgentReviewRequest) -> dict[str, Any]:
         return self._post("/internal/agent/v2/reviews", request.to_agent_wire())
 
+    def review_experience(self, request: AgentReviewRequest) -> dict[str, Any]:
+        return self._post("/internal/agent/v3/reviews", request.to_agent_wire())
+
+    def review_experience_stream(
+        self,
+        request: AgentReviewRequest,
+        *,
+        on_event: Callable[[dict[str, Any]], None],
+    ) -> dict[str, Any]:
+        return self._post_ndjson(
+            "/internal/agent/v3/reviews/stream",
+            request.to_agent_wire(),
+            on_event=on_event,
+        )
+
     def revise(self, request: AgentRevisionRequest) -> dict[str, Any]:
         return self._post("/internal/agent/v2/revisions", request.to_agent_wire())
 
@@ -324,6 +486,21 @@ class HttpAgentClient:
                 "Agent answer violated the V3 response contract"
             ) from exc
 
+    def answer_v2(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/internal/agent/v3/answers", payload)
+
+    def answer_v2_stream(
+        self,
+        payload: dict[str, Any],
+        *,
+        on_event: Callable[[dict[str, Any]], None],
+    ) -> dict[str, Any]:
+        return self._post_ndjson(
+            "/internal/agent/v3/answers/stream",
+            payload,
+            on_event=on_event,
+        )
+
     def metadata(self) -> dict[str, Any]:
         with self._client.stream("GET", "/internal/agent/v2/metadata") as response:
             try:
@@ -336,6 +513,20 @@ class HttpAgentClient:
                 response,
                 maximum_bytes=1_000_000,
                 response_name="metadata",
+            )
+
+    def experience_metadata(self) -> dict[str, Any]:
+        with self._client.stream("GET", "/internal/agent/v3/metadata") as response:
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise AgentResponseRejectedError(
+                    f"Agent experience metadata returned HTTP {response.status_code}"
+                ) from exc
+            return self._decode_object(
+                response,
+                maximum_bytes=1_000_000,
+                response_name="experience metadata",
             )
 
     def uat_readiness(self) -> dict[str, Any]:
@@ -365,7 +556,12 @@ class CallableAgentClient:
         *,
         revise: Callable[[AgentRevisionRequest], dict[str, Any]] | None = None,
         answer: Callable[[dict[str, Any], str, str], AgentAnswerResponse] | None = None,
+        review_experience: Callable[[AgentReviewRequest], dict[str, Any]] | None = None,
+        answer_v2: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        review_events: list[dict[str, Any]] | None = None,
+        answer_events: list[dict[str, Any]] | None = None,
         metadata: dict[str, Any] | None = None,
+        experience_metadata: dict[str, Any] | None = None,
         uat_readiness: dict[str, Any] | None = None,
     ) -> None:
         self._review = review
@@ -385,13 +581,35 @@ class CallableAgentClient:
             )
         )
         self._metadata = metadata or {"assurance_level": "diagnostic"}
+        self._experience_metadata = experience_metadata or {
+            "status": "unavailable",
+        }
         self._uat_readiness = uat_readiness or {"status": "unavailable"}
+        self._review_experience = review_experience
+        self._answer_v2 = answer_v2
+        self._review_events = list(review_events or [])
+        self._answer_events = list(answer_events or [])
 
     def review(self, request: AgentReviewRequest) -> dict[str, Any]:
         return self._review(request)
 
     def revise(self, request: AgentRevisionRequest) -> dict[str, Any]:
         return self._revise(request)
+
+    def review_experience(self, request: AgentReviewRequest) -> dict[str, Any]:
+        if self._review_experience is None:
+            raise RuntimeError("test Agent experience behavior was not configured")
+        return self._review_experience(request)
+
+    def review_experience_stream(
+        self,
+        request: AgentReviewRequest,
+        *,
+        on_event: Callable[[dict[str, Any]], None],
+    ) -> dict[str, Any]:
+        for event in self._review_events:
+            on_event(dict(event))
+        return self.review_experience(request)
 
     def answer(
         self,
@@ -402,8 +620,26 @@ class CallableAgentClient:
     ) -> AgentAnswerResponse:
         return self._answer(provider_result, question, question_id)
 
+    def answer_v2(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self._answer_v2 is None:
+            raise RuntimeError("test Agent Chat V2 behavior was not configured")
+        return self._answer_v2(payload)
+
+    def answer_v2_stream(
+        self,
+        payload: dict[str, Any],
+        *,
+        on_event: Callable[[dict[str, Any]], None],
+    ) -> dict[str, Any]:
+        for event in self._answer_events:
+            on_event(dict(event))
+        return self.answer_v2(payload)
+
     def metadata(self) -> dict[str, Any]:
         return dict(self._metadata)
+
+    def experience_metadata(self) -> dict[str, Any]:
+        return dict(self._experience_metadata)
 
     def uat_readiness(self) -> dict[str, Any]:
         return dict(self._uat_readiness)

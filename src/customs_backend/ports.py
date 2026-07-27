@@ -24,6 +24,14 @@ from customs_backend.domain import (
     SupportingDocumentRecord,
     VerificationAssertionRecord,
 )
+from customs_backend.experience import (
+    AssistantConversationRecord,
+    AssistantJobRecord,
+    AssistantJobState,
+    AssistantMessageRecord,
+    AssistantStageEvent,
+    ReviewPresentationRecord,
+)
 
 
 class ConflictError(RuntimeError):
@@ -202,6 +210,14 @@ class WorkbenchRepository(Protocol):
         expected_lease_id: str | None = None,
     ) -> JobRecord: ...
     def list_stage_events(self, org_id: str, job_id: str) -> list[StageEvent]: ...
+    def recent_review_durations_ms(
+        self,
+        *,
+        org_id: str,
+        evidence_profile: str,
+        document_count: int,
+        limit: int = 30,
+    ) -> list[int]: ...
     def save_run(self, run: ReviewRunRecord, audit: AuditRecord) -> ReviewRunRecord: ...
     def get_provider_result(self, org_id: str, review_run_id: str) -> dict[str, Any] | None: ...
     def complete_job(
@@ -215,6 +231,7 @@ class WorkbenchRepository(Protocol):
         run_audit: AuditRecord,
         job_audit: AuditRecord,
         expected_lease_id: str,
+        presentation: ReviewPresentationRecord | None = None,
     ) -> ReviewRunRecord: ...
     def get_run(self, org_id: str, review_run_id: str) -> ReviewRunRecord | None: ...
     def list_runs(self, org_id: str, case_id: str) -> list[ReviewRunRecord]: ...
@@ -288,6 +305,81 @@ class WorkbenchRepository(Protocol):
         self, org_id: str, idempotency_key: str
     ) -> ChatRecord | None: ...
     def list_chat(self, org_id: str, review_run_id: str) -> list[ChatRecord]: ...
+    def get_review_presentation(
+        self, org_id: str, review_run_id: str
+    ) -> ReviewPresentationRecord | None: ...
+    def create_assistant_conversation(
+        self, record: AssistantConversationRecord, audit: AuditRecord
+    ) -> AssistantConversationRecord: ...
+    def get_assistant_conversation(
+        self, org_id: str, conversation_id: str
+    ) -> AssistantConversationRecord | None: ...
+    def list_assistant_conversations(
+        self, org_id: str, review_run_id: str
+    ) -> list[AssistantConversationRecord]: ...
+    def enqueue_assistant_message(
+        self,
+        *,
+        conversation: AssistantConversationRecord,
+        user_message: AssistantMessageRecord,
+        job: AssistantJobRecord,
+        outbox: OutboxRecord,
+        audit: AuditRecord,
+        expected_case_revision: int,
+        actor_window_started_at: Any,
+        actor_window_limit: int,
+        review_run_limit: int,
+    ) -> tuple[AssistantJobRecord, AssistantMessageRecord, bool]: ...
+    def get_assistant_job(
+        self, org_id: str, assistant_job_id: str
+    ) -> AssistantJobRecord | None: ...
+    def get_assistant_job_by_idempotency_key(
+        self, org_id: str, idempotency_key: str
+    ) -> AssistantJobRecord | None: ...
+    def list_assistant_jobs(
+        self, org_id: str, conversation_id: str
+    ) -> list[AssistantJobRecord]: ...
+    def claim_assistant_job(
+        self,
+        *,
+        org_id: str,
+        assistant_job_id: str,
+        lease_id: str,
+        lease_expires_at: Any,
+        event: AssistantStageEvent,
+    ) -> AssistantJobRecord: ...
+    def append_assistant_event(
+        self,
+        *,
+        org_id: str,
+        assistant_job_id: str,
+        expected_lease_id: str,
+        event: AssistantStageEvent,
+    ) -> AssistantJobRecord: ...
+    def complete_assistant_job(
+        self,
+        *,
+        job: AssistantJobRecord,
+        answer_message: AssistantMessageRecord,
+        event: AssistantStageEvent,
+        audit: AuditRecord,
+        expected_lease_id: str,
+        expected_case_revision: int,
+    ) -> AssistantJobRecord: ...
+    def mark_assistant_job_terminal(
+        self,
+        *,
+        org_id: str,
+        assistant_job_id: str,
+        state: AssistantJobState,
+        error_code: str,
+        event: AssistantStageEvent,
+        audit: AuditRecord,
+        expected_lease_id: str,
+    ) -> AssistantJobRecord: ...
+    def list_assistant_messages(
+        self, org_id: str, conversation_id: str
+    ) -> list[AssistantMessageRecord]: ...
     def list_audit(self, org_id: str, case_id: str) -> list[AuditRecord]: ...
     def claim_pending_outbox(
         self, *, lease_id: str, lease_expires_at: Any, limit: int = 100
@@ -305,6 +397,7 @@ class ObjectStore(Protocol):
 class JobPublisher(Protocol):
     def health(self) -> bool: ...
     def publish(self, *, org_id: str, job_id: str, outbox_id: str) -> None: ...
+    def publish_assistant(self, *, org_id: str, assistant_job_id: str, outbox_id: str) -> None: ...
 
 
 class AgentClient(Protocol):
@@ -317,7 +410,22 @@ class AgentClient(Protocol):
         question: str,
         question_id: str,
     ) -> AgentAnswerResponse: ...
+    def review_experience(self, request: AgentReviewRequest) -> dict[str, Any]: ...
+    def review_experience_stream(
+        self,
+        request: AgentReviewRequest,
+        *,
+        on_event: Callable[[dict[str, Any]], None],
+    ) -> dict[str, Any]: ...
+    def answer_v2(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+    def answer_v2_stream(
+        self,
+        payload: dict[str, Any],
+        *,
+        on_event: Callable[[dict[str, Any]], None],
+    ) -> dict[str, Any]: ...
     def metadata(self) -> dict[str, Any]: ...
+    def experience_metadata(self) -> dict[str, Any]: ...
     def uat_readiness(self) -> dict[str, Any]: ...
 
 

@@ -7,11 +7,11 @@ from customs_backend.api import create_app
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DESTINATION = ROOT / "docs" / "openapi-v1.json"
+DEFAULT_DESTINATION = ROOT / "docs" / "openapi-v2.json"
 
 
 def render_product_openapi() -> bytes:
-    """Return the canonical, reproducible public Backend OpenAPI bytes."""
+    """Return the canonical, reproducible current public Backend OpenAPI bytes."""
 
     encoded = json.dumps(
         create_app().openapi(),

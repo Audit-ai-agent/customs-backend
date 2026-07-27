@@ -196,6 +196,109 @@ def test_http_agent_client_recognizes_only_proven_pre_execution_dependency_rejec
     assert captured.value.error_code == "dependency_unready"
 
 
+def test_http_agent_v3_review_stream_uses_exact_ndjson_wire_and_forwards_events() -> None:
+    observed_events: list[dict] = []
+    stage = {"sequence": 0, "stage_code": "request_validation"}
+    terminal = {"envelope_sha256": "a" * 64}
+
+    def provider_boundary(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/internal/agent/v3/reviews/stream"
+        assert request.headers["Authorization"] == "Bearer test-token"
+        assert request.headers["Accept"] == "application/x-ndjson"
+        payload = json.loads(request.content)
+        assert "image_pages" not in payload["documents"][0]
+        content = (
+            json.dumps({"type": "stage_event", "event": stage})
+            + "\n"
+            + json.dumps({"type": "result", "result": terminal})
+            + "\n"
+        )
+        return httpx.Response(
+            200,
+            content=content.encode(),
+            headers={"Content-Type": "application/x-ndjson"},
+            request=request,
+        )
+
+    client = HttpAgentClient(
+        base_url="http://agent.test",
+        service_token="test-token",
+        transport=httpx.MockTransport(provider_boundary),
+    )
+    try:
+        assert (
+            client.review_experience_stream(
+                _review_request(),
+                on_event=observed_events.append,
+            )
+            == terminal
+        )
+    finally:
+        client.close()
+    assert observed_events == [stage]
+
+
+def test_http_agent_v3_stream_recognizes_only_proven_pre_execution_rejection() -> None:
+    def reject_before_execution(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            503,
+            json=_dependency_unready_payload(),
+            headers={
+                "X-Request-ID": _AGENT_REQUEST_ID,
+                "X-Agent-Execution-State": "not-started",
+            },
+            request=request,
+        )
+
+    client = HttpAgentClient(
+        base_url="http://agent.test",
+        service_token="test-token",
+        transport=httpx.MockTransport(reject_before_execution),
+    )
+    try:
+        with pytest.raises(AgentPreExecutionRetryableError) as captured:
+            client.review_experience_stream(
+                _review_request(),
+                on_event=lambda _event: None,
+            )
+    finally:
+        client.close()
+    assert captured.value.request_id == _AGENT_REQUEST_ID
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"type":"result","result":{}}\n{"type":"stage_event","event":{}}\n',
+        '{"type":"stage_event","event":{}}\n',
+        '{"type":"stage_event","event":{},"extra":true}\n',
+        '{"type":"result","result":NaN}\n',
+        '{"type":"result","result":{},"result":{}}\n',
+    ],
+)
+def test_http_agent_v3_stream_rejects_ambiguous_or_incomplete_ndjson(content: str) -> None:
+    client = HttpAgentClient(
+        base_url="http://agent.test",
+        service_token="test-token",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                content=content.encode(),
+                headers={"Content-Type": "application/x-ndjson"},
+                request=request,
+            )
+        ),
+    )
+    try:
+        with pytest.raises(AgentResponseRejectedError):
+            client.review_experience_stream(
+                _review_request(),
+                on_event=lambda _event: None,
+            )
+    finally:
+        client.close()
+
+
 @pytest.mark.parametrize(
     "case",
     [

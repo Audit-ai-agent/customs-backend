@@ -11,6 +11,15 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import DBAPIError
 from tests.product.agent_v3_fixture import build_agent_v3_result
+from tests.product.test_commercial_agent_experience import (
+    _ANSWER_STAGES,
+    _EVIDENCE_RUNTIME_SHA,
+    _REVIEW_STAGES,
+    _answer,
+    _answer_events,
+    _experience,
+    _review_events,
+)
 
 from customs_backend.agent_chat_semantics import expected_answer_projection
 from customs_backend.adapters import (
@@ -43,6 +52,10 @@ from customs_backend.ports import (
     ConflictError,
     NotFoundError,
     QuotaExceededError,
+)
+from customs_backend.experience import (
+    AssistantMessageCreateV2,
+    ConversationCreateV2,
 )
 from customs_backend.repository import PostgresWorkbenchRepository
 from customs_backend.service import WorkbenchService
@@ -83,6 +96,10 @@ def test_postgres_migration_atomicity_persistence_and_isolation() -> None:
         "human_decisions",
         "product_outbox",
         "review_stage_events",
+        "review_presentations",
+        "assistant_conversations",
+        "assistant_jobs",
+        "assistant_messages",
     } <= tables
     with engine.connect() as connection:
         job_columns = set(
@@ -638,6 +655,103 @@ def test_postgres_migration_atomicity_persistence_and_isolation() -> None:
         len(restarted_repository.list_decisions(reviewer_a.org_id, current_parent.review_run_id))
         == 2
     )  # one proposal decision plus one general Run decision
+
+    # TASK-0027 experience/presentation and assistant records must survive a
+    # real PostgreSQL process boundary with the same immutable result binding.
+    enhanced_agent = CallableAgentClient(
+        lambda request: _experience(request)["canonical_result"],
+        review_experience=_experience,
+        answer_v2=_answer,
+        review_events=_review_events(),
+        answer_events=_answer_events(),
+    )
+    enhanced_service = WorkbenchService(
+        repository=restarted_repository,
+        object_store=objects,
+        publisher=publisher,
+        agent=enhanced_agent,
+        auto_completion_enabled=False,
+        enhanced_agent_experience=True,
+        uat_adaptive_active=True,
+        evidence_profile="preserved-3law-v3-scenario-eval",
+        expected_evidence_runtime_v3_sha256=_EVIDENCE_RUNTIME_SHA,
+    )
+    experience_job, experience_created = enhanced_service.enqueue_review(
+        reviewer_a,
+        case_a.case_id,
+        ReviewEnqueueRequest(),
+        "postgres-commercial-experience",
+        experience_api_version="3.0",
+        evidence_profile="preserved-3law-v3-scenario-eval",
+    )
+    assert experience_created
+    experience_run = enhanced_service.execute_job(
+        org_id=reviewer_a.org_id,
+        job_id=experience_job.job_id,
+    )
+    presentation = restarted_repository.get_review_presentation(
+        reviewer_a.org_id,
+        experience_run.review_run_id,
+    )
+    assert presentation is not None
+    assert presentation.bound_provider_result_sha256 == experience_run.provider_result_sha256
+    experience_stages = restarted_repository.list_stage_events(
+        reviewer_a.org_id,
+        experience_job.job_id,
+    )
+    assert {event.stage for event in experience_stages} >= set(_REVIEW_STAGES)
+
+    conversation = enhanced_service.create_assistant_conversation(
+        reviewer_a,
+        experience_run.review_run_id,
+        ConversationCreateV2(
+            bound_result_sha256=experience_run.provider_result_sha256,
+        ),
+    )
+    assistant_request = AssistantMessageCreateV2(
+        question="현재 결과에서 무엇을 먼저 확인해야 합니까?",
+        parent_message_id=None,
+        bound_result_sha256=experience_run.provider_result_sha256,
+    )
+
+    def enqueue_same_assistant_message():
+        return enhanced_service.enqueue_assistant_message(
+            reviewer_a,
+            conversation.conversation_id,
+            assistant_request,
+            "postgres-commercial-assistant",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assistant_replays = [
+            future.result(timeout=10)
+            for future in [
+                executor.submit(enqueue_same_assistant_message),
+                executor.submit(enqueue_same_assistant_message),
+            ]
+        ]
+    assert sorted(created for _job, _message, created in assistant_replays) == [False, True]
+    assert assistant_replays[0][0] == assistant_replays[1][0]
+    assert assistant_replays[0][1] == assistant_replays[1][1]
+    assistant_job = assistant_replays[0][0]
+    completed_assistant = enhanced_service.execute_assistant_job(
+        org_id=reviewer_a.org_id,
+        assistant_job_id=assistant_job.assistant_job_id,
+    )
+    assert {event.stage_code for event in completed_assistant.events} >= set(_ANSWER_STAGES)
+
+    reloaded_experience_repository = PostgresWorkbenchRepository(dsn)
+    reloaded_presentation = reloaded_experience_repository.get_review_presentation(
+        reviewer_a.org_id,
+        experience_run.review_run_id,
+    )
+    assert reloaded_presentation == presentation
+    reloaded_messages = reloaded_experience_repository.list_assistant_messages(
+        reviewer_a.org_id,
+        conversation.conversation_id,
+    )
+    assert [message.role for message in reloaded_messages] == ["user", "assistant"]
+    assert reloaded_messages[-1].structured_answer is not None
 
     # Once an external call may have been delivered, a process restart must
     # never call the Agent again for the same Job.

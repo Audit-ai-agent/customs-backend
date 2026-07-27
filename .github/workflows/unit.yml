@@ -80,7 +80,7 @@ jobs:
               )
           PY
 
-      - name: Apply migrations explicitly in order (003 to 007)
+      - name: Apply migrations explicitly in order (003 to 008)
         env:
           CUSTOMS_BACKEND_ENVIRONMENT: test
           CUSTOMS_BACKEND_PROCESS_ROLE: migration
@@ -104,8 +104,10 @@ jobs:
           uv run --locked alembic current | grep -Fx "20260722_0006"
           uv run --locked python tools/verify_legacy_005_upgrade.py remove-invalid-006
           uv run --locked alembic upgrade 20260722_0007
-          uv run --locked alembic current | grep -Fx "20260722_0007 (head)"
+          uv run --locked alembic current | grep -Fx "20260722_0007"
           uv run --locked python tools/verify_legacy_005_upgrade.py verify-007
+          uv run --locked alembic upgrade 20260727_0008
+          uv run --locked alembic current | grep -Fx "20260727_0008 (head)"
 
       - name: Unit, product, contract, and live PostgreSQL tests
         env:

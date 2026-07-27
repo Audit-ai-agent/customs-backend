@@ -367,6 +367,7 @@ def test_review_worker_registers_the_configured_hard_time_limit(
 
     broker = dramatiq.get_broker()
     broker.actors.pop("customs_backend.execute_review_job", None)
+    broker.actors.pop("customs_backend.execute_assistant_job", None)
     broker.actors.pop("customs_backend.dispatch_pending_outbox", None)
 
     try:
@@ -381,6 +382,7 @@ def test_review_worker_registers_the_configured_hard_time_limit(
     finally:
         sys.modules.pop("customs_backend.worker", None)
         broker.actors.pop("customs_backend.execute_review_job", None)
+        broker.actors.pop("customs_backend.execute_assistant_job", None)
         broker.actors.pop("customs_backend.dispatch_pending_outbox", None)
 
 
@@ -864,6 +866,16 @@ def test_local_uat_readiness_is_separate_from_strict_production_readiness(
             "production_release": False,
         }
         assert ready.json()["evidence_dataset"] == metadata.json()["evidence_dataset"]
+        metadata_v2 = client.get("/api/v2/uat/metadata")
+        assert metadata_v2.status_code == 200
+        assert metadata_v2.json() == {
+            **metadata.json(),
+            "enhanced_agent_experience": False,
+            "uat_adaptive_active": False,
+            "agent_experience_api_version": "disabled",
+            "assistant_api_version": "disabled",
+            "actual_stage_streaming": False,
+        }
 
 
 def test_local_uat_health_never_serializes_upstream_urls_secrets_or_raw_metadata(

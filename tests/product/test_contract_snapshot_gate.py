@@ -22,10 +22,24 @@ def _repository(tmp_path: Path) -> tuple[Path, bytes]:
     openapi = b'{"openapi":"3.1.0"}\n'
     files = {
         "docs/openapi-v1.json": openapi,
+        "docs/openapi-v2.json": openapi,
         "src/customs_backend/agent_contract.lock.json": b"{}\n",
+        "src/customs_backend/agent_experience_contract.lock.json": b"{}\n",
         "src/customs_backend/contracts/agent/v3/review-request.schema.json": b"{}\n",
         "src/customs_backend/contracts/agent/v3/review-result.schema.json": b"{}\n",
     }
+    for filename in (
+        "manifest.json",
+        "asset-manifest.json",
+        "meaning-catalog-v1.json",
+        "openapi.lock.json",
+        "agent-uat-capability-v1.schema.json",
+        "assistant-answer-v2.schema.json",
+        "case-conversation-request-v2.schema.json",
+        "review-experience-envelope-v1.schema.json",
+        "review-stage-event-v1.schema.json",
+    ):
+        files[f"src/customs_backend/contracts/agent/service/v3/{filename}"] = b"{}\n"
     for relative, content in files.items():
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -44,6 +58,7 @@ def test_contract_snapshot_gate_accepts_tracked_clean_exact_bytes(tmp_path: Path
         root,
         openapi_renderer=lambda: openapi,
         contract_validator=lambda: None,
+        experience_contract_validator=lambda: None,
     )
 
 
@@ -56,7 +71,7 @@ def test_contract_snapshot_gate_fails_closed(tmp_path: Path, failure: str) -> No
 
     renderer = exact_renderer
     if failure == "untracked":
-        _git(root, "rm", "--cached", "docs/openapi-v1.json")
+        _git(root, "rm", "--cached", "docs/openapi-v2.json")
     elif failure == "dirty":
         (root / "src/customs_backend/agent_contract.lock.json").write_bytes(b'{"dirty":true}\n')
     else:
@@ -71,4 +86,5 @@ def test_contract_snapshot_gate_fails_closed(tmp_path: Path, failure: str) -> No
             root,
             openapi_renderer=renderer,
             contract_validator=lambda: None,
+            experience_contract_validator=lambda: None,
         )

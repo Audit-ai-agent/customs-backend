@@ -44,6 +44,24 @@ def execute_review_job(org_id: str, job_id: str, _outbox_id: str) -> None:
 
 
 @dramatiq.actor(
+    actor_name="customs_backend.execute_assistant_job",
+    queue_name="customs-review",
+    max_retries=0,
+    time_limit=_settings.review_actor_time_limit_milliseconds,
+)
+def execute_assistant_job(org_id: str, assistant_job_id: str, _outbox_id: str) -> None:
+    """Assistant calls are call-once; uncertain delivery always requires inspection."""
+
+    try:
+        _container().service.execute_assistant_job(
+            org_id=org_id,
+            assistant_job_id=assistant_job_id,
+        )
+    except JobExecutionNotRunnableError:
+        return
+
+
+@dramatiq.actor(
     actor_name="customs_backend.dispatch_pending_outbox",
     queue_name="customs-review",
     max_retries=0,
