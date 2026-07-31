@@ -199,6 +199,11 @@ def test_http_agent_client_recognizes_only_proven_pre_execution_dependency_rejec
 def test_http_agent_v3_review_stream_uses_exact_ndjson_wire_and_forwards_events() -> None:
     observed_events: list[dict] = []
     stage = {"sequence": 0, "stage_code": "request_validation"}
+    stage_terminal = {
+        "sequence": 1,
+        "stage_code": "completed",
+        "state": "completed",
+    }
     terminal = {"envelope_sha256": "a" * 64}
 
     def provider_boundary(request: httpx.Request) -> httpx.Response:
@@ -209,6 +214,8 @@ def test_http_agent_v3_review_stream_uses_exact_ndjson_wire_and_forwards_events(
         assert "image_pages" not in payload["documents"][0]
         content = (
             json.dumps({"type": "stage_event", "event": stage})
+            + "\n"
+            + json.dumps({"type": "stage_event", "event": stage_terminal})
             + "\n"
             + json.dumps({"type": "result", "result": terminal})
             + "\n"
@@ -235,7 +242,48 @@ def test_http_agent_v3_review_stream_uses_exact_ndjson_wire_and_forwards_events(
         )
     finally:
         client.close()
-    assert observed_events == [stage]
+    assert observed_events == [stage, stage_terminal]
+
+
+def test_http_agent_v3_stream_binds_failed_stage_terminal_to_one_error() -> None:
+    observed_events: list[dict] = []
+    failed_terminal = {
+        "sequence": 0,
+        "stage_code": "failed",
+        "state": "failed",
+    }
+    content = (
+        json.dumps({"type": "stage_event", "event": failed_terminal})
+        + "\n"
+        + json.dumps(
+            {
+                "type": "error",
+                "error": {"code": "internal_error", "retryable": False},
+            }
+        )
+        + "\n"
+    )
+    client = HttpAgentClient(
+        base_url="http://agent.test",
+        service_token="test-token",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                content=content.encode(),
+                headers={"Content-Type": "application/x-ndjson"},
+                request=request,
+            )
+        ),
+    )
+    try:
+        with pytest.raises(AgentResponseRejectedError, match="failed with internal_error"):
+            client.review_experience_stream(
+                _review_request(),
+                on_event=observed_events.append,
+            )
+    finally:
+        client.close()
+    assert observed_events == [failed_terminal]
 
 
 def test_http_agent_v3_stream_recognizes_only_proven_pre_execution_rejection() -> None:
@@ -270,6 +318,25 @@ def test_http_agent_v3_stream_recognizes_only_proven_pre_execution_rejection() -
     "content",
     [
         '{"type":"result","result":{}}\n{"type":"stage_event","event":{}}\n',
+        (
+            '{"type":"stage_event","event":{"stage_code":"completed","state":"completed"}}\n'
+            '{"type":"error","error":{"code":"internal_error","retryable":false}}\n'
+        ),
+        (
+            '{"type":"stage_event","event":{"stage_code":"failed","state":"failed"}}\n'
+            '{"type":"result","result":{}}\n'
+        ),
+        (
+            '{"type":"stage_event","event":{"stage_code":"completed","state":"completed"}}\n'
+            '{"type":"stage_event","event":{"stage_code":"completed","state":"completed"}}\n'
+            '{"type":"result","result":{}}\n'
+        ),
+        (
+            '{"type":"stage_event","event":{"stage_code":"completed","state":"completed"}}\n'
+            '{"type":"stage_event","event":{"stage_code":"result_validation",'
+            '"state":"completed"}}\n'
+            '{"type":"result","result":{}}\n'
+        ),
         '{"type":"stage_event","event":{}}\n',
         '{"type":"stage_event","event":{},"extra":true}\n',
         '{"type":"result","result":NaN}\n',

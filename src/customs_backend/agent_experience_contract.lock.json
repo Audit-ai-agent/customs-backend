@@ -18,7 +18,7 @@
     "scope_classifier": "9889573adc91c99989b8ed8eeb65b1c2c277332b7cd20c4eff8a9f3ff32f686d",
     "scope_classifier_semantic": "cff8825cc0413de58b9b8dfbbf3d53538e1f0da6f0cb24f16878304ab063623a"
   },
-  "provider_commit": "445647f9739548c451c049346cc505481e2df774",
+  "provider_commit": "c816ccc827cb203fb336ed0cb9037da3fa523bca",
   "provider_asset_manifest_sha256": "a7ee9dd86fdf6a6ea0d669556fd5cdae7b2d9b62c669245378551c1bc8947361",
   "provider_manifest_sha256": "b04b23afc0d04b7d8d2c87990fd59bad592dd67adabcc81831bf94619e1bcd20",
   "provider_openapi_lock_file_sha256": "8a1d143f816b37a405aaa568f3f28a88e086be3db81518333e0130ecf99627e3",
@@ -27,6 +27,7 @@
     "canonical_sha256": "63af4fe6a38ee1980e4829f5860ec806706466b7aefb1b49b5b2a0520b3526a5",
     "file_sha256": "72e70f901ef0bc7402159f4a1d1e25043effa02213f450ac017b611aaa37f912"
   },
+  "provider_runtime_tool_registry_id": "customs-agent-tools/text-v1",
   "schema_version": "customs-backend-agent-experience-consumer-lock/v1",
   "uat_tool_registry_id": "customs-agent-tools/text-uat-v2",
   "uat_tool_registry_sha256": "50f97c0515b65ea5450390172601dc59418b4c326c95e2fbb5d3f6382858dca4",

@@ -361,7 +361,7 @@ class WorkbenchRepository(Protocol):
         *,
         job: AssistantJobRecord,
         answer_message: AssistantMessageRecord,
-        event: AssistantStageEvent,
+        events: tuple[AssistantStageEvent, AssistantStageEvent],
         audit: AuditRecord,
         expected_lease_id: str,
         expected_case_revision: int,

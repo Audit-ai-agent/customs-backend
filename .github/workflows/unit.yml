@@ -446,10 +446,11 @@ jobs:
           --expected-git-sha "${AGENT_REF}"
           --source-root "${AGENT_CHECKOUT}"
 
-      - name: Exercise Backend client to installed wheel full V3 over actual HTTP
+      - name: Exercise installed Agent v2 regression and enhanced V3 over actual HTTP
         run: >-
           .venv/bin/python tools/probe_installed_agent_http.py
           --agent-python "${AGENT_RUNTIME_PYTHON}"
+          --agent-checkout "${AGENT_CHECKOUT}"
           --expected-git-sha "${AGENT_REF}"
           --expected-wheel-sha256 "${AGENT_WHEEL_SHA256}"
 

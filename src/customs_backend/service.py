@@ -5,7 +5,7 @@ import logging
 import math
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any, Literal, cast
 from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
@@ -168,11 +168,59 @@ _SENSITIVE_URI_QUERY_KEYS = frozenset(
 class _OrderedAgentStageStream:
     stages: tuple[str, ...]
     skippable_stages: frozenset[str] = frozenset()
+    retry_groups: tuple[tuple[str, ...], ...] = ()
+    max_attempts_per_stage: int = 3
     operation_id: str | None = None
     next_stage_index: int = 0
     active_stage: str | None = None
     event_count: int = 0
     terminal: tuple[str, str] | None = None
+    failed_stage: str | None = None
+    stage_attempts: dict[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if (
+            not self.stages
+            or len(self.stages) != len(set(self.stages))
+            or not 1 <= self.max_attempts_per_stage <= 3
+        ):
+            raise ValueError("Agent stream policy is not bounded or ordered")
+        occupied: set[str] = set()
+        for group in self.retry_groups:
+            if not group or len(group) != len(set(group)) or occupied.intersection(group):
+                raise ValueError("Agent stream retry groups overlap or are empty")
+            try:
+                indices = [self.stages.index(stage) for stage in group]
+            except ValueError:
+                raise ValueError("Agent stream retry group contains an unknown stage") from None
+            if indices != list(range(indices[0], indices[0] + len(indices))):
+                raise ValueError("Agent stream retry group is not contiguous")
+            occupied.update(group)
+
+    def _retry_group_bounds(self, stage_index: int) -> tuple[int, int] | None:
+        for group in self.retry_groups:
+            start = self.stages.index(group[0])
+            end = start + len(group) - 1
+            if start <= stage_index <= end:
+                return start, end
+        return None
+
+    def _start_stage(self, event: AgentReviewStageEventV1, stage_index: int) -> None:
+        normal_start = stage_index == self.next_stage_index
+        group = self._retry_group_bounds(stage_index)
+        retry_start = False
+        if group is not None:
+            group_start, group_end = group
+            progress_is_within_group = group_start < self.next_stage_index <= group_end + 1
+            retry_start = progress_is_within_group and stage_index == group_start
+        if not normal_start and not retry_start:
+            raise ConflictError("Agent stream stage order is inconsistent")
+        attempts = self.stage_attempts.get(event.stage_code, 0) + 1
+        if attempts > self.max_attempts_per_stage:
+            raise ConflictError("Agent stream exceeded the bounded stage retry count")
+        self.stage_attempts[event.stage_code] = attempts
+        self.next_stage_index = stage_index
+        self.active_stage = event.stage_code
 
     def observe(self, event: AgentReviewStageEventV1) -> None:
         self.event_count += 1
@@ -185,6 +233,10 @@ class _OrderedAgentStageStream:
         if self.terminal is not None:
             raise ConflictError("Agent stage event followed its terminal")
         if event.stage_code in {"completed", "failed"}:
+            if event.stage_code == "failed" and event.state == "failed":
+                self.active_stage = None
+                self.terminal = (event.stage_code, event.state)
+                return
             if (
                 self.active_stage is not None
                 or self.next_stage_index != len(self.stages)
@@ -194,28 +246,49 @@ class _OrderedAgentStageStream:
                 raise ConflictError("Agent stream terminal is premature or unsuccessful")
             self.terminal = (event.stage_code, event.state)
             return
+        if self.failed_stage is not None:
+            raise ConflictError("Agent stage event followed an unrecoverable stage failure")
         if self.next_stage_index >= len(self.stages):
             raise ConflictError("Agent stream contains a stage after its ordered workflow")
-        expected = self.stages[self.next_stage_index]
-        if event.stage_code != expected:
+        try:
+            stage_index = self.stages.index(event.stage_code)
+        except ValueError:
             raise ConflictError("Agent stream stage order is inconsistent")
         if self.active_stage is None:
             if event.state == "started":
-                self.active_stage = event.stage_code
+                self._start_stage(event, stage_index)
                 return
-            if event.state == "completed" or (
-                event.state == "skipped" and event.stage_code in self.skippable_stages
-            ):
+            if stage_index != self.next_stage_index:
+                raise ConflictError("Agent stream stage order is inconsistent")
+            if event.state == "completed":
+                attempts = self.stage_attempts.get(event.stage_code, 0) + 1
+                if attempts > self.max_attempts_per_stage:
+                    raise ConflictError("Agent stream exceeded the bounded stage retry count")
+                self.stage_attempts[event.stage_code] = attempts
+                self.next_stage_index += 1
+                return
+            if event.state == "skipped" and event.stage_code in self.skippable_stages:
                 self.next_stage_index += 1
                 return
             raise ConflictError("Agent stream stage did not start or complete safely")
         if self.active_stage != event.stage_code:
             raise ConflictError("Agent stream changed stage before completion")
-        if event.state == "completed" or (
-            event.state == "skipped" and event.stage_code in self.skippable_stages
-        ):
+        if event.state == "completed":
             self.active_stage = None
-            self.next_stage_index += 1
+            self.next_stage_index = stage_index + 1
+            return
+        if event.state == "skipped" and event.stage_code in self.skippable_stages:
+            self.active_stage = None
+            self.next_stage_index = stage_index + 1
+            return
+        retry_group = self._retry_group_bounds(stage_index)
+        if event.state == "failed" and retry_group is not None:
+            self.active_stage = None
+            self.next_stage_index = retry_group[0]
+            return
+        if event.state == "failed":
+            self.active_stage = None
+            self.failed_stage = event.stage_code
             return
         raise ConflictError("Agent stream repeated or failed an active stage")
 
@@ -2484,14 +2557,15 @@ class WorkbenchService:
                             "normalization",
                             "document_pairing",
                             "cross_validation",
-                            "adaptive_investigation",
                             "evidence_retrieval",
                             "compliance_review",
+                            "adaptive_investigation",
                             "report_composition",
                             "grounding_verification",
                             "result_validation",
                         ),
                         skippable_stages=frozenset({"adaptive_investigation"}),
+                        retry_groups=(("report_composition", "grounding_verification"),),
                     )
 
                     def persist_agent_stage(raw_event: dict[str, Any]) -> None:
@@ -3907,7 +3981,8 @@ class WorkbenchService:
                     "answer_composition",
                     "grounding_verification",
                     "result_validation",
-                )
+                ),
+                retry_groups=(("answer_composition", "grounding_verification"),),
             )
             pending_result_validation_event: AgentAnswerStageEventV1 | None = None
 
@@ -4003,6 +4078,20 @@ class WorkbenchService:
                 ),
             )
             sequence += 1
+            persistence_started_at = utc_now()
+            self.repository.append_assistant_event(
+                org_id=org_id,
+                assistant_job_id=assistant_job_id,
+                expected_lease_id=lease_id,
+                event=_assistant_event(
+                    assistant_job_id=assistant_job_id,
+                    sequence=sequence,
+                    stage_code="persistence",
+                    state="started",
+                    message_key="assistant.persistence.started",
+                ),
+            )
+            sequence += 1
             now = utc_now()
             answer_message = AssistantMessageRecord(
                 message_id=(
@@ -4036,12 +4125,25 @@ class WorkbenchService:
             return self.repository.complete_assistant_job(
                 job=completed,
                 answer_message=answer_message,
-                event=_assistant_event(
-                    assistant_job_id=assistant_job_id,
-                    sequence=sequence,
-                    stage_code="completed",
-                    state="completed",
-                    message_key="assistant.completed",
+                events=(
+                    _assistant_event(
+                        assistant_job_id=assistant_job_id,
+                        sequence=sequence,
+                        stage_code="persistence",
+                        state="completed",
+                        message_key="assistant.persistence.completed",
+                        duration_ms=max(
+                            0,
+                            int((utc_now() - persistence_started_at).total_seconds() * 1000),
+                        ),
+                    ),
+                    _assistant_event(
+                        assistant_job_id=assistant_job_id,
+                        sequence=sequence + 1,
+                        stage_code="completed",
+                        state="completed",
+                        message_key="assistant.completed",
+                    ),
                 ),
                 audit=self._audit(
                     system,
@@ -4059,7 +4161,7 @@ class WorkbenchService:
         except Exception as exc:
             if response_validated:
                 state = AssistantJobState.response_persistence_uncertain
-            elif response_received:
+            elif response_received or isinstance(exc, AgentResponseRejectedError):
                 state = AssistantJobState.response_received_rejected
             elif isinstance(exc, AgentPreExecutionRetryableError):
                 state = AssistantJobState.failed

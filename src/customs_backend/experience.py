@@ -8,6 +8,7 @@ from typing import Any, Literal, cast
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from customs_backend.agent_v3_semantics import reconstruct_current_agent_facts
 from customs_backend.domain import (
     AgentReviewResultV3,
     JobStatus,
@@ -222,6 +223,7 @@ _SAFE_STAGE_COUNT_KEYS = frozenset(
         "issues",
         "findings",
         "evidence",
+        "actions",
         "statements",
         "turns",
         "citations",
@@ -750,6 +752,20 @@ def build_canonical_experience_claim_catalog(
         for item in fact_entries
         if isinstance(item.get("kind"), str) and isinstance(item.get("reference_id"), str)
     }
+    _current_facts, occurrence_references = reconstruct_current_agent_facts(
+        result.model_dump(mode="json")
+    )
+    issue_references = occurrence_references.get("issues")
+    finding_references = occurrence_references.get("findings")
+    if (
+        not isinstance(issue_references, list)
+        or not all(isinstance(reference, str) for reference in issue_references)
+        or len(issue_references) != len(result.validation_issues)
+        or not isinstance(finding_references, list)
+        or not all(isinstance(reference, str) for reference in finding_references)
+        or len(finding_references) != len(result.regulatory_findings)
+    ):
+        raise ValueError("canonical occurrence references are incomplete")
     outcome_entry = next(
         (
             item
@@ -820,13 +836,15 @@ def build_canonical_experience_claim_catalog(
             )
         )
     if result.validation_issues:
-        for issue in result.validation_issues:
+        for issue, reference in zip(
+            result.validation_issues,
+            issue_references,
+            strict=True,
+        ):
             code = issue.get("issue_code") if isinstance(issue, dict) else None
-            reference = outcome.reference_id
-            for (kind, reference_id), fact in facts.items():
-                if kind == "issue" and isinstance(reference_id, str) and fact.get("label") == code:
-                    reference = reference_id
-                    break
+            fact = facts.get(("issue", reference))
+            if fact is None or fact.get("label") != code:
+                raise ValueError("canonical issue occurrence reference is inconsistent")
             issue_meaning = meaning_catalog.issues.get(str(code))
             title, explanation, impact = (
                 (
@@ -878,17 +896,15 @@ def build_canonical_experience_claim_catalog(
             ]
         )
     if result.regulatory_findings:
-        for finding in result.regulatory_findings:
+        for finding, reference in zip(
+            result.regulatory_findings,
+            finding_references,
+            strict=True,
+        ):
             code = finding.get("finding_code") if isinstance(finding, dict) else None
-            reference = outcome.reference_id
-            for (kind, reference_id), fact in facts.items():
-                if (
-                    kind == "finding"
-                    and isinstance(reference_id, str)
-                    and fact.get("label") == code
-                ):
-                    reference = reference_id
-                    break
+            fact = facts.get(("finding", reference))
+            if fact is None or fact.get("label") != code:
+                raise ValueError("canonical finding occurrence reference is inconsistent")
             finding_meaning = meaning_catalog.findings.get(str(code))
             explanation, impact = (
                 (finding_meaning.explanation, finding_meaning.impact)
@@ -1919,7 +1935,7 @@ def validate_presentation_against_result(envelope: ReviewExperienceEnvelopeV1) -
         capability.agent_commit != runtime.agent_git_sha
         or capability.agent_code_snapshot_sha256 != runtime.agent_code_snapshot_sha256
         or capability.model_id != runtime.model_id
-        or capability.tool_registry_id != runtime.tool_registry_id
+        or runtime.tool_registry_id != contract_lock.provider_runtime_tool_registry_id
         or capability.evidence_runtime_v3_sha256 != runtime.evidence_runtime_v3_sha256
         or capability.auto_completion_enabled is not False
         or capability.agent_commit != contract_lock.provider_commit

@@ -36,7 +36,11 @@ from customs_backend.experience import (
     validate_answer_against_context,
     validate_presentation_against_result,
 )
-from customs_backend.ports import ConflictError, JobExecutionNotRunnableError
+from customs_backend.ports import (
+    AgentResponseRejectedError,
+    ConflictError,
+    JobExecutionNotRunnableError,
+)
 from customs_backend.experience_contract import validate_agent_experience_contract_bundle
 from customs_backend.experience_contract import provider_meaning_catalog
 from customs_backend.repository import InMemoryWorkbenchRepository
@@ -53,9 +57,9 @@ _REVIEW_STAGES = [
     "normalization",
     "document_pairing",
     "cross_validation",
-    "adaptive_investigation",
     "evidence_retrieval",
     "compliance_review",
+    "adaptive_investigation",
     "report_composition",
     "grounding_verification",
     "result_validation",
@@ -119,6 +123,27 @@ def _agent_event(
     return {**payload, "event_sha256": canonical_digest(payload)}
 
 
+def _agent_event_with_state(
+    *,
+    operation_id: str,
+    sequence: int,
+    stage_code: str,
+    state: str,
+) -> AgentReviewStageEventV1:
+    raw = _agent_event(
+        operation_id=operation_id,
+        sequence=sequence,
+        stage_code=stage_code,
+        message_key=f"agent.stage.{stage_code}.{state}",
+    )
+    raw["state"] = state
+    raw["duration_ms"] = None if state == "started" else 10
+    raw["event_sha256"] = canonical_digest(
+        {key: value for key, value in raw.items() if key != "event_sha256"}
+    )
+    return AgentReviewStageEventV1.model_validate(raw)
+
+
 def _review_events() -> list[dict[str, Any]]:
     return [
         _agent_event(
@@ -144,12 +169,16 @@ def _answer_events() -> list[dict[str, Any]]:
 
 
 def _experience(request: AgentReviewRequest) -> dict[str, Any]:
-    lock = validate_agent_experience_contract_bundle().lock
     result = build_agent_v3_result(request, auto_complete=False)
+    return _experience_from_result(result)
+
+
+def _experience_from_result(result: dict[str, Any]) -> dict[str, Any]:
+    lock = validate_agent_experience_contract_bundle().lock
     result["runtime_release"]["evidence_runtime_v3_sha256"] = _EVIDENCE_RUNTIME_SHA
     result["runtime_release"]["agent_git_sha"] = lock.provider_commit
     result["runtime_release"]["result_schema_sha256"] = lock.provider_review_result_v3.file_sha256
-    result["runtime_release"]["tool_registry_id"] = lock.uat_tool_registry_id
+    result["runtime_release"]["tool_registry_id"] = lock.provider_runtime_tool_registry_id
     _rehash_result(result)
     typed_result = AgentReviewResultV3.model_validate(result)
     claims = build_canonical_experience_claim_catalog(typed_result)
@@ -237,7 +266,7 @@ def _experience(request: AgentReviewRequest) -> dict[str, Any]:
         "model_id": result["runtime_release"]["model_id"],
         "prompt_bundle_sha256": lock.experience_prompt_bundle_sha256,
         "schema_bundle_sha256": lock.experience_schema_bundle_sha256,
-        "tool_registry_id": result["runtime_release"]["tool_registry_id"],
+        "tool_registry_id": lock.uat_tool_registry_id,
         "tool_registry_sha256": lock.uat_tool_registry_sha256,
         "evidence_runtime_v3_sha256": _EVIDENCE_RUNTIME_SHA,
         "max_cycles": 2,
@@ -253,11 +282,24 @@ def _experience(request: AgentReviewRequest) -> dict[str, Any]:
     meaning_catalog = provider_meaning_catalog()
     user_action_events = []
     for action in result["required_actions"]:
+        action_code = action["action_code"]
+        action_description = meaning_catalog.actions.get(action_code)
+        if action_description is None and action_code.startswith("resolve_"):
+            source_code = action_code.removeprefix("resolve_").upper()
+            source_meaning = meaning_catalog.issues.get(
+                source_code
+            ) or meaning_catalog.findings.get(source_code)
+            if source_meaning is not None:
+                action_description = source_meaning.next_action
+        if action_description is None:
+            action_description = (
+                "해석되지 않은 확인 항목이 있어 담당자가 연결된 근거를 직접 확인해야 합니다."
+            )
         action_payload = {
             "schema_version": "1.0",
-            "action_code": action["action_code"],
+            "action_code": action_code,
             "title": "담당자 확인이 필요합니다",
-            "description": meaning_catalog.actions[action["action_code"]],
+            "description": action_description,
             "status": "needs_attention",
             "source_reference_ids": action["source_reference_ids"],
         }
@@ -715,7 +757,19 @@ def test_v2_review_experience_and_multiturn_assistant_are_end_to_end_bound(
         org_id="org-a",
         assistant_job_id=assistant_job["assistant_job_id"],
     )
-    assert {event.stage_code for event in completed_assistant_job.events} >= set(_ANSWER_STAGES)
+    assert {event.stage_code for event in completed_assistant_job.events} >= {
+        *_ANSWER_STAGES,
+        "persistence",
+    }
+    persistence_events = [
+        (event.state, event.message_key)
+        for event in completed_assistant_job.events
+        if event.stage_code == "persistence"
+    ]
+    assert persistence_events == [
+        ("started", "assistant.persistence.started"),
+        ("completed", "assistant.persistence.completed"),
+    ]
     assert [event.stage_code for event in completed_assistant_job.events].count("completed") == 1
     assistant_terminal = completed_assistant_job.events[-1]
     assistant_replay = client.get(
@@ -767,6 +821,69 @@ def test_v2_review_experience_and_multiturn_assistant_are_end_to_end_bound(
     ]
 
 
+def test_assistant_failed_agent_terminal_is_persisted_as_response_rejected(
+    commercial_workbench,
+    monkeypatch,
+) -> None:
+    client, container, _observed = commercial_workbench
+    case = _create_case(client)
+    queued_review = client.post(
+        f"/api/v2/cases/{case['case_id']}/reviews",
+        json={},
+        headers={**_auth(), "Idempotency-Key": "failed-terminal-review"},
+    ).json()["job"]
+    run = container.service.execute_job(
+        org_id="org-a",
+        job_id=queued_review["job_id"],
+    )
+    conversation_id = client.post(
+        f"/api/v2/review-runs/{run.review_run_id}/assistant/conversations",
+        json={"bound_result_sha256": run.provider_result_sha256},
+        headers=_auth(),
+    ).json()["conversation_id"]
+    assistant_job = client.post(
+        f"/api/v2/assistant/conversations/{conversation_id}/messages",
+        json={
+            "question": "현재 심사 결과를 설명해 주십시오.",
+            "parent_message_id": None,
+            "bound_result_sha256": run.provider_result_sha256,
+        },
+        headers={**_auth(), "Idempotency-Key": "failed-terminal-answer"},
+    ).json()["job"]
+
+    def failed_stream(
+        _payload: dict[str, Any],
+        *,
+        on_event: Any,
+    ) -> dict[str, Any]:
+        on_event(
+            _agent_event_with_state(
+                operation_id="operation-assistant-provider-failed",
+                sequence=0,
+                stage_code="failed",
+                state="failed",
+            ).model_dump(mode="json")
+        )
+        raise AgentResponseRejectedError("Agent stream failed with internal_error")
+
+    monkeypatch.setattr(container.agent, "answer_v2_stream", failed_stream)
+
+    with pytest.raises(AgentResponseRejectedError, match="internal_error"):
+        container.service.execute_assistant_job(
+            org_id="org-a",
+            assistant_job_id=assistant_job["assistant_job_id"],
+        )
+
+    rejected = container.repository.get_assistant_job(
+        "org-a",
+        assistant_job["assistant_job_id"],
+    )
+    assert rejected is not None
+    assert rejected.state.value == "response_received_rejected"
+    assert rejected.events[-1].stage_code == "failed"
+    assert rejected.events[-1].message_key == "assistant.response_received_rejected"
+
+
 def test_presentation_text_cannot_reuse_a_stale_verifier_digest() -> None:
     raw = deepcopy(_experience(_review_request()))
     statement = raw["user_presentation"]["sections"][0]["statements"][0]
@@ -807,6 +924,22 @@ def test_presentation_action_event_is_exactly_bound_to_current_statement_ids() -
     raw["envelope_sha256"] = canonical_digest(envelope_payload)
     with pytest.raises(ValueError, match="user action copy"):
         validate_presentation_against_result(ReviewExperienceEnvelopeV1.model_validate(raw))
+
+
+def test_experience_pins_distinct_production_and_uat_tool_registries() -> None:
+    envelope = ReviewExperienceEnvelopeV1.model_validate(_experience(_review_request()))
+    lock = validate_agent_experience_contract_bundle().lock
+
+    assert (
+        envelope.canonical_result.runtime_release.tool_registry_id
+        == lock.provider_runtime_tool_registry_id
+    )
+    assert envelope.capability_attestation.tool_registry_id == lock.uat_tool_registry_id
+    assert (
+        envelope.canonical_result.runtime_release.tool_registry_id
+        != envelope.capability_attestation.tool_registry_id
+    )
+    validate_presentation_against_result(envelope)
 
 
 @pytest.mark.parametrize(
@@ -1334,6 +1467,231 @@ def test_agent_stream_rejects_duplicate_out_of_order_and_failed_stages(
         stream.observe(event)
 
 
+@pytest.mark.parametrize(
+    ("retry_group", "events"),
+    [
+        (
+            ("report_composition", "grounding_verification"),
+            [
+                ("request_validation", "completed"),
+                ("report_composition", "started"),
+                ("report_composition", "completed"),
+                ("report_composition", "started"),
+                ("report_composition", "completed"),
+                ("grounding_verification", "started"),
+                ("grounding_verification", "failed"),
+                ("report_composition", "started"),
+                ("report_composition", "completed"),
+                ("grounding_verification", "started"),
+                ("grounding_verification", "completed"),
+                ("result_validation", "completed"),
+                ("completed", "completed"),
+            ],
+        ),
+        (
+            ("answer_composition", "grounding_verification"),
+            [
+                ("request_validation", "completed"),
+                ("answer_composition", "started"),
+                ("answer_composition", "completed"),
+                ("answer_composition", "started"),
+                ("answer_composition", "completed"),
+                ("grounding_verification", "started"),
+                ("grounding_verification", "completed"),
+                ("result_validation", "completed"),
+                ("completed", "completed"),
+            ],
+        ),
+    ],
+)
+def test_agent_stream_accepts_bounded_verified_generation_retries(
+    retry_group: tuple[str, str],
+    events: list[tuple[str, str]],
+) -> None:
+    stages = ("request_validation", *retry_group, "result_validation")
+    stream = _OrderedAgentStageStream(
+        stages=stages,
+        retry_groups=(retry_group,),
+    )
+    operation_id = "operation-bounded-retry"
+    for sequence, (stage_code, state) in enumerate(events):
+        stream.observe(
+            _agent_event_with_state(
+                operation_id=operation_id,
+                sequence=sequence,
+                stage_code=stage_code,
+                state=state,
+            )
+        )
+
+    stream.require_success()
+
+
+def test_agent_stream_rejects_a_fourth_generation_attempt_and_duplicate_terminal() -> None:
+    stream = _OrderedAgentStageStream(
+        stages=(
+            "request_validation",
+            "report_composition",
+            "grounding_verification",
+            "result_validation",
+        ),
+        retry_groups=(("report_composition", "grounding_verification"),),
+    )
+    operation_id = "operation-retry-limit"
+    sequence = 0
+    stream.observe(
+        _agent_event_with_state(
+            operation_id=operation_id,
+            sequence=sequence,
+            stage_code="request_validation",
+            state="completed",
+        )
+    )
+    sequence += 1
+    for _attempt in range(3):
+        for state in ("started", "completed"):
+            stream.observe(
+                _agent_event_with_state(
+                    operation_id=operation_id,
+                    sequence=sequence,
+                    stage_code="report_composition",
+                    state=state,
+                )
+            )
+            sequence += 1
+    with pytest.raises(ConflictError, match="retry count"):
+        stream.observe(
+            _agent_event_with_state(
+                operation_id=operation_id,
+                sequence=sequence,
+                stage_code="report_composition",
+                state="started",
+            )
+        )
+
+    successful = _OrderedAgentStageStream(stages=("request_validation",))
+    successful.observe(
+        _agent_event_with_state(
+            operation_id=operation_id,
+            sequence=0,
+            stage_code="request_validation",
+            state="completed",
+        )
+    )
+    terminal = _agent_event_with_state(
+        operation_id=operation_id,
+        sequence=1,
+        stage_code="completed",
+        state="completed",
+    )
+    successful.observe(terminal)
+    with pytest.raises(ConflictError, match="followed its terminal"):
+        successful.observe(terminal)
+
+
+@pytest.mark.parametrize("grounding_state", ["completed", "failed"])
+def test_agent_stream_requires_regeneration_to_restart_at_composition(
+    grounding_state: str,
+) -> None:
+    stream = _OrderedAgentStageStream(
+        stages=(
+            "request_validation",
+            "answer_composition",
+            "grounding_verification",
+            "result_validation",
+        ),
+        retry_groups=(("answer_composition", "grounding_verification"),),
+    )
+    operation_id = "operation-no-grounding-only-retry"
+    sequence = 0
+    for stage_code, state in [
+        ("request_validation", "completed"),
+        ("answer_composition", "started"),
+        ("answer_composition", "completed"),
+        ("grounding_verification", "started"),
+        ("grounding_verification", grounding_state),
+    ]:
+        stream.observe(
+            _agent_event_with_state(
+                operation_id=operation_id,
+                sequence=sequence,
+                stage_code=stage_code,
+                state=state,
+            )
+        )
+        sequence += 1
+
+    with pytest.raises(ConflictError, match="stage order"):
+        stream.observe(
+            _agent_event_with_state(
+                operation_id=operation_id,
+                sequence=sequence,
+                stage_code="grounding_verification",
+                state="started",
+            )
+        )
+
+
+def test_agent_stream_accepts_one_failed_terminal_but_never_reports_success() -> None:
+    stream = _OrderedAgentStageStream(stages=("request_validation", "document_analysis"))
+    failed = _agent_event_with_state(
+        operation_id="operation-terminal-failure",
+        sequence=0,
+        stage_code="failed",
+        state="failed",
+    )
+
+    stream.observe(failed)
+
+    with pytest.raises(ConflictError, match="omitted an ordered stage"):
+        stream.require_success()
+    with pytest.raises(ConflictError, match="followed its terminal"):
+        stream.observe(failed)
+
+
+def test_agent_stream_accepts_failed_stage_only_when_followed_by_failed_terminal() -> None:
+    stream = _OrderedAgentStageStream(stages=("request_validation", "document_analysis"))
+    operation_id = "operation-stage-then-terminal-failure"
+    events = [
+        ("request_validation", "completed"),
+        ("document_analysis", "started"),
+        ("document_analysis", "failed"),
+        ("failed", "failed"),
+    ]
+    for sequence, (stage_code, state) in enumerate(events):
+        stream.observe(
+            _agent_event_with_state(
+                operation_id=operation_id,
+                sequence=sequence,
+                stage_code=stage_code,
+                state=state,
+            )
+        )
+
+    with pytest.raises(ConflictError, match="omitted an ordered stage"):
+        stream.require_success()
+
+    interrupted = _OrderedAgentStageStream(stages=("request_validation", "document_analysis"))
+    for sequence, (stage_code, state) in enumerate(events[:-1]):
+        interrupted.observe(
+            _agent_event_with_state(
+                operation_id=operation_id,
+                sequence=sequence,
+                stage_code=stage_code,
+                state=state,
+            )
+        )
+    with pytest.raises(ConflictError, match="unrecoverable stage failure"):
+        interrupted.observe(
+            _agent_event_with_state(
+                operation_id=operation_id,
+                sequence=len(events) - 1,
+                stage_code="document_analysis",
+                state="started",
+            )
+        )
+
+
 @pytest.mark.parametrize("injection_target", ["message_key", "safe_counts"])
 def test_agent_stage_public_metadata_rejects_untrusted_text(
     injection_target: str,
@@ -1353,6 +1711,27 @@ def test_agent_stage_public_metadata_rejects_untrusted_text(
     )
     with pytest.raises(ValueError):
         AgentReviewStageEventV1.model_validate(raw)
+
+
+def test_agent_stage_public_metadata_accepts_bounded_action_count() -> None:
+    raw = _agent_event(
+        operation_id="operation-public-action-count",
+        sequence=0,
+        stage_code="adaptive_investigation",
+    )
+    raw["safe_counts"] = {
+        "actions": 6,
+        "evidence": 1,
+        "findings": 0,
+        "issues": 2,
+    }
+    raw["event_sha256"] = canonical_digest(
+        {key: value for key, value in raw.items() if key != "event_sha256"}
+    )
+
+    event = AgentReviewStageEventV1.model_validate(raw)
+
+    assert event.safe_counts["actions"] == 6
 
 
 def test_expired_assistant_lease_is_reconciled_without_a_second_agent_call(
