@@ -59,7 +59,7 @@ Backend→Agent timeout은 실제 Agent 실행 budget보다 큰 `435`초 이상�
 시작을 거절한다. 기존 진단 프로필은 `ACTUAL_CODES_HUMAN_ONLY`, 합성 프로필은
 `SYNTHETIC_FIXTURE` 정책 모드를 계속 사용한다.
 
-Scenario-eval에서 사람 승인 assertion을 만드는 경우에만 Harness가 `_secrets`
+Scenario-eval에서 사람 승인 assertion을 만드는 경우에만 Harness가 `_local/secrets`
 밖으로 노출되지 않는 private Ed25519 registry와 Agent용 public trust store를
 생성한다. Backend는 `uat-approver`의 exact authority, active 한 개 key,
 public trust SHA를 시작 시 결박한다. 정책 fixture도 exact CCCT

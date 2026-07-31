@@ -79,10 +79,12 @@ def _local_uat_values(**overrides: Any) -> dict[str, Any]:
         "uat_evidence_rag_quality_evaluated": False,
         "uat_planner_mode": "shadow",
         "uat_assertion_signing_key_registry_path": (
-            "C:/_secrets/uat/assertion-signing-key-registry.json"
+            "C:/_local/secrets/uat/assertion-signing-key-registry.json"
         ),
         "uat_assertion_trust_store_sha256": "d" * 64,
-        "uat_requirement_policy_fixture_path": ("C:/_secrets/uat/requirement-policy-fixture.json"),
+        "uat_requirement_policy_fixture_path": (
+            "C:/_local/secrets/uat/requirement-policy-fixture.json"
+        ),
         "uat_requirement_policy_fixture_sha256": "e" * 64,
         "uat_evidence_runtime_v3_sha256": (
             _diagnostic_evidence_identity()["runtime_release_v3_sha256"]
@@ -180,7 +182,7 @@ def _uat_policy_resolver() -> LocalUatRequirementPolicyIdentityResolver:
 
 
 def _write_uat_policy_fixture(root: Path, payload: dict[str, Any]) -> Path:
-    path = root / "_secrets" / "uat" / "requirement-policy-fixture.json"
+    path = root / "_local" / "secrets" / "uat" / "requirement-policy-fixture.json"
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
