@@ -109,6 +109,30 @@ def _validate_assistant_event_append(
         raise ConflictError("assistant event is not the next bounded job event")
 
 
+def _assistant_completion_events(
+    record: AssistantJobRecord,
+    events: tuple[AssistantStageEvent, AssistantStageEvent],
+) -> list[AssistantStageEvent]:
+    persistence_completed, terminal_completed = events
+    if (
+        not record.events
+        or record.events[-1].stage_code != "persistence"
+        or record.events[-1].state != "started"
+        or persistence_completed.stage_code != "persistence"
+        or persistence_completed.state != "completed"
+        or terminal_completed.stage_code != "completed"
+        or terminal_completed.state != "completed"
+    ):
+        raise ConflictError("assistant completion events do not prove persistence")
+    accumulated = list(record.events)
+    current = record
+    for event in events:
+        _validate_assistant_event_append(current, event)
+        accumulated.append(event)
+        current = _updated_assistant_job(current, events=accumulated)
+    return accumulated
+
+
 class InMemoryWorkbenchRepository:
     """Thread-safe test adapter implementing the same atomic aggregate operations."""
 
@@ -1472,7 +1496,7 @@ class InMemoryWorkbenchRepository:
         *,
         job: AssistantJobRecord,
         answer_message: AssistantMessageRecord,
-        event: AssistantStageEvent,
+        events: tuple[AssistantStageEvent, AssistantStageEvent],
         audit: AuditRecord,
         expected_lease_id: str,
         expected_case_revision: int,
@@ -1504,10 +1528,10 @@ class InMemoryWorkbenchRepository:
                 or job.state != AssistantJobState.succeeded
             ):
                 raise ConflictError("assistant result is not bound to its job")
-            _validate_assistant_event_append(current, event)
+            completed_events = _assistant_completion_events(current, events)
             completed = _updated_assistant_job(
                 job,
-                events=[*current.events, event],
+                events=completed_events,
                 lease_id=None,
                 lease_expires_at=None,
                 updated_at=utc_now(),
@@ -4044,7 +4068,7 @@ class PostgresWorkbenchRepository:
         *,
         job: AssistantJobRecord,
         answer_message: AssistantMessageRecord,
-        event: AssistantStageEvent,
+        events: tuple[AssistantStageEvent, AssistantStageEvent],
         audit: AuditRecord,
         expected_lease_id: str,
         expected_case_revision: int,
@@ -4103,10 +4127,10 @@ class PostgresWorkbenchRepository:
                 or job.state != AssistantJobState.succeeded
             ):
                 raise ConflictError("assistant result is not bound to its job")
-            _validate_assistant_event_append(current, event)
+            completed_events = _assistant_completion_events(current, events)
             completed = _updated_assistant_job(
                 job,
-                events=[*current.events, event],
+                events=completed_events,
                 lease_id=None,
                 lease_expires_at=None,
                 updated_at=utc_now(),

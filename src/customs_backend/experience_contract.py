@@ -103,6 +103,7 @@ class ExperienceContractLock(BaseModel):
     provider_openapi_lock_file_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     provider_openapi_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     provider_review_result_v3: ExperienceSchemaIdentity
+    provider_runtime_tool_registry_id: Literal["customs-agent-tools/text-v1"]
     meaning_catalog_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     meaning_catalog_file_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     experience_prompt_bundle_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")

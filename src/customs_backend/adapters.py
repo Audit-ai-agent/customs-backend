@@ -320,11 +320,13 @@ class HttpAgentClient:
             total_bytes = 0
             terminal: dict[str, Any] | None = None
             seen_terminal = False
+            stage_terminal: str | None = None
             pending = bytearray()
 
             def consume_line(encoded_line: bytes) -> None:
                 nonlocal terminal
                 nonlocal seen_terminal
+                nonlocal stage_terminal
                 if encoded_line.endswith(b"\r"):
                     encoded_line = encoded_line[:-1]
                 if len(encoded_line) > 4_000_000:
@@ -371,10 +373,26 @@ class HttpAgentClient:
                     event = item["event"]
                     if not isinstance(event, dict):
                         raise AgentResponseRejectedError("Agent stream event is malformed")
+                    stage_code = event.get("stage_code")
+                    state = event.get("state")
+                    if stage_code in {"completed", "failed"}:
+                        if state != stage_code or stage_terminal is not None:
+                            raise AgentResponseRejectedError(
+                                "Agent stream stage terminal is malformed or repeated"
+                            )
+                        stage_terminal = stage_code
+                    elif stage_terminal is not None:
+                        raise AgentResponseRejectedError(
+                            "Agent stream emitted a stage after its stage terminal"
+                        )
                     on_event(event)
                     return
                 seen_terminal = True
                 if item_type == "error":
+                    if stage_terminal != "failed":
+                        raise AgentResponseRejectedError(
+                            "Agent stream error is not bound to one failed stage terminal"
+                        )
                     error = item["error"]
                     if (
                         not isinstance(error, dict)
@@ -384,6 +402,10 @@ class HttpAgentClient:
                     ):
                         raise AgentResponseRejectedError("Agent stream error is malformed")
                     raise AgentResponseRejectedError(f"Agent stream failed with {error['code']}")
+                if stage_terminal != "completed":
+                    raise AgentResponseRejectedError(
+                        "Agent stream result is not bound to one completed stage terminal"
+                    )
                 terminal = item["result"]
                 if not isinstance(terminal, dict):
                     raise AgentResponseRejectedError("Agent stream result is malformed")
