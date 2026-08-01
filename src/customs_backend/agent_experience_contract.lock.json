@@ -18,7 +18,7 @@
     "scope_classifier": "9889573adc91c99989b8ed8eeb65b1c2c277332b7cd20c4eff8a9f3ff32f686d",
     "scope_classifier_semantic": "cff8825cc0413de58b9b8dfbbf3d53538e1f0da6f0cb24f16878304ab063623a"
   },
-  "provider_commit": "1f0970b324f50abc20bebddd8beeecf9d9481ab7",
+  "provider_commit": "ef76769c327167a0f4ebf7d69455c961f08a9760",
   "provider_asset_manifest_sha256": "a7ee9dd86fdf6a6ea0d669556fd5cdae7b2d9b62c669245378551c1bc8947361",
   "provider_manifest_sha256": "b04b23afc0d04b7d8d2c87990fd59bad592dd67adabcc81831bf94619e1bcd20",
   "provider_openapi_lock_file_sha256": "8a1d143f816b37a405aaa568f3f28a88e086be3db81518333e0130ecf99627e3",
