@@ -11,6 +11,20 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 _MAX_TRACE_RECORD_BYTES = 32 * 1024
 _MAX_TRACE_FILE_BYTES = _MAX_TRACE_RECORD_BYTES * 100
 _MAX_TRACE_RECORDS = 100
+_TRACE_FILENAME = "three-law-scenario-eval-trace.jsonl"
+_WINDOWS_CANONICAL_TRACE_SUFFIX = (
+    "_local",
+    "state",
+    "runtime",
+    "local-user-uat",
+    _TRACE_FILENAME,
+)
+_CONTAINER_CANONICAL_TRACE_PARTS = (
+    "/",
+    "run",
+    "local-user-uat",
+    _TRACE_FILENAME,
+)
 
 
 class UatEvidenceTraceError(RuntimeError):
@@ -129,19 +143,24 @@ def _assert_external_trace_path(path: str | Path) -> Path:
         resolved = unresolved.resolve(strict=True)
     except OSError:
         raise UatEvidenceTraceError("local UAT Evidence trace is unavailable") from None
-    parts = tuple(part.casefold() for part in resolved.parts)
+    parts = resolved.parts
     if not resolved.is_file() or not _is_allowed_trace_path_parts(parts):
         raise UatEvidenceTraceError("local UAT Evidence trace path is invalid")
     return resolved
 
 
 def _is_allowed_trace_path_parts(parts: tuple[str, ...]) -> bool:
-    in_artifact_runtime = any(
-        parts[index : index + 3] == ("_artifacts", "runtime", "local-user-uat")
-        for index in range(max(0, len(parts) - 2))
+    has_windows_drive_root = (
+        bool(parts) and len(parts[0]) == 3 and parts[0][0].isalpha() and parts[0][1:] == ":\\"
     )
-    in_runtime_run = len(parts) > 1 and parts[1] == "run"
-    return in_artifact_runtime or in_runtime_run
+    if has_windows_drive_root:
+        normalized = tuple(part.casefold() for part in parts)
+        return (
+            len(normalized) >= len(_WINDOWS_CANONICAL_TRACE_SUFFIX)
+            and normalized[-len(_WINDOWS_CANONICAL_TRACE_SUFFIX) :]
+            == _WINDOWS_CANONICAL_TRACE_SUFFIX
+        )
+    return parts == _CONTAINER_CANONICAL_TRACE_PARTS
 
 
 def _strict_trace_records(path: Path) -> list[_RawScenarioTrace]:
