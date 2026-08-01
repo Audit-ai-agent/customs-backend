@@ -34,6 +34,7 @@ Evidence 환경으로 검토하고, 검증된 설명 보고서와 멀티턴 심�
 - `GET /api/v2/review-runs/{review_run_id}/assistant/conversations`
 - `POST /api/v2/assistant/conversations/{conversation_id}/messages`
 - `GET /api/v2/assistant/conversations/{conversation_id}/messages`
+- `GET /api/v2/assistant/conversations/{conversation_id}/jobs`
 - `GET /api/v2/assistant/jobs/{assistant_job_id}`
 - `GET /api/v2/assistant/jobs/{assistant_job_id}/events/stream`
 
