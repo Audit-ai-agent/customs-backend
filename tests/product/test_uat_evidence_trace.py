@@ -21,7 +21,7 @@ _REQUEST_ID = "run-1-retrieve-0"
 
 def _trace_record() -> dict[str, Any]:
     return {
-        "schema_version": "three-law-evidence-v3-scenario-eval-trace/v1",
+        "schema_version": "three-law-evidence-v3-scenario-eval-trace/v2",
         "request_id": _REQUEST_ID,
         "http_status_code": 200,
         "evidence_profile": "preserved-3law-v3-scenario-eval",
@@ -68,6 +68,14 @@ def _trace_record() -> dict[str, Any]:
                 "result_count": 20,
                 "top_k_result_count": 1,
                 "duration_ms": 13,
+            },
+            "rerank": {
+                "attempted": True,
+                "succeeded": True,
+                "attempt_count": 1,
+                "result_count": 20,
+                "top_k_result_count": 2,
+                "duration_ms": 17,
             },
             "graph": {
                 "attempted": True,

@@ -58,6 +58,10 @@ class _RawRetrievalStages(BaseModel):
     structured: _RawRetrievalStage
     dense: _RawRetrievalStage
     bm25: _RawRetrievalStage
+    # The scenario-eval provider requires BGE reranking after Dense/BM25
+    # fusion. This stage is validated at the Backend trust boundary while the
+    # existing browser-safe V1 projection remains wire-compatible.
+    rerank: _RawRetrievalStage
     graph: _RawRetrievalStage
 
 
@@ -92,7 +96,7 @@ class _RawProviderIdentity(BaseModel):
 class _RawScenarioTrace(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal["three-law-evidence-v3-scenario-eval-trace/v1"]
+    schema_version: Literal["three-law-evidence-v3-scenario-eval-trace/v2"]
     request_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
     http_status_code: Literal[200]
     evidence_profile: Literal["preserved-3law-v3-scenario-eval"]
