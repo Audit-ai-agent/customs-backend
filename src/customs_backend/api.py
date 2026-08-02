@@ -704,6 +704,9 @@ class _UnavailableAgentClient:
     def revise(self, request: Any) -> dict[str, Any]:
         self._fail()
 
+    def revise_experience(self, request: Any) -> dict[str, Any]:
+        self._fail()
+
     def review_experience(self, request: Any) -> dict[str, Any]:
         self._fail()
 

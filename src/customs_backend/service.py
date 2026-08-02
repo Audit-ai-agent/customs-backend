@@ -110,9 +110,9 @@ from customs_backend.experience import (
     ReviewEta,
     ReviewExperienceEnvelopeV1,
     ReviewPresentationRecord,
+    ReviewRevisionExperienceResultV1,
     ReviewStageEta,
     ReviewStageEtaSet,
-    build_deterministic_review_experience,
     public_review_experience,
     validate_answer_against_context,
     validate_presentation_against_result,
@@ -2458,6 +2458,38 @@ class WorkbenchService:
                 revision_request_wire = revision_request.to_agent_wire()
                 if len(canonical_json_bytes(revision_request_wire)) > MAX_AGENT_REQUEST_BODY_BYTES:
                     raise ConflictError("Agent revision request exceeds the 2 MiB transport limit")
+                enhanced_revision = running.request.get("experience_api_version") == "3.0"
+                if enhanced_revision:
+                    self.require_enhanced_experience()
+                    if running.parent_run_id is None or parent_run is None:
+                        raise ConflictError("enhanced revision has no parent Run")
+                    parent_presentation = self.repository.get_review_presentation(
+                        org_id,
+                        running.parent_run_id,
+                    )
+                    if (
+                        parent_presentation is None
+                        or parent_presentation.bound_provider_result_sha256
+                        != parent_run.provider_result_sha256
+                        or parent_presentation.bound_effective_result_digest
+                        != parent_run.result_digest
+                        or not self._experience_matches_effective_run(
+                            parent_presentation.envelope,
+                            parent_run,
+                        )
+                    ):
+                        raise ConflictError(
+                            "enhanced revision parent has no bound review experience"
+                        )
+                    try:
+                        validate_presentation_against_result(parent_presentation.envelope)
+                        self._assert_uat_capability_is_current(
+                            parent_presentation.envelope.capability_attestation
+                        )
+                    except ValueError as exc:
+                        raise ConflictError(
+                            "parent UAT experience is not valid for the child revision"
+                        ) from exc
                 emit_progress(
                     "input_validation",
                     "review.input_validation_completed",
@@ -2478,7 +2510,11 @@ class WorkbenchService:
                 )
                 call_started = True
                 emit_progress("agent_analysis", "agent.analysis_started")
-                raw_revision_response = self.agent.revise(revision_request)
+                raw_revision_response = (
+                    self.agent.revise_experience(revision_request)
+                    if enhanced_revision
+                    else self.agent.revise(revision_request)
+                )
                 response_received = True
                 emit_progress(
                     "agent_analysis",
@@ -2486,39 +2522,47 @@ class WorkbenchService:
                     state="completed",
                 )
                 emit_progress("result_validation", "agent.response_validation_started")
-                try:
-                    revision_response = AgentRevisionResult.model_validate(raw_revision_response)
-                except ValidationError as exc:
-                    raise ConflictError(
-                        "Agent revision response violates the trusted Backend policy boundary"
-                    ) from exc
-                if revision_response.parent_result_sha256 != running.request[
-                    "parent_provider_result_sha256"
-                ] or revision_response.applied_decision_ids != [
-                    item.decision_id for item in decisions
-                ]:
-                    raise ConflictError("Agent revision response is not bound to its approval")
-                result = revision_response.child_result.model_dump(mode="json")
-                if running.request.get("experience_api_version") == "3.0":
-                    if running.parent_run_id is None:
-                        raise ConflictError("enhanced revision has no parent Run")
-                    parent_presentation = self.repository.get_review_presentation(
-                        org_id,
-                        running.parent_run_id,
-                    )
-                    if parent_presentation is not None:
-                        capability = parent_presentation.envelope.capability_attestation
-                        try:
-                            self._assert_uat_capability_is_current(capability)
-                        except ValueError as exc:
-                            raise ConflictError(
-                                "parent UAT capability is not valid for the child revision"
-                            ) from exc
-                        experience_envelope = build_deterministic_review_experience(
-                            result=AgentReviewResultV3.model_validate(result),
-                            capability_attestation=capability,
-                            reason_code="approved_child_revision_deterministic_fallback",
+                if enhanced_revision:
+                    try:
+                        revision_experience = ReviewRevisionExperienceResultV1.model_validate(
+                            raw_revision_response
                         )
+                        validate_presentation_against_result(
+                            revision_experience.experience_envelope
+                        )
+                        self._assert_uat_capability_is_current(
+                            revision_experience.experience_envelope.capability_attestation
+                        )
+                    except (ValidationError, ValueError) as exc:
+                        raise ConflictError(
+                            "Agent revision experience violates the trusted Backend boundary"
+                        ) from exc
+                    if revision_experience.parent_result_sha256 != running.request[
+                        "parent_provider_result_sha256"
+                    ] or revision_experience.applied_decision_ids != [
+                        item.decision_id for item in decisions
+                    ]:
+                        raise ConflictError(
+                            "Agent revision experience is not bound to its approval"
+                        )
+                    experience_envelope = revision_experience.experience_envelope
+                    result = experience_envelope.canonical_result.model_dump(mode="json")
+                else:
+                    try:
+                        revision_response = AgentRevisionResult.model_validate(
+                            raw_revision_response
+                        )
+                    except ValidationError as exc:
+                        raise ConflictError(
+                            "Agent revision response violates the trusted Backend policy boundary"
+                        ) from exc
+                    if revision_response.parent_result_sha256 != running.request[
+                        "parent_provider_result_sha256"
+                    ] or revision_response.applied_decision_ids != [
+                        item.decision_id for item in decisions
+                    ]:
+                        raise ConflictError("Agent revision response is not bound to its approval")
+                    result = revision_response.child_result.model_dump(mode="json")
             else:
                 emit_progress(
                     "input_validation",
@@ -2696,6 +2740,14 @@ class WorkbenchService:
                 experience_envelope is not None
                 and self._experience_matches_effective_run(experience_envelope, run)
             )
+            if (
+                job.kind == "revision"
+                and running.request.get("experience_api_version") == "3.0"
+                and not experience_matches_effective_run
+            ):
+                raise ConflictError(
+                    "Agent revision experience does not match the effective child Run"
+                )
             presentation = (
                 ReviewPresentationRecord(
                     presentation_id=(

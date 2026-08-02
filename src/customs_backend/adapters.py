@@ -485,6 +485,9 @@ class HttpAgentClient:
     def revise(self, request: AgentRevisionRequest) -> dict[str, Any]:
         return self._post("/internal/agent/v2/revisions", request.to_agent_wire())
 
+    def revise_experience(self, request: AgentRevisionRequest) -> dict[str, Any]:
+        return self._post("/internal/agent/v3/revisions", request.to_agent_wire())
+
     def answer(
         self,
         *,
@@ -577,6 +580,7 @@ class CallableAgentClient:
         review: Callable[[AgentReviewRequest], dict[str, Any]],
         *,
         revise: Callable[[AgentRevisionRequest], dict[str, Any]] | None = None,
+        revise_experience: Callable[[AgentRevisionRequest], dict[str, Any]] | None = None,
         answer: Callable[[dict[str, Any], str, str], AgentAnswerResponse] | None = None,
         review_experience: Callable[[AgentReviewRequest], dict[str, Any]] | None = None,
         answer_v2: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
@@ -594,6 +598,7 @@ class CallableAgentClient:
                 "applied_decision_ids": [decision.decision_id for decision in request.decisions],
             }
         )
+        self._revise_experience = revise_experience
         self._answer = answer or (
             lambda _result, _question, question_id: AgentAnswerResponse(
                 question_id=question_id,
@@ -617,6 +622,11 @@ class CallableAgentClient:
 
     def revise(self, request: AgentRevisionRequest) -> dict[str, Any]:
         return self._revise(request)
+
+    def revise_experience(self, request: AgentRevisionRequest) -> dict[str, Any]:
+        if self._revise_experience is None:
+            raise RuntimeError("test Agent revision experience behavior was not configured")
+        return self._revise_experience(request)
 
     def review_experience(self, request: AgentReviewRequest) -> dict[str, Any]:
         if self._review_experience is None:

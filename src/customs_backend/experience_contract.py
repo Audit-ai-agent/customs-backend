@@ -18,6 +18,7 @@ ExperienceContractName = Literal[
     "assistant-answer-v2",
     "case-conversation-request-v2",
     "review-experience-envelope-v1",
+    "review-revision-experience-result-v1",
     "review-result-v3",
     "review-stage-event-v1",
 ]
@@ -26,6 +27,7 @@ _SCHEMA_FILENAMES: dict[ExperienceContractName, str] = {
     "assistant-answer-v2": "assistant-answer-v2.schema.json",
     "case-conversation-request-v2": "case-conversation-request-v2.schema.json",
     "review-experience-envelope-v1": "review-experience-envelope-v1.schema.json",
+    "review-revision-experience-result-v1": "review-revision-experience-result-v1.schema.json",
     "review-stage-event-v1": "review-stage-event-v1.schema.json",
 }
 _RESOURCE_DIRECTORY = "contracts/agent/service/v3"
@@ -47,6 +49,7 @@ _EXPECTED_PROVIDER_PATHS = {
     "/internal/agent/v3/metadata": ["get"],
     "/internal/agent/v3/reviews": ["post"],
     "/internal/agent/v3/reviews/stream": ["post"],
+    "/internal/agent/v3/revisions": ["post"],
 }
 _EXPECTED_PROMPT_IDENTITIES = frozenset(
     {"presentation", "entailment", "chat", "chat_verifier", "scope_classifier"}

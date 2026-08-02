@@ -511,11 +511,12 @@ def test_backend_agent_request_model_rejects_seven_primary_documents() -> None:
 
 def test_http_revision_wire_contains_hash_bound_parent_and_omits_visual_keys() -> None:
     captured: dict = {}
+    observed_paths: list[str] = []
 
     def provider_boundary(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
         captured.update(payload)
-        assert request.url.path == "/internal/agent/v2/revisions"
+        observed_paths.append(request.url.path)
         for nested_name in ("parent_request", "revised_request"):
             assert nested_name in payload
             assert "image_pages" not in payload[nested_name]["documents"][0]
@@ -573,7 +574,12 @@ def test_http_revision_wire_contains_hash_bound_parent_and_omits_visual_keys() -
     )
     try:
         assert client.revise(revision) == {"accepted": True}
+        assert client.revise_experience(revision) == {"accepted": True}
     finally:
         client.close()
+    assert observed_paths == [
+        "/internal/agent/v2/revisions",
+        "/internal/agent/v3/revisions",
+    ]
     assert captured["parent_input_manifest_sha256"] == parent.input_manifest_sha256
     assert captured["parent_input_manifest_sha256"] != canonical_digest(captured["parent_request"])

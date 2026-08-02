@@ -1288,6 +1288,26 @@ class ReviewExperienceEnvelopeV1(BaseModel):
         return self
 
 
+class ReviewRevisionExperienceResultV1(BaseModel):
+    """Additive Agent V3 revision response carrying the verified child experience."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"] = "1.0"
+    parent_result_sha256: str = Field(pattern=_SHA256_PATTERN)
+    applied_decision_ids: list[str] = Field(min_length=1, max_length=100)
+    experience_envelope: ReviewExperienceEnvelopeV1
+
+    @field_validator("applied_decision_ids")
+    @classmethod
+    def decision_ids_are_unique_and_typed(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)) or any(
+            re.fullmatch(r"decision_[a-f0-9]{64}", item) is None for item in value
+        ):
+            raise ValueError("revision experience contains an invalid decision ID")
+        return value
+
+
 class PublicReviewExperienceV1(BaseModel):
     """Browser-safe projection; the full canonical Agent result remains private."""
 
@@ -2216,130 +2236,6 @@ def build_deterministic_review_experience(
     return envelope
 
 
-def _expected_fallback_answer_fields(
-    *,
-    answer: AssistantAnswerV2,
-    result: AgentReviewResultV3,
-    expected_context_message_ids: list[str],
-) -> dict[str, Any]:
-    classification = answer.generation_audit.scope_classification
-    if classification is None:
-        raise ValueError("assistant fallback omitted scope-classification audit")
-    scope = answer.answer_scope
-    claims = build_answer_experience_claim_catalog(result)
-    guidance: dict[str, str] = {}
-    if scope == "evidence_grounded":
-        claims = [item for item in claims if item.section_code == "regulatory_meaning"]
-    elif scope == "case_grounded":
-        pass
-    elif scope == "general_customs_guidance":
-        catalog = provider_meaning_catalog()
-        try:
-            guidance = {
-                topic: catalog.general_guidance[topic] for topic in classification.guidance_topics
-            }
-        except KeyError as exc:
-            raise ValueError("assistant guidance topic is outside the provider catalog") from exc
-        claims = []
-    else:
-        claims = []
-    claims = claims[:100]
-    selected_claims: list[CanonicalExperienceClaimV1] = []
-    claim_selections: dict[str, list[str]] = {
-        "direct_answer": [],
-        "explanation": [],
-        "evidence_meaning": [],
-        "impact": [],
-        "next_steps": [],
-    }
-    if scope == "out_of_scope":
-        status = "out_of_scope"
-        direct = (
-            "이 요청은 통관 심사 지원 범위에서 답변할 수 없습니다. 현재 심사 건의 문서, "
-            "법령 근거, 보완 조치 또는 일반 통관 절차를 질문해 주십시오."
-        )
-        explanation: list[str] = []
-    elif scope == "clarification_needed":
-        status = "clarification_needed"
-        direct = (
-            "질문의 대상을 조금 더 구체적으로 알려주시면 현재 심사 결과에 맞추어 설명하겠습니다."
-        )
-        explanation = [
-            "예를 들어 발견된 문제의 원인, 적용된 법령 근거, 업무상 영향 또는 다음 조치 중 무엇을 "
-            "확인하려는지 알려주십시오."
-        ]
-    elif scope == "insufficient_evidence":
-        status = "insufficient_evidence"
-        direct = (
-            "현재 심사 결과에는 이 질문에 답할 수 있는 충분한 법령 근거가 연결되어 있지 않습니다."
-        )
-        explanation = ["추가 법령 범위 또는 담당자 확인이 필요합니다."]
-    elif scope == "general_customs_guidance":
-        if not guidance:
-            raise ValueError("assistant general-guidance fallback has no approved topic")
-        status = "answered"
-        direct = next(iter(guidance.values()))
-        explanation = list(guidance.values())[1:]
-    else:
-        if not claims:
-            raise ValueError("assistant Case fallback has no canonical claim")
-        status = "answered"
-        direct_claim = claims[0]
-        explanation_claims = [
-            item for item in claims[1:] if item.role in _ANSWER_AREA_ROLES["explanation"]
-        ][:5]
-        direct = direct_claim.canonical_text
-        explanation = [item.canonical_text for item in explanation_claims]
-        claim_selections["direct_answer"] = [direct_claim.claim_id]
-        claim_selections["explanation"] = [item.claim_id for item in explanation_claims]
-        selected_claims.extend([direct_claim, *explanation_claims])
-    evidence_claims = (
-        [item for item in claims if item.role in _ANSWER_AREA_ROLES["evidence_meaning"]][:5]
-        if status == "answered" and scope != "general_customs_guidance"
-        else []
-    )
-    impact_claims = (
-        [item for item in claims if item.role in _ANSWER_AREA_ROLES["impact"]][:5]
-        if status == "answered" and scope != "general_customs_guidance"
-        else []
-    )
-    action_claims = (
-        [item for item in claims if item.role in _ANSWER_AREA_ROLES["next_steps"]][:5]
-        if status == "answered" and scope != "general_customs_guidance"
-        else []
-    )
-    selected_claims.extend([*evidence_claims, *impact_claims, *action_claims])
-    claim_selections["evidence_meaning"] = [item.claim_id for item in evidence_claims]
-    claim_selections["impact"] = [item.claim_id for item in impact_claims]
-    claim_selections["next_steps"] = [item.claim_id for item in action_claims]
-    evidence_meaning = [item.canonical_text for item in evidence_claims]
-    impact = [item.canonical_text for item in impact_claims]
-    next_steps = [item.canonical_text for item in action_claims]
-    citations = list(
-        {
-            (citation.kind, citation.reference_id): citation
-            for claim in selected_claims
-            for citation in claim.citation_references
-        }.values()
-    )
-    limitations = [
-        (_GENERAL_GUIDANCE_LIMITATION if scope == "general_customs_guidance" else _CASE_LIMITATION)
-    ]
-    return {
-        "status": status,
-        "direct_answer": direct,
-        "explanation": explanation,
-        "evidence_meaning": evidence_meaning,
-        "impact": impact,
-        "next_steps": next_steps,
-        "limitations": limitations,
-        "claim_selections": AnswerClaimSelectionsV1.model_validate(claim_selections),
-        "citations": citations if status == "answered" else [],
-        "suggested_questions": _SAFE_SUGGESTED_QUESTIONS,
-        "used_context_message_ids": expected_context_message_ids,
-    }
-
-
 def validate_answer_against_context(
     *,
     answer: AssistantAnswerV2,
@@ -2471,6 +2367,12 @@ def validate_answer_against_context(
                         f"material assistant {area} prose failed deterministic grounding: "
                         + ",".join(blockers)
                     )
+            elif len(texts) != len(typed_claims) or texts != [
+                claim.canonical_text for claim in typed_claims
+            ]:
+                raise ValueError(
+                    f"material assistant {area} fallback is not a one-to-one claim projection"
+                )
             for claim in typed_claims:
                 selected_claims[claim.claim_id] = claim
         if not answer.direct_answer or not answer.claim_selections.direct_answer:
@@ -2493,6 +2395,8 @@ def validate_answer_against_context(
                     "material assistant limitation failed deterministic grounding: "
                     + ",".join(limitation_blockers)
                 )
+        elif answer.limitations != [_CASE_LIMITATION]:
+            raise ValueError("material assistant fallback limitation is not pinned")
         expected_citations = {
             (citation.kind, citation.reference_id)
             for claim in selected_claims.values()
@@ -2547,8 +2451,26 @@ def validate_answer_against_context(
                 raise ValueError(
                     "general customs guidance failed deterministic grounding: " + ",".join(blockers)
                 )
+        else:
+            guidance_texts = [answer.direct_answer, *answer.explanation]
+            if (
+                len(guidance_texts) != len(set(guidance_texts))
+                or any(text not in guidance_values for text in guidance_texts)
+                or answer.limitations != [_GENERAL_GUIDANCE_LIMITATION]
+            ):
+                raise ValueError(
+                    "general customs guidance fallback is not bound to the approved catalog"
+                )
     elif any(answer.claim_selections.model_dump(mode="json").values()):
         raise ValueError("non-grounded assistant answer cannot select canonical claims")
+    elif generation.mode != "claude" and (
+        answer.citations
+        or answer.evidence_meaning
+        or answer.impact
+        or answer.next_steps
+        or answer.limitations != [_CASE_LIMITATION]
+    ):
+        raise ValueError("non-grounded assistant fallback contains unbound material content")
 
     candidate_answer = {
         "direct_answer": answer.direct_answer,
@@ -2604,29 +2526,6 @@ def validate_answer_against_context(
             or not verification.reason_codes
         ):
             raise ValueError("deterministic assistant fallback audit is inconsistent")
-        expected = _expected_fallback_answer_fields(
-            answer=answer,
-            result=result,
-            expected_context_message_ids=expected_context_message_ids,
-        )
-        observed = {
-            key: getattr(answer, key)
-            for key in (
-                "status",
-                "direct_answer",
-                "explanation",
-                "evidence_meaning",
-                "impact",
-                "next_steps",
-                "limitations",
-                "claim_selections",
-                "citations",
-                "suggested_questions",
-                "used_context_message_ids",
-            )
-        }
-        if observed != expected:
-            raise ValueError("deterministic assistant fallback differs from canonical content")
     if answer.suggested_questions != _SAFE_SUGGESTED_QUESTIONS:
         raise ValueError("assistant suggested questions are not the pinned safe catalog")
 

@@ -18,6 +18,7 @@ from customs_backend.auth import StaticTokenVerifier
 from customs_backend.domain import (
     AgentReviewRequest,
     AgentReviewResultV3,
+    AgentRevisionRequest,
     AgentDocumentInput,
     Principal,
     Role,
@@ -173,6 +174,15 @@ def _answer_events() -> list[dict[str, Any]]:
 def _experience(request: AgentReviewRequest) -> dict[str, Any]:
     result = build_agent_v3_result(request, auto_complete=False)
     return _experience_from_result(result)
+
+
+def _revision_experience(request: AgentRevisionRequest) -> dict[str, Any]:
+    return {
+        "schema_version": "1.0",
+        "parent_result_sha256": request.parent_result_sha256,
+        "applied_decision_ids": [item.decision_id for item in request.decisions],
+        "experience_envelope": _experience(request.revised_request),
+    }
 
 
 def _experience_from_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -561,6 +571,7 @@ def commercial_workbench():
 
     agent = CallableAgentClient(
         lambda request: _experience(request)["canonical_result"],
+        revise_experience=_revision_experience,
         review_experience=_experience,
         answer_v2=answer,
         review_events=_review_events(),
@@ -576,10 +587,16 @@ def commercial_workbench():
         org_id="org-b",
         roles=frozenset({Role.reviewer}),
     )
+    approver_principal = Principal(
+        subject="approver-1",
+        org_id="org-a",
+        roles=frozenset({Role.approver}),
+    )
     verifier = StaticTokenVerifier(
         {
             "reviewer-token": principal,
             "other-reviewer-token": other_principal,
+            "approver-token": approver_principal,
         }
     )
     settings = Settings(
@@ -656,6 +673,113 @@ def _create_case(client: TestClient) -> dict[str, Any]:
     )
     assert response.status_code == 201, response.text
     return case
+
+
+def _create_enhanced_revision_job(
+    client: TestClient,
+    container: Container,
+    *,
+    suffix: str,
+) -> tuple[Any, dict[str, Any]]:
+    case = _create_case(client)
+    queued = client.post(
+        f"/api/v2/cases/{case['case_id']}/reviews",
+        json={},
+        headers={**_auth(), "Idempotency-Key": f"{suffix}-parent"},
+    )
+    assert queued.status_code == 202, queued.text
+    parent = container.service.execute_job(
+        org_id="org-a",
+        job_id=queued.json()["job"]["job_id"],
+    )
+    proposal = client.post(
+        f"/api/v1/review-runs/{parent.review_run_id}/revision-proposals",
+        json={
+            "parent_result_digest": parent.result_digest,
+            "parent_input_manifest_sha256": parent.agent_input_manifest_sha256,
+            "case_revision": parent.case_revision,
+            "actions": [
+                {
+                    "decision": "approve_review",
+                    "reason": "독립 담당자가 심사 결과를 확인했습니다.",
+                }
+            ],
+        },
+        headers={**_auth(), "Idempotency-Key": f"{suffix}-proposal"},
+    )
+    assert proposal.status_code == 201, proposal.text
+    approval = client.post(
+        f"/api/v1/revision-proposals/{proposal.json()['proposal_id']}/decisions",
+        json={
+            "decision": "approve",
+            "reason": "제안자와 다른 승인자가 확인했습니다.",
+            "parent_result_digest": parent.result_digest,
+            "case_revision": parent.case_revision,
+        },
+        headers={
+            "Authorization": "Bearer approver-token",
+            "Idempotency-Key": f"{suffix}-approval",
+        },
+    )
+    assert approval.status_code == 201, approval.text
+    return parent, approval.json()["job"]
+
+
+def test_enhanced_revision_stores_agent_generated_child_experience(
+    commercial_workbench,
+) -> None:
+    client, container, _observed = commercial_workbench
+    parent, child_job = _create_enhanced_revision_job(
+        client,
+        container,
+        suffix="enhanced-revision",
+    )
+
+    child = container.service.execute_job(org_id="org-a", job_id=child_job["job_id"])
+    presentation = container.repository.get_review_presentation(
+        "org-a",
+        child.review_run_id,
+    )
+
+    assert child.parent_run_id == parent.review_run_id
+    assert presentation is not None
+    assert presentation.bound_provider_result_sha256 == child.provider_result_sha256
+    assert presentation.bound_effective_result_digest == child.result_digest
+    assert presentation.envelope.canonical_result.result_sha256 == child.provider_result_sha256
+    assert presentation.envelope.user_presentation.generation_audit.mode == "claude"
+    assert presentation.envelope.capability_attestation.adaptive_active is True
+    validate_presentation_against_result(presentation.envelope)
+
+
+@pytest.mark.parametrize("mismatch", ["parent", "decision"])
+def test_enhanced_revision_rejects_unbound_parent_or_approval(
+    commercial_workbench,
+    mismatch: str,
+) -> None:
+    client, container, _observed = commercial_workbench
+    _parent, child_job = _create_enhanced_revision_job(
+        client,
+        container,
+        suffix=f"enhanced-revision-{mismatch}",
+    )
+
+    def unbound_revision(request: AgentRevisionRequest) -> dict[str, Any]:
+        response = _revision_experience(request)
+        if mismatch == "parent":
+            response["parent_result_sha256"] = "f" * 64
+        else:
+            response["applied_decision_ids"] = [f"decision_{'f' * 64}"]
+        return response
+
+    container.agent._revise_experience = unbound_revision
+    with pytest.raises(ConflictError, match="not bound to its approval"):
+        container.service.execute_job(org_id="org-a", job_id=child_job["job_id"])
+
+    rejected = container.repository.get_job("org-a", child_job["job_id"])
+    assert rejected is not None
+    assert rejected.status.value == "response_received_rejected"
+    assert container.repository.get_provider_result("org-a", child_job["review_run_id"]) is None
+    assert container.repository.get_review_presentation("org-a", child_job["review_run_id"]) is None
 
 
 def test_stage_eta_uses_one_sample_per_successful_run_and_sums_stage_retries(
@@ -1260,6 +1384,100 @@ def test_assistant_accepts_natural_prose_when_claims_citations_and_verifier_are_
         answer=AssistantAnswerV2.model_validate(raw),
         request=CaseConversationRequestV2.model_validate(request),
     )
+
+
+def _material_fallback_for_nonfirst_claim(
+    request: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    raw = _answer(request)
+    claims = build_answer_experience_claim_catalog(
+        AgentReviewResultV3.model_validate(request["review_result"])
+    )
+    selected = next(
+        claim
+        for claim in claims[1:]
+        if claim.role in {"conclusion", "observation", "reason", "limitation"}
+        and claim.citation_references
+    )
+    raw["direct_answer"] = selected.canonical_text
+    raw["explanation"] = []
+    raw["evidence_meaning"] = []
+    raw["impact"] = []
+    raw["next_steps"] = []
+    raw["limitations"] = [_CASE_LIMITATION]
+    raw["claim_selections"] = {
+        "direct_answer": [selected.claim_id],
+        "explanation": [],
+        "evidence_meaning": [],
+        "impact": [],
+        "next_steps": [],
+    }
+    raw["citations"] = [item.model_dump(mode="json") for item in selected.citation_references]
+    raw["generation_audit"].update(
+        {
+            "mode": "deterministic_fallback",
+            "model_id": None,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "latency_ms": 0,
+        }
+    )
+    raw["verification_audit"].update(
+        {
+            "status": "fallback",
+            "entailment_verifier": "not_run",
+            "verifier_model_id": None,
+            "verifier_context_sha256": None,
+            "checked_statement_count": 2,
+            "reason_codes": ["claude_answer_unavailable"],
+        }
+    )
+    _rehash_answer(raw, request, refresh_verifier_context=False)
+    return raw, selected.claim_id
+
+
+def test_material_fallback_accepts_any_bound_claim_without_backend_intent_selection() -> None:
+    result = _experience(_review_request())["canonical_result"]
+    request = {
+        "conversation_id": "conversation-fallback-selection",
+        "parent_message_id": None,
+        "question": "현재 심사에서 확인된 내용을 알려주십시오.",
+        "bound_result_sha256": result["result_sha256"],
+        "conversation_context_sha256": canonical_digest([]),
+        "recent_turns": [],
+        "review_result": result,
+        "locale": "ko-KR",
+    }
+    raw, selected_claim_id = _material_fallback_for_nonfirst_claim(request)
+
+    validate_answer_against_context(
+        answer=AssistantAnswerV2.model_validate(raw),
+        request=CaseConversationRequestV2.model_validate(request),
+    )
+    assert raw["claim_selections"]["direct_answer"] == [selected_claim_id]
+
+
+def test_material_fallback_rejects_text_not_projected_from_its_selected_claim() -> None:
+    result = _experience(_review_request())["canonical_result"]
+    request = {
+        "conversation_id": "conversation-fallback-unbound-copy",
+        "parent_message_id": None,
+        "question": "현재 심사에서 확인된 내용을 알려주십시오.",
+        "bound_result_sha256": result["result_sha256"],
+        "conversation_context_sha256": canonical_digest([]),
+        "recent_turns": [],
+        "review_result": result,
+        "locale": "ko-KR",
+    }
+    raw, _selected_claim_id = _material_fallback_for_nonfirst_claim(request)
+    raw["direct_answer"] = "선택한 근거와 관계없는 임의 답변입니다."
+    _rehash_answer(raw, request, refresh_verifier_context=False)
+
+    with pytest.raises(ValueError, match="one-to-one claim projection"):
+        validate_answer_against_context(
+            answer=AssistantAnswerV2.model_validate(raw),
+            request=CaseConversationRequestV2.model_validate(request),
+        )
 
 
 def test_general_guidance_rejects_case_outcome_prose_with_fresh_hashes() -> None:
