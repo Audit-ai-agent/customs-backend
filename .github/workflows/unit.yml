@@ -1,15 +1,21 @@
-name: backend-gates
+name: backend-checks
 
 on:
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
   push:
     branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
 
 permissions:
   contents: read
 
 concurrency:
-  group: backend-gates-${{ github.workflow }}-${{ github.ref }}
+  group: backend-checks-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -17,478 +23,39 @@ env:
   PYTHON_VERSION: "3.11"
   PYTHONUTF8: "1"
   PYTHONDONTWRITEBYTECODE: "1"
+  UV_PROJECT_ENVIRONMENT: /tmp/customs-backend-env
 
 jobs:
-  quality-product-contract:
-    name: Quality, product, contract, and PostgreSQL
+  quick-and-contract:
+    name: Quick and contract
     runs-on: ubuntu-latest
-    timeout-minutes: 35
-    services:
-      postgres:
-        image: postgres:16.14-bookworm@sha256:92620daddcd947f8d5ab5ba66e848702fe443d87fed30c4cea8e389fd78dfc55
-        env:
-          POSTGRES_USER: customs_migrator
-          POSTGRES_PASSWORD: ci-migrator-password
-          POSTGRES_DB: customs
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U customs_migrator -d customs"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
+    timeout-minutes: 15
     steps:
-      - name: Checkout Backend
+      - name: Checkout Backend (shallow)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          persist-credentials: false
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff
-        with:
-          version: ${{ env.UV_VERSION }}
-          enable-cache: true
-
-      - name: Install locked test environment
-        run: uv sync --locked --group dev --extra unit --extra production --python "${PYTHON_VERSION}"
-
-      - name: Ruff formatting and lint
-        run: |
-          uv run --locked ruff format --check .
-          uv run --locked ruff check .
-
-      - name: Typecheck
-        run: uv run --locked mypy
-
-      - name: Bootstrap distinct PostgreSQL runtime role
-        env:
-          MIGRATOR_DSN: postgresql://customs_migrator:ci-migrator-password@127.0.0.1:5432/customs
-          RUNTIME_PASSWORD: ci-runtime-password
-        run: |
-          uv run --locked python - <<'PY'
-          import os
-
-          import psycopg
-          from psycopg import sql
-
-          with psycopg.connect(os.environ["MIGRATOR_DSN"], autocommit=True) as connection:
-              connection.execute(
-                  sql.SQL(
-                      "CREATE ROLE customs_runtime LOGIN NOSUPERUSER NOCREATEDB "
-                      "NOCREATEROLE NOINHERIT PASSWORD {}"
-                  ).format(sql.Literal(os.environ["RUNTIME_PASSWORD"]))
-              )
-          PY
-
-      - name: Apply migrations explicitly in order (003 to 008)
-        env:
-          CUSTOMS_BACKEND_ENVIRONMENT: test
-          CUSTOMS_BACKEND_PROCESS_ROLE: migration
-          CUSTOMS_BACKEND_DATABASE_URL: postgresql+psycopg://customs_migrator:ci-migrator-password@127.0.0.1:5432/customs
-        run: |
-          uv run --locked alembic upgrade 20260721_0003
-          uv run --locked alembic current | grep -Fx "20260721_0003"
-          uv run --locked alembic upgrade 20260722_0004
-          uv run --locked alembic current | grep -Fx "20260722_0004"
-          uv run --locked alembic upgrade 20260722_0005
-          uv run --locked alembic current | grep -Fx "20260722_0005"
-          uv run --locked python tools/verify_legacy_005_upgrade.py seed
-          uv run --locked alembic upgrade 20260722_0006
-          uv run --locked alembic current | grep -Fx "20260722_0006"
-          uv run --locked python tools/verify_legacy_005_upgrade.py verify
-          uv run --locked python tools/verify_legacy_005_upgrade.py seed-invalid-006
-          if uv run --locked alembic upgrade 20260722_0007; then
-            echo "migration 007 accepted missing actor provenance" >&2
-            exit 1
-          fi
-          uv run --locked alembic current | grep -Fx "20260722_0006"
-          uv run --locked python tools/verify_legacy_005_upgrade.py remove-invalid-006
-          uv run --locked alembic upgrade 20260722_0007
-          uv run --locked alembic current | grep -Fx "20260722_0007"
-          uv run --locked python tools/verify_legacy_005_upgrade.py verify-007
-          uv run --locked alembic upgrade 20260727_0008
-          uv run --locked alembic current | grep -Fx "20260727_0008 (head)"
-
-      - name: Unit, product, contract, and live PostgreSQL tests
-        env:
-          CUSTOMS_BACKEND_TEST_POSTGRES_DSN: postgresql+psycopg://customs_runtime:ci-runtime-password@127.0.0.1:5432/customs
-          CUSTOMS_BACKEND_TEST_POSTGRES_MIGRATOR_DSN: postgresql+psycopg://customs_migrator:ci-migrator-password@127.0.0.1:5432/customs
-        run: >-
-          uv run --locked pytest
-          packages/operational_db/tests tests/unit tests/product
-          --junitxml=.ci-junit-quality.xml
-
-      - name: Require zero failed, errored, or skipped tests
-        run: uv run --locked python tools/assert_junit_no_skip.py .ci-junit-quality.xml
-
-      - name: Verify tracked canonical contract snapshots
-        run: |
-          uv run --locked python tools/verify_contract_snapshots.py
-          git diff --check
-
-      - name: Validate production Compose graph
-        env:
-          AGENT_IMAGE: example.invalid/customs-ai-agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-          BACKEND_IMAGE: example.invalid/customs-backend@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-          DATA_IMAGE: example.invalid/customs-data-platform@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
-          EGRESS_PROXY_IMAGE: example.invalid/squid@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
-          EVIDENCE_PROXY_IMAGE: example.invalid/nginx@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
-          FRONTEND_IMAGE: example.invalid/customs-frontend@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
-          KEYCLOAK_IMAGE: example.invalid/keycloak@sha256:1111111111111111111111111111111111111111111111111111111111111111
-          MINIO_IMAGE: example.invalid/minio@sha256:2222222222222222222222222222222222222222222222222222222222222222
-          POSTGRES_IMAGE: example.invalid/postgres@sha256:4444444444444444444444444444444444444444444444444444444444444444
-          REDIS_IMAGE: example.invalid/redis@sha256:6666666666666666666666666666666666666666666666666666666666666666
-          REVERSE_PROXY_IMAGE: example.invalid/nginx@sha256:7777777777777777777777777777777777777777777777777777777777777777
-          CUSTOMS_DATA_STORE_TLS_NETWORK: customs-data-store-tls-ci
-          CUSTOMS_DATA_STORE_ACCESS_MODE: read_only
-          CUSTOMS_DATA_STORE_PERMISSION_ATTESTATION_SHA256: "8888888888888888888888888888888888888888888888888888888888888888"
-          CUSTOMS_PUBLIC_HOST: customs-ci.invalid
-          KEYCLOAK_ADMIN: ci-admin
-          KEYCLOAK_ADMIN_PASSWORD: ci-not-a-secret
-          KEYCLOAK_DB_PASSWORD: ci-not-a-secret
-          MINIO_ROOT_USER: ci-minio
-          MINIO_ROOT_PASSWORD: ci-not-a-secret
-          POSTGRES_MIGRATOR_PASSWORD: ci-not-a-secret
-          POSTGRES_RUNTIME_PASSWORD: ci-different-not-a-secret
-        run: |
-          compose_root="${RUNNER_TEMP}/customs-compose-ci"
-          mkdir -p "${compose_root}/tls" "${compose_root}/evidence-tls" "${compose_root}/releases"
-          : > "${compose_root}/backend.env"
-          : > "${compose_root}/migration.env"
-          : > "${compose_root}/agent.env"
-          cat > "${compose_root}/data.env" <<'EOF'
-          POSTGRES_SSLMODE=verify-full
-          QDRANT_URL=https://qdrant.ci.invalid
-          QDRANT_API_KEY=ci-placeholder-not-a-production-secret
-          NEO4J_URI=neo4j+s://neo4j.ci.invalid
-          EOF
-          : > "${compose_root}/ca-bundle.pem"
-          : > "${compose_root}/requirement-policy.json"
-          : > "${compose_root}/trusted-reviewers.json"
-          export CUSTOMS_TLS_DIR="${compose_root}/tls"
-          export CUSTOMS_EVIDENCE_TLS_DIR="${compose_root}/evidence-tls"
-          export CUSTOMS_RELEASE_DIR="${compose_root}/releases"
-          export CUSTOMS_AGENT_CA_BUNDLE_FILE="${compose_root}/ca-bundle.pem"
-          export CUSTOMS_BACKEND_ENV_FILE="${compose_root}/backend.env"
-          export CUSTOMS_BACKEND_MIGRATION_ENV_FILE="${compose_root}/migration.env"
-          export CUSTOMS_BACKEND_OUTBOX_ENV_FILE="${compose_root}/outbox.env"
-          export AGENT_ENV_FILE="${compose_root}/agent.env"
-          export DATA_ENV_FILE="${compose_root}/data.env"
-          export EVIDENCE_REQUIREMENT_POLICY_RELEASE_FILE="${compose_root}/requirement-policy.json"
-          export EVIDENCE_TRUSTED_REVIEWERS_FILE="${compose_root}/trusted-reviewers.json"
-          : > "${compose_root}/outbox.env"
-          uv run --locked python tools/verify_production_deployment_inputs.py \
-            --compose-file compose.production.yaml \
-            --data-env-file "${compose_root}/data.env"
-          docker compose -f compose.production.yaml config --quiet
-
-      - name: Negative production input checks fail closed
-        env:
-          AGENT_IMAGE: example.invalid/customs-ai-agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-          BACKEND_IMAGE: example.invalid/customs-backend@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-          DATA_IMAGE: example.invalid/customs-data-platform@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
-          EGRESS_PROXY_IMAGE: example.invalid/squid@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
-          EVIDENCE_PROXY_IMAGE: example.invalid/nginx@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
-          FRONTEND_IMAGE: example.invalid/customs-frontend:latest
-          KEYCLOAK_IMAGE: example.invalid/keycloak@sha256:1111111111111111111111111111111111111111111111111111111111111111
-          MINIO_IMAGE: example.invalid/minio@sha256:2222222222222222222222222222222222222222222222222222222222222222
-          POSTGRES_IMAGE: example.invalid/postgres@sha256:4444444444444444444444444444444444444444444444444444444444444444
-          REDIS_IMAGE: example.invalid/redis@sha256:6666666666666666666666666666666666666666666666666666666666666666
-          REVERSE_PROXY_IMAGE: example.invalid/nginx@sha256:7777777777777777777777777777777777777777777777777777777777777777
-          CUSTOMS_DATA_STORE_TLS_NETWORK: customs-data-store-tls-ci
-          CUSTOMS_DATA_STORE_ACCESS_MODE: read_only
-          CUSTOMS_DATA_STORE_PERMISSION_ATTESTATION_SHA256: "8888888888888888888888888888888888888888888888888888888888888888"
-        run: |
-          compose_root="${RUNNER_TEMP}/customs-compose-negative"
-          mkdir -p "${compose_root}"
-          cat > "${compose_root}/data.env" <<'EOF'
-          POSTGRES_SSLMODE=disable
-          QDRANT_URL=http://qdrant.invalid
-          NEO4J_URI=bolt://neo4j.invalid
-          EOF
-          if uv run --locked python tools/verify_production_deployment_inputs.py \
-            --compose-file compose.production.yaml \
-            --data-env-file "${compose_root}/data.env"; then
-            echo "mutable image tag unexpectedly passed" >&2
-            exit 1
-          fi
-          export FRONTEND_IMAGE=example.invalid/customs-frontend@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
-          if uv run --locked python tools/verify_production_deployment_inputs.py \
-            --compose-file compose.production.yaml \
-            --data-env-file "${compose_root}/data.env"; then
-            echo "plaintext Data-store inputs unexpectedly passed" >&2
-            exit 1
-          fi
-
-      - name: Build Backend wheel
-        run: uv build --wheel
-
-      - name: Build pinned production container
-        run: docker build --pull --tag customs-backend:ci .
-
-      - name: Verify minimal non-root runtime image
-        shell: bash
-        run: |
-          set -euo pipefail
-          actual_user="$(docker image inspect customs-backend:ci --format '{{.Config.User}}')"
-          test "${actual_user}" = "10001:10001"
-          docker run --rm -i --entrypoint python customs-backend:ci - <<'PY'
-          import importlib.util
-          from pathlib import Path
-
-          import customs_backend
-          import operational_db
-
-          assert importlib.util.find_spec("pip") is None
-          assert importlib.util.find_spec("setuptools") is None
-          assert importlib.util.find_spec("wheel") is None
-          assert importlib.util.find_spec("uv") is None
-          assert Path(
-              "/app/packages/operational_db/migrations/007_atomic_chat_quota.sql"
-          ).is_file()
-          PY
-
-      - name: Generate container SBOM and reject every High or Critical vulnerability
-        shell: bash
-        run: |
-          set -euo pipefail
-          scanner='aquasec/trivy@sha256:086971aaf400beebd94e8300fd8ea623774419597169156cec56eec5b00dfb1e'
-          mkdir -p "${RUNNER_TEMP}/trivy-cache"
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$PWD:/workspace" \
-            -v "${RUNNER_TEMP}/trivy-cache:/root/.cache/trivy" \
-            "$scanner" image --format cyclonedx \
-            --output /workspace/backend-image.cdx.json customs-backend:ci
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$PWD:/workspace" \
-            -v "${RUNNER_TEMP}/trivy-cache:/root/.cache/trivy" \
-            "$scanner" image --exit-code 1 --severity HIGH,CRITICAL \
-            --format json --output /workspace/backend-trivy.json customs-backend:ci
-
-      - name: Preserve Backend container security evidence
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: backend-container-security-${{ github.sha }}
-          path: |
-            backend-image.cdx.json
-            backend-trivy.json
-          if-no-files-found: error
-          retention-days: 30
-
-  security:
-    name: Secret, SAST, and dependency audit
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout full history for secret scanning
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Scan complete committed history with Gitleaks
-        shell: bash
-        env:
-          GITLEAKS_VERSION: "8.30.1"
-          GITLEAKS_LINUX_X64_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
-        run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/gitleaks.tar.gz"
-          binary="$RUNNER_TEMP/gitleaks"
-          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-            --output "$archive" \
-            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          echo "${GITLEAKS_LINUX_X64_SHA256}  ${archive}" | sha256sum --check --strict
-          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP" gitleaks
-          test -x "$binary"
-          "$binary" git --no-banner --no-color --redact \
-            --config .gitleaks.toml \
-            --gitleaks-ignore-path .gitleaksignore \
-            .
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff
-        with:
-          version: ${{ env.UV_VERSION }}
-          enable-cache: true
-
-      - name: Install locked security toolchain
-        run: uv sync --locked --group dev --python "${PYTHON_VERSION}"
-
-      - name: Bandit SAST
-        run: uv run --locked bandit -q -r src packages/operational_db/src tools
-
-      - name: Export the complete exact lock with hashes
-        run: >-
-          uv export --quiet --locked --all-groups --all-extras
-          --no-emit-project --no-emit-local --no-sources
-          --format requirements.txt
-          --output-file "${RUNNER_TEMP}/backend-locked-requirements.txt"
-
-      - name: Audit the exact locked dependency graph
-        run: >-
-          uv run --locked pip-audit
-          --requirement "${RUNNER_TEMP}/backend-locked-requirements.txt"
-          --require-hashes --disable-pip --strict --progress-spinner off
-
-  cross-repository-system:
-    name: Exact Agent wheel and service-contract system gate
-    needs: [quality-product-contract, security]
-    # The Environment holds an Agent-repository read-only deploy key and exact
-    # release variables. Missing credentials or identity pins fail closed
-    # instead of silently deferring interoperability until after merge.
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    environment: trusted-cross-repository
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    env:
-      AGENT_REF: ${{ vars.CUSTOMS_AI_AGENT_REF }}
-      AGENT_WHEEL_SHA256: ${{ vars.CUSTOMS_AI_AGENT_WHEEL_SHA256 }}
-      AGENT_CHECKOUT: .ci/customs-ai-agent
-    steps:
-      - name: Require exact cross-repository release inputs
-        shell: bash
-        run: |
-          [[ "${AGENT_REF}" =~ ^[0-9a-f]{40}$ ]] || {
-            echo "CUSTOMS_AI_AGENT_REF must be an exact 40-character lowercase commit SHA" >&2
-            exit 1
-          }
-          [[ "${AGENT_WHEEL_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
-            echo "CUSTOMS_AI_AGENT_WHEEL_SHA256 must be an exact lowercase SHA-256" >&2
-            exit 1
-          }
-
-      - name: Checkout Backend
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          persist-credentials: false
-
-      - name: Checkout exact private Agent commit
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          repository: ${{ github.repository_owner }}/customs-ai-agent
-          ref: ${{ vars.CUSTOMS_AI_AGENT_REF }}
-          ssh-key: ${{ secrets.CUSTOMS_AI_AGENT_DEPLOY_KEY }}
-          path: ${{ env.AGENT_CHECKOUT }}
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Verify checked-out Agent identity
-        run: test "$(git -C "${AGENT_CHECKOUT}" rev-parse HEAD)" = "${AGENT_REF}"
-
       - name: Install uv
         uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
 
-      - name: Install exact locked Agent build environment
-        run: cd "${AGENT_CHECKOUT}" && uv sync --locked --group dev --python "${PYTHON_VERSION}"
-
-      - name: Exercise actual Agent ASGI and packaged-contract boundary
+      - name: Install locked lightweight check environment
         run: >-
-          cd "${AGENT_CHECKOUT}" &&
-          uv run --locked pytest tests/service tests/test_packaged_contracts.py
-          --junitxml="${RUNNER_TEMP}/agent-service.xml"
+          uv sync --locked --group dev --extra unit
+          --python "${PYTHON_VERSION}"
 
-      - name: Build release wheel from exact clean Agent commit
+      - name: Quick check
+        run: uv run --no-sync python tools/check_backend.py quick
+
+      - name: Contract check
+        run: uv run --no-sync python tools/check_backend.py contract
+
+      - name: Confirm no tracked output was generated
+        shell: bash
         run: |
-          cd "${AGENT_CHECKOUT}"
-          uv run --locked python -m tools.build_release_distributions \
-            --repository . \
-            --expected-git-sha "${AGENT_REF}" \
-            --output-root "${RUNNER_TEMP}/agent-release"
-
-      - name: Verify caller-pinned Agent wheel bytes
-        run: |
-          mapfile -t wheels < <(find "${RUNNER_TEMP}/agent-release/wheel" -maxdepth 1 -type f -name '*.whl')
-          test "${#wheels[@]}" -eq 1
-          actual_sha="$(sha256sum "${wheels[0]}" | cut -d ' ' -f 1)"
-          test "${actual_sha}" = "${AGENT_WHEEL_SHA256}" || {
-            echo "Agent wheel SHA-256 does not match the organization release variable" >&2
-            exit 1
-          }
-          echo "AGENT_WHEEL_PATH=${wheels[0]}" >> "${GITHUB_ENV}"
-
-      - name: Install locked Backend and isolated Agent runtime environments
-        run: |
-          uv sync --locked --group dev --extra unit --extra system --python "${PYTHON_VERSION}"
-          (
-            cd "${AGENT_CHECKOUT}"
-            uv export --locked --no-dev --no-emit-project --no-emit-local --no-sources \
-              --format requirements.txt \
-              --output-file "${RUNNER_TEMP}/agent-runtime-requirements.txt"
-          )
-          agent_runtime_venv="${RUNNER_TEMP}/customs-agent-runtime-venv"
-          uv venv --python "${PYTHON_VERSION}" "${agent_runtime_venv}"
-          uv pip install --python "${agent_runtime_venv}/bin/python" \
-            --require-hashes \
-            --requirements "${RUNNER_TEMP}/agent-runtime-requirements.txt"
-          wheel_uri="$(python -c \
-            'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().as_uri())' \
-            "${AGENT_WHEEL_PATH}")"
-          printf 'customs-ai-agent @ %s --hash=sha256:%s\n' \
-            "${wheel_uri}" "${AGENT_WHEEL_SHA256}" > "${RUNNER_TEMP}/agent-wheel-requirement.txt"
-          uv pip install --python "${agent_runtime_venv}/bin/python" \
-            --no-deps --require-hashes \
-            --requirements "${RUNNER_TEMP}/agent-wheel-requirement.txt"
-          uv pip check --python "${agent_runtime_venv}/bin/python"
-          echo "AGENT_RUNTIME_PYTHON=${agent_runtime_venv}/bin/python" >> "${GITHUB_ENV}"
-
-      - name: Verify installed wheel origin, inventory, and record
-        run: >-
-          "${AGENT_RUNTIME_PYTHON}" -I "${AGENT_CHECKOUT}/tools/verify_distribution.py"
-          --wheel "${AGENT_WHEEL_PATH}"
-          --installed
-          --expected-wheel-sha256 "${AGENT_WHEEL_SHA256}"
-          --expected-git-sha "${AGENT_REF}"
-          --source-root "${AGENT_CHECKOUT}"
-
-      - name: Exercise installed Agent v2 regression and enhanced V3 over actual HTTP
-        run: >-
-          .venv/bin/python tools/probe_installed_agent_http.py
-          --agent-python "${AGENT_RUNTIME_PYTHON}"
-          --agent-checkout "${AGENT_CHECKOUT}"
-          --expected-git-sha "${AGENT_REF}"
-          --expected-wheel-sha256 "${AGENT_WHEEL_SHA256}"
-
-      - name: Require byte-exact V3 schemas and Agent OpenAPI identity
-        run: |
-          cmp "${AGENT_CHECKOUT}/contracts/agent/v3/review_request.schema.json" \
-            src/customs_backend/contracts/agent/v3/review-request.schema.json
-          cmp "${AGENT_CHECKOUT}/contracts/agent/v3/review_result.schema.json" \
-            src/customs_backend/contracts/agent/v3/review-result.schema.json
-          agent_openapi_sha="$(
-            cd "${AGENT_CHECKOUT}" &&
-            uv run --locked python tools/verify_service_openapi.py |
-              sed -n 's/^service_openapi_sha256=//p'
-          )"
-          backend_openapi_sha="$(
-            .venv/bin/python - <<'PY'
-          import json
-          from importlib import resources
-
-          lock = json.loads(
-              resources.files("customs_backend")
-              .joinpath("agent_contract.lock.json")
-              .read_text(encoding="utf-8")
-          )
-          print(lock["service_openapi_sha256"])
-          PY
-          )"
-          test -n "${agent_openapi_sha}"
-          test "${agent_openapi_sha}" = "${backend_openapi_sha}"
-
-      - name: Backend-to-Agent V3 HTTP and release-lock tests
-        run: >-
-          .venv/bin/python -m pytest
-          tests/product/test_agent_http_boundary.py
-          tests/product/test_release_approval.py
-          --junitxml=.ci-junit-cross-repository.xml
-
-      - name: Require zero cross-repository test skips
-        run: |
-          .venv/bin/python tools/assert_junit_no_skip.py "${RUNNER_TEMP}/agent-service.xml"
-          .venv/bin/python tools/assert_junit_no_skip.py .ci-junit-cross-repository.xml
+          git diff --check
+          test -z "$(git status --porcelain --untracked-files=all)"

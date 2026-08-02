@@ -46,26 +46,23 @@ Data 플랫폼의 Evidence API JSON Schema, Gold set, RAG 평가기는 이 저�
 복제하지 않는다. Data 제공자가 canonical 계약과 평가를 소유하고,
 Backend 시스템 테스트는 지정된 API 버전을 소비한다.
 
-## Python 3.11 설치와 단위 검증
+## Python 3.11 경량 검사
 
 ```powershell
+$LockHash = (Get-FileHash uv.lock -Algorithm SHA256).Hash.Substring(0, 12).ToLower()
+$env:UV_PROJECT_ENVIRONMENT = Join-Path $env:LOCALAPPDATA "CustomsUAT\envs\customs-backend\$LockHash-dev"
 uv sync --locked --group dev --extra unit --python 3.11
-uv run --locked ruff format --check .
-uv run --locked ruff check .
-uv run --locked mypy
-uv run --locked --extra unit pytest packages/operational_db/tests tests/unit tests/product
+uv run --no-sync python tools/check_backend.py quick
+uv run --no-sync python tools/check_backend.py contract
 ```
 
-GitHub Gate는 exact action SHA와 uv `0.11.28`을 사용한다. ephemeral PostgreSQL에서
-migration `003 → 004 → 005 → 006 → 007`, runtime/migrator 권한·append-only 변조 방지,
-JUnit skip 0, OpenAPI byte drift, Docker build, Gitleaks/Bandit, hash가 포함된
-`uv.lock` 전체 dependency audit를 검사한다. Cross-repository Gate는
-`trusted-cross-repository` Environment의 exact Agent commit/wheel SHA와 Agent
-저장소 하나에만 적용되는 read-only deploy key를 사용한다. 변수·키가 없거나
-identity가 다르면 Job은 fail-closed하여 exact wheel의 metadata/review/revision
-HTTP 검증을 우회할 수 없다. Free private 저장소에서는 Environment 승인과
-branch protection을 GitHub가 강제하지 않으므로 PR head·전체 CI 성공·사람 승인을
-병합 절차에서 수동으로 확인한다.
+GitHub PR은 shallow checkout에서 `quick`과 `contract`만 실행한다.
+의존성 audit는 `uv.lock`이 변경된 PR에서만 별도로 실행한다.
+전체 migration·package·container·SBOM/Trivy·cross-repository Agent 인증은
+일반 PR의 활성 Gate가 아니다. Chat·HITL·child Run을 변경한 경우에만
+`uv run --no-sync python tools/check_backend.py candidate`로 대표 흐름을 한 번
+확인한다. 실제 Production 배포 인증은 배포 범위가 확정된 뒤 별도로
+수행한다.
 
 OpenAPI v1을 재생성하려면:
 

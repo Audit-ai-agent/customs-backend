@@ -11,6 +11,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY --from=uv /uv /usr/local/bin/uv
 COPY pyproject.toml uv.lock README.md ./
+
+# Resolve and install locked third-party dependencies before copying source.
+# Source-only changes can therefore reuse this comparatively expensive layer.
+RUN uv sync --frozen --no-dev --extra production --no-editable --no-install-project
+
 COPY src ./src
 COPY packages ./packages
 COPY migrations ./migrations

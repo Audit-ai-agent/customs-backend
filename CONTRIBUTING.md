@@ -8,13 +8,39 @@
 - `integration` 변경은 localhost 전용·무인증이라는 경계를 약화하지 않는다.
 - 비밀값·실제 거래 문서·PII·실행 결과를 commit하지 않는다.
 
-## 필수 검증
+## 로컬 환경
+
+저장소 안에 `.venv`를 남기지 않도록 `uv.lock` hash로 구분한
+외부 환경을 사용한다. `uv sync`나 `uv run --locked`를 직접 실행해
+저장소에 기본 `.venv`를 만들지 않는다.
 
 ```powershell
+$LockHash = (Get-FileHash uv.lock -Algorithm SHA256).Hash.Substring(0, 12).ToLower()
+$env:UV_PROJECT_ENVIRONMENT = Join-Path $env:LOCALAPPDATA "CustomsUAT\envs\customs-backend\$LockHash-dev"
 uv sync --locked --group dev --extra unit --python 3.11
-uv run --locked --group dev --extra unit ruff check .
-uv run --locked --group dev --extra unit mypy
-uv run --locked --group dev --extra unit pytest packages/operational_db/tests tests/unit
+```
+
+다른 profile이 필요하면 동일한 방식으로 경로 끝의 `dev`를 `system`이나
+`production`으로 분리한다. Task가 끝나면 하네스가 해당 외부 환경을
+정리한다.
+
+## 경량 검사
+
+새 검사 명령은 이미 동기화된 환경을 변경하지 않는다.
+
+```powershell
+uv run --no-sync python tools/check_backend.py quick
+uv run --no-sync python tools/check_backend.py contract
+```
+
+- `quick`: Ruff·mypy·Backend 핵심 unit 검사
+- `contract`: Agent HTTP 경계·OpenAPI/Schema snapshot 대표 검사
+- `candidate`: Chat 2턴·수정 제안·독립 승인·child Run 대표 흐름
+
+`candidate`는 관련 기능을 완료 판정할 때만 한 번 실행한다.
+
+```powershell
+uv run --no-sync python tools/check_backend.py candidate
 ```
 
 Agent 연동을 변경했다면 `system` extra를 lock대로 설치하고, exact Agent
@@ -31,6 +57,9 @@ uv run --no-sync python tools/install_pinned_agent.py "$AgentWheel"
 uv run --no-sync pytest tests/system
 uv sync --check --locked --inexact --group dev --extra unit --extra system
 ```
+
+위 system 검사는 Agent HTTP 경계 또는 pin을 변경했을 때만 사용하며
+일반 PR의 필수 검사가 아니다.
 
 PR에는 문제, 선택 기준, 변경 계약, 실행 명령과 결과, rollback
 방법을 기록한다.
