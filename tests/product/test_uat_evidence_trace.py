@@ -86,7 +86,6 @@ def _write_trace(root: Path, records: list[dict[str, Any]]) -> Path:
         root
         / "_local"
         / "state"
-        / "runtime"
         / "local-user-uat"
         / "three-law-scenario-eval-trace.jsonl"
     )
@@ -279,7 +278,7 @@ def test_trace_reader_rejects_path_outside_runtime_allowlist(tmp_path: Path) -> 
 
 def test_trace_path_allowlist_matches_harness_windows_and_container_runtime() -> None:
     windows_parts = PureWindowsPath(
-        "C:/workspace/_local/state/runtime/local-user-uat/three-law-scenario-eval-trace.jsonl"
+        "C:/workspace/_local/state/local-user-uat/three-law-scenario-eval-trace.jsonl"
     ).parts
     container_parts = PurePosixPath("/run/local-user-uat/three-law-scenario-eval-trace.jsonl").parts
 
@@ -288,7 +287,7 @@ def test_trace_path_allowlist_matches_harness_windows_and_container_runtime() ->
 
     uppercase_windows_parts = tuple(
         PureWindowsPath(
-            "C:/WORKSPACE/_LOCAL/STATE/RUNTIME/LOCAL-USER-UAT/THREE-LAW-SCENARIO-EVAL-TRACE.JSONL"
+            "C:/WORKSPACE/_LOCAL/STATE/LOCAL-USER-UAT/THREE-LAW-SCENARIO-EVAL-TRACE.JSONL"
         ).parts
     )
     assert _is_allowed_trace_path_parts(uppercase_windows_parts) is True
@@ -300,9 +299,10 @@ def test_trace_path_allowlist_matches_harness_windows_and_container_runtime() ->
         "C:/workspace/_artifacts/runtime/local-user-uat/three-law-scenario-eval-trace.jsonl",
         "C:/workspace/_artifacts/uat/runtime/three-law-scenario-eval-trace.jsonl",
         "C:/workspace/_local/runtime/local-user-uat/three-law-scenario-eval-trace.jsonl",
-        "C:/workspace/_local/state/runtime/local-user-uat-decoy/three-law-scenario-eval-trace.jsonl",
-        "C:/workspace/_local/state/runtime/local-user-uat/nested/three-law-scenario-eval-trace.jsonl",
-        "C:/workspace/_local/state/runtime/local-user-uat/other.jsonl",
+        "C:/workspace/_local/state/runtime/local-user-uat/three-law-scenario-eval-trace.jsonl",
+        "C:/workspace/_local/state/local-user-uat-decoy/three-law-scenario-eval-trace.jsonl",
+        "C:/workspace/_local/state/local-user-uat/nested/three-law-scenario-eval-trace.jsonl",
+        "C:/workspace/_local/state/local-user-uat/other.jsonl",
     ],
 )
 def test_trace_path_allowlist_rejects_obsolete_and_decoy_windows_paths(path: str) -> None:

@@ -15,7 +15,6 @@ _TRACE_FILENAME = "three-law-scenario-eval-trace.jsonl"
 _WINDOWS_CANONICAL_TRACE_SUFFIX = (
     "_local",
     "state",
-    "runtime",
     "local-user-uat",
     _TRACE_FILENAME,
 )

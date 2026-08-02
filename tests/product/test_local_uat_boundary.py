@@ -90,7 +90,7 @@ def _local_uat_values(**overrides: Any) -> dict[str, Any]:
             _diagnostic_evidence_identity()["runtime_release_v3_sha256"]
         ),
         "uat_evidence_trace_path": (
-            "C:/_local/state/runtime/local-user-uat/three-law-scenario-eval-trace.jsonl"
+            "C:/_local/state/local-user-uat/three-law-scenario-eval-trace.jsonl"
         ),
     }
     values.update(overrides)
@@ -594,7 +594,7 @@ def test_local_uat_rejects_production_release_only_configuration(
         Settings(
             environment="test",
             uat_evidence_trace_path=(
-                "C:/_local/state/runtime/local-user-uat/three-law-scenario-eval-trace.jsonl"
+                "C:/_local/state/local-user-uat/three-law-scenario-eval-trace.jsonl"
             ),
         )
 
