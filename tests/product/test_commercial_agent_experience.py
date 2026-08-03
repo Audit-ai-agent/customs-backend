@@ -14,6 +14,7 @@ from customs_backend.adapters import (
     InMemoryObjectStore,
 )
 from customs_backend.api import Container, create_app
+from customs_backend.agent_v3_semantics import reconstruct_current_agent_facts
 from customs_backend.auth import StaticTokenVerifier
 from customs_backend.domain import (
     AgentReviewRequest,
@@ -174,6 +175,110 @@ def _answer_events() -> list[dict[str, Any]]:
 def _experience(request: AgentReviewRequest) -> dict[str, Any]:
     result = build_agent_v3_result(request, auto_complete=False)
     return _experience_from_result(result)
+
+
+def _finding_only_result() -> AgentReviewResultV3:
+    raw = build_agent_v3_result(_review_request(), auto_complete=False)
+    evidence = raw["rag_evidence"][0]
+    evidence.update(
+        {
+            "source_type": "customs_requirement",
+            "eligibility": "finding",
+            "required_document_code": "IMPORT_REQUIREMENT_CERT",
+            "required_document_name": "수입요건확인서",
+        }
+    )
+    evidence_id = evidence["evidence_id"]
+    raw["retrieval_results"][0]["requirements_found"] = True
+    raw["regulatory_findings"] = [
+        {
+            "finding_code": "supporting_document_required",
+            "severity": "low",
+            "message": "요건서류를 확인해야 합니다.",
+            "item_id": raw["retrieval_results"][0]["item_id"],
+            "required_document_code": "IMPORT_REQUIREMENT_CERT",
+            "required_document_name": "수입요건확인서",
+            "evidence_ids": [evidence_id],
+            "confidence": 1.0,
+            "confidence_basis": "structured_requirement_policy",
+            "source": None,
+        }
+    ]
+    raw["assessment"] = "issues_detected"
+    raw["report"]["summary"]["total_issues"] = 1
+    raw["report"]["summary"]["low"] = 1
+    raw["report"]["regulatory_findings"] = deepcopy(raw["regulatory_findings"])
+    raw["report"]["rag_evidence"] = [
+        {**deepcopy(evidence), "raw_scores": [{"method": "exact_hs", "score": 1.0}]}
+    ]
+    fact_entries, references = reconstruct_current_agent_facts(raw)
+    raw["required_actions"] = [
+        {
+            "action_code": "resolve_supporting_document_required",
+            "message": raw["regulatory_findings"][0]["message"],
+            "source_reference_ids": [references["findings"][0], evidence_id],
+        },
+        {
+            "action_code": "obtain_production_release_approval",
+            "message": (
+                "Claude extraction과 법령 범위에 대한 독립 검수 및 Release 승인이 필요합니다."
+            ),
+            "source_reference_ids": [references["outcome"]],
+        },
+    ]
+
+    def narrative_claim(text: str, citations: list[dict[str, str]]) -> dict[str, Any]:
+        payload = {"text": text, "material": True, "citations": citations}
+        return {"claim_id": f"claim_{canonical_digest(payload)}", **payload}
+
+    outcome_citation = [{"kind": "outcome", "reference_id": references["outcome"]}]
+    raw["narrative_report"].update(
+        {
+            "summary": [
+                narrative_claim(
+                    (
+                        "사전심사 결론: 확인이 필요한 문서 불일치 또는 미충족 규정 요건이 "
+                        "있어 담당자 검토가 필요합니다."
+                    ),
+                    outcome_citation,
+                )
+            ],
+            "document_consistency": [
+                narrative_claim(
+                    "문서 검토 결과: 결정론적 문서 교차검증에서 불일치가 확인되지 않았습니다.",
+                    outcome_citation,
+                )
+            ],
+            "regulatory_review": [
+                narrative_claim(
+                    (
+                        "규정 검토 원인(supporting_document_required): 요건서류를 "
+                        "확인해야 합니다. 이 요건이 충족되기 전에는 규정 검토를 완료할 수 "
+                        "없습니다."
+                    ),
+                    [
+                        {"kind": "finding", "reference_id": references["findings"][0]},
+                        {"kind": "evidence", "reference_id": evidence_id},
+                    ],
+                )
+            ],
+            "required_actions": [
+                narrative_claim(
+                    (
+                        "다음 조치: 현재 결과가 담당자 검토를 요구하므로, 담당자는 관련 원문, "
+                        "추출값, 규정 Evidence를 확인한 뒤 필요한 수정 또는 승인 결정을 "
+                        "기록해야 합니다."
+                    ),
+                    outcome_citation,
+                )
+            ],
+        }
+    )
+    raw["fact_ledger"] = {
+        "ledger_id": f"ledger_{canonical_digest(fact_entries)}",
+        "entries": fact_entries,
+    }
+    return AgentReviewResultV3.model_validate(_rehash_result(raw))
 
 
 def _revision_experience(request: AgentRevisionRequest) -> dict[str, Any]:
@@ -1176,6 +1281,75 @@ def test_presentation_text_cannot_reuse_a_stale_verifier_digest() -> None:
     typed = ReviewExperienceEnvelopeV1.model_validate(raw)
     with pytest.raises(ValueError, match="verification identity"):
         validate_presentation_against_result(typed)
+
+
+def test_backend_claim_catalog_matches_agent_for_finding_only_complete_documents() -> None:
+    claims = build_canonical_experience_claim_catalog(_finding_only_result())
+    conclusion = next(
+        claim
+        for claim in claims
+        if claim.section_code == "conclusion" and claim.role == "conclusion"
+    )
+
+    assert conclusion.canonical_text == (
+        "문서 정합성 검토에서는 제출 문서 사이의 값 불일치가 발견되지 "
+        "않았습니다. 이와 별도로 규정 검토에서는 담당자가 확인하고 보완해야 할 "
+        "사항이 발견되었습니다."
+    )
+    assert [citation.kind for citation in conclusion.citation_references] == [
+        "outcome",
+        "finding",
+    ]
+    assert any(
+        claim.section_code == "document_comparison"
+        and claim.role == "observation"
+        and claim.canonical_text
+        == "현재 검증 기준으로 문서 사이의 값 불일치는 발견되지 않았습니다."
+        for claim in claims
+    )
+
+
+@pytest.mark.parametrize(
+    "incomplete_reason",
+    ["no_documents", "failed_document", "model_error", "model_conflict"],
+)
+def test_backend_claim_catalog_does_not_claim_document_consistency_when_incomplete(
+    incomplete_reason: str,
+) -> None:
+    result = _finding_only_result()
+    update: dict[str, Any] = {}
+    if incomplete_reason == "no_documents":
+        update["document_results"] = []
+    elif incomplete_reason == "failed_document":
+        document_results = deepcopy(result.document_results)
+        document_results[0]["extraction_status"] = "failed"
+        update["document_results"] = document_results
+    elif incomplete_reason == "model_error":
+        update["model_errors"] = [{"error_code": "provider_error"}]
+    else:
+        update["model_conflicts"] = [{"field_name": "invoice_number"}]
+
+    claims = build_canonical_experience_claim_catalog(result.model_copy(update=update, deep=True))
+    conclusion = next(
+        claim
+        for claim in claims
+        if claim.section_code == "conclusion" and claim.role == "conclusion"
+    )
+
+    assert conclusion.canonical_text == (
+        "문서 또는 규정 검토에서 담당자가 확인하고 보완해야 할 사항이 발견되었습니다."
+    )
+    assert [citation.kind for citation in conclusion.citation_references] == ["outcome"]
+    assert not any(
+        "문서 사이의 값 불일치는 발견되지 않았습니다." in claim.canonical_text for claim in claims
+    )
+    assert any(
+        claim.section_code == "document_comparison"
+        and claim.role == "limitation"
+        and claim.canonical_text
+        == "문서 분석이 완전히 끝나지 않아 문서 사이의 값 일치 여부를 확정하지 않았습니다."
+        for claim in claims
+    )
 
 
 @pytest.mark.parametrize("context_kind", ["flat_claim_catalog", "wrong_statement_claim"])

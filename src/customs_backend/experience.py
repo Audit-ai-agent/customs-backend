@@ -817,21 +817,54 @@ def build_canonical_experience_claim_catalog(
         kind="outcome",
         reference_id=outcome_entry["reference_id"],
     )
+    finding_citations = [
+        CitationReferenceV1(kind="finding", reference_id=reference)
+        for reference in finding_references
+    ]
+    document_consistency_complete = (
+        not result.model_errors
+        and not result.model_conflicts
+        and bool(result.document_results)
+        and all(
+            isinstance(item, dict) and item.get("extraction_status") == "completed"
+            for item in result.document_results
+        )
+    )
     claims: list[CanonicalExperienceClaimV1] = []
+    conclusion_citations = [outcome]
     if result.assessment.value == "no_issue_detected":
         conclusion = (
             "제출된 문서와 현재 조회된 법령 근거 범위에서는 별도의 불일치나 규정상 누락을 "
             "확인하지 못했습니다."
         )
     elif result.assessment.value == "issues_detected":
-        conclusion = "문서 또는 규정 검토에서 담당자가 확인하고 보완해야 할 사항이 발견되었습니다."
+        if (
+            document_consistency_complete
+            and not result.validation_issues
+            and result.regulatory_findings
+        ):
+            conclusion = (
+                "문서 정합성 검토에서는 제출 문서 사이의 값 불일치가 발견되지 "
+                "않았습니다. 이와 별도로 규정 검토에서는 담당자가 확인하고 보완해야 할 "
+                "사항이 발견되었습니다."
+            )
+            conclusion_citations.extend(finding_citations)
+        else:
+            conclusion = (
+                "문서 또는 규정 검토에서 담당자가 확인하고 보완해야 할 사항이 발견되었습니다."
+            )
     else:
         conclusion = (
             "현재 자료와 근거만으로 심사 결과를 확정하기 어려워 담당자의 추가 확인이 필요합니다."
         )
     claims.extend(
         [
-            _canonical_claim("conclusion", "conclusion", conclusion, [outcome]),
+            _canonical_claim(
+                "conclusion",
+                "conclusion",
+                conclusion,
+                conclusion_citations,
+            ),
             _canonical_claim(
                 "conclusion",
                 "limitation",
@@ -915,7 +948,7 @@ def build_canonical_experience_claim_catalog(
                     ),
                 ]
             )
-    else:
+    elif document_consistency_complete:
         claims.extend(
             [
                 _canonical_claim(
@@ -928,6 +961,29 @@ def build_canonical_experience_claim_catalog(
                     "issues_and_causes",
                     "observation",
                     "문서 교차검증에서 별도로 설명할 오류 원인은 확인되지 않았습니다.",
+                    [outcome],
+                ),
+            ]
+        )
+    else:
+        claims.extend(
+            [
+                _canonical_claim(
+                    "document_comparison",
+                    "limitation",
+                    (
+                        "문서 분석이 완전히 끝나지 않아 문서 사이의 값 일치 여부를 "
+                        "확정하지 않았습니다."
+                    ),
+                    [outcome],
+                ),
+                _canonical_claim(
+                    "issues_and_causes",
+                    "limitation",
+                    (
+                        "완료되지 않은 문서 분석이 있어 교차검증 결과와 오류 원인을 "
+                        "추가로 확인해야 합니다."
+                    ),
                     [outcome],
                 ),
             ]
