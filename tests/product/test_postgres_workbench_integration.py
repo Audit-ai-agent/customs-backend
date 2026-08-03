@@ -50,6 +50,7 @@ from customs_backend.domain import (
 from customs_backend.ports import (
     AgentPreExecutionRetryableError,
     ConflictError,
+    JobExecutionNotRunnableError,
     NotFoundError,
     QuotaExceededError,
 )
@@ -845,7 +846,10 @@ def test_postgres_migration_atomicity_persistence_and_isolation() -> None:
         raise TimeoutError("external response lost")
 
     restarted_service.agent = CallableAgentClient(uncertain_review)
-    with pytest.raises(TimeoutError, match="external response lost"):
+    with pytest.raises(
+        JobExecutionNotRunnableError,
+        match="automatic retry is prohibited",
+    ):
         restarted_service.execute_job(org_id=reviewer_a.org_id, job_id=uncertain_job.job_id)
     uncertain_record = restarted_repository.get_job(reviewer_a.org_id, uncertain_job.job_id)
     assert uncertain_record is not None

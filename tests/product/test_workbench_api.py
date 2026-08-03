@@ -631,7 +631,10 @@ def test_delivery_uncertainty_blocks_new_call_until_approver_reconciliation(work
         json={},
         headers={**_auth(), "Idempotency-Key": "uncertain-first"},
     ).json()["job"]
-    with pytest.raises(TimeoutError, match="response lost"):
+    with pytest.raises(
+        JobExecutionNotRunnableError,
+        match="automatic retry is prohibited",
+    ):
         container.service.execute_job(org_id="org-a", job_id=job["job_id"])
     different = client.post(
         url,
@@ -2193,7 +2196,10 @@ def test_external_agent_failure_closes_durable_call_once_barrier(workbench):
         json={},
         headers={**_auth(), "Idempotency-Key": "bounded-retries"},
     ).json()["job"]
-    with pytest.raises(RuntimeError, match="provider unavailable"):
+    with pytest.raises(
+        JobExecutionNotRunnableError,
+        match="automatic retry is prohibited",
+    ):
         container.service.execute_job(org_id="org-a", job_id=job["job_id"])
     stored = container.repository.get_job("org-a", job["job_id"])
     assert stored is not None
@@ -2250,7 +2256,10 @@ def test_external_revision_failure_uses_the_same_call_once_barrier(workbench):
         raise TimeoutError("revision delivery response lost")
 
     container.service.agent = CallableAgentClient(_agent_result, revise=fail_revision)
-    with pytest.raises(TimeoutError, match="revision delivery response lost"):
+    with pytest.raises(
+        JobExecutionNotRunnableError,
+        match="automatic retry is prohibited",
+    ):
         container.service.execute_job(org_id="org-a", job_id=child_job["job_id"])
     stored = container.repository.get_job("org-a", child_job["job_id"])
     assert stored is not None
@@ -2444,7 +2453,12 @@ def test_proven_pre_execution_503_exhausts_at_three_and_never_calls_fourth(workb
 @pytest.mark.parametrize(
     ("failure", "expected_exception", "expected_status", "expected_call_state"),
     [
-        ("timeout", httpx.ReadTimeout, "delivery_uncertain", "delivery_uncertain"),
+        (
+            "timeout",
+            JobExecutionNotRunnableError,
+            "delivery_uncertain",
+            "delivery_uncertain",
+        ),
         (
             "http-502",
             AgentResponseRejectedError,

@@ -2940,7 +2940,9 @@ class WorkbenchService:
                         detail={"job_id": job_id, "error_code": "agent_delivery_uncertain"},
                     ),
                 )
-                raise
+                raise JobExecutionNotRunnableError(
+                    "Agent delivery is uncertain; automatic retry is prohibited"
+                ) from exc
             terminal_failure = running.attempt_count >= self.job_max_attempts
             failed = running.model_copy(
                 update={
