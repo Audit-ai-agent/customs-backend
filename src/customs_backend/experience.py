@@ -931,7 +931,7 @@ def build_canonical_experience_claim_catalog(
                     _canonical_claim(
                         "document_comparison",
                         "observation",
-                        title + ".",
+                        f"문서 대조 결과, {title}.",
                         [citation],
                     ),
                     _canonical_claim(
