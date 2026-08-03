@@ -1,24 +1,24 @@
 {
   "meaning_catalog_sha256": "73a2830c6ba4474c181871c783e7acfa4cfff1fc9ed378d7f12ae7b330a0c66b",
   "meaning_catalog_file_sha256": "e7e2de1b52943930af9354d590381e5acf068138265e1f43371133e5e45a9511",
-  "experience_prompt_bundle_sha256": "e0ecd23d95a0b2699576e869c7df2df269c1b1671d0b3a6bde05399fe2028a1e",
-  "experience_schema_bundle_sha256": "96cf54eaad8634568b93a4c27b6e35d540d973c68346801f875ff1e2d1a5bd62",
+  "experience_prompt_bundle_sha256": "1c1eee5ef7233e58fffec4fe7dd1397b683b8af089c97f173926b1927772ff0e",
+  "experience_schema_bundle_sha256": "4f45ae0941acc39e165484c80c6c1b9e90febad8dbf65aa8870afd94e6013e57",
   "experience_prompt_sha256": {
     "chat": "7c9fda2c72bdc10691b62a54d81a3ae11c7bb0e2fce19e8ae8a38c2425499df6",
     "chat_verifier": "e272c7d2e67944c65cf6129fadf8b464609691d0b2137c50c6f72cc445ac96b1",
     "entailment": "3117334d7ec92db065bb12418a5acf468e1b50bc1ee2d58ab7154ffcd91c6b15",
-    "presentation": "6369253224258fd73246787176fab830ac636817a7b49cdbe8340a38d60133b6",
+    "presentation": "082e31de8d93c439a1cc6bad81b2e3559f7195b55f110274c29ac737f40f2e59",
     "scope_classifier": "9db8f95d4b46bf9d8ea9734e45fa45b178df4de85328adb10788a9dbaff83798"
   },
   "experience_output_schema_sha256": {
     "chat": "ee6d49db15f6edf7e00978451e315a9c6d720072c6673054d2234e833b413236",
     "chat_verifier": "3318e497dc39b09824b9649238fa9a3b347df492ad5423057e3f41db7c9c3f9b",
     "entailment": "f8f033608b202c465e9227157812581ea4d13bcff38b435d936652caf1d25292",
-    "presentation": "1eb2a5f3bda36a727395372ca2238fe380d0c56381ffab7ad0334e026e2baca2",
+    "presentation": "d94bf93d1a80ecd366282b317a4968f01dfced5334209fc56792af09de48dc2f",
     "scope_classifier": "9889573adc91c99989b8ed8eeb65b1c2c277332b7cd20c4eff8a9f3ff32f686d",
     "scope_classifier_semantic": "cff8825cc0413de58b9b8dfbbf3d53538e1f0da6f0cb24f16878304ab063623a"
   },
-  "provider_commit": "1bc4f1b21988fa32f95299c304828a24d459318b",
+  "provider_commit": "0d8057ed39e60eefe81e3d698d5a54662902d300",
   "provider_asset_manifest_sha256": "c5e5af541632183f69379cd47a3bc32d2bd06bb8d3c41c45cbc4e1402302243f",
   "provider_manifest_sha256": "1982587f5e34ed66ac570ad960092cbf86b87a59669d41f20f5dac4750020fe6",
   "provider_openapi_lock_file_sha256": "1b20d97de2e61181e05a4812a778a8b62f40ec42aac9280ffab0bb09df6e5b3f",
