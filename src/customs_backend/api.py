@@ -1166,7 +1166,7 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
                 or bound_agent_metadata.get("source_snapshot_sha256")
                 != runtime_binding.agent.working_tree_sha256
                 or bound_agent_metadata.get("wheel_sha256") != runtime_binding.agent.wheel_sha256
-                or not runtime_binding.matches_result_runtime(bound_runtime_identity)
+                or not runtime_binding.matches_service_metadata_runtime(bound_runtime_identity)
             ):
                 raise ReleaseConfigurationError("Agent UAT metadata differs from runtime binding")
         if actual_container.service.service_pin is not None:

@@ -107,6 +107,23 @@ def test_development_binding_does_not_require_static_release_pin() -> None:
     assert _binding_requires_static_service_pin(candidate) is True
 
 
+def test_service_metadata_keeps_case_evidence_and_uat_tool_identity_separate() -> None:
+    now = datetime(2026, 8, 3, 4, 0, tzinfo=UTC)
+    binding = LocalUatRuntimeBindingV1.model_validate(_binding_payload(now=now))
+    metadata_runtime = ReleaseIdentityV3.model_construct(
+        agent_git_sha=binding.agent.commit,
+        agent_source_snapshot_sha256=binding.agent.working_tree_sha256,
+        agent_code_snapshot_sha256=binding.agent.code_snapshot_sha256,
+        model_id=binding.agent.model_id,
+        evidence_runtime_v3_sha256=None,
+        tool_registry_id="customs-agent-tools/text-v1",
+        kill_switch_active=True,
+    )
+
+    assert binding.matches_service_metadata_runtime(metadata_runtime) is True
+    assert binding.matches_result_runtime(metadata_runtime) is False
+
+
 def test_incremental_revision_requires_exact_parent_provenance() -> None:
     parent_calls = [
         {

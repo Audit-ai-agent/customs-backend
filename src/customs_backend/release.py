@@ -441,6 +441,22 @@ class LocalUatRuntimeBindingV1(BaseModel):
             and identity.kill_switch_active
         )
 
+    def matches_service_metadata_runtime(self, identity: ReleaseIdentityV3) -> bool:
+        """Match the Agent build advertised before a Case-specific Evidence run.
+
+        Base service metadata intentionally advertises the packaged text tool
+        registry and no Case Evidence identity.  The UAT capability and the
+        separate Evidence V3 identity bind those two dynamic boundaries.
+        """
+
+        return (
+            identity.agent_git_sha == self.agent.commit
+            and identity.agent_source_snapshot_sha256 == self.agent.working_tree_sha256
+            and identity.agent_code_snapshot_sha256 == self.agent.code_snapshot_sha256
+            and identity.model_id == self.agent.model_id
+            and identity.kill_switch_active
+        )
+
 
 def load_local_uat_runtime_binding(
     path: str | Path,
@@ -801,9 +817,8 @@ class AgentServicePin(BaseModel):
                 or agent.get("build_sha") != binding.agent.commit
                 or agent.get("source_snapshot_sha256") != binding.agent.working_tree_sha256
                 or agent.get("wheel_sha256") != binding.agent.wheel_sha256
-                or not binding.matches_result_runtime(runtime)
+                or not binding.matches_service_metadata_runtime(runtime)
                 or evidence_identity.runtime_release_v3_sha256 != binding.evidence_runtime_v3_sha256
-                or runtime.tool_registry_id != binding.agent.tool_registry_id
             ):
                 raise ReleaseConfigurationError(
                     "Agent metadata differs from the local UAT runtime binding"
@@ -823,7 +838,7 @@ class AgentServicePin(BaseModel):
                     "coordinator_schema_sha256": runtime.coordinator_schema_sha256,
                     "narrative_schema_sha256": runtime.narrative_schema_sha256,
                     "chat_schema_sha256": runtime.chat_schema_sha256,
-                    "tool_registry_id": binding.agent.tool_registry_id,
+                    "tool_registry_id": runtime.tool_registry_id,
                 }
             )
             dynamic_pin.validate_local_uat_metadata(value)
