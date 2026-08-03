@@ -57,6 +57,17 @@ _ANSWER_AREA_ROLES: dict[str, frozenset[str]] = {
     "impact": frozenset({"impact"}),
     "next_steps": frozenset({"action"}),
 }
+_ANSWER_INTENTS = (
+    "summary",
+    "reason",
+    "evidence",
+    "impact",
+    "next_action",
+    "priority_action",
+    "comparison",
+    "clarification",
+    "general",
+)
 _CASE_LIMITATION = "답변은 현재 심사 회차와 연결된 문서·법령 근거 범위에 한정됩니다."
 _GENERAL_GUIDANCE_LIMITATION = (
     "위 내용은 일반 통관 안내이며 현재 심사 건의 판정이나 법적 의무를 뜻하지 않습니다."
@@ -2484,20 +2495,39 @@ def validate_answer_against_context(
         "suggested_questions": answer.suggested_questions,
         "used_context_message_ids": answer.used_context_message_ids,
     }
-    verifier_context_sha256 = canonical_digest(
-        {
-            "question": request.question,
-            "recent_turns": [turn.model_dump(mode="json") for turn in request.recent_turns],
-            "answer_scope": answer.answer_scope,
-            "allowed_claims": [claim.model_dump(mode="json") for claim in answer_claims],
-            "general_guidance": guidance,
-            "fixed_limitation_source": (
-                _GENERAL_GUIDANCE_LIMITATION
-                if answer.answer_scope == "general_customs_guidance"
-                else _CASE_LIMITATION
-            ),
-            "candidate_answer": candidate_answer,
-        }
+    claim_index = {claim.claim_id: claim for claim in answer_claims}
+    claim_selections = answer.claim_selections.model_dump(mode="json")
+    fixed_claim_assignments = {
+        area: [claim_index[claim_id].model_dump(mode="json") for claim_id in claim_ids]
+        for area, claim_ids in claim_selections.items()
+    }
+    verifier_context_base = {
+        "question": request.question,
+        "recent_turns": [turn.model_dump(mode="json") for turn in request.recent_turns],
+        "answer_scope": answer.answer_scope,
+        "allowed_claims": [claim.model_dump(mode="json") for claim in answer_claims],
+        "fixed_claim_assignments": fixed_claim_assignments,
+        "general_guidance": guidance,
+        "fixed_limitation_source": (
+            _GENERAL_GUIDANCE_LIMITATION
+            if answer.answer_scope == "general_customs_guidance"
+            else _CASE_LIMITATION
+        ),
+        "fixed_used_context_message_ids": answer.used_context_message_ids,
+        "candidate_answer": candidate_answer,
+    }
+    if answer.answer_scope == "general_customs_guidance":
+        allowed_answer_intents = ("general",)
+    elif answer.answer_scope in material_scopes:
+        allowed_answer_intents = tuple(
+            intent for intent in _ANSWER_INTENTS if intent != "general"
+        )
+    else:
+        allowed_answer_intents = ("clarification",)
+    verifier_context_matches = any(
+        verification.verifier_context_sha256
+        == canonical_digest({**verifier_context_base, "answer_intent": intent})
+        for intent in allowed_answer_intents
     )
     if classification.mode == "claude":
         if classification.model_id != result.runtime_release.model_id:
@@ -2510,7 +2540,7 @@ def validate_answer_against_context(
             or verification.status != "passed"
             or verification.entailment_verifier != "claude"
             or verification.verifier_model_id != result.runtime_release.model_id
-            or verification.verifier_context_sha256 != verifier_context_sha256
+            or not verifier_context_matches
             or verification.checked_statement_count != expected_claude_count
             or verification.reason_codes
         ):

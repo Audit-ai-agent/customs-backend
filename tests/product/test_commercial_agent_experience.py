@@ -410,6 +410,11 @@ def _answer(payload: dict[str, Any]) -> dict[str, Any]:
             item["message_id"] for item in normalized_request["recent_turns"]
         ],
     }
+    claim_index = {item.claim_id: item for item in claims}
+    fixed_claim_assignments = {
+        area: [claim_index[claim_id].model_dump(mode="json") for claim_id in claim_ids]
+        for area, claim_ids in answer_content["claim_selections"].items()
+    }
     answer_payload = {
         "schema_version": "2.0",
         **answer_content,
@@ -452,9 +457,14 @@ def _answer(payload: dict[str, Any]) -> dict[str, Any]:
                     "question": normalized_request["question"],
                     "recent_turns": normalized_request["recent_turns"],
                     "answer_scope": "case_grounded",
+                    "answer_intent": "summary",
                     "allowed_claims": [item.model_dump(mode="json") for item in claims[:100]],
+                    "fixed_claim_assignments": fixed_claim_assignments,
                     "general_guidance": {},
                     "fixed_limitation_source": _CASE_LIMITATION,
+                    "fixed_used_context_message_ids": answer_content[
+                        "used_context_message_ids"
+                    ],
                     "candidate_answer": {
                         "direct_answer": answer_content["direct_answer"],
                         "explanation": answer_content["explanation"],
@@ -528,18 +538,33 @@ def _rehash_answer(
                 topic: catalog.general_guidance[topic]
                 for topic in raw["generation_audit"]["scope_classification"]["guidance_topics"]
             }
+        claim_index = {item.claim_id: item for item in claims}
+        fixed_claim_assignments = {
+            area: [claim_index[claim_id].model_dump(mode="json") for claim_id in claim_ids]
+            for area, claim_ids in raw["claim_selections"].items()
+        }
+        answer_intent = (
+            "general"
+            if scope == "general_customs_guidance"
+            else "summary"
+            if scope in {"case_grounded", "evidence_grounded"}
+            else "clarification"
+        )
         raw["verification_audit"]["verifier_context_sha256"] = canonical_digest(
             {
                 "question": normalized_request["question"],
                 "recent_turns": normalized_request["recent_turns"],
                 "answer_scope": scope,
+                "answer_intent": answer_intent,
                 "allowed_claims": [item.model_dump(mode="json") for item in claims[:100]],
+                "fixed_claim_assignments": fixed_claim_assignments,
                 "general_guidance": guidance,
                 "fixed_limitation_source": (
                     _GENERAL_GUIDANCE_LIMITATION
                     if scope == "general_customs_guidance"
                     else _CASE_LIMITATION
                 ),
+                "fixed_used_context_message_ids": raw["used_context_message_ids"],
                 "candidate_answer": {
                     "direct_answer": raw["direct_answer"],
                     "explanation": raw["explanation"],
