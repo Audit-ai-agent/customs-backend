@@ -46,6 +46,7 @@ from customs_backend.domain import (
     JobStatus,
     MAX_SUPPORTING_DOCUMENTS_PER_CASE,
     Principal,
+    ReleaseIdentityV3,
     ReviewEnqueueRequest,
     RevisionProposalCreate,
     ReviewRunRecord,
@@ -87,8 +88,10 @@ from customs_backend.release import (
     AgentReleasePin,
     AgentServicePin,
     EvidenceRuntimeReleaseIdentityV3,
+    LocalUatRuntimeBindingV1,
     ReleaseConfigurationError,
     load_auto_completion_approval,
+    load_local_uat_runtime_binding,
     validate_agent_contract_bundle,
 )
 from customs_backend.repository import InMemoryWorkbenchRepository, PostgresWorkbenchRepository
@@ -449,13 +452,52 @@ class Container:
     agent: AgentClient
     token_verifier: TokenVerifier
     service: WorkbenchService
+    local_uat_runtime_binding: LocalUatRuntimeBindingV1 | None = None
     uat_evidence_trace_reader: UatEvidenceTraceReader | None = None
+
+
+def _binding_requires_static_service_pin(
+    binding: LocalUatRuntimeBindingV1 | None,
+) -> bool:
+    """Keep the static release pin at the candidate boundary only.
+
+    A short-lived development binding already pins the live wheel, source tree,
+    model, contracts, capability and Evidence runtime.  Requiring the packaged
+    release pin as well would force every local edit through the release-pin
+    update chain that this binding is specifically intended to avoid.
+    """
+
+    return binding is not None and binding.mode != "development"
 
 
 def build_container(settings: Settings) -> Container:
     if settings.process_role != "runtime":
         raise ReleaseConfigurationError("the HTTP/worker container requires the runtime role")
     validate_agent_contract_bundle()
+    local_uat_runtime_binding = (
+        load_local_uat_runtime_binding(
+            settings.uat_runtime_binding_path,
+            expected_file_sha256=settings.uat_runtime_binding_sha256,
+        )
+        if settings.uat_runtime_binding_path is not None
+        and settings.uat_runtime_binding_sha256 is not None
+        else None
+    )
+    if (
+        settings.environment == "local_uat"
+        and settings.enhanced_agent_experience
+        and local_uat_runtime_binding is None
+    ):
+        raise ReleaseConfigurationError(
+            "enhanced local UAT runtime requires one exact runtime binding file"
+        )
+    if (
+        local_uat_runtime_binding is not None
+        and local_uat_runtime_binding.loopback_origin.rstrip("/") != settings.public_base_url
+    ):
+        raise ReleaseConfigurationError(
+            "local UAT runtime binding origin differs from the Backend public origin"
+        )
     verifier = OidcJwtVerifier(
         issuer=settings.oidc_issuer,
         audience=settings.oidc_audience,
@@ -530,6 +572,10 @@ def build_container(settings: Settings) -> Container:
         if all(value is not None for value in service_pin_values.values())
         else None
     )
+    if _binding_requires_static_service_pin(local_uat_runtime_binding) and service_pin is None:
+        raise ReleaseConfigurationError(
+            "candidate UAT runtime binding requires the packaged Agent service contract pin"
+        )
     release_values = {
         "model_revision": settings.agent_expected_model_revision,
         "evidence_snapshot_id": settings.agent_expected_evidence_snapshot_id,
@@ -680,6 +726,7 @@ def build_container(settings: Settings) -> Container:
         uat_adaptive_active=settings.uat_adaptive_active,
         evidence_profile=settings.uat_evidence_profile,
         expected_uat_capability_sha256=(settings.uat_expected_capability_sha256),
+        local_uat_runtime_binding=local_uat_runtime_binding,
         uat_evidence_trace_reader=uat_evidence_trace_reader,
     )
     return Container(
@@ -690,6 +737,7 @@ def build_container(settings: Settings) -> Container:
         agent,
         verifier,
         service,
+        local_uat_runtime_binding,
         uat_evidence_trace_reader,
     )
 
@@ -914,11 +962,18 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         except (KeyError, TypeError, ValueError):
             raise ReleaseConfigurationError("Agent UAT capability is invalid") from None
         contract_lock = validate_agent_experience_contract_bundle().lock
+        runtime_binding = actual_container.local_uat_runtime_binding
+        if runtime_binding is not None:
+            runtime_binding.require_active()
         capability_now = datetime.now(UTC)
-        if (
+        common_identity_differs = (
             payload.get("uat_capability_sha256") != capability.capability_sha256
             or payload.get("uat_capability_sha256")
             != actual_container.settings.uat_expected_capability_sha256
+            or (
+                runtime_binding is not None
+                and payload.get("uat_capability_sha256") != runtime_binding.capability_sha256
+            )
             or not isinstance(payload.get("uat_capability_file_sha256"), str)
             or any(
                 character not in "0123456789abcdef"
@@ -927,6 +982,11 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             or len(payload["uat_capability_file_sha256"]) != 64
             or payload.get("uat_capability_file_sha256")
             != actual_container.settings.uat_expected_capability_file_sha256
+            or (
+                runtime_binding is not None
+                and payload.get("uat_capability_file_sha256")
+                != runtime_binding.capability_file_sha256
+            )
             or payload.get("uat_capability_expires_at") != capability.expires_at.isoformat()
             or payload.get("agent_commit") != capability.agent_commit
             or capability.expires_at <= capability_now
@@ -934,14 +994,36 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             or capability.expires_at > capability_now + timedelta(hours=24, minutes=5)
             or capability.adaptive_active != actual_container.settings.uat_adaptive_active
             or capability.evidence_profile != actual_container.settings.uat_evidence_profile
-            or capability.agent_commit != contract_lock.provider_commit
+            or capability.evidence_runtime_v3_sha256
+            != actual_container.settings.uat_evidence_runtime_v3_sha256
+            or (
+                runtime_binding is not None
+                and capability.evidence_runtime_v3_sha256
+                != runtime_binding.evidence_runtime_v3_sha256
+            )
+        )
+        binding_identity_differs = runtime_binding is not None and (
+            capability.agent_commit != runtime_binding.agent.commit
+            or capability.prompt_bundle_sha256 != runtime_binding.agent.prompt_bundle_sha256
+            or capability.schema_bundle_sha256 != runtime_binding.agent.schema_bundle_sha256
+            or capability.tool_registry_id != runtime_binding.agent.tool_registry_id
+            or capability.tool_registry_sha256 != runtime_binding.agent.tool_registry_sha256
+        )
+        candidate_lock_differs = (
+            runtime_binding is None or runtime_binding.mode == "candidate"
+        ) and (
+            capability.agent_commit != contract_lock.provider_commit
             or capability.prompt_bundle_sha256 != contract_lock.experience_prompt_bundle_sha256
             or capability.schema_bundle_sha256 != contract_lock.experience_schema_bundle_sha256
             or capability.tool_registry_id != contract_lock.uat_tool_registry_id
             or capability.tool_registry_sha256 != contract_lock.uat_tool_registry_sha256
-            or capability.evidence_runtime_v3_sha256
-            != actual_container.settings.uat_evidence_runtime_v3_sha256
-        ):
+            or (
+                runtime_binding is not None
+                and runtime_binding.agent.meaning_catalog_sha256
+                != expected_meaning_catalog_sha256()
+            )
+        )
+        if common_identity_differs or binding_identity_differs or candidate_lock_differs:
             raise ReleaseConfigurationError("Agent UAT capability identity differs")
         return capability
 
@@ -960,6 +1042,11 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         if (
             any(payload.get(key) != value for key, value in expected_keys.items())
             or payload.get("meaning_catalog_sha256") != expected_meaning_catalog_sha256()
+            or (
+                actual_container.local_uat_runtime_binding is not None
+                and payload.get("meaning_catalog_sha256")
+                != actual_container.local_uat_runtime_binding.agent.meaning_catalog_sha256
+            )
             or not isinstance(schemas, dict)
             or schemas.get("service_openapi_sha256") != contract_lock.provider_openapi_sha256
         ):
@@ -1063,8 +1150,33 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             raise ReleaseConfigurationError(
                 "Agent UAT assertion fixture is forbidden for this profile"
             )
+        runtime_binding = actual_container.local_uat_runtime_binding
+        if runtime_binding is not None:
+            runtime_binding.require_active()
+            bound_agent_metadata = agent_metadata.get("agent")
+            bound_runtime_release = agent_metadata.get("runtime_release")
+            if not isinstance(bound_agent_metadata, dict):
+                raise ReleaseConfigurationError("Agent UAT build metadata is invalid")
+            try:
+                bound_runtime_identity = ReleaseIdentityV3.model_validate(bound_runtime_release)
+            except (TypeError, ValueError):
+                raise ReleaseConfigurationError("Agent UAT runtime metadata is invalid") from None
+            if (
+                bound_agent_metadata.get("build_sha") != runtime_binding.agent.commit
+                or bound_agent_metadata.get("source_snapshot_sha256")
+                != runtime_binding.agent.working_tree_sha256
+                or bound_agent_metadata.get("wheel_sha256") != runtime_binding.agent.wheel_sha256
+                or not runtime_binding.matches_result_runtime(bound_runtime_identity)
+            ):
+                raise ReleaseConfigurationError("Agent UAT metadata differs from runtime binding")
         if actual_container.service.service_pin is not None:
-            actual_container.service.service_pin.validate_local_uat_metadata(agent_metadata)
+            if runtime_binding is not None and runtime_binding.mode == "development":
+                actual_container.service.service_pin.validate_local_uat_development_metadata(
+                    agent_metadata,
+                    binding=runtime_binding,
+                )
+            else:
+                actual_container.service.service_pin.validate_local_uat_metadata(agent_metadata)
         if actual_container.settings.enhanced_agent_experience:
             experience_metadata = actual_container.agent.experience_metadata()
             capability = validate_enhanced_capability(experience_metadata)

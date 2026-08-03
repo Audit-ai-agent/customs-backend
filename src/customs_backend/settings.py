@@ -140,6 +140,11 @@ class Settings(BaseSettings):
         default=None,
         pattern=r"^[a-f0-9]{64}$",
     )
+    uat_runtime_binding_path: str | None = Field(default=None, repr=False)
+    uat_runtime_binding_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9]{64}$",
+    )
     uat_evidence_profile: Literal[
         "synthetic-v3",
         "preserved-3law-v3-diagnostic",
@@ -199,6 +204,20 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def production_is_fail_closed(self) -> "Settings":
+        runtime_binding_values = {
+            "uat_runtime_binding_path": self.uat_runtime_binding_path,
+            "uat_runtime_binding_sha256": self.uat_runtime_binding_sha256,
+        }
+        if any(value is not None for value in runtime_binding_values.values()) and not all(
+            value is not None for value in runtime_binding_values.values()
+        ):
+            raise ValueError(
+                "local UAT runtime binding path and SHA-256 must be configured together"
+            )
+        if any(value is not None for value in runtime_binding_values.values()) and (
+            self.environment != "local_uat" or self.process_role != "runtime"
+        ):
+            raise ValueError("local UAT runtime binding is restricted to local_uat runtime")
         local_uat_assertion_fixture = {
             "uat_assertion_signing_key_registry_path": (
                 self.uat_assertion_signing_key_registry_path

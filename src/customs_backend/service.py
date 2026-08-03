@@ -59,6 +59,7 @@ from customs_backend.domain import (
     ModelExecutionSummary,
     OutboxRecord,
     Principal,
+    ReleaseIdentityV3,
     RequiredAction,
     ReviewDisposition,
     ReviewEnqueueRequest,
@@ -125,6 +126,7 @@ from customs_backend.release import (
     AgentReleasePin,
     AgentServicePin,
     AutoCompletionApprovalManifest,
+    LocalUatRuntimeBindingV1,
     ReleaseConfigurationError,
     load_agent_contract_lock,
     load_domain_reviewer_trust_store,
@@ -713,6 +715,136 @@ def _bounded_model_execution_summary(
     )
 
 
+def _revision_document_model_call_counts(
+    *,
+    envelope: AgentReviewResultV3,
+    job: JobRecord,
+    parent_result: dict[str, Any] | None,
+    expected_reuse_key_sha256: str | None = None,
+) -> tuple[int, int]:
+    """Verify the optional parent-extraction reuse attestation.
+
+    A normal review or a revision that safely fell back to full analysis reports
+    all observed document calls as actual calls.  A reused revision must carry
+    exactly one canonical, hash-bound audit entry and preserve the parent's model
+    call provenance byte-for-byte.
+    """
+
+    reuse_events = [
+        item
+        for item in envelope.audit_trail
+        if isinstance(item, dict) and item.get("event") == "parent_extraction_reused"
+    ]
+    if not reuse_events:
+        return len(envelope.model_calls), 0
+    if job.kind != "revision" or len(reuse_events) != 1 or parent_result is None:
+        raise ConflictError("Agent extraction reuse audit is not bound to one child revision")
+    event = reuse_events[0]
+    metadata = event.get("metadata")
+    expected_parent_sha256 = job.request.get("parent_provider_result_sha256")
+    parent_calls = parent_result.get("model_calls")
+    parent_documents = parent_result.get("document_results")
+    if (
+        event.get("stage") != "extract_documents"
+        or not isinstance(event.get("message"), str)
+        or not event["message"]
+        or not isinstance(metadata, dict)
+        or set(metadata)
+        != {
+            "parent_result_sha256",
+            "aggregate_reuse_key_sha256",
+            "reused_document_count",
+            "inherited_model_call_count",
+            "actual_document_model_call_count",
+        }
+        or metadata.get("parent_result_sha256") != expected_parent_sha256
+        or not _is_sha256(metadata.get("aggregate_reuse_key_sha256"))
+        or (
+            expected_reuse_key_sha256 is not None
+            and metadata.get("aggregate_reuse_key_sha256") != expected_reuse_key_sha256
+        )
+        or not isinstance(parent_calls, list)
+        or not isinstance(parent_documents, list)
+        or metadata.get("actual_document_model_call_count") != 0
+        or metadata.get("inherited_model_call_count") != len(parent_calls)
+        or metadata.get("reused_document_count") != len(parent_documents)
+        or metadata.get("reused_document_count") != len(envelope.document_results)
+        or envelope.model_calls != parent_calls
+    ):
+        raise ConflictError("Agent extraction reuse audit differs from its parent result")
+    return 0, len(parent_calls)
+
+
+def _expected_parent_extraction_reuse_key(
+    *,
+    parent_result: dict[str, Any],
+    parent_request: AgentReviewRequest,
+    parent_input_manifest_sha256: str,
+    child_runtime: Any,
+) -> str:
+    """Independently reproduce the Agent's content-addressed reuse key."""
+
+    try:
+        parent_runtime = ReleaseIdentityV3.model_validate(parent_result["runtime_release"])
+        results = parent_result["document_results"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ConflictError("parent extraction identity is unavailable") from exc
+    extraction_identity = {
+        "agent_code_snapshot_sha256": child_runtime.agent_code_snapshot_sha256,
+        "model_id": child_runtime.model_id,
+        "model_revision": child_runtime.model_revision,
+        "extraction_prompt_sha256": child_runtime.extraction_prompt_sha256,
+        "extraction_schema_sha256": child_runtime.extraction_schema_sha256,
+    }
+    if extraction_identity != {
+        "agent_code_snapshot_sha256": parent_runtime.agent_code_snapshot_sha256,
+        "model_id": parent_runtime.model_id,
+        "model_revision": parent_runtime.model_revision,
+        "extraction_prompt_sha256": parent_runtime.extraction_prompt_sha256,
+        "extraction_schema_sha256": parent_runtime.extraction_schema_sha256,
+    } or not isinstance(results, list):
+        raise ConflictError("parent extraction identity differs from child runtime")
+    by_document_id = {
+        item.get("document_id"): item
+        for item in results
+        if isinstance(item, dict) and isinstance(item.get("document_id"), str)
+    }
+    if len(by_document_id) != len(results):
+        raise ConflictError("parent extraction results are not uniquely bound")
+    manifest_documents = parent_request.to_agent_manifest_wire()["documents"]
+    documents: list[dict[str, str]] = []
+    for document, manifest_document in zip(
+        parent_request.documents,
+        manifest_documents,
+        strict=True,
+    ):
+        extraction = by_document_id.get(document.document_id)
+        if extraction is None:
+            raise ConflictError("parent extraction result is missing a request document")
+        documents.append(
+            {
+                "document_id": document.document_id,
+                # Agent V3 parses the text-only transport into its canonical
+                # document model before hashing.  That semantic shape includes
+                # the safe visual defaults (image_pages=[], pdf_pages=None),
+                # even though the HTTP wire intentionally omits those keys.
+                "input_sha256": canonical_digest(manifest_document),
+                "extraction_sha256": canonical_digest(extraction),
+            }
+        )
+    if len(documents) != len(results):
+        raise ConflictError("parent extraction results contain an unrequested document")
+    return canonical_digest(
+        {
+            "schema_version": "parent-extraction-reuse/v1",
+            "parent_result_sha256": parent_result.get("result_sha256"),
+            "parent_input_manifest_sha256": parent_input_manifest_sha256,
+            "extraction_identity": extraction_identity,
+            "documents": documents,
+        }
+    )
+
+
 def _warn_terminal_state_not_persisted(*, boundary: str, error: Exception) -> None:
     """Record only an exception type; never serialize DB errors or request content."""
 
@@ -884,7 +1016,11 @@ def _public_input_manifest_digest(
 def _sanitized_review_stage_trace(audit_trail: list[dict[str, Any]]) -> list[ReviewStageTraceEntry]:
     trace: list[ReviewStageTraceEntry] = []
     for raw in audit_trail:
-        if not isinstance(raw, dict) or raw.get("stage") not in MANDATORY_AGENT_STAGE_SEQUENCE:
+        if (
+            not isinstance(raw, dict)
+            or raw.get("stage") not in MANDATORY_AGENT_STAGE_SEQUENCE
+            or raw.get("event") == "parent_extraction_reused"
+        ):
             continue
         raw_metadata = raw.get("metadata")
         metadata: dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
@@ -1165,6 +1301,7 @@ class WorkbenchService:
         uat_adaptive_active: bool = False,
         evidence_profile: str = "unknown",
         expected_uat_capability_sha256: str | None = None,
+        local_uat_runtime_binding: LocalUatRuntimeBindingV1 | None = None,
         uat_evidence_trace_reader: UatEvidenceTraceReader | None = None,
     ) -> None:
         self.repository = repository
@@ -1200,6 +1337,7 @@ class WorkbenchService:
         ):
             raise ValueError("expected UAT capability identity must be a SHA-256 digest")
         self.expected_uat_capability_sha256 = expected_uat_capability_sha256
+        self.local_uat_runtime_binding = local_uat_runtime_binding
         if self.release_pin is not None and (
             self.service_pin is None or self.release_pin.service_pin() != self.service_pin
         ):
@@ -1231,6 +1369,23 @@ class WorkbenchService:
             or (
                 self.expected_uat_capability_sha256 is not None
                 and capability.capability_sha256 != self.expected_uat_capability_sha256
+            )
+            or (
+                self.local_uat_runtime_binding is not None
+                and (
+                    capability.capability_sha256 != self.local_uat_runtime_binding.capability_sha256
+                    or capability.agent_commit != self.local_uat_runtime_binding.agent.commit
+                    or capability.prompt_bundle_sha256
+                    != self.local_uat_runtime_binding.agent.prompt_bundle_sha256
+                    or capability.schema_bundle_sha256
+                    != self.local_uat_runtime_binding.agent.schema_bundle_sha256
+                    or capability.tool_registry_id
+                    != self.local_uat_runtime_binding.agent.tool_registry_id
+                    or capability.tool_registry_sha256
+                    != self.local_uat_runtime_binding.agent.tool_registry_sha256
+                    or capability.evidence_runtime_v3_sha256
+                    != self.local_uat_runtime_binding.evidence_runtime_v3_sha256
+                )
             )
         ):
             raise ValueError("Agent UAT capability is expired or differs from Backend mode")
@@ -3057,7 +3212,17 @@ class WorkbenchService:
             raise ConflictError("Agent result changed the immutable review policy input")
         if envelope.knowledge_snapshot_id != envelope.runtime_release.evidence_snapshot_id:
             raise ConflictError("Agent result snapshot differs from its runtime release identity")
-        if self.service_pin is not None and not self.service_pin.matches_common_runtime(
+        development_binding = (
+            self.local_uat_runtime_binding
+            if self.local_uat_runtime_binding is not None
+            and self.local_uat_runtime_binding.mode == "development"
+            else None
+        )
+        if development_binding is not None:
+            development_binding.require_active()
+            if not development_binding.matches_result_runtime(envelope.runtime_release):
+                raise ConflictError("Agent runtime differs from the local UAT binding")
+        elif self.service_pin is not None and not self.service_pin.matches_common_runtime(
             envelope.runtime_release
         ):
             raise ConflictError("Agent runtime differs from the Backend service pin")
@@ -3066,8 +3231,10 @@ class WorkbenchService:
                 raise ConflictError("Agent runtime release differs from the approved Backend pin")
             if envelope.knowledge_snapshot_id != self.release_pin.evidence_snapshot_id:
                 raise ConflictError("Agent result snapshot differs from the approved Backend pin")
-        elif self.service_pin is not None and not self.service_pin.matches_unreleased_runtime(
-            envelope.runtime_release
+        elif (
+            development_binding is None
+            and self.service_pin is not None
+            and not self.service_pin.matches_unreleased_runtime(envelope.runtime_release)
         ):
             raise ConflictError("Agent runtime must remain unreleased in candidate mode")
         execution = envelope.execution_status
@@ -3092,6 +3259,54 @@ class WorkbenchService:
             expected_prompt_sha256=envelope.runtime_release.narrative_prompt_sha256,
             expected_schema_sha256=envelope.runtime_release.narrative_schema_sha256,
             expected_task_id="customs_narrative_report",
+        )
+        parent_provider_result = (
+            self.repository.get_provider_result(job.org_id, job.parent_run_id)
+            if job.kind == "revision" and job.parent_run_id is not None
+            else None
+        )
+        expected_reuse_key_sha256: str | None = None
+        if any(
+            isinstance(item, dict) and item.get("event") == "parent_extraction_reused"
+            for item in envelope.audit_trail
+        ):
+            parent_run = (
+                self.repository.get_run(job.org_id, job.parent_run_id)
+                if job.parent_run_id is not None
+                else None
+            )
+            parent_job = (
+                self.repository.get_job(job.org_id, parent_run.job_id)
+                if parent_run is not None and parent_run.job_id is not None
+                else None
+            )
+            parent_input_sha256 = job.request.get("parent_input_manifest_sha256")
+            if (
+                parent_provider_result is None
+                or parent_job is None
+                or not isinstance(parent_input_sha256, str)
+            ):
+                raise ConflictError("parent extraction reuse inputs are unavailable")
+            parent_request = _agent_review_request_from_snapshot(
+                object_store=self.object_store,
+                review_run_id=job.parent_run_id,
+                case_id=parent_job.case_id,
+                snapshot=parent_job.request,
+            )
+            expected_reuse_key_sha256 = _expected_parent_extraction_reuse_key(
+                parent_result=parent_provider_result,
+                parent_request=parent_request,
+                parent_input_manifest_sha256=parent_input_sha256,
+                child_runtime=envelope.runtime_release,
+            )
+        (
+            actual_document_model_calls,
+            inherited_document_model_calls,
+        ) = _revision_document_model_call_counts(
+            envelope=envelope,
+            job=job,
+            parent_result=parent_provider_result,
+            expected_reuse_key_sha256=expected_reuse_key_sha256,
         )
         content_gate_reasons = _auto_completion_content_gate_reasons(
             envelope=envelope,
@@ -3333,6 +3548,8 @@ class WorkbenchService:
         detail["review_stage_trace"] = [item.model_dump(mode="json") for item in stage_trace]
         detail["model_execution_summary"] = model_execution_summary.model_dump(mode="json")
         detail["narrative_execution_summary"] = narrative_execution_summary.model_dump(mode="json")
+        detail["actual_document_model_calls"] = actual_document_model_calls
+        detail["inherited_document_model_calls"] = inherited_document_model_calls
         detail["evidence_provenance"] = evidence_provenance
         effective_narrative = envelope.narrative_report
         if (
