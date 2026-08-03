@@ -185,6 +185,23 @@ def _revision_experience(request: AgentRevisionRequest) -> dict[str, Any]:
     }
 
 
+def _presentation_verifier_context(claims, sections) -> dict[str, Any]:
+    claim_index = {claim.claim_id: claim for claim in claims}
+    return {
+        "candidate_statements": [
+            {
+                **statement,
+                "canonical_claims": [
+                    claim_index[claim_id].model_dump(mode="json")
+                    for claim_id in statement["source_claim_ids"]
+                ],
+            }
+            for section in sections
+            for statement in section["statements"]
+        ],
+    }
+
+
 def _experience_from_result(result: dict[str, Any]) -> dict[str, Any]:
     lock = validate_agent_experience_contract_bundle().lock
     result["runtime_release"]["evidence_runtime_v3_sha256"] = _EVIDENCE_RUNTIME_SHA
@@ -221,14 +238,7 @@ def _experience_from_result(result: dict[str, Any]) -> dict[str, Any]:
             "sections": sections,
         }
     )
-    verifier_context_sha256 = canonical_digest(
-        {
-            "canonical_claims": [item.model_dump(mode="json") for item in claims],
-            "candidate_statements": [
-                statement for section in sections for statement in section["statements"]
-            ],
-        }
-    )
+    verifier_context_sha256 = canonical_digest(_presentation_verifier_context(claims, sections))
     presentation_payload = {
         "schema_version": "1.0",
         "headline": headline,
@@ -462,9 +472,7 @@ def _answer(payload: dict[str, Any], *, answer_intent: str = "summary") -> dict[
                     "fixed_claim_assignments": fixed_claim_assignments,
                     "general_guidance": {},
                     "fixed_limitation_source": _CASE_LIMITATION,
-                    "fixed_used_context_message_ids": answer_content[
-                        "used_context_message_ids"
-                    ],
+                    "fixed_used_context_message_ids": answer_content["used_context_message_ids"],
                     "candidate_answer": {
                         "direct_answer": answer_content["direct_answer"],
                         "explanation": answer_content["explanation"],
@@ -1170,6 +1178,43 @@ def test_presentation_text_cannot_reuse_a_stale_verifier_digest() -> None:
         validate_presentation_against_result(typed)
 
 
+@pytest.mark.parametrize("context_kind", ["flat_claim_catalog", "wrong_statement_claim"])
+def test_presentation_rejects_a_verifier_context_without_exact_statement_binding(
+    context_kind: str,
+) -> None:
+    raw = deepcopy(_experience(_review_request()))
+    result = AgentReviewResultV3.model_validate(raw["canonical_result"])
+    claims = build_canonical_experience_claim_catalog(result)
+    sections = raw["user_presentation"]["sections"]
+    if context_kind == "flat_claim_catalog":
+        context = {
+            "canonical_claims": [claim.model_dump(mode="json") for claim in claims],
+            "candidate_statements": [
+                statement for section in sections for statement in section["statements"]
+            ],
+        }
+    else:
+        context = _presentation_verifier_context(claims, sections)
+        first = context["candidate_statements"][0]
+        bound_ids = set(first["source_claim_ids"])
+        wrong_claim = next(claim for claim in claims if claim.claim_id not in bound_ids)
+        first["canonical_claims"] = [wrong_claim.model_dump(mode="json")]
+    raw["user_presentation"]["verification_audit"]["verifier_context_sha256"] = canonical_digest(
+        context
+    )
+    presentation_payload = {
+        key: value
+        for key, value in raw["user_presentation"].items()
+        if key != "presentation_sha256"
+    }
+    raw["user_presentation"]["presentation_sha256"] = canonical_digest(presentation_payload)
+    envelope_payload = {key: value for key, value in raw.items() if key != "envelope_sha256"}
+    raw["envelope_sha256"] = canonical_digest(envelope_payload)
+
+    with pytest.raises(ValueError, match="Claude presentation audit"):
+        validate_presentation_against_result(ReviewExperienceEnvelopeV1.model_validate(raw))
+
+
 def test_presentation_action_event_is_exactly_bound_to_current_statement_ids() -> None:
     raw = deepcopy(_experience(_review_request()))
     expected_statement_ids = sorted(
@@ -1231,14 +1276,10 @@ def test_presentation_rejects_unsupported_factual_content_even_with_fresh_audit(
         AgentReviewResultV3.model_validate(raw["canonical_result"])
     )
     raw["user_presentation"]["verification_audit"]["verifier_context_sha256"] = canonical_digest(
-        {
-            "canonical_claims": [item.model_dump(mode="json") for item in canonical_claims],
-            "candidate_statements": [
-                item
-                for section in raw["user_presentation"]["sections"]
-                for item in section["statements"]
-            ],
-        }
+        _presentation_verifier_context(
+            canonical_claims,
+            raw["user_presentation"]["sections"],
+        )
     )
     raw["user_presentation"]["verification_audit"]["verified_content_sha256"] = canonical_digest(
         {

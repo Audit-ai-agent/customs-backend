@@ -6,6 +6,7 @@ from customs_backend.api import build_container
 from customs_backend.ports import (
     AgentPreExecutionRetriesExhaustedError,
     AgentPreExecutionRetryableError,
+    ConflictError,
     JobExecutionNotRunnableError,
 )
 from customs_backend.settings import get_settings
@@ -37,7 +38,7 @@ def execute_review_job(org_id: str, job_id: str, _outbox_id: str) -> None:
             "Agent admission dependency is not ready",
             delay=_settings.agent_pre_execution_retry_delay_seconds * 1_000,
         ) from exc
-    except (AgentPreExecutionRetriesExhaustedError, JobExecutionNotRunnableError):
+    except (AgentPreExecutionRetriesExhaustedError, ConflictError):
         # These states are already durable and terminal for automatic delivery.
         # Returning prevents Dramatiq from scheduling a meaningless retry.
         return

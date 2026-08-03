@@ -2011,16 +2011,24 @@ def _validate_presentation_audit(
         }
     )
     canonical_claims = build_canonical_experience_claim_catalog(envelope.canonical_result)
-    verifier_context_sha256 = canonical_digest(
-        {
-            "canonical_claims": [claim.model_dump(mode="json") for claim in canonical_claims],
+    claim_index = {claim.claim_id: claim for claim in canonical_claims}
+    try:
+        verifier_context = {
             "candidate_statements": [
-                statement.model_dump(mode="json")
+                {
+                    **statement.model_dump(mode="json"),
+                    "canonical_claims": [
+                        claim_index[claim_id].model_dump(mode="json")
+                        for claim_id in statement.source_claim_ids
+                    ],
+                }
                 for section in presentation.sections
                 for statement in section.statements
             ],
         }
-    )
+    except KeyError as exc:
+        raise ValueError("presentation verifier context cites an unknown claim") from exc
+    verifier_context_sha256 = canonical_digest(verifier_context)
     if (
         generation.task_id != _PRESENTATION_TASK_ID
         or generation.prompt_sha256 != prompts["presentation"]

@@ -404,6 +404,7 @@ def test_review_worker_delays_only_proven_pre_execution_retry_and_swallows_termi
     from customs_backend.ports import (
         AgentPreExecutionRetriesExhaustedError,
         AgentPreExecutionRetryableError,
+        ConflictError,
         JobExecutionNotRunnableError,
     )
 
@@ -437,6 +438,7 @@ def test_review_worker_delays_only_proven_pre_execution_retry_and_swallows_termi
         for terminal in (
             AgentPreExecutionRetriesExhaustedError("exhausted"),
             JobExecutionNotRunnableError("terminal"),
+            ConflictError("durable response_received_rejected"),
         ):
             service.error = terminal
             assert worker_module.execute_review_job.fn("org-a", "job-a", "outbox-a") is None
