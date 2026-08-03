@@ -357,7 +357,7 @@ def _experience_from_result(result: dict[str, Any]) -> dict[str, Any]:
     ).model_dump(mode="json")
 
 
-def _answer(payload: dict[str, Any]) -> dict[str, Any]:
+def _answer(payload: dict[str, Any], *, answer_intent: str = "summary") -> dict[str, Any]:
     lock = validate_agent_experience_contract_bundle().lock
     normalized_request = CaseConversationRequestV2.model_validate(payload).model_dump(mode="json")
     request_sha256 = canonical_digest(normalized_request)
@@ -457,7 +457,7 @@ def _answer(payload: dict[str, Any]) -> dict[str, Any]:
                     "question": normalized_request["question"],
                     "recent_turns": normalized_request["recent_turns"],
                     "answer_scope": "case_grounded",
-                    "answer_intent": "summary",
+                    "answer_intent": answer_intent,
                     "allowed_claims": [item.model_dump(mode="json") for item in claims[:100]],
                     "fixed_claim_assignments": fixed_claim_assignments,
                     "general_guidance": {},
@@ -1658,6 +1658,26 @@ def test_assistant_rejects_a_verifier_receipt_from_another_question_context() ->
             answer=AssistantAnswerV2.model_validate(raw),
             request=CaseConversationRequestV2.model_validate(request),
         )
+
+
+def test_assistant_accepts_an_intent_bound_reason_verifier_receipt() -> None:
+    result = _experience(_review_request())["canonical_result"]
+    request = {
+        "conversation_id": "conversation-reason-intent",
+        "parent_message_id": None,
+        "question": "이 심사 건이 사람 검토가 필요한 이유는 무엇입니까?",
+        "bound_result_sha256": result["result_sha256"],
+        "conversation_context_sha256": canonical_digest([]),
+        "recent_turns": [],
+        "review_result": result,
+        "locale": "ko-KR",
+    }
+    raw = _answer(request, answer_intent="reason")
+
+    validate_answer_against_context(
+        answer=AssistantAnswerV2.model_validate(raw),
+        request=CaseConversationRequestV2.model_validate(request),
+    )
 
 
 @pytest.mark.parametrize(

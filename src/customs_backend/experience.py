@@ -2520,7 +2520,7 @@ def validate_answer_against_context(
         allowed_answer_intents = ("general",)
     elif answer.answer_scope in material_scopes:
         allowed_answer_intents = tuple(
-            intent for intent in _ANSWER_INTENTS if intent != "general"
+            intent for intent in _ANSWER_INTENTS if intent not in {"clarification", "general"}
         )
     else:
         allowed_answer_intents = ("clarification",)
