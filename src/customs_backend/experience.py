@@ -2068,6 +2068,30 @@ def _validate_presentation_audit(
     )
     canonical_claims = build_canonical_experience_claim_catalog(envelope.canonical_result)
     claim_index = {claim.claim_id: claim for claim in canonical_claims}
+    observed_claim_ids: list[str] = []
+    exact_code_owned_presentation = True
+    for section in presentation.sections:
+        for statement in section.statements:
+            if any(claim_id not in claim_index for claim_id in statement.source_claim_ids):
+                exact_code_owned_presentation = False
+                continue
+            expected_text = " ".join(
+                unicodedata.normalize(
+                    "NFKC",
+                    " ".join(
+                        claim_index[claim_id].canonical_text
+                        for claim_id in statement.source_claim_ids
+                    ),
+                ).split()
+            )
+            actual_text = " ".join(unicodedata.normalize("NFKC", statement.text).split())
+            if actual_text != expected_text:
+                exact_code_owned_presentation = False
+            observed_claim_ids.extend(statement.source_claim_ids)
+    exact_code_owned_presentation = exact_code_owned_presentation and (
+        len(observed_claim_ids) == len(set(observed_claim_ids))
+        and set(observed_claim_ids) == set(claim_index)
+    )
     try:
         verifier_context = {
             "candidate_statements": [
@@ -2097,14 +2121,21 @@ def _validate_presentation_audit(
     ):
         raise ValueError("presentation generation or verification identity is not pinned")
     if generation.mode == "claude":
-        if (
+        common_claude_audit_invalid = (
             generation.model_id != envelope.capability_attestation.model_id
             or verification.status != "passed"
-            or verification.entailment_verifier != "claude"
-            or verification.verifier_model_id != envelope.capability_attestation.model_id
-            or verification.verifier_context_sha256 != verifier_context_sha256
             or verification.reason_codes
-        ):
+        )
+        claude_verifier_invalid = verification.entailment_verifier == "claude" and (
+            verification.verifier_model_id != envelope.capability_attestation.model_id
+            or verification.verifier_context_sha256 != verifier_context_sha256
+        )
+        exact_projection_invalid = verification.entailment_verifier == "not_run" and (
+            not exact_code_owned_presentation
+            or verification.verifier_model_id is not None
+            or verification.verifier_context_sha256 is not None
+        )
+        if common_claude_audit_invalid or claude_verifier_invalid or exact_projection_invalid:
             raise ValueError("Claude presentation audit is incomplete")
     elif (
         generation.model_id is not None

@@ -307,6 +307,68 @@ def _presentation_verifier_context(claims, sections) -> dict[str, Any]:
     }
 
 
+def _refresh_presentation_integrity(raw: dict[str, Any]) -> None:
+    presentation = raw["user_presentation"]
+    for section in presentation["sections"]:
+        for statement in section["statements"]:
+            statement_payload = {
+                key: value for key, value in statement.items() if key != "statement_id"
+            }
+            statement["statement_id"] = f"statement_{canonical_digest(statement_payload)}"
+    verification = presentation["verification_audit"]
+    verification["checked_statement_count"] = sum(
+        len(section["statements"]) for section in presentation["sections"]
+    )
+    verification["verified_content_sha256"] = canonical_digest(
+        {
+            "headline": presentation["headline"],
+            "sections": presentation["sections"],
+        }
+    )
+    explanation_event = next(
+        event
+        for event in raw["user_action_events"]
+        if event["action_code"] == "explanation.compose/v2"
+    )
+    explanation_event["source_reference_ids"] = sorted(
+        {
+            statement["statement_id"]
+            for section in presentation["sections"]
+            for statement in section["statements"]
+        }
+    )[:100]
+    event_payload = {key: value for key, value in explanation_event.items() if key != "event_id"}
+    explanation_event["event_id"] = f"user_action_{canonical_digest(event_payload)}"
+    presentation_payload = {
+        key: value for key, value in presentation.items() if key != "presentation_sha256"
+    }
+    presentation["presentation_sha256"] = canonical_digest(presentation_payload)
+    envelope_payload = {key: value for key, value in raw.items() if key != "envelope_sha256"}
+    raw["envelope_sha256"] = canonical_digest(envelope_payload)
+
+
+def _as_exact_code_owned_presentation(raw: dict[str, Any], *, attempt_count: int = 1) -> None:
+    result = AgentReviewResultV3.model_validate(raw["canonical_result"])
+    claims = build_canonical_experience_claim_catalog(result)
+    presentation = raw["user_presentation"]
+    presentation["sections"] = [
+        section.model_dump(mode="json")
+        for section in build_controlled_presentation_sections(claims)
+    ]
+    presentation["generation_audit"]["attempt_count"] = attempt_count
+    presentation["verification_audit"].update(
+        {
+            "status": "passed",
+            "deterministic_checks_passed": True,
+            "entailment_verifier": "not_run",
+            "verifier_model_id": None,
+            "verifier_context_sha256": None,
+            "reason_codes": [],
+        }
+    )
+    _refresh_presentation_integrity(raw)
+
+
 def _experience_from_result(result: dict[str, Any]) -> dict[str, Any]:
     lock = validate_agent_experience_contract_bundle().lock
     result["runtime_release"]["evidence_runtime_v3_sha256"] = _EVIDENCE_RUNTIME_SHA
@@ -1410,6 +1472,47 @@ def test_presentation_action_event_is_exactly_bound_to_current_statement_ids() -
     raw["envelope_sha256"] = canonical_digest(envelope_payload)
     with pytest.raises(ValueError, match="user action copy"):
         validate_presentation_against_result(ReviewExperienceEnvelopeV1.model_validate(raw))
+
+
+@pytest.mark.parametrize("attempt_count", [1, 2])
+def test_exact_code_owned_claude_presentation_can_skip_entailment_verifier(
+    attempt_count: int,
+) -> None:
+    raw = deepcopy(_experience(_review_request()))
+    _as_exact_code_owned_presentation(raw, attempt_count=attempt_count)
+
+    envelope = ReviewExperienceEnvelopeV1.model_validate(raw)
+
+    assert envelope.user_presentation.generation_audit.mode == "claude"
+    assert envelope.user_presentation.verification_audit.status == "passed"
+    assert envelope.user_presentation.verification_audit.entailment_verifier == "not_run"
+    validate_presentation_against_result(envelope)
+
+
+def test_not_run_entailment_rejects_noncanonical_claude_prose() -> None:
+    raw = deepcopy(_experience(_review_request()))
+    _as_exact_code_owned_presentation(raw)
+    statement = raw["user_presentation"]["sections"][0]["statements"][0]
+    statement["text"] += " 담당자는 연결된 근거를 함께 확인해야 합니다."
+    _refresh_presentation_integrity(raw)
+
+    envelope = ReviewExperienceEnvelopeV1.model_validate(raw)
+    with pytest.raises(ValueError, match="Claude presentation audit is incomplete"):
+        validate_presentation_against_result(envelope)
+
+
+def test_not_run_entailment_rejects_incomplete_canonical_projection() -> None:
+    raw = deepcopy(_experience(_review_request()))
+    _as_exact_code_owned_presentation(raw)
+    section = next(
+        item for item in raw["user_presentation"]["sections"] if len(item["statements"]) > 1
+    )
+    section["statements"].pop()
+    _refresh_presentation_integrity(raw)
+
+    envelope = ReviewExperienceEnvelopeV1.model_validate(raw)
+    with pytest.raises(ValueError, match="Claude presentation audit is incomplete"):
+        validate_presentation_against_result(envelope)
 
 
 def test_experience_pins_distinct_production_and_uat_tool_registries() -> None:
