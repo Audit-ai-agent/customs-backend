@@ -3284,6 +3284,7 @@ class WorkbenchService:
             if (
                 parent_provider_result is None
                 or parent_job is None
+                or job.parent_run_id is None
                 or not isinstance(parent_input_sha256, str)
             ):
                 raise ConflictError("parent extraction reuse inputs are unavailable")

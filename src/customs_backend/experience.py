@@ -2442,6 +2442,7 @@ def validate_answer_against_context(
         answer_claims = []
     answer_claims = answer_claims[:100]
     guidance: dict[str, str] = {}
+    allowed_answer_intents: tuple[str, ...]
     if answer.answer_scope == "general_customs_guidance":
         catalog = provider_meaning_catalog()
         try:
