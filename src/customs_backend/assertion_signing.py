@@ -667,7 +667,10 @@ def _assert_local_uat_external_path(path: str | Path) -> Path:
     except OSError:
         raise AssertionSigningConfigurationError("local UAT fixture is unavailable") from None
     parts = tuple(part.casefold() for part in resolved.parts)
-    in_workspace_secrets = "_secrets" in parts
+    in_workspace_secrets = any(
+        parts[index : index + 2] == ("_local", "secrets")
+        for index in range(max(0, len(parts) - 1))
+    )
     in_runtime_secrets = any(
         parts[index : index + 2] == ("run", "secrets") for index in range(max(0, len(parts) - 1))
     )

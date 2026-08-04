@@ -456,7 +456,7 @@ class JobRecord(BaseModel):
     lease_expires_at: datetime | None = None
     attempt_count: int = Field(default=0, ge=0)
     agent_call_state: AgentCallState = AgentCallState.not_started
-    agent_call_endpoint: Literal["review", "revision"] | None = None
+    agent_call_endpoint: Literal["review", "revision", "review_experience"] | None = None
     agent_call_request_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     agent_call_started_at: datetime | None = None
     delivery_reconciled_by: str | None = None
@@ -934,6 +934,7 @@ class AgentReviewResultV3(BaseModel):
             if tool_name not in {
                 primary_tool_by_gap_type[gap.gap_type],
                 "explanation.compose/v1",
+                "explanation.compose/v2",
             }:
                 raise ValueError("Agent Tool is not allowed to investigate its bound gap type")
             if (
@@ -1068,7 +1069,7 @@ class AgentReviewResultV3(BaseModel):
         # Trace reasons explain why an action was planned. Observation reasons
         # are execution outcomes, so those two reason codes intentionally differ.
         if any(
-            item.get("tool_name") != "explanation.compose/v1"
+            item.get("tool_name") not in {"explanation.compose/v1", "explanation.compose/v2"}
             and (
                 item.get("provider") != "deterministic_policy"
                 or item.get("model_id") is not None
@@ -1080,7 +1081,10 @@ class AgentReviewResultV3(BaseModel):
         ):
             raise ValueError("non-explanation Tool traces cannot claim direct model execution")
         for item in trace_by_id.values():
-            if item.get("tool_name") != "explanation.compose/v1":
+            if item.get("tool_name") not in {
+                "explanation.compose/v1",
+                "explanation.compose/v2",
+            }:
                 continue
             narrative_call = self.narrative_report.get("model_call")
             if item.get("provider") == "anthropic":
@@ -1331,6 +1335,25 @@ class ReviewRunRecord(BaseModel):
         default_factory=list,
         max_length=MAX_REVIEW_STAGE_TRACE_ENTRIES,
     )
+    evidence_profile: str = Field(default="unknown", min_length=1, max_length=128)
+    evidence_data_source: Literal[
+        "UNATTESTED",
+        "ACTUAL_POSTGRESQL_QDRANT_NEO4J_READ_ONLY",
+    ] = "UNATTESTED"
+    evidence_request_id: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+    )
+    observed_retrieval_methods: list[Literal["exact_hs", "dense", "bm25", "graph"]] = Field(
+        default_factory=list, max_length=4
+    )
+    attempted_retrieval_methods: list[Literal["exact_hs", "dense", "bm25", "graph"]] = Field(
+        default_factory=list, max_length=4
+    )
+    successful_retrieval_methods: list[Literal["exact_hs", "dense", "bm25", "graph"]] = Field(
+        default_factory=list, max_length=4
+    )
+    retrieval_execution_attested: bool = False
     result_detail: dict[str, Any]
     release_identity: dict[str, Any] = Field(default_factory=dict)
     auto_completion_profile: AutoCompletionProfileBinding = Field(
@@ -1341,6 +1364,31 @@ class ReviewRunRecord(BaseModel):
 
     @model_validator(mode="after")
     def immutable_input_manifest_is_bound(self) -> "ReviewRunRecord":
+        retrieval_order = {"exact_hs": 0, "dense": 1, "bm25": 2, "graph": 3}
+        for methods in (
+            self.observed_retrieval_methods,
+            self.attempted_retrieval_methods,
+            self.successful_retrieval_methods,
+        ):
+            if len(methods) != len(set(methods)) or methods != sorted(
+                methods, key=retrieval_order.__getitem__
+            ):
+                raise ValueError("retrieval methods must be unique and canonically ordered")
+        if not set(self.successful_retrieval_methods).issubset(self.attempted_retrieval_methods):
+            raise ValueError("successful retrieval methods must have been attempted")
+        if self.retrieval_execution_attested:
+            if (
+                self.evidence_data_source != "ACTUAL_POSTGRESQL_QDRANT_NEO4J_READ_ONLY"
+                or self.evidence_request_id is None
+                or not self.attempted_retrieval_methods
+            ):
+                raise ValueError("retrieval execution attestation is incomplete")
+        elif (
+            self.evidence_data_source != "UNATTESTED"
+            or self.attempted_retrieval_methods
+            or self.successful_retrieval_methods
+        ):
+            raise ValueError("unattested retrieval cannot advertise Store execution")
         model_execution_summary = ModelExecutionSummary.model_validate(
             self.result_detail.get("model_execution_summary")
         )
@@ -1389,6 +1437,13 @@ class ReviewRunRecord(BaseModel):
                 "review_stage_trace": [
                     item.model_dump(mode="json") for item in self.review_stage_trace
                 ],
+                "evidence_profile": self.evidence_profile,
+                "evidence_data_source": self.evidence_data_source,
+                "evidence_request_id": self.evidence_request_id,
+                "observed_retrieval_methods": self.observed_retrieval_methods,
+                "attempted_retrieval_methods": self.attempted_retrieval_methods,
+                "successful_retrieval_methods": self.successful_retrieval_methods,
+                "retrieval_execution_attested": self.retrieval_execution_attested,
                 "auto_completion_profile": self.auto_completion_profile.model_dump(mode="json"),
                 "model_execution_summary": model_execution_summary.model_dump(mode="json"),
                 "narrative_execution_summary": narrative_execution_summary.model_dump(mode="json"),
@@ -1703,8 +1758,19 @@ class StageEvent(BaseModel):
         "agent_analysis",
         "result_validation",
         "persistence",
+        "request_validation",
         "document_analysis",
         "normalization",
+        "document_pairing",
+        "cross_validation",
+        "adaptive_investigation",
+        "evidence_retrieval",
+        "compliance_review",
+        "report_composition",
+        "grounding_verification",
+        "conversation_binding",
+        "answer_planning",
+        "answer_composition",
         "validation",
         "evidence",
         "compliance",
@@ -1712,7 +1778,7 @@ class StageEvent(BaseModel):
         "completed",
         "failed",
     ]
-    state: Literal["started", "progress", "completed", "failed"]
+    state: Literal["started", "progress", "completed", "skipped", "failed"]
     message_code: str
     occurred_at: datetime
     detail: dict[str, Any] = Field(default_factory=dict)

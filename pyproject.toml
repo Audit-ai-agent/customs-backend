@@ -67,8 +67,10 @@ include = ["customs_backend*", "integration*", "operational_db*"]
 integration = ["agent_webui.html", "agent_contract.json"]
 customs_backend = [
   "agent_contract.lock.json",
+  "agent_experience_contract.lock.json",
   "domain_reviewer_trust_store.json",
   "contracts/agent/v3/*.schema.json",
+  "contracts/agent/service/v3/*.json",
 ]
 
 [tool.pytest.ini_options]

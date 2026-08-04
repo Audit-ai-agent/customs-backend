@@ -11,6 +11,19 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 _MAX_TRACE_RECORD_BYTES = 32 * 1024
 _MAX_TRACE_FILE_BYTES = _MAX_TRACE_RECORD_BYTES * 100
 _MAX_TRACE_RECORDS = 100
+_TRACE_FILENAME = "three-law-scenario-eval-trace.jsonl"
+_WINDOWS_CANONICAL_TRACE_SUFFIX = (
+    "_local",
+    "state",
+    "local-user-uat",
+    _TRACE_FILENAME,
+)
+_CONTAINER_CANONICAL_TRACE_PARTS = (
+    "/",
+    "run",
+    "local-user-uat",
+    _TRACE_FILENAME,
+)
 
 
 class UatEvidenceTraceError(RuntimeError):
@@ -28,14 +41,17 @@ class _RawRetrievalStage(BaseModel):
     duration_ms: int = Field(ge=0, le=300_000)
 
     @model_validator(mode="after")
-    def successful_stage_is_consistent(self) -> "_RawRetrievalStage":
-        if (
-            not self.attempted
-            or not self.succeeded
-            or self.attempt_count < 1
-            or self.top_k_result_count > self.result_count
-        ):
+    def stage_observation_is_consistent(self) -> "_RawRetrievalStage":
+        if self.attempted != (self.attempt_count > 0):
+            raise ValueError("scenario retrieval stage attempt state is inconsistent")
+        if self.succeeded and not self.attempted:
+            raise ValueError("scenario retrieval stage success state is inconsistent")
+        if self.top_k_result_count > self.result_count:
             raise ValueError("scenario retrieval stage is incomplete")
+        if not self.attempted and (
+            self.result_count != 0 or self.top_k_result_count != 0 or self.duration_ms != 0
+        ):
+            raise ValueError("unattempted scenario retrieval stage contains observations")
         return self
 
 
@@ -45,6 +61,10 @@ class _RawRetrievalStages(BaseModel):
     structured: _RawRetrievalStage
     dense: _RawRetrievalStage
     bm25: _RawRetrievalStage
+    # The scenario-eval provider requires BGE reranking after Dense/BM25
+    # fusion. This stage is validated at the Backend trust boundary while the
+    # existing browser-safe V1 projection remains wire-compatible.
+    rerank: _RawRetrievalStage
     graph: _RawRetrievalStage
 
 
@@ -79,7 +99,7 @@ class _RawProviderIdentity(BaseModel):
 class _RawScenarioTrace(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal["three-law-evidence-v3-scenario-eval-trace/v1"]
+    schema_version: Literal["three-law-evidence-v3-scenario-eval-trace/v2"]
     request_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
     http_status_code: Literal[200]
     evidence_profile: Literal["preserved-3law-v3-scenario-eval"]
@@ -129,19 +149,24 @@ def _assert_external_trace_path(path: str | Path) -> Path:
         resolved = unresolved.resolve(strict=True)
     except OSError:
         raise UatEvidenceTraceError("local UAT Evidence trace is unavailable") from None
-    parts = tuple(part.casefold() for part in resolved.parts)
+    parts = resolved.parts
     if not resolved.is_file() or not _is_allowed_trace_path_parts(parts):
         raise UatEvidenceTraceError("local UAT Evidence trace path is invalid")
     return resolved
 
 
 def _is_allowed_trace_path_parts(parts: tuple[str, ...]) -> bool:
-    in_artifact_runtime = any(
-        parts[index : index + 3] == ("_artifacts", "runtime", "local-user-uat")
-        for index in range(max(0, len(parts) - 2))
+    has_windows_drive_root = (
+        bool(parts) and len(parts[0]) == 3 and parts[0][0].isalpha() and parts[0][1:] == ":\\"
     )
-    in_runtime_run = len(parts) > 1 and parts[1] == "run"
-    return in_artifact_runtime or in_runtime_run
+    if has_windows_drive_root:
+        normalized = tuple(part.casefold() for part in parts)
+        return (
+            len(normalized) >= len(_WINDOWS_CANONICAL_TRACE_SUFFIX)
+            and normalized[-len(_WINDOWS_CANONICAL_TRACE_SUFFIX) :]
+            == _WINDOWS_CANONICAL_TRACE_SUFFIX
+        )
+    return parts == _CONTAINER_CANONICAL_TRACE_PARTS
 
 
 def _strict_trace_records(path: Path) -> list[_RawScenarioTrace]:
@@ -219,6 +244,16 @@ class UatEvidenceTraceReader:
             != self._expected_runtime_v3_sha256
         ):
             raise UatEvidenceTraceError("local UAT Evidence trace runtime identity differs")
+
+        # A failed observation is still a structurally valid audit record. Only
+        # the request selected for this Run must prove every required stage.
+        for stage_name in ("structured", "dense", "bm25", "rerank", "graph"):
+            stage_observation = getattr(record.retrieval, stage_name)
+            if not stage_observation.attempted or not stage_observation.succeeded:
+                raise UatEvidenceTraceError(
+                    "local UAT Evidence trace selected request has an unsuccessful "
+                    f"{stage_name} stage"
+                )
 
         def stage(value: _RawRetrievalStage) -> UatEvidenceRetrievalStageResponse:
             return UatEvidenceRetrievalStageResponse(

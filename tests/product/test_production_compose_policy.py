@@ -208,14 +208,14 @@ def test_environment_example_pins_the_reviewed_data_provider_build() -> None:
 def test_environment_example_pins_the_final_agent_candidate_contracts() -> None:
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
     for expected in (
-        "CUSTOMS_BACKEND_AGENT_EXPECTED_BUILD_SHA=a021b633b7ba3f4531b1b4facc6f2b0860df3293",
+        "CUSTOMS_BACKEND_AGENT_EXPECTED_BUILD_SHA=445647f9739548c451c049346cc505481e2df774",
         "CUSTOMS_BACKEND_AGENT_EXPECTED_WHEEL_SHA256="
-        "086a21c351c493ca9a4892a0cd2b43abdec5642ac247876e5d66537d68af736f",
+        "1be35669f6149eb67a11facc2047edddfb7ec734d1c672554c95a60bcdc545be",
         "CUSTOMS_BACKEND_AGENT_EXPECTED_SOURCE_SNAPSHOT_SHA256="
-        "fd4bda9473d29874ab4e7cf95009d1aeca721ca532bc49c68538ce85fbd16f66",
+        "c087df73216ad140ff88cc7cf73ea7595fb1fca8d9e85970e35db3cd93d417c3",
         "CUSTOMS_BACKEND_AGENT_EXPECTED_PACKAGE_VERSION=0.3.0",
         "CUSTOMS_BACKEND_AGENT_EXPECTED_CODE_SNAPSHOT_SHA256="
-        "689180deb579488e821b18bd11f86d3342bf82f786616dfefdd0a2b8b95ca0b8",
+        "3549a52300807223c9d32fc70fa42729eb06d20964ada162176a6b757f62f1d5",
         "CUSTOMS_BACKEND_AGENT_EXPECTED_MODEL_ID=claude-sonnet-5",
         "CUSTOMS_BACKEND_AGENT_EXPECTED_EXTRACTION_PROMPT_SHA256="
         "93c7ba900a631f82473c9d480360404c2f93442ecfd2e48a110a1519f0262cb5",
@@ -224,15 +224,15 @@ def test_environment_example_pins_the_final_agent_candidate_contracts() -> None:
         "CUSTOMS_BACKEND_AGENT_EXPECTED_COORDINATOR_PROMPT_SHA256="
         "2efae54814785bf1c55520214fb837c0d1de3f3a5df6764b38bd441f19d05c3e",
         "CUSTOMS_BACKEND_AGENT_EXPECTED_NARRATIVE_PROMPT_SHA256="
-        "80ab98e927c4cb8fcd02f69b18ae8b9539f074b7cdd03179ca370d5fbb0c24ff",
+        "19c86ef071ceaa22e52c009f956e273532d4f2646a53d9fbbaf9b0bdeec0e742",
         "CUSTOMS_BACKEND_AGENT_EXPECTED_CHAT_PROMPT_SHA256="
-        "6a3316007ccd1c6a680e44aa74df99829b308cfe16b815943111896a533aafe3",
+        "a59aa371794647f7edab3f108dbe5ad8daeb548ce0b54cce690a31568d850ada",
         "CUSTOMS_BACKEND_AGENT_EXPECTED_COORDINATOR_SCHEMA_SHA256="
-        "9f4543effee85439f7b3a867bd3fc8ac483ed1ece6c0d4019b5f9dd4245b6ca0",
+        "4881321cd51185d301afda78be6679f5bb0c407e8e9a46699f33432de8b594dd",
         "CUSTOMS_BACKEND_AGENT_EXPECTED_NARRATIVE_SCHEMA_SHA256="
-        "9a68c84229e0e7adc2a30b955f57e60bea758ed6ce0827d968a4fe1ab33f481e",
+        "6b4ec0e2b26926e581643fa2005f5e42baaf9e1ce57a9740d51dcfd0bcce58fd",
         "CUSTOMS_BACKEND_AGENT_EXPECTED_CHAT_SCHEMA_SHA256="
-        "0fdc73c91049fa1c414ed54d7e52200a581a01c14cfd0986be97ef53bc466832",
+        "683b7e7340d7c9b2f5406a54e71b903301895ee5ec246542c5ceecc4c8bbceb0",
         "CUSTOMS_BACKEND_AGENT_EXPECTED_POLICY_ID=bounded-adaptive-customs-review/v1",
         "CUSTOMS_BACKEND_AGENT_EXPECTED_TOOL_REGISTRY_ID=customs-agent-tools/text-v1",
         "CUSTOMS_BACKEND_AGENT_EXPECTED_ASSERTION_TRUST_STORE_RELEASE_STATE=unreleased",
@@ -250,8 +250,8 @@ def test_readme_distinguishes_current_agent_pin_from_legacy_pilot() -> None:
     ]
     legacy_section = readme.split("legacy/historical pilot 전용", 1)[1]
     assert "customs-ai-agent==0.3.0" in current_section
-    assert "a021b633b7ba3f4531b1b4facc6f2b0860df3293" in current_section
-    assert "086a21c351c493ca9a4892a0cd2b43abdec5642ac247876e5d66537d68af736f" in (current_section)
+    assert "445647f9739548c451c049346cc505481e2df774" in current_section
+    assert "1be35669f6149eb67a11facc2047edddfb7ec734d1c672554c95a60bcdc545be" in (current_section)
     assert "customs-ai-agent==0.1.0" not in current_section
     assert "Agent 0.1.0" in legacy_section
 

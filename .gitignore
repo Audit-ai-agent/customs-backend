@@ -5,8 +5,15 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.hypothesis/
+.nox/
+.tox/
+.cache/
+.uv-cache/
 .coverage
+.coverage.*
 coverage.xml
+coverage/
 htmlcov/
 
 # Environments and build products
@@ -15,6 +22,7 @@ venv/
 dist/
 build/
 *.whl
+site-packages/
 
 # Local configuration and secrets
 .env
@@ -28,6 +36,9 @@ outputs/
 artifacts/
 *.log
 *.junit.xml
+.ci-*.xml
+*-trivy.json
+*.cdx.json
 
 # Editors and OS
 .idea/

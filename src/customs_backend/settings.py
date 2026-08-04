@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -129,6 +130,21 @@ class Settings(BaseSettings):
     job_max_attempts: int = Field(default=3, ge=1, le=3)
     agent_pre_execution_retry_delay_seconds: int = Field(default=60, ge=60, le=300)
     outbox_lease_seconds: int = Field(default=30, ge=5, le=300)
+    enhanced_agent_experience: bool = False
+    uat_adaptive_active: bool = False
+    uat_expected_capability_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9]{64}$",
+    )
+    uat_expected_capability_file_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9]{64}$",
+    )
+    uat_runtime_binding_path: str | None = Field(default=None, repr=False)
+    uat_runtime_binding_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9]{64}$",
+    )
     uat_evidence_profile: Literal[
         "synthetic-v3",
         "preserved-3law-v3-diagnostic",
@@ -188,6 +204,20 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def production_is_fail_closed(self) -> "Settings":
+        runtime_binding_values = {
+            "uat_runtime_binding_path": self.uat_runtime_binding_path,
+            "uat_runtime_binding_sha256": self.uat_runtime_binding_sha256,
+        }
+        if any(value is not None for value in runtime_binding_values.values()) and not all(
+            value is not None for value in runtime_binding_values.values()
+        ):
+            raise ValueError(
+                "local UAT runtime binding path and SHA-256 must be configured together"
+            )
+        if any(value is not None for value in runtime_binding_values.values()) and (
+            self.environment != "local_uat" or self.process_role != "runtime"
+        ):
+            raise ValueError("local UAT runtime binding is restricted to local_uat runtime")
         local_uat_assertion_fixture = {
             "uat_assertion_signing_key_registry_path": (
                 self.uat_assertion_signing_key_registry_path
@@ -200,6 +230,37 @@ class Settings(BaseSettings):
         configured_local_uat_assertion_fixture = sorted(
             name for name, value in local_uat_assertion_fixture.items() if value is not None
         )
+        if self.enhanced_agent_experience or self.uat_adaptive_active:
+            if self.environment != "local_uat" or self.process_role != "runtime":
+                raise ValueError("enhanced Agent experience is restricted to local UAT runtime")
+            loopback_hosts = {"127.0.0.1", "::1"}
+            if (
+                urlsplit(self.public_base_url).hostname not in loopback_hosts
+                or urlsplit(self.agent_base_url).hostname not in loopback_hosts
+            ):
+                raise ValueError("enhanced Agent experience requires literal loopback endpoints")
+            if (
+                self.uat_expected_capability_sha256 is None
+                or self.uat_expected_capability_file_sha256 is None
+            ):
+                raise ValueError(
+                    "enhanced Agent experience requires exact UAT capability identities"
+                )
+        elif (
+            self.uat_expected_capability_sha256 is not None
+            or self.uat_expected_capability_file_sha256 is not None
+        ):
+            raise ValueError("UAT capability identities require enhanced Agent experience")
+        if self.uat_adaptive_active:
+            if not self.enhanced_agent_experience:
+                raise ValueError("UAT adaptive mode requires enhanced Agent experience")
+            if (
+                self.uat_evidence_profile != "preserved-3law-v3-scenario-eval"
+                or self.uat_planner_mode != "diagnostic_active"
+            ):
+                raise ValueError(
+                    "UAT adaptive mode requires scenario-eval Evidence and diagnostic_active"
+                )
         if (
             self.environment != "local_uat" or self.process_role != "runtime"
         ) and self.uat_evidence_trace_path is not None:

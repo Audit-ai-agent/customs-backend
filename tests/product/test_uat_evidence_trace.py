@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+import customs_backend.uat_evidence_trace as trace_module
 from customs_backend.uat_evidence_trace import (
     UatEvidenceTraceError,
     UatEvidenceTraceReader,
@@ -20,7 +21,7 @@ _REQUEST_ID = "run-1-retrieve-0"
 
 def _trace_record() -> dict[str, Any]:
     return {
-        "schema_version": "three-law-evidence-v3-scenario-eval-trace/v1",
+        "schema_version": "three-law-evidence-v3-scenario-eval-trace/v2",
         "request_id": _REQUEST_ID,
         "http_status_code": 200,
         "evidence_profile": "preserved-3law-v3-scenario-eval",
@@ -68,6 +69,14 @@ def _trace_record() -> dict[str, Any]:
                 "top_k_result_count": 1,
                 "duration_ms": 13,
             },
+            "rerank": {
+                "attempted": True,
+                "succeeded": True,
+                "attempt_count": 1,
+                "result_count": 20,
+                "top_k_result_count": 2,
+                "duration_ms": 17,
+            },
             "graph": {
                 "attempted": True,
                 "succeeded": True,
@@ -81,9 +90,7 @@ def _trace_record() -> dict[str, Any]:
 
 
 def _write_trace(root: Path, records: list[dict[str, Any]]) -> Path:
-    path = (
-        root / "_artifacts" / "runtime" / "local-user-uat" / "three-law-scenario-eval-trace.jsonl"
-    )
+    path = root / "_local" / "state" / "local-user-uat" / "three-law-scenario-eval-trace.jsonl"
     path.parent.mkdir(parents=True)
     path.write_text(
         "".join(
@@ -95,8 +102,22 @@ def _write_trace(root: Path, records: list[dict[str, Any]]) -> Path:
     return path
 
 
+@pytest.fixture
+def isolated_trace_content_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep JSONL contract tests independent from the deployment filesystem layout."""
+
+    def assert_regular_test_file(path: str | Path) -> Path:
+        resolved = Path(path).resolve(strict=True)
+        if not resolved.is_file():
+            raise UatEvidenceTraceError("local UAT Evidence trace path is invalid")
+        return resolved
+
+    monkeypatch.setattr(trace_module, "_assert_external_trace_path", assert_regular_test_file)
+
+
 def test_trace_reader_returns_only_the_run_bound_safe_stage_projection(
     tmp_path: Path,
+    isolated_trace_content_guard: None,
 ) -> None:
     path = _write_trace(tmp_path, [_trace_record()])
     reader = UatEvidenceTraceReader(
@@ -157,8 +178,9 @@ def test_trace_reader_returns_only_the_run_bound_safe_stage_projection(
         assert forbidden not in serialized
 
 
-def test_trace_reader_rejects_duplicate_or_failed_request_records(
+def test_trace_reader_rejects_duplicate_or_selected_failed_request_records(
     tmp_path: Path,
+    isolated_trace_content_guard: None,
 ) -> None:
     duplicate_path = _write_trace(tmp_path / "duplicate", [_trace_record(), _trace_record()])
     duplicate_reader = UatEvidenceTraceReader(
@@ -174,15 +196,64 @@ def test_trace_reader_rejects_duplicate_or_failed_request_records(
     failed = _trace_record()
     failed["retrieval"]["graph"]["succeeded"] = False
     failed_path = _write_trace(tmp_path / "failed", [failed])
+    failed_reader = UatEvidenceTraceReader(
+        failed_path,
+        expected_runtime_v3_sha256=_RUNTIME_SHA256,
+    )
+    with pytest.raises(UatEvidenceTraceError, match="unsuccessful graph stage"):
+        failed_reader.projection(
+            request_id=_REQUEST_ID,
+            knowledge_snapshot_id=_SNAPSHOT,
+        )
+
+
+def test_trace_reader_ignores_an_unrelated_failed_request_stage(
+    tmp_path: Path,
+    isolated_trace_content_guard: None,
+) -> None:
+    failed = _trace_record()
+    failed["request_id"] = "prior-run-retrieve-0"
+    failed["retrieval"]["graph"]["succeeded"] = False
+    current = _trace_record()
+    path = _write_trace(tmp_path, [failed, current])
+    reader = UatEvidenceTraceReader(
+        path,
+        expected_runtime_v3_sha256=_RUNTIME_SHA256,
+    )
+
+    projection = reader.projection(
+        request_id=_REQUEST_ID,
+        knowledge_snapshot_id=_SNAPSHOT,
+    )
+
+    assert projection.request_id == _REQUEST_ID
+    assert projection.retrieval.graph.succeeded is True
+
+
+def test_trace_reader_rejects_structurally_inconsistent_stage_observations(
+    tmp_path: Path,
+    isolated_trace_content_guard: None,
+) -> None:
+    inconsistent = _trace_record()
+    inconsistent["retrieval"]["graph"].update(
+        {
+            "attempted": False,
+            "succeeded": False,
+            "attempt_count": 1,
+        }
+    )
+    path = _write_trace(tmp_path, [inconsistent])
+
     with pytest.raises(UatEvidenceTraceError, match="record is invalid"):
         UatEvidenceTraceReader(
-            failed_path,
+            path,
             expected_runtime_v3_sha256=_RUNTIME_SHA256,
         )
 
 
-def test_trace_reader_rejects_identity_drift_extra_fields_and_unsafe_paths(
+def test_trace_reader_rejects_identity_drift_and_extra_fields(
     tmp_path: Path,
+    isolated_trace_content_guard: None,
 ) -> None:
     path = _write_trace(tmp_path / "drift", [_trace_record()])
     reader = UatEvidenceTraceReader(
@@ -216,16 +287,11 @@ def test_trace_reader_rejects_identity_drift_extra_fields_and_unsafe_paths(
             expected_runtime_v3_sha256=_RUNTIME_SHA256,
         )
 
-    outside = tmp_path / "trace.jsonl"
-    outside.write_text("{}\n", encoding="utf-8")
-    with pytest.raises(UatEvidenceTraceError, match="path is invalid"):
-        UatEvidenceTraceReader(
-            outside,
-            expected_runtime_v3_sha256=_RUNTIME_SHA256,
-        )
 
-
-def test_trace_reader_rejects_partial_jsonl_records(tmp_path: Path) -> None:
+def test_trace_reader_rejects_partial_jsonl_records(
+    tmp_path: Path,
+    isolated_trace_content_guard: None,
+) -> None:
     path = _write_trace(tmp_path, [_trace_record()])
     path.write_bytes(path.read_bytes().removesuffix(b"\n"))
     with pytest.raises(UatEvidenceTraceError, match="incomplete record"):
@@ -235,7 +301,10 @@ def test_trace_reader_rejects_partial_jsonl_records(tmp_path: Path) -> None:
         )
 
 
-def test_trace_reader_fails_closed_for_excessive_json_nesting(tmp_path: Path) -> None:
+def test_trace_reader_fails_closed_for_excessive_json_nesting(
+    tmp_path: Path,
+    isolated_trace_content_guard: None,
+) -> None:
     path = _write_trace(tmp_path, [])
     path.write_text("[" * 1_100 + "0" + "]" * 1_100 + "\n", encoding="utf-8")
 
@@ -246,24 +315,64 @@ def test_trace_reader_fails_closed_for_excessive_json_nesting(tmp_path: Path) ->
         )
 
 
+def test_trace_reader_rejects_path_outside_runtime_allowlist(tmp_path: Path) -> None:
+    outside = tmp_path / "trace.jsonl"
+    outside.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(UatEvidenceTraceError, match="path is invalid"):
+        UatEvidenceTraceReader(
+            outside,
+            expected_runtime_v3_sha256=_RUNTIME_SHA256,
+        )
+
+
 def test_trace_path_allowlist_matches_harness_windows_and_container_runtime() -> None:
-    windows_parts = tuple(
-        part.casefold()
-        for part in PureWindowsPath(
-            "C:/workspace/_artifacts/runtime/local-user-uat/three-law-scenario-eval-trace.jsonl"
-        ).parts
-    )
-    container_parts = tuple(
-        part.casefold()
-        for part in PurePosixPath("/run/local-user-uat/three-law-scenario-eval-trace.jsonl").parts
-    )
-    obsolete_parts = tuple(
-        part.casefold()
-        for part in PureWindowsPath(
-            "C:/workspace/_artifacts/uat/runtime/three-law-scenario-eval-trace.jsonl"
-        ).parts
-    )
+    windows_parts = PureWindowsPath(
+        "C:/workspace/_local/state/local-user-uat/three-law-scenario-eval-trace.jsonl"
+    ).parts
+    container_parts = PurePosixPath("/run/local-user-uat/three-law-scenario-eval-trace.jsonl").parts
 
     assert _is_allowed_trace_path_parts(windows_parts) is True
     assert _is_allowed_trace_path_parts(container_parts) is True
-    assert _is_allowed_trace_path_parts(obsolete_parts) is False
+
+    uppercase_windows_parts = tuple(
+        PureWindowsPath(
+            "C:/WORKSPACE/_LOCAL/STATE/LOCAL-USER-UAT/THREE-LAW-SCENARIO-EVAL-TRACE.JSONL"
+        ).parts
+    )
+    assert _is_allowed_trace_path_parts(uppercase_windows_parts) is True
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "C:/workspace/_artifacts/runtime/local-user-uat/three-law-scenario-eval-trace.jsonl",
+        "C:/workspace/_artifacts/uat/runtime/three-law-scenario-eval-trace.jsonl",
+        "C:/workspace/_local/runtime/local-user-uat/three-law-scenario-eval-trace.jsonl",
+        "C:/workspace/_local/state/runtime/local-user-uat/three-law-scenario-eval-trace.jsonl",
+        "C:/workspace/_local/state/local-user-uat-decoy/three-law-scenario-eval-trace.jsonl",
+        "C:/workspace/_local/state/local-user-uat/nested/three-law-scenario-eval-trace.jsonl",
+        "C:/workspace/_local/state/local-user-uat/other.jsonl",
+    ],
+)
+def test_trace_path_allowlist_rejects_obsolete_and_decoy_windows_paths(path: str) -> None:
+    parts = PureWindowsPath(path).parts
+
+    assert _is_allowed_trace_path_parts(parts) is False
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/run/local-user-uat-decoy/three-law-scenario-eval-trace.jsonl",
+        "/run/local-user-uat/nested/three-law-scenario-eval-trace.jsonl",
+        "/run/local-user-uat/other.jsonl",
+        "/tmp/run/local-user-uat/three-law-scenario-eval-trace.jsonl",
+        "/tmp/_local/state/runtime/local-user-uat/three-law-scenario-eval-trace.jsonl",
+        "/RUN/LOCAL-USER-UAT/THREE-LAW-SCENARIO-EVAL-TRACE.JSONL",
+    ],
+)
+def test_trace_path_allowlist_rejects_decoy_container_paths(path: str) -> None:
+    parts = PurePosixPath(path).parts
+
+    assert _is_allowed_trace_path_parts(parts) is False

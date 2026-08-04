@@ -5,10 +5,10 @@ import logging
 import math
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Any, Literal
-from urllib.parse import urlsplit, urlunsplit
+from typing import Any, Literal, cast
+from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
 
 from pydantic import ValidationError
 
@@ -59,6 +59,7 @@ from customs_backend.domain import (
     ModelExecutionSummary,
     OutboxRecord,
     Principal,
+    ReleaseIdentityV3,
     RequiredAction,
     ReviewDisposition,
     ReviewEnqueueRequest,
@@ -90,14 +91,50 @@ from customs_backend.ports import (
     ObjectStore,
     WorkbenchRepository,
 )
+from customs_backend.experience import (
+    REVIEW_TIMED_STAGE_CODES,
+    AssistantAnswerV2,
+    AgentAnswerStageEventV1,
+    AssistantConversationRecord,
+    AssistantJobRecord,
+    AssistantJobState,
+    AssistantMessageCreateV2,
+    AssistantMessageRecord,
+    AssistantStageCode,
+    AssistantStageEvent,
+    AgentReviewStageEventV1,
+    CaseConversationRequestV2,
+    ConversationCreateV2,
+    ConversationTurnV2,
+    JobExperienceView,
+    PublicReviewExperienceV1,
+    ReviewEta,
+    ReviewExperienceEnvelopeV1,
+    ReviewPresentationRecord,
+    ReviewRevisionExperienceResultV1,
+    ReviewStageEta,
+    ReviewStageEtaSet,
+    public_review_experience,
+    validate_answer_against_context,
+    validate_presentation_against_result,
+)
+from customs_backend.experience_contract import (
+    validate_agent_experience_contract_bundle,
+    validate_agent_experience_payload,
+)
 from customs_backend.release import (
     AgentReleasePin,
     AgentServicePin,
     AutoCompletionApprovalManifest,
+    LocalUatRuntimeBindingV1,
     ReleaseConfigurationError,
     load_agent_contract_lock,
     load_domain_reviewer_trust_store,
     validate_agent_v3_payload,
+)
+from customs_backend.uat_evidence_trace import (
+    UatEvidenceTraceError,
+    UatEvidenceTraceReader,
 )
 
 
@@ -113,6 +150,160 @@ _SAFE_EVIDENCE_SOURCE_TYPES = frozenset(
 )
 _SHA256 = re.compile(r"^[a-f0-9]{64}$")
 _EVIDENCE_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SENSITIVE_PUBLIC_TEXT = re.compile(
+    r"(?i)(?:authorization\s*:|bearer\s+|api[_-]?key\s*[:=]|"
+    r"access[_-]?token\s*[:=]|token\s*=|password\s*[:=]|secret\s*[:=])"
+)
+_SENSITIVE_URI_QUERY_KEYS = frozenset(
+    {
+        "apikey",
+        "accesstoken",
+        "authorization",
+        "credential",
+        "key",
+        "password",
+        "secret",
+        "servicekey",
+        "token",
+    }
+)
+
+
+@dataclass
+class _OrderedAgentStageStream:
+    stages: tuple[str, ...]
+    skippable_stages: frozenset[str] = frozenset()
+    retry_groups: tuple[tuple[str, ...], ...] = ()
+    max_attempts_per_stage: int = 3
+    operation_id: str | None = None
+    next_stage_index: int = 0
+    active_stage: str | None = None
+    event_count: int = 0
+    terminal: tuple[str, str] | None = None
+    failed_stage: str | None = None
+    stage_attempts: dict[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if (
+            not self.stages
+            or len(self.stages) != len(set(self.stages))
+            or not 1 <= self.max_attempts_per_stage <= 3
+        ):
+            raise ValueError("Agent stream policy is not bounded or ordered")
+        occupied: set[str] = set()
+        for group in self.retry_groups:
+            if not group or len(group) != len(set(group)) or occupied.intersection(group):
+                raise ValueError("Agent stream retry groups overlap or are empty")
+            try:
+                indices = [self.stages.index(stage) for stage in group]
+            except ValueError:
+                raise ValueError("Agent stream retry group contains an unknown stage") from None
+            if indices != list(range(indices[0], indices[0] + len(indices))):
+                raise ValueError("Agent stream retry group is not contiguous")
+            occupied.update(group)
+
+    def _retry_group_bounds(self, stage_index: int) -> tuple[int, int] | None:
+        for group in self.retry_groups:
+            start = self.stages.index(group[0])
+            end = start + len(group) - 1
+            if start <= stage_index <= end:
+                return start, end
+        return None
+
+    def _start_stage(self, event: AgentReviewStageEventV1, stage_index: int) -> None:
+        normal_start = stage_index == self.next_stage_index
+        group = self._retry_group_bounds(stage_index)
+        retry_start = False
+        if group is not None:
+            group_start, group_end = group
+            progress_is_within_group = group_start < self.next_stage_index <= group_end + 1
+            retry_start = progress_is_within_group and stage_index == group_start
+        if not normal_start and not retry_start:
+            raise ConflictError("Agent stream stage order is inconsistent")
+        attempts = self.stage_attempts.get(event.stage_code, 0) + 1
+        if attempts > self.max_attempts_per_stage:
+            raise ConflictError("Agent stream exceeded the bounded stage retry count")
+        self.stage_attempts[event.stage_code] = attempts
+        self.next_stage_index = stage_index
+        self.active_stage = event.stage_code
+
+    def observe(self, event: AgentReviewStageEventV1) -> None:
+        self.event_count += 1
+        if self.event_count > 100:
+            raise ConflictError("Agent stream exceeded the bounded event count")
+        if self.operation_id is None:
+            self.operation_id = event.operation_id
+        elif self.operation_id != event.operation_id:
+            raise ConflictError("Agent stream changed operation identity")
+        if self.terminal is not None:
+            raise ConflictError("Agent stage event followed its terminal")
+        if event.stage_code in {"completed", "failed"}:
+            if event.stage_code == "failed" and event.state == "failed":
+                self.active_stage = None
+                self.terminal = (event.stage_code, event.state)
+                return
+            if (
+                self.active_stage is not None
+                or self.next_stage_index != len(self.stages)
+                or event.stage_code != "completed"
+                or event.state != "completed"
+            ):
+                raise ConflictError("Agent stream terminal is premature or unsuccessful")
+            self.terminal = (event.stage_code, event.state)
+            return
+        if self.failed_stage is not None:
+            raise ConflictError("Agent stage event followed an unrecoverable stage failure")
+        if self.next_stage_index >= len(self.stages):
+            raise ConflictError("Agent stream contains a stage after its ordered workflow")
+        try:
+            stage_index = self.stages.index(event.stage_code)
+        except ValueError:
+            raise ConflictError("Agent stream stage order is inconsistent")
+        if self.active_stage is None:
+            if event.state == "started":
+                self._start_stage(event, stage_index)
+                return
+            if stage_index != self.next_stage_index:
+                raise ConflictError("Agent stream stage order is inconsistent")
+            if event.state == "completed":
+                attempts = self.stage_attempts.get(event.stage_code, 0) + 1
+                if attempts > self.max_attempts_per_stage:
+                    raise ConflictError("Agent stream exceeded the bounded stage retry count")
+                self.stage_attempts[event.stage_code] = attempts
+                self.next_stage_index += 1
+                return
+            if event.state == "skipped" and event.stage_code in self.skippable_stages:
+                self.next_stage_index += 1
+                return
+            raise ConflictError("Agent stream stage did not start or complete safely")
+        if self.active_stage != event.stage_code:
+            raise ConflictError("Agent stream changed stage before completion")
+        if event.state == "completed":
+            self.active_stage = None
+            self.next_stage_index = stage_index + 1
+            return
+        if event.state == "skipped" and event.stage_code in self.skippable_stages:
+            self.active_stage = None
+            self.next_stage_index = stage_index + 1
+            return
+        retry_group = self._retry_group_bounds(stage_index)
+        if event.state == "failed" and retry_group is not None:
+            self.active_stage = None
+            self.next_stage_index = retry_group[0]
+            return
+        if event.state == "failed":
+            self.active_stage = None
+            self.failed_stage = event.stage_code
+            return
+        raise ConflictError("Agent stream repeated or failed an active stage")
+
+    def require_success(self) -> None:
+        if (
+            self.active_stage is not None
+            or self.next_stage_index != len(self.stages)
+            or self.terminal != ("completed", "completed")
+        ):
+            raise ConflictError("Agent stream omitted an ordered stage or successful terminal")
 
 
 def _bounded_provenance_text(
@@ -154,10 +345,57 @@ def _safe_public_evidence_uri(value: object) -> str:
         or parsed.password is not None
     ):
         raise ConflictError("Agent Evidence source URI is not a safe HTTPS reference")
+
+    def decoded_component(raw: str) -> str:
+        decoded = raw
+        for _attempt in range(8):
+            try:
+                expanded = unquote(decoded, errors="strict")
+            except UnicodeDecodeError:
+                raise ConflictError(
+                    "Agent Evidence source URI has invalid percent encoding"
+                ) from None
+            if expanded == decoded:
+                return decoded
+            decoded = expanded
+        raise ConflictError("Agent Evidence source URI is excessively encoded")
+
+    decoded_path = decoded_component(parsed.path)
+    decoded_query = decoded_component(parsed.query)
+    decoded_fragment = decoded_component(parsed.fragment)
+    decoded_query_pairs = parse_qsl(decoded_query, keep_blank_values=True)
+    query_keys = {re.sub(r"[^a-z0-9]", "", key.casefold()) for key, _value in decoded_query_pairs}
+    if query_keys & _SENSITIVE_URI_QUERY_KEYS or _SENSITIVE_PUBLIC_TEXT.search(
+        decoded_path
+        + "?"
+        + "&".join(f"{key}={query_value}" for key, query_value in decoded_query_pairs)
+        + "#"
+        + decoded_fragment
+    ):
+        # The full provider result is retained as an immutable audit record.  A
+        # credential-like URI therefore has to be rejected before persistence;
+        # removing it only from the Browser projection would still leak it into
+        # the database.
+        raise ConflictError("Agent Evidence source URI contains credential material")
     # Query strings and fragments are not needed to identify the legal source and
-    # can accidentally carry access tokens.  The public projection deliberately
-    # removes them while the provider-owned result remains hash-bound internally.
+    # may contain non-secret provider parameters.  Those parameters remain
+    # provider-owned and hash-bound, while the Browser projection omits them.
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
+def _safe_evidence_display_text(
+    value: object,
+    *,
+    field: str,
+    maximum: int,
+) -> str:
+    text = _bounded_provenance_text(value, field=field, maximum=maximum)
+    if text is None:
+        raise ConflictError(f"Agent {field} is missing")
+    normalized = " ".join(text.split())
+    if not normalized or _SENSITIVE_PUBLIC_TEXT.search(normalized):
+        raise ConflictError(f"Agent {field} contains unsafe public text")
+    return normalized
 
 
 def _finite_score(value: object, *, field: str, optional: bool = False) -> float | None:
@@ -352,6 +590,16 @@ def _safe_evidence_provenance(envelope: AgentReviewResultV3) -> dict[str, Any]:
                     "item_id": item["item_id"],
                     "rank": rank,
                     "source_type": source_type,
+                    "title": _safe_evidence_display_text(
+                        evidence.get("title"),
+                        field="Evidence title",
+                        maximum=1000,
+                    ),
+                    "excerpt": _safe_evidence_display_text(
+                        evidence.get("text"),
+                        field="Evidence excerpt",
+                        maximum=4000,
+                    ),
                     "retrieval_methods": list(methods),
                     "score": _finite_score(
                         evidence.get("score"),
@@ -467,6 +715,136 @@ def _bounded_model_execution_summary(
     )
 
 
+def _revision_document_model_call_counts(
+    *,
+    envelope: AgentReviewResultV3,
+    job: JobRecord,
+    parent_result: dict[str, Any] | None,
+    expected_reuse_key_sha256: str | None = None,
+) -> tuple[int, int]:
+    """Verify the optional parent-extraction reuse attestation.
+
+    A normal review or a revision that safely fell back to full analysis reports
+    all observed document calls as actual calls.  A reused revision must carry
+    exactly one canonical, hash-bound audit entry and preserve the parent's model
+    call provenance byte-for-byte.
+    """
+
+    reuse_events = [
+        item
+        for item in envelope.audit_trail
+        if isinstance(item, dict) and item.get("event") == "parent_extraction_reused"
+    ]
+    if not reuse_events:
+        return len(envelope.model_calls), 0
+    if job.kind != "revision" or len(reuse_events) != 1 or parent_result is None:
+        raise ConflictError("Agent extraction reuse audit is not bound to one child revision")
+    event = reuse_events[0]
+    metadata = event.get("metadata")
+    expected_parent_sha256 = job.request.get("parent_provider_result_sha256")
+    parent_calls = parent_result.get("model_calls")
+    parent_documents = parent_result.get("document_results")
+    if (
+        event.get("stage") != "extract_documents"
+        or not isinstance(event.get("message"), str)
+        or not event["message"]
+        or not isinstance(metadata, dict)
+        or set(metadata)
+        != {
+            "parent_result_sha256",
+            "aggregate_reuse_key_sha256",
+            "reused_document_count",
+            "inherited_model_call_count",
+            "actual_document_model_call_count",
+        }
+        or metadata.get("parent_result_sha256") != expected_parent_sha256
+        or not _is_sha256(metadata.get("aggregate_reuse_key_sha256"))
+        or (
+            expected_reuse_key_sha256 is not None
+            and metadata.get("aggregate_reuse_key_sha256") != expected_reuse_key_sha256
+        )
+        or not isinstance(parent_calls, list)
+        or not isinstance(parent_documents, list)
+        or metadata.get("actual_document_model_call_count") != 0
+        or metadata.get("inherited_model_call_count") != len(parent_calls)
+        or metadata.get("reused_document_count") != len(parent_documents)
+        or metadata.get("reused_document_count") != len(envelope.document_results)
+        or envelope.model_calls != parent_calls
+    ):
+        raise ConflictError("Agent extraction reuse audit differs from its parent result")
+    return 0, len(parent_calls)
+
+
+def _expected_parent_extraction_reuse_key(
+    *,
+    parent_result: dict[str, Any],
+    parent_request: AgentReviewRequest,
+    parent_input_manifest_sha256: str,
+    child_runtime: Any,
+) -> str:
+    """Independently reproduce the Agent's content-addressed reuse key."""
+
+    try:
+        parent_runtime = ReleaseIdentityV3.model_validate(parent_result["runtime_release"])
+        results = parent_result["document_results"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ConflictError("parent extraction identity is unavailable") from exc
+    extraction_identity = {
+        "agent_code_snapshot_sha256": child_runtime.agent_code_snapshot_sha256,
+        "model_id": child_runtime.model_id,
+        "model_revision": child_runtime.model_revision,
+        "extraction_prompt_sha256": child_runtime.extraction_prompt_sha256,
+        "extraction_schema_sha256": child_runtime.extraction_schema_sha256,
+    }
+    if extraction_identity != {
+        "agent_code_snapshot_sha256": parent_runtime.agent_code_snapshot_sha256,
+        "model_id": parent_runtime.model_id,
+        "model_revision": parent_runtime.model_revision,
+        "extraction_prompt_sha256": parent_runtime.extraction_prompt_sha256,
+        "extraction_schema_sha256": parent_runtime.extraction_schema_sha256,
+    } or not isinstance(results, list):
+        raise ConflictError("parent extraction identity differs from child runtime")
+    by_document_id = {
+        item.get("document_id"): item
+        for item in results
+        if isinstance(item, dict) and isinstance(item.get("document_id"), str)
+    }
+    if len(by_document_id) != len(results):
+        raise ConflictError("parent extraction results are not uniquely bound")
+    manifest_documents = parent_request.to_agent_manifest_wire()["documents"]
+    documents: list[dict[str, str]] = []
+    for document, manifest_document in zip(
+        parent_request.documents,
+        manifest_documents,
+        strict=True,
+    ):
+        extraction = by_document_id.get(document.document_id)
+        if extraction is None:
+            raise ConflictError("parent extraction result is missing a request document")
+        documents.append(
+            {
+                "document_id": document.document_id,
+                # Agent V3 parses the text-only transport into its canonical
+                # document model before hashing.  That semantic shape includes
+                # the safe visual defaults (image_pages=[], pdf_pages=None),
+                # even though the HTTP wire intentionally omits those keys.
+                "input_sha256": canonical_digest(manifest_document),
+                "extraction_sha256": canonical_digest(extraction),
+            }
+        )
+    if len(documents) != len(results):
+        raise ConflictError("parent extraction results contain an unrequested document")
+    return canonical_digest(
+        {
+            "schema_version": "parent-extraction-reuse/v1",
+            "parent_result_sha256": parent_result.get("result_sha256"),
+            "parent_input_manifest_sha256": parent_input_manifest_sha256,
+            "extraction_identity": extraction_identity,
+            "documents": documents,
+        }
+    )
+
+
 def _warn_terminal_state_not_persisted(*, boundary: str, error: Exception) -> None:
     """Record only an exception type; never serialize DB errors or request content."""
 
@@ -478,6 +856,41 @@ def _warn_terminal_state_not_persisted(*, boundary: str, error: Exception) -> No
 
 def _id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def _assistant_event(
+    *,
+    assistant_job_id: str,
+    sequence: int,
+    stage_code: AssistantStageCode,
+    state: Literal["started", "completed", "skipped", "failed"],
+    message_key: str,
+    duration_ms: int = 0,
+    safe_counts: dict[str, int] | None = None,
+) -> AssistantStageEvent:
+    occurred_at = utc_now()
+    bounded_counts = safe_counts or {}
+    payload = {
+        "assistant_job_id": assistant_job_id,
+        "sequence": sequence,
+        "stage_code": stage_code,
+        "state": state,
+        "occurred_at": occurred_at.isoformat().replace("+00:00", "Z"),
+        "duration_ms": duration_ms,
+        "safe_counts": bounded_counts,
+        "message_key": message_key,
+    }
+    return AssistantStageEvent(
+        event_id=f"assistant_event_{canonical_digest(payload)}",
+        assistant_job_id=assistant_job_id,
+        sequence=sequence,
+        stage_code=stage_code,
+        state=state,
+        occurred_at=occurred_at,
+        duration_ms=duration_ms,
+        safe_counts=bounded_counts,
+        message_key=message_key,
+    )
 
 
 def _scoped_idempotency_key(
@@ -603,7 +1016,11 @@ def _public_input_manifest_digest(
 def _sanitized_review_stage_trace(audit_trail: list[dict[str, Any]]) -> list[ReviewStageTraceEntry]:
     trace: list[ReviewStageTraceEntry] = []
     for raw in audit_trail:
-        if not isinstance(raw, dict) or raw.get("stage") not in MANDATORY_AGENT_STAGE_SEQUENCE:
+        if (
+            not isinstance(raw, dict)
+            or raw.get("stage") not in MANDATORY_AGENT_STAGE_SEQUENCE
+            or raw.get("event") == "parent_extraction_reused"
+        ):
             continue
         raw_metadata = raw.get("metadata")
         metadata: dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
@@ -880,6 +1297,12 @@ class WorkbenchService:
         job_lease_seconds: int = 300,
         job_max_attempts: int = 3,
         outbox_lease_seconds: int = 30,
+        enhanced_agent_experience: bool = False,
+        uat_adaptive_active: bool = False,
+        evidence_profile: str = "unknown",
+        expected_uat_capability_sha256: str | None = None,
+        local_uat_runtime_binding: LocalUatRuntimeBindingV1 | None = None,
+        uat_evidence_trace_reader: UatEvidenceTraceReader | None = None,
     ) -> None:
         self.repository = repository
         self.object_store = object_store
@@ -904,6 +1327,17 @@ class WorkbenchService:
         self.job_lease_seconds = job_lease_seconds
         self.job_max_attempts = job_max_attempts
         self.outbox_lease_seconds = outbox_lease_seconds
+        self.enhanced_agent_experience = enhanced_agent_experience
+        self.uat_adaptive_active = uat_adaptive_active
+        self.evidence_profile = evidence_profile
+        self.uat_evidence_trace_reader = uat_evidence_trace_reader
+        if (
+            expected_uat_capability_sha256 is not None
+            and _SHA256.fullmatch(expected_uat_capability_sha256) is None
+        ):
+            raise ValueError("expected UAT capability identity must be a SHA-256 digest")
+        self.expected_uat_capability_sha256 = expected_uat_capability_sha256
+        self.local_uat_runtime_binding = local_uat_runtime_binding
         if self.release_pin is not None and (
             self.service_pin is None or self.release_pin.service_pin() != self.service_pin
         ):
@@ -920,6 +1354,41 @@ class WorkbenchService:
         ):
             raise ValueError("auto completion requires one exact two-reviewer release approval")
         self.assert_auto_completion_ready()
+
+    def require_enhanced_experience(self) -> None:
+        if not self.enhanced_agent_experience:
+            raise ConflictError("enhanced Agent experience is disabled for this runtime")
+
+    def _assert_uat_capability_is_current(self, capability: Any) -> None:
+        capability_now = utc_now()
+        if (
+            capability.expires_at <= capability_now
+            or capability.issued_at > capability_now + timedelta(minutes=5)
+            or capability.expires_at > capability_now + timedelta(hours=24, minutes=5)
+            or capability.adaptive_active != self.uat_adaptive_active
+            or (
+                self.expected_uat_capability_sha256 is not None
+                and capability.capability_sha256 != self.expected_uat_capability_sha256
+            )
+            or (
+                self.local_uat_runtime_binding is not None
+                and (
+                    capability.capability_sha256 != self.local_uat_runtime_binding.capability_sha256
+                    or capability.agent_commit != self.local_uat_runtime_binding.agent.commit
+                    or capability.prompt_bundle_sha256
+                    != self.local_uat_runtime_binding.agent.prompt_bundle_sha256
+                    or capability.schema_bundle_sha256
+                    != self.local_uat_runtime_binding.agent.schema_bundle_sha256
+                    or capability.tool_registry_id
+                    != self.local_uat_runtime_binding.agent.tool_registry_id
+                    or capability.tool_registry_sha256
+                    != self.local_uat_runtime_binding.agent.tool_registry_sha256
+                    or capability.evidence_runtime_v3_sha256
+                    != self.local_uat_runtime_binding.evidence_runtime_v3_sha256
+                )
+            )
+        ):
+            raise ValueError("Agent UAT capability is expired or differs from Backend mode")
 
     def assert_auto_completion_ready(self) -> None:
         if not self.auto_completion_enabled:
@@ -1271,6 +1740,9 @@ class WorkbenchService:
         case_id: str,
         request: ReviewEnqueueRequest,
         idempotency_key: str,
+        *,
+        experience_api_version: Literal["3.0"] | None = None,
+        evidence_profile: str | None = None,
     ) -> tuple[JobRecord, bool]:
         # Authorization is checked before entering the repository transaction;
         # the repository then locks the Case and snapshots all three aggregate
@@ -1278,14 +1750,25 @@ class WorkbenchService:
         self.get_case(principal, case_id)
         now = utc_now()
         scoped_idempotency_key = _scoped_idempotency_key(
-            endpoint="review.enqueue/v1",
+            endpoint=(
+                "review.enqueue/v2" if experience_api_version == "3.0" else "review.enqueue/v1"
+            ),
             principal=principal,
             case_id=case_id,
             supplied_key=idempotency_key,
         )
-        idempotency_request_digest = canonical_digest(
-            {"case_id": case_id, "request": request.model_dump(mode="json")}
-        )
+        idempotency_payload: dict[str, Any] = {
+            "case_id": case_id,
+            "request": request.model_dump(mode="json"),
+        }
+        if experience_api_version is not None:
+            idempotency_payload.update(
+                {
+                    "experience_api_version": experience_api_version,
+                    "evidence_profile": evidence_profile,
+                }
+            )
+        idempotency_request_digest = canonical_digest(idempotency_payload)
 
         def build(
             case: CaseRecord,
@@ -1319,6 +1802,10 @@ class WorkbenchService:
                 ],
                 "assertion_cutoff_at": now.isoformat(),
             }
+            if experience_api_version is not None:
+                request_payload["experience_api_version"] = experience_api_version
+                request_payload["evidence_profile"] = evidence_profile
+                request_payload["document_count"] = len(primary_documents)
             logical_request_sha256 = canonical_digest(
                 {
                     key: value
@@ -1355,7 +1842,11 @@ class WorkbenchService:
             outbox = OutboxRecord(
                 outbox_id=_id("outbox"),
                 org_id=principal.org_id,
-                topic="review.requested.v1",
+                topic=(
+                    "review.experience.requested.v3"
+                    if experience_api_version == "3.0"
+                    else "review.requested.v1"
+                ),
                 aggregate_id=job.job_id,
                 payload={"job_id": job.job_id, "org_id": principal.org_id},
                 created_at=now,
@@ -1925,11 +2416,18 @@ class WorkbenchService:
         if outbox.lease_id is None:
             raise ConflictError("outbox must be claimed before publication")
         try:
-            self.publisher.publish(
-                org_id=outbox.org_id,
-                job_id=outbox.aggregate_id,
-                outbox_id=outbox.outbox_id,
-            )
+            if outbox.topic == "assistant.message.requested.v2":
+                self.publisher.publish_assistant(
+                    org_id=outbox.org_id,
+                    assistant_job_id=outbox.aggregate_id,
+                    outbox_id=outbox.outbox_id,
+                )
+            else:
+                self.publisher.publish(
+                    org_id=outbox.org_id,
+                    job_id=outbox.aggregate_id,
+                    outbox_id=outbox.outbox_id,
+                )
         except Exception:
             self.repository.release_outbox_claim(outbox.outbox_id, lease_id=outbox.lease_id)
             return False
@@ -2063,6 +2561,7 @@ class WorkbenchService:
         call_started = False
         response_received = False
         response_validated = False
+        experience_envelope: ReviewExperienceEnvelopeV1 | None = None
         try:
             case = self.repository.get_case(org_id, job.case_id)
             if case is None:
@@ -2114,6 +2613,38 @@ class WorkbenchService:
                 revision_request_wire = revision_request.to_agent_wire()
                 if len(canonical_json_bytes(revision_request_wire)) > MAX_AGENT_REQUEST_BODY_BYTES:
                     raise ConflictError("Agent revision request exceeds the 2 MiB transport limit")
+                enhanced_revision = running.request.get("experience_api_version") == "3.0"
+                if enhanced_revision:
+                    self.require_enhanced_experience()
+                    if running.parent_run_id is None or parent_run is None:
+                        raise ConflictError("enhanced revision has no parent Run")
+                    parent_presentation = self.repository.get_review_presentation(
+                        org_id,
+                        running.parent_run_id,
+                    )
+                    if (
+                        parent_presentation is None
+                        or parent_presentation.bound_provider_result_sha256
+                        != parent_run.provider_result_sha256
+                        or parent_presentation.bound_effective_result_digest
+                        != parent_run.result_digest
+                        or not self._experience_matches_effective_run(
+                            parent_presentation.envelope,
+                            parent_run,
+                        )
+                    ):
+                        raise ConflictError(
+                            "enhanced revision parent has no bound review experience"
+                        )
+                    try:
+                        validate_presentation_against_result(parent_presentation.envelope)
+                        self._assert_uat_capability_is_current(
+                            parent_presentation.envelope.capability_attestation
+                        )
+                    except ValueError as exc:
+                        raise ConflictError(
+                            "parent UAT experience is not valid for the child revision"
+                        ) from exc
                 emit_progress(
                     "input_validation",
                     "review.input_validation_completed",
@@ -2134,7 +2665,11 @@ class WorkbenchService:
                 )
                 call_started = True
                 emit_progress("agent_analysis", "agent.analysis_started")
-                raw_revision_response = self.agent.revise(revision_request)
+                raw_revision_response = (
+                    self.agent.revise_experience(revision_request)
+                    if enhanced_revision
+                    else self.agent.revise(revision_request)
+                )
                 response_received = True
                 emit_progress(
                     "agent_analysis",
@@ -2142,19 +2677,47 @@ class WorkbenchService:
                     state="completed",
                 )
                 emit_progress("result_validation", "agent.response_validation_started")
-                try:
-                    revision_response = AgentRevisionResult.model_validate(raw_revision_response)
-                except ValidationError as exc:
-                    raise ConflictError(
-                        "Agent revision response violates the trusted Backend policy boundary"
-                    ) from exc
-                if revision_response.parent_result_sha256 != running.request[
-                    "parent_provider_result_sha256"
-                ] or revision_response.applied_decision_ids != [
-                    item.decision_id for item in decisions
-                ]:
-                    raise ConflictError("Agent revision response is not bound to its approval")
-                result = revision_response.child_result.model_dump(mode="json")
+                if enhanced_revision:
+                    try:
+                        revision_experience = ReviewRevisionExperienceResultV1.model_validate(
+                            raw_revision_response
+                        )
+                        validate_presentation_against_result(
+                            revision_experience.experience_envelope
+                        )
+                        self._assert_uat_capability_is_current(
+                            revision_experience.experience_envelope.capability_attestation
+                        )
+                    except (ValidationError, ValueError) as exc:
+                        raise ConflictError(
+                            "Agent revision experience violates the trusted Backend boundary"
+                        ) from exc
+                    if revision_experience.parent_result_sha256 != running.request[
+                        "parent_provider_result_sha256"
+                    ] or revision_experience.applied_decision_ids != [
+                        item.decision_id for item in decisions
+                    ]:
+                        raise ConflictError(
+                            "Agent revision experience is not bound to its approval"
+                        )
+                    experience_envelope = revision_experience.experience_envelope
+                    result = experience_envelope.canonical_result.model_dump(mode="json")
+                else:
+                    try:
+                        revision_response = AgentRevisionResult.model_validate(
+                            raw_revision_response
+                        )
+                    except ValidationError as exc:
+                        raise ConflictError(
+                            "Agent revision response violates the trusted Backend policy boundary"
+                        ) from exc
+                    if revision_response.parent_result_sha256 != running.request[
+                        "parent_provider_result_sha256"
+                    ] or revision_response.applied_decision_ids != [
+                        item.decision_id for item in decisions
+                    ]:
+                        raise ConflictError("Agent revision response is not bound to its approval")
+                    result = revision_response.child_result.model_dump(mode="json")
             else:
                 emit_progress(
                     "input_validation",
@@ -2165,25 +2728,145 @@ class WorkbenchService:
                     org_id=org_id,
                     job_id=job_id,
                     expected_lease_id=lease_id,
-                    endpoint="review",
+                    endpoint=(
+                        "review_experience"
+                        if running.request.get("experience_api_version") == "3.0"
+                        else "review"
+                    ),
                     request_sha256=agent_request_wire_sha256,
                     audit=self._audit(
                         system,
                         "agent_call.started",
                         case_id=job.case_id,
-                        detail={"job_id": job_id, "endpoint": "review"},
+                        detail={
+                            "job_id": job_id,
+                            "endpoint": (
+                                "review_experience"
+                                if running.request.get("experience_api_version") == "3.0"
+                                else "review"
+                            ),
+                        },
                     ),
                 )
                 call_started = True
-                emit_progress("agent_analysis", "agent.analysis_started")
-                result = self.agent.review(agent_request)
-                response_received = True
-                emit_progress(
-                    "agent_analysis",
-                    "agent.analysis_completed",
-                    state="completed",
-                )
-                emit_progress("result_validation", "agent.response_validation_started")
+                if running.request.get("experience_api_version") == "3.0":
+                    self.require_enhanced_experience()
+                    expected_agent_event_sequence = 0
+                    review_stream = _OrderedAgentStageStream(
+                        stages=(
+                            "request_validation",
+                            "document_analysis",
+                            "normalization",
+                            "document_pairing",
+                            "cross_validation",
+                            "evidence_retrieval",
+                            "compliance_review",
+                            "adaptive_investigation",
+                            "report_composition",
+                            "grounding_verification",
+                            "result_validation",
+                        ),
+                        skippable_stages=frozenset({"adaptive_investigation"}),
+                        retry_groups=(("report_composition", "grounding_verification"),),
+                    )
+
+                    def persist_agent_stage(raw_event: dict[str, Any]) -> None:
+                        nonlocal running
+                        nonlocal next_sequence
+                        nonlocal expected_agent_event_sequence
+                        try:
+                            validate_agent_experience_payload(
+                                "review-stage-event-v1",
+                                raw_event,
+                            )
+                            agent_event = AgentReviewStageEventV1.model_validate(raw_event)
+                        except ValidationError as exc:
+                            raise ConflictError(
+                                "Agent stage event violated the V3 streaming contract"
+                            ) from exc
+                        if agent_event.sequence != expected_agent_event_sequence:
+                            raise ConflictError("Agent stage event sequence is discontinuous")
+                        if agent_event.stage_code in {
+                            "conversation_binding",
+                            "answer_planning",
+                            "answer_composition",
+                        }:
+                            raise ConflictError(
+                                "Agent review stream contained an answer-only stage"
+                            )
+                        review_stream.observe(agent_event)
+                        # The Agent terminal proves stream completeness, but the
+                        # Backend publishes its own single terminal only after the
+                        # verified result and presentation are atomically persisted.
+                        if agent_event.stage_code not in {"completed", "failed"}:
+                            running = self.repository.update_job(
+                                running,
+                                StageEvent(
+                                    event_id=_id("event"),
+                                    job_id=job_id,
+                                    sequence=next_sequence,
+                                    stage=agent_event.stage_code,
+                                    state=agent_event.state,
+                                    message_code=agent_event.message_key,
+                                    occurred_at=agent_event.occurred_at,
+                                    detail={
+                                        "operation_id": agent_event.operation_id,
+                                        "agent_sequence": agent_event.sequence,
+                                        "duration_ms": agent_event.duration_ms,
+                                        "safe_counts": agent_event.safe_counts,
+                                        "agent_event_sha256": agent_event.event_sha256,
+                                    },
+                                ),
+                                self._audit(
+                                    system,
+                                    "review.agent_stage",
+                                    case_id=running.case_id,
+                                    review_run_id=running.review_run_id,
+                                    detail={
+                                        "job_id": job_id,
+                                        "stage": agent_event.stage_code,
+                                        "state": agent_event.state,
+                                    },
+                                ),
+                                expected_lease_id=lease_id,
+                            )
+                            next_sequence += 1
+                        expected_agent_event_sequence += 1
+
+                    raw_experience = self.agent.review_experience_stream(
+                        agent_request,
+                        on_event=persist_agent_stage,
+                    )
+                    response_received = True
+                    review_stream.require_success()
+                    try:
+                        validate_agent_experience_payload(
+                            "review-experience-envelope-v1",
+                            raw_experience,
+                        )
+                        experience_envelope = ReviewExperienceEnvelopeV1.model_validate(
+                            raw_experience
+                        )
+                        validate_presentation_against_result(experience_envelope)
+                        self._assert_uat_capability_is_current(
+                            experience_envelope.capability_attestation
+                        )
+                    except (ValidationError, ValueError) as exc:
+                        raise ConflictError(
+                            "Agent experience violated the trusted Backend boundary"
+                        ) from exc
+                    result = experience_envelope.canonical_result.model_dump(mode="json")
+                else:
+                    emit_progress("agent_analysis", "agent.analysis_started")
+                    result = self.agent.review(agent_request)
+                    response_received = True
+                    emit_progress(
+                        "agent_analysis",
+                        "agent.analysis_completed",
+                        state="completed",
+                    )
+                if running.request.get("experience_api_version") != "3.0":
+                    emit_progress("result_validation", "agent.response_validation_started")
             run = self._run_from_agent(
                 system,
                 job=running,
@@ -2192,11 +2875,12 @@ class WorkbenchService:
                 expected_agent_input_sha256=agent_input_manifest_sha256,
             )
             response_validated = True
-            emit_progress(
-                "result_validation",
-                "agent.response_validation_completed",
-                state="completed",
-            )
+            if running.request.get("experience_api_version") != "3.0":
+                emit_progress(
+                    "result_validation",
+                    "agent.response_validation_completed",
+                    state="completed",
+                )
             emit_progress("persistence", "review.persistence_started")
             succeeded = running.model_copy(
                 update={
@@ -2206,6 +2890,35 @@ class WorkbenchService:
                     "lease_expires_at": None,
                     "updated_at": utc_now(),
                 }
+            )
+            experience_matches_effective_run = (
+                experience_envelope is not None
+                and self._experience_matches_effective_run(experience_envelope, run)
+            )
+            if (
+                job.kind == "revision"
+                and running.request.get("experience_api_version") == "3.0"
+                and not experience_matches_effective_run
+            ):
+                raise ConflictError(
+                    "Agent revision experience does not match the effective child Run"
+                )
+            presentation = (
+                ReviewPresentationRecord(
+                    presentation_id=(
+                        "presentation_"
+                        + canonical_digest({"envelope_sha256": experience_envelope.envelope_sha256})
+                    ),
+                    review_run_id=run.review_run_id,
+                    case_id=run.case_id,
+                    org_id=run.org_id,
+                    bound_provider_result_sha256=run.provider_result_sha256,
+                    bound_effective_result_digest=run.result_digest,
+                    envelope=experience_envelope,
+                    created_at=utc_now(),
+                )
+                if experience_matches_effective_run and experience_envelope is not None
+                else None
             )
             return self.repository.complete_job(
                 run=run,
@@ -2237,6 +2950,7 @@ class WorkbenchService:
                     detail={"job_id": job_id},
                 ),
                 expected_lease_id=lease_id,
+                presentation=presentation,
             )
         except AgentPreExecutionRetryableError as exc:
             if not call_started:
@@ -2381,7 +3095,9 @@ class WorkbenchService:
                         detail={"job_id": job_id, "error_code": "agent_delivery_uncertain"},
                     ),
                 )
-                raise
+                raise JobExecutionNotRunnableError(
+                    "Agent delivery is uncertain; automatic retry is prohibited"
+                ) from exc
             terminal_failure = running.attempt_count >= self.job_max_attempts
             failed = running.model_copy(
                 update={
@@ -2425,7 +3141,11 @@ class WorkbenchService:
         result: dict[str, Any],
         expected_agent_input_sha256: str,
     ) -> ReviewRunRecord:
-        validate_agent_v3_payload("review_result", result)
+        enhanced_v3_result = job.request.get("experience_api_version") == "3.0"
+        if enhanced_v3_result:
+            validate_agent_experience_payload("review-result-v3", result)
+        else:
+            validate_agent_v3_payload("review_result", result)
         try:
             envelope = AgentReviewResultV3.model_validate(result)
         except ValidationError as exc:
@@ -2472,10 +3192,12 @@ class WorkbenchService:
             or job.request.get("input_manifest_digest") != input_manifest_digest
         ):
             raise ConflictError("immutable Job public input manifest is inconsistent")
-        if (
-            envelope.runtime_release.result_schema_sha256
-            != load_agent_contract_lock().review_result_v3_sha256
-        ):
+        expected_result_schema_sha256 = (
+            validate_agent_experience_contract_bundle().lock.provider_review_result_v3.file_sha256
+            if enhanced_v3_result
+            else load_agent_contract_lock().review_result_v3_sha256
+        )
+        if envelope.runtime_release.result_schema_sha256 != expected_result_schema_sha256:
             raise ConflictError("Agent result advertises another provider Schema")
         if (
             envelope.case_id != case.case_id
@@ -2490,7 +3212,17 @@ class WorkbenchService:
             raise ConflictError("Agent result changed the immutable review policy input")
         if envelope.knowledge_snapshot_id != envelope.runtime_release.evidence_snapshot_id:
             raise ConflictError("Agent result snapshot differs from its runtime release identity")
-        if self.service_pin is not None and not self.service_pin.matches_common_runtime(
+        development_binding = (
+            self.local_uat_runtime_binding
+            if self.local_uat_runtime_binding is not None
+            and self.local_uat_runtime_binding.mode == "development"
+            else None
+        )
+        if development_binding is not None:
+            development_binding.require_active()
+            if not development_binding.matches_result_runtime(envelope.runtime_release):
+                raise ConflictError("Agent runtime differs from the local UAT binding")
+        elif self.service_pin is not None and not self.service_pin.matches_common_runtime(
             envelope.runtime_release
         ):
             raise ConflictError("Agent runtime differs from the Backend service pin")
@@ -2499,8 +3231,10 @@ class WorkbenchService:
                 raise ConflictError("Agent runtime release differs from the approved Backend pin")
             if envelope.knowledge_snapshot_id != self.release_pin.evidence_snapshot_id:
                 raise ConflictError("Agent result snapshot differs from the approved Backend pin")
-        elif self.service_pin is not None and not self.service_pin.matches_unreleased_runtime(
-            envelope.runtime_release
+        elif (
+            development_binding is None
+            and self.service_pin is not None
+            and not self.service_pin.matches_unreleased_runtime(envelope.runtime_release)
         ):
             raise ConflictError("Agent runtime must remain unreleased in candidate mode")
         execution = envelope.execution_status
@@ -2525,6 +3259,55 @@ class WorkbenchService:
             expected_prompt_sha256=envelope.runtime_release.narrative_prompt_sha256,
             expected_schema_sha256=envelope.runtime_release.narrative_schema_sha256,
             expected_task_id="customs_narrative_report",
+        )
+        parent_provider_result = (
+            self.repository.get_provider_result(job.org_id, job.parent_run_id)
+            if job.kind == "revision" and job.parent_run_id is not None
+            else None
+        )
+        expected_reuse_key_sha256: str | None = None
+        if any(
+            isinstance(item, dict) and item.get("event") == "parent_extraction_reused"
+            for item in envelope.audit_trail
+        ):
+            parent_run = (
+                self.repository.get_run(job.org_id, job.parent_run_id)
+                if job.parent_run_id is not None
+                else None
+            )
+            parent_job = (
+                self.repository.get_job(job.org_id, parent_run.job_id)
+                if parent_run is not None and parent_run.job_id is not None
+                else None
+            )
+            parent_input_sha256 = job.request.get("parent_input_manifest_sha256")
+            if (
+                parent_provider_result is None
+                or parent_job is None
+                or job.parent_run_id is None
+                or not isinstance(parent_input_sha256, str)
+            ):
+                raise ConflictError("parent extraction reuse inputs are unavailable")
+            parent_request = _agent_review_request_from_snapshot(
+                object_store=self.object_store,
+                review_run_id=job.parent_run_id,
+                case_id=parent_job.case_id,
+                snapshot=parent_job.request,
+            )
+            expected_reuse_key_sha256 = _expected_parent_extraction_reuse_key(
+                parent_result=parent_provider_result,
+                parent_request=parent_request,
+                parent_input_manifest_sha256=parent_input_sha256,
+                child_runtime=envelope.runtime_release,
+            )
+        (
+            actual_document_model_calls,
+            inherited_document_model_calls,
+        ) = _revision_document_model_call_counts(
+            envelope=envelope,
+            job=job,
+            parent_result=parent_provider_result,
+            expected_reuse_key_sha256=expected_reuse_key_sha256,
         )
         content_gate_reasons = _auto_completion_content_gate_reasons(
             envelope=envelope,
@@ -2695,6 +3478,57 @@ class WorkbenchService:
             prefix="finding",
             code_key="finding_code",
         )
+        evidence_provenance = _safe_evidence_provenance(envelope)
+        observed_retrieval_methods = sorted(
+            {
+                method
+                for evidence in evidence_provenance["ranked_evidence"]
+                for method in evidence["retrieval_methods"]
+            },
+            key={"exact_hs": 0, "dense": 1, "bm25": 2, "graph": 3}.__getitem__,
+        )
+        evidence_profile = str(job.request.get("evidence_profile", self.evidence_profile))
+        evidence_request_id = evidence_provenance.get("request_id")
+        attempted_retrieval_methods: list[Literal["exact_hs", "dense", "bm25", "graph"]] = []
+        successful_retrieval_methods: list[Literal["exact_hs", "dense", "bm25", "graph"]] = []
+        retrieval_execution_attested = False
+        evidence_data_source: Literal[
+            "UNATTESTED",
+            "ACTUAL_POSTGRESQL_QDRANT_NEO4J_READ_ONLY",
+        ] = "UNATTESTED"
+        if self.uat_evidence_trace_reader is not None:
+            if (
+                evidence_profile != "preserved-3law-v3-scenario-eval"
+                or not isinstance(evidence_request_id, str)
+                or not isinstance(envelope.knowledge_snapshot_id, str)
+            ):
+                raise ConflictError("actual UAT Evidence execution binding is incomplete")
+            try:
+                trace = self.uat_evidence_trace_reader.projection(
+                    request_id=evidence_request_id,
+                    knowledge_snapshot_id=envelope.knowledge_snapshot_id,
+                )
+            except UatEvidenceTraceError as exc:
+                raise ConflictError(
+                    "actual UAT Evidence execution trace is unavailable or differs"
+                ) from exc
+            method_by_stage: dict[
+                str,
+                Literal["exact_hs", "dense", "bm25", "graph"],
+            ] = {
+                "structured": "exact_hs",
+                "dense": "dense",
+                "bm25": "bm25",
+                "graph": "graph",
+            }
+            for stage_name, method in method_by_stage.items():
+                stage = getattr(trace.retrieval, stage_name)
+                if stage.attempted:
+                    attempted_retrieval_methods.append(method)
+                if stage.succeeded:
+                    successful_retrieval_methods.append(method)
+            retrieval_execution_attested = True
+            evidence_data_source = "ACTUAL_POSTGRESQL_QDRANT_NEO4J_READ_ONLY"
         detail = {
             key: provider_public[key]
             for key in {
@@ -2704,10 +3538,8 @@ class WorkbenchService:
                 "retrieval_status",
                 "retrieval_coverage",
                 "knowledge_snapshot_id",
-                "retrieval_results",
                 "validation_issues",
                 "regulatory_findings",
-                "rag_evidence",
                 "document_results",
                 "fact_ledger",
                 "review_gaps",
@@ -2717,7 +3549,9 @@ class WorkbenchService:
         detail["review_stage_trace"] = [item.model_dump(mode="json") for item in stage_trace]
         detail["model_execution_summary"] = model_execution_summary.model_dump(mode="json")
         detail["narrative_execution_summary"] = narrative_execution_summary.model_dump(mode="json")
-        detail["evidence_provenance"] = _safe_evidence_provenance(envelope)
+        detail["actual_document_model_calls"] = actual_document_model_calls
+        detail["inherited_document_model_calls"] = inherited_document_model_calls
+        detail["evidence_provenance"] = evidence_provenance
         effective_narrative = envelope.narrative_report
         if (
             disposition != envelope.review_disposition
@@ -2743,6 +3577,13 @@ class WorkbenchService:
             "completion_eligibility": eligibility.model_dump(mode="json"),
             "required_actions": [item.model_dump(mode="json") for item in required_actions],
             "review_stage_trace": [item.model_dump(mode="json") for item in stage_trace],
+            "evidence_profile": evidence_profile,
+            "evidence_data_source": evidence_data_source,
+            "evidence_request_id": evidence_request_id,
+            "observed_retrieval_methods": observed_retrieval_methods,
+            "attempted_retrieval_methods": attempted_retrieval_methods,
+            "successful_retrieval_methods": successful_retrieval_methods,
+            "retrieval_execution_attested": retrieval_execution_attested,
             "auto_completion_profile": profile_binding.model_dump(mode="json"),
             "model_execution_summary": model_execution_summary.model_dump(mode="json"),
             "narrative_execution_summary": narrative_execution_summary.model_dump(mode="json"),
@@ -2771,6 +3612,13 @@ class WorkbenchService:
             narrative_report=effective_narrative,
             action_trace=envelope.action_trace,
             review_stage_trace=stage_trace,
+            evidence_profile=evidence_profile,
+            evidence_data_source=evidence_data_source,
+            evidence_request_id=evidence_request_id,
+            observed_retrieval_methods=observed_retrieval_methods,
+            attempted_retrieval_methods=attempted_retrieval_methods,
+            successful_retrieval_methods=successful_retrieval_methods,
+            retrieval_execution_attested=retrieval_execution_attested,
             result_detail=detail,
             release_identity={
                 **envelope.runtime_release.model_dump(mode="json"),
@@ -2827,6 +3675,13 @@ class WorkbenchService:
             "completion_eligibility": eligibility.model_dump(mode="json"),
             "required_actions": [item.model_dump(mode="json") for item in actions],
             "review_stage_trace": [item.model_dump(mode="json") for item in run.review_stage_trace],
+            "evidence_profile": run.evidence_profile,
+            "evidence_data_source": run.evidence_data_source,
+            "evidence_request_id": run.evidence_request_id,
+            "observed_retrieval_methods": run.observed_retrieval_methods,
+            "attempted_retrieval_methods": run.attempted_retrieval_methods,
+            "successful_retrieval_methods": run.successful_retrieval_methods,
+            "retrieval_execution_attested": run.retrieval_execution_attested,
             "auto_completion_profile": run.auto_completion_profile.model_dump(mode="json"),
             "model_execution_summary": run.result_detail["model_execution_summary"],
             "narrative_execution_summary": run.result_detail["narrative_execution_summary"],
@@ -2852,6 +3707,98 @@ class WorkbenchService:
             raise NotFoundError("job not found")
         self.get_case(principal, job.case_id)
         return job
+
+    def get_job_experience(self, principal: Principal, job_id: str) -> JobExperienceView:
+        self.require_enhanced_experience()
+        job = self.get_job(principal, job_id)
+        document_count = int(job.request.get("document_count", 0))
+        evidence_profile = str(job.request.get("evidence_profile", self.evidence_profile))
+        durations = sorted(
+            self.repository.recent_review_durations_ms(
+                org_id=principal.org_id,
+                evidence_profile=evidence_profile,
+                document_count=document_count,
+                limit=30,
+            )
+        )
+        if len(durations) >= 5:
+
+            def percentile(fraction: float) -> int:
+                index = min(len(durations) - 1, int((len(durations) - 1) * fraction + 0.5))
+                return max(0, durations[index] // 1000)
+
+            p50 = percentile(0.5)
+            p90 = percentile(0.9)
+            eta = ReviewEta(
+                source="observed",
+                sample_size=len(durations),
+                p50_seconds=p50,
+                p90_seconds=p90,
+                range_min_seconds=p50,
+                range_max_seconds=max(p50, p90),
+            )
+        else:
+            eta = ReviewEta(
+                source="validated_default",
+                sample_size=len(durations),
+                range_min_seconds=4 * 60,
+                range_max_seconds=7 * 60,
+            )
+        stage_samples = self.repository.recent_review_stage_durations_ms(
+            org_id=principal.org_id,
+            evidence_profile=evidence_profile,
+            document_count=document_count,
+            limit=30,
+        )
+        stage_estimates: list[ReviewStageEta] = []
+        for stage_code in REVIEW_TIMED_STAGE_CODES:
+            stage_durations = sorted(
+                sample[stage_code] for sample in stage_samples if stage_code in sample
+            )
+            if len(stage_durations) >= 5:
+
+                def stage_percentile(fraction: float) -> int:
+                    index = min(
+                        len(stage_durations) - 1,
+                        int((len(stage_durations) - 1) * fraction + 0.5),
+                    )
+                    return max(0, stage_durations[index] // 1000)
+
+                stage_estimates.append(
+                    ReviewStageEta(
+                        stage_code=stage_code,
+                        source="observed",
+                        sample_count=len(stage_durations),
+                        p50_seconds=stage_percentile(0.5),
+                        p90_seconds=stage_percentile(0.9),
+                    )
+                )
+            else:
+                stage_estimates.append(
+                    ReviewStageEta(
+                        stage_code=stage_code,
+                        source="insufficient_samples",
+                        sample_count=len(stage_durations),
+                    )
+                )
+        elapsed = max(0, int((utc_now() - job.created_at).total_seconds()))
+        return JobExperienceView(
+            job_id=job.job_id,
+            case_id=job.case_id,
+            kind=job.kind,
+            parent_run_id=job.parent_run_id,
+            status=job.status,
+            review_run_id=job.review_run_id,
+            error_code=job.error_code,
+            attempt_count=job.attempt_count,
+            agent_call_state=job.agent_call_state.value,
+            created_by=job.created_by,
+            created_at=job.created_at,
+            updated_at=job.updated_at,
+            elapsed_seconds=elapsed,
+            eta=eta,
+            stage_eta=ReviewStageEtaSet(stages=stage_estimates),
+        )
 
     def reconcile_delivery_uncertain(
         self,
@@ -2884,6 +3831,685 @@ class WorkbenchService:
             raise NotFoundError("review run not found")
         self.get_case(principal, run.case_id)
         return run
+
+    def get_review_experience(
+        self, principal: Principal, review_run_id: str
+    ) -> ReviewExperienceEnvelopeV1:
+        self.require_enhanced_experience()
+        run = self.get_run(principal, review_run_id)
+        presentation = self.repository.get_review_presentation(principal.org_id, review_run_id)
+        if presentation is None:
+            raise NotFoundError("verified review presentation is unavailable")
+        if (
+            presentation.bound_provider_result_sha256 != run.provider_result_sha256
+            or presentation.bound_effective_result_digest != run.result_digest
+            or not self._experience_matches_effective_run(presentation.envelope, run)
+        ):
+            raise ConflictError("review presentation binding is stale")
+        return presentation.envelope
+
+    def get_public_review_experience(
+        self, principal: Principal, review_run_id: str
+    ) -> PublicReviewExperienceV1:
+        envelope = self.get_review_experience(principal, review_run_id)
+        run = self.get_run(principal, review_run_id)
+        return public_review_experience(
+            envelope,
+            effective_result_digest=run.result_digest,
+        )
+
+    @staticmethod
+    def _experience_matches_effective_run(
+        envelope: ReviewExperienceEnvelopeV1,
+        run: ReviewRunRecord,
+    ) -> bool:
+        canonical = envelope.canonical_result
+        return (
+            canonical.result_sha256 == run.provider_result_sha256
+            and canonical.execution_status == run.execution_status
+            and canonical.assessment == run.assessment
+            and canonical.review_disposition == run.review_disposition
+            and canonical.assurance_level == run.assurance_level
+            and canonical.completion_eligibility == run.completion_eligibility
+            and canonical.required_actions == run.required_actions
+            and canonical.narrative_report == run.narrative_report
+        )
+
+    def create_assistant_conversation(
+        self,
+        principal: Principal,
+        review_run_id: str,
+        request: ConversationCreateV2,
+    ) -> AssistantConversationRecord:
+        self.require_enhanced_experience()
+        run = self.get_run(principal, review_run_id)
+        current_case = self.get_case(principal, run.case_id)
+        if current_case.revision != run.case_revision:
+            raise ConflictError(
+                "cannot start an assistant conversation from a stale review revision"
+            )
+        if request.bound_result_sha256 != run.provider_result_sha256:
+            raise ConflictError("conversation result binding is stale")
+        presentation = self.repository.get_review_presentation(principal.org_id, review_run_id)
+        if (
+            presentation is None
+            or presentation.bound_effective_result_digest != run.result_digest
+            or not self._experience_matches_effective_run(presentation.envelope, run)
+        ):
+            raise ConflictError(
+                "assistant is unavailable because no presentation matches the effective review"
+            )
+        now = utc_now()
+        record = AssistantConversationRecord(
+            conversation_id=(
+                "conversation_"
+                + canonical_digest(
+                    {
+                        "org_id": principal.org_id,
+                        "review_run_id": review_run_id,
+                        "created_by": principal.subject,
+                        "nonce": uuid.uuid4().hex,
+                    }
+                )
+            ),
+            review_run_id=review_run_id,
+            case_id=run.case_id,
+            org_id=principal.org_id,
+            bound_result_sha256=run.provider_result_sha256,
+            bound_effective_result_digest=run.result_digest,
+            created_by=principal.subject,
+            created_at=now,
+            updated_at=now,
+        )
+        return self.repository.create_assistant_conversation(
+            record,
+            self._audit(
+                principal,
+                "assistant_conversation.created",
+                case_id=run.case_id,
+                review_run_id=review_run_id,
+                detail={"conversation_id": record.conversation_id},
+            ),
+        )
+
+    def list_assistant_conversations(
+        self, principal: Principal, review_run_id: str
+    ) -> list[AssistantConversationRecord]:
+        self.require_enhanced_experience()
+        self.get_run(principal, review_run_id)
+        return self.repository.list_assistant_conversations(principal.org_id, review_run_id)
+
+    def get_assistant_conversation(
+        self, principal: Principal, conversation_id: str
+    ) -> AssistantConversationRecord:
+        self.require_enhanced_experience()
+        conversation = self.repository.get_assistant_conversation(principal.org_id, conversation_id)
+        if conversation is None:
+            raise NotFoundError("assistant conversation not found")
+        run = self.get_run(principal, conversation.review_run_id)
+        if (
+            run.provider_result_sha256 != conversation.bound_result_sha256
+            or run.result_digest != conversation.bound_effective_result_digest
+        ):
+            raise ConflictError("assistant conversation result binding is stale")
+        return conversation
+
+    @staticmethod
+    def _conversation_turns(
+        messages: list[AssistantMessageRecord],
+    ) -> list[ConversationTurnV2]:
+        return [
+            ConversationTurnV2(
+                message_id=item.message_id,
+                parent_message_id=item.parent_message_id,
+                role=item.role,
+                content=item.content,
+                created_at=item.created_at,
+                answer_sha256=(
+                    item.structured_answer.answer_sha256
+                    if item.structured_answer is not None
+                    else None
+                ),
+            )
+            for item in messages[-8:]
+        ]
+
+    def enqueue_assistant_message(
+        self,
+        principal: Principal,
+        conversation_id: str,
+        request: AssistantMessageCreateV2,
+        idempotency_key: str,
+    ) -> tuple[AssistantJobRecord, AssistantMessageRecord, bool]:
+        conversation = self.get_assistant_conversation(principal, conversation_id)
+        run = self.get_run(principal, conversation.review_run_id)
+        current_case = self.get_case(principal, run.case_id)
+        if current_case.revision != run.case_revision:
+            raise ConflictError("assistant conversation is stale because the Case changed")
+        if request.bound_result_sha256 != conversation.bound_result_sha256:
+            raise ConflictError("assistant message result binding is stale")
+        scoped_idempotency_key = _scoped_idempotency_key(
+            endpoint="case.answer/v2",
+            principal=principal,
+            case_id=conversation.case_id,
+            supplied_key=idempotency_key,
+        )
+        existing_job = self.repository.get_assistant_job_by_idempotency_key(
+            principal.org_id,
+            scoped_idempotency_key,
+        )
+        if existing_job is not None:
+            expected_digest = canonical_digest(
+                {
+                    "conversation_id": conversation_id,
+                    "message": request.model_dump(mode="json"),
+                    "conversation_context_sha256": existing_job.request.get(
+                        "conversation_context_sha256"
+                    ),
+                }
+            )
+            if (
+                existing_job.conversation_id != conversation_id
+                or existing_job.created_by != principal.subject
+                or existing_job.idempotency_request_digest != expected_digest
+            ):
+                raise ConflictError("assistant idempotency key was reused")
+            stored_message = next(
+                (
+                    item
+                    for item in self.repository.list_assistant_messages(
+                        principal.org_id,
+                        conversation_id,
+                    )
+                    if item.message_id == existing_job.user_message_id
+                ),
+                None,
+            )
+            if stored_message is None:
+                raise ConflictError("assistant idempotency replay lost its user message")
+            return existing_job, stored_message, False
+        messages = self.repository.list_assistant_messages(principal.org_id, conversation_id)
+        latest_message_id = messages[-1].message_id if messages else None
+        if request.parent_message_id != latest_message_id:
+            raise ConflictError("assistant message parent is stale")
+        provider_result = self.repository.get_provider_result(principal.org_id, run.review_run_id)
+        if provider_result is None:
+            raise ConflictError("provider result is unavailable for grounded assistant")
+        try:
+            canonical_result = AgentReviewResultV3.model_validate(provider_result)
+        except ValidationError as exc:
+            raise ConflictError("stored provider result is no longer contract-valid") from exc
+        recent_turns = self._conversation_turns(messages)
+        context_sha256 = canonical_digest([item.model_dump(mode="json") for item in recent_turns])
+        agent_request = CaseConversationRequestV2(
+            conversation_id=conversation_id,
+            parent_message_id=request.parent_message_id,
+            question=request.question,
+            bound_result_sha256=conversation.bound_result_sha256,
+            conversation_context_sha256=context_sha256,
+            recent_turns=recent_turns,
+            review_result=canonical_result,
+        )
+        agent_request_wire = agent_request.model_dump(mode="json")
+        if len(canonical_json_bytes(agent_request_wire)) > MAX_AGENT_REQUEST_BODY_BYTES:
+            raise ConflictError("assistant request exceeds the 2 MiB transport limit")
+        idempotency_request_digest = canonical_digest(
+            {
+                "conversation_id": conversation_id,
+                "message": request.model_dump(mode="json"),
+                "conversation_context_sha256": context_sha256,
+            }
+        )
+        now = utc_now()
+        assistant_job_id = "assistant_job_" + canonical_digest(
+            {"idempotency_key": scoped_idempotency_key}
+        )
+        user_message = AssistantMessageRecord(
+            message_id=(
+                "assistant_message_"
+                + canonical_digest(
+                    {
+                        "idempotency_key": scoped_idempotency_key,
+                        "role": "user",
+                    }
+                )
+            ),
+            conversation_id=conversation_id,
+            review_run_id=run.review_run_id,
+            case_id=run.case_id,
+            org_id=principal.org_id,
+            parent_message_id=request.parent_message_id,
+            role="user",
+            content=request.question,
+            bound_result_sha256=conversation.bound_result_sha256,
+            created_by=principal.subject,
+            created_at=now,
+        )
+        queued_event = _assistant_event(
+            assistant_job_id=assistant_job_id,
+            sequence=1,
+            stage_code="queued",
+            state="completed",
+            message_key="assistant.queued",
+        )
+        job = AssistantJobRecord(
+            assistant_job_id=assistant_job_id,
+            conversation_id=conversation_id,
+            review_run_id=run.review_run_id,
+            case_id=run.case_id,
+            org_id=principal.org_id,
+            user_message_id=user_message.message_id,
+            idempotency_key=scoped_idempotency_key,
+            idempotency_request_digest=idempotency_request_digest,
+            agent_request_sha256=canonical_digest(agent_request_wire),
+            request=agent_request_wire,
+            events=[queued_event],
+            created_by=principal.subject,
+            created_at=now,
+            updated_at=now,
+        )
+        outbox = OutboxRecord(
+            outbox_id=_id("outbox"),
+            org_id=principal.org_id,
+            topic="assistant.message.requested.v2",
+            aggregate_id=assistant_job_id,
+            payload={
+                "assistant_job_id": assistant_job_id,
+                "org_id": principal.org_id,
+            },
+            created_at=now,
+        )
+        return self.repository.enqueue_assistant_message(
+            conversation=conversation,
+            user_message=user_message,
+            job=job,
+            outbox=outbox,
+            audit=self._audit(
+                principal,
+                "assistant_message.enqueued",
+                case_id=run.case_id,
+                review_run_id=run.review_run_id,
+                detail={
+                    "conversation_id": conversation_id,
+                    "assistant_job_id": assistant_job_id,
+                    "user_message_id": user_message.message_id,
+                },
+            ),
+            expected_case_revision=run.case_revision,
+            actor_window_started_at=now - timedelta(minutes=1),
+            actor_window_limit=CHAT_INTERACTIONS_PER_ACTOR_PER_MINUTE,
+            review_run_limit=CHAT_INTERACTIONS_PER_REVIEW_RUN,
+        )
+
+    def _reconcile_expired_assistant_job(
+        self,
+        job: AssistantJobRecord,
+    ) -> AssistantJobRecord:
+        if (
+            job.state != AssistantJobState.running
+            or job.lease_id is None
+            or job.lease_expires_at is None
+            or job.lease_expires_at > utc_now()
+        ):
+            return job
+        system = Principal(
+            subject="system:assistant-reconciler",
+            org_id=job.org_id,
+            roles=frozenset(),
+        )
+        try:
+            return self.repository.mark_assistant_job_terminal(
+                org_id=job.org_id,
+                assistant_job_id=job.assistant_job_id,
+                state=AssistantJobState.delivery_uncertain,
+                error_code="delivery_uncertain:expired_call_once_lease",
+                event=_assistant_event(
+                    assistant_job_id=job.assistant_job_id,
+                    sequence=len(job.events) + 1,
+                    stage_code="failed",
+                    state="failed",
+                    message_key="assistant.delivery_uncertain",
+                ),
+                audit=self._audit(
+                    system,
+                    "assistant_message.delivery_uncertain",
+                    case_id=job.case_id,
+                    review_run_id=job.review_run_id,
+                    detail={
+                        "assistant_job_id": job.assistant_job_id,
+                        "reason": "expired_call_once_lease",
+                    },
+                ),
+                expected_lease_id=job.lease_id,
+            )
+        except ConflictError:
+            current = self.repository.get_assistant_job(job.org_id, job.assistant_job_id)
+            if current is None:
+                raise NotFoundError("assistant job not found") from None
+            return current
+
+    def get_assistant_job(self, principal: Principal, assistant_job_id: str) -> AssistantJobRecord:
+        self.require_enhanced_experience()
+        job = self.repository.get_assistant_job(principal.org_id, assistant_job_id)
+        if job is None:
+            raise NotFoundError("assistant job not found")
+        job = self._reconcile_expired_assistant_job(job)
+        self.get_run(principal, job.review_run_id)
+        return job
+
+    def list_assistant_jobs(
+        self, principal: Principal, conversation_id: str
+    ) -> list[AssistantJobRecord]:
+        self.require_enhanced_experience()
+        conversation = self.get_assistant_conversation(principal, conversation_id)
+        return [
+            self._reconcile_expired_assistant_job(job)
+            for job in self.repository.list_assistant_jobs(
+                principal.org_id,
+                conversation.conversation_id,
+            )
+        ]
+
+    def list_assistant_messages(
+        self, principal: Principal, conversation_id: str
+    ) -> list[AssistantMessageRecord]:
+        conversation = self.get_assistant_conversation(principal, conversation_id)
+        return self.repository.list_assistant_messages(
+            principal.org_id, conversation.conversation_id
+        )
+
+    def execute_assistant_job(self, *, org_id: str, assistant_job_id: str) -> AssistantJobRecord:
+        self.require_enhanced_experience()
+        job = self.repository.get_assistant_job(org_id, assistant_job_id)
+        if job is None:
+            raise NotFoundError("assistant job not found")
+        if job.state == AssistantJobState.succeeded:
+            return job
+        job = self._reconcile_expired_assistant_job(job)
+        if job.state != AssistantJobState.queued:
+            raise JobExecutionNotRunnableError("assistant job is not runnable")
+        system = Principal(
+            subject="system:assistant-worker",
+            org_id=org_id,
+            roles=frozenset(),
+        )
+        lease_id = _id("assistantlease")
+        started = self.repository.claim_assistant_job(
+            org_id=org_id,
+            assistant_job_id=assistant_job_id,
+            lease_id=lease_id,
+            lease_expires_at=utc_now() + timedelta(seconds=self.job_lease_seconds),
+            event=_assistant_event(
+                assistant_job_id=assistant_job_id,
+                sequence=len(job.events) + 1,
+                stage_code="request_validation",
+                state="started",
+                message_key="assistant.request_validation_started",
+            ),
+        )
+        sequence = len(started.events) + 1
+        external_call_started = False
+        response_received = False
+        response_validated = False
+        try:
+            request = CaseConversationRequestV2.model_validate(started.request)
+            validate_agent_experience_payload(
+                "case-conversation-request-v2",
+                request.model_dump(mode="json"),
+            )
+            if canonical_digest(request.model_dump(mode="json")) != started.agent_request_sha256:
+                raise ConflictError("assistant immutable request hash is inconsistent")
+            conversation = self.repository.get_assistant_conversation(
+                org_id, started.conversation_id
+            )
+            run = self.repository.get_run(org_id, started.review_run_id)
+            case = self.repository.get_case(org_id, started.case_id)
+            if conversation is None or run is None or case is None:
+                raise ConflictError("assistant job lineage is unavailable")
+            if (
+                conversation.bound_result_sha256 != request.bound_result_sha256
+                or run.provider_result_sha256 != request.bound_result_sha256
+                or run.result_digest != conversation.bound_effective_result_digest
+                or case.revision != run.case_revision
+                or request.review_result.result_sha256 != request.bound_result_sha256
+            ):
+                raise ConflictError("assistant request result binding is stale")
+            presentation = self.repository.get_review_presentation(
+                org_id,
+                started.review_run_id,
+            )
+            if (
+                presentation is None
+                or presentation.bound_provider_result_sha256 != request.bound_result_sha256
+                or presentation.bound_effective_result_digest != run.result_digest
+            ):
+                raise ConflictError("assistant verified presentation binding is unavailable")
+            self._assert_uat_capability_is_current(presentation.envelope.capability_attestation)
+            expected_agent_sequence = 0
+            answer_stream = _OrderedAgentStageStream(
+                stages=(
+                    "request_validation",
+                    "conversation_binding",
+                    "answer_planning",
+                    "answer_composition",
+                    "grounding_verification",
+                    "result_validation",
+                ),
+                retry_groups=(("answer_composition", "grounding_verification"),),
+            )
+            pending_result_validation_event: AgentAnswerStageEventV1 | None = None
+
+            def persist_answer_stage(raw_event: dict[str, Any]) -> None:
+                nonlocal sequence
+                nonlocal expected_agent_sequence
+                nonlocal pending_result_validation_event
+                try:
+                    validate_agent_experience_payload(
+                        "review-stage-event-v1",
+                        raw_event,
+                    )
+                    event = AgentAnswerStageEventV1.model_validate(raw_event)
+                except ValidationError as exc:
+                    raise ConflictError(
+                        "Agent answer stage violated the streaming contract"
+                    ) from exc
+                if event.sequence != expected_agent_sequence:
+                    raise ConflictError("Agent answer stage sequence is discontinuous")
+                if event.stage_code not in {
+                    "request_validation",
+                    "conversation_binding",
+                    "answer_planning",
+                    "answer_composition",
+                    "grounding_verification",
+                    "result_validation",
+                    "completed",
+                    "failed",
+                }:
+                    raise ConflictError("Agent answer stream contained a review-only stage")
+                answer_stream.observe(event)
+                # Persist exactly one Browser-visible terminal after the verified
+                # answer and its message are atomically committed.  The Agent's
+                # result-validation event is held until the Backend independently
+                # validates the structured answer below.
+                if event.stage_code == "result_validation":
+                    pending_result_validation_event = event
+                elif event.stage_code not in {"completed", "failed"}:
+                    assistant_stage_code = cast(AssistantStageCode, event.stage_code)
+                    self.repository.append_assistant_event(
+                        org_id=org_id,
+                        assistant_job_id=assistant_job_id,
+                        expected_lease_id=lease_id,
+                        event=_assistant_event(
+                            assistant_job_id=assistant_job_id,
+                            sequence=sequence,
+                            stage_code=assistant_stage_code,
+                            state=event.state,
+                            message_key=event.message_key,
+                            duration_ms=event.duration_ms or 0,
+                            safe_counts=event.safe_counts,
+                        ),
+                    )
+                    sequence += 1
+                expected_agent_sequence += 1
+
+            external_call_started = True
+            raw_answer = self.agent.answer_v2_stream(
+                request.model_dump(mode="json"),
+                on_event=persist_answer_stage,
+            )
+            response_received = True
+            answer_stream.require_success()
+            try:
+                validate_agent_experience_payload(
+                    "assistant-answer-v2",
+                    raw_answer,
+                )
+                answer = AssistantAnswerV2.model_validate(raw_answer)
+                validate_answer_against_context(
+                    answer=answer,
+                    request=request,
+                )
+            except (ValidationError, ValueError) as exc:
+                raise ConflictError(
+                    "Agent assistant answer violated the trusted Backend boundary"
+                ) from exc
+            if pending_result_validation_event is None:
+                raise ConflictError("Agent assistant answer omitted result validation")
+            response_validated = True
+            self.repository.append_assistant_event(
+                org_id=org_id,
+                assistant_job_id=assistant_job_id,
+                expected_lease_id=lease_id,
+                event=_assistant_event(
+                    assistant_job_id=assistant_job_id,
+                    sequence=sequence,
+                    stage_code="result_validation",
+                    state=pending_result_validation_event.state,
+                    message_key=pending_result_validation_event.message_key,
+                    duration_ms=pending_result_validation_event.duration_ms or 0,
+                    safe_counts=pending_result_validation_event.safe_counts,
+                ),
+            )
+            sequence += 1
+            persistence_started_at = utc_now()
+            self.repository.append_assistant_event(
+                org_id=org_id,
+                assistant_job_id=assistant_job_id,
+                expected_lease_id=lease_id,
+                event=_assistant_event(
+                    assistant_job_id=assistant_job_id,
+                    sequence=sequence,
+                    stage_code="persistence",
+                    state="started",
+                    message_key="assistant.persistence.started",
+                ),
+            )
+            sequence += 1
+            now = utc_now()
+            answer_message = AssistantMessageRecord(
+                message_id=(
+                    "assistant_message_"
+                    + canonical_digest(
+                        {
+                            "assistant_job_id": assistant_job_id,
+                            "answer_sha256": answer.answer_sha256,
+                        }
+                    )
+                ),
+                conversation_id=started.conversation_id,
+                review_run_id=started.review_run_id,
+                case_id=started.case_id,
+                org_id=started.org_id,
+                parent_message_id=started.user_message_id,
+                role="assistant",
+                content=answer.direct_answer,
+                structured_answer=answer,
+                bound_result_sha256=request.bound_result_sha256,
+                created_by="system:assistant-worker",
+                created_at=now,
+            )
+            completed = started.model_copy(
+                update={
+                    "state": AssistantJobState.succeeded,
+                    "answer_message_id": answer_message.message_id,
+                    "updated_at": now,
+                }
+            )
+            return self.repository.complete_assistant_job(
+                job=completed,
+                answer_message=answer_message,
+                events=(
+                    _assistant_event(
+                        assistant_job_id=assistant_job_id,
+                        sequence=sequence,
+                        stage_code="persistence",
+                        state="completed",
+                        message_key="assistant.persistence.completed",
+                        duration_ms=max(
+                            0,
+                            int((utc_now() - persistence_started_at).total_seconds() * 1000),
+                        ),
+                    ),
+                    _assistant_event(
+                        assistant_job_id=assistant_job_id,
+                        sequence=sequence + 1,
+                        stage_code="completed",
+                        state="completed",
+                        message_key="assistant.completed",
+                    ),
+                ),
+                audit=self._audit(
+                    system,
+                    "assistant_message.completed",
+                    case_id=started.case_id,
+                    review_run_id=started.review_run_id,
+                    detail={
+                        "assistant_job_id": assistant_job_id,
+                        "answer_message_id": answer_message.message_id,
+                    },
+                ),
+                expected_lease_id=lease_id,
+                expected_case_revision=run.case_revision,
+            )
+        except Exception as exc:
+            if response_validated:
+                state = AssistantJobState.response_persistence_uncertain
+            elif response_received or isinstance(exc, AgentResponseRejectedError):
+                state = AssistantJobState.response_received_rejected
+            elif isinstance(exc, AgentPreExecutionRetryableError):
+                state = AssistantJobState.failed
+            elif external_call_started:
+                state = AssistantJobState.delivery_uncertain
+            else:
+                state = AssistantJobState.failed
+            try:
+                self.repository.mark_assistant_job_terminal(
+                    org_id=org_id,
+                    assistant_job_id=assistant_job_id,
+                    state=state,
+                    error_code=f"{state.value}:{type(exc).__name__}",
+                    event=_assistant_event(
+                        assistant_job_id=assistant_job_id,
+                        sequence=sequence,
+                        stage_code="failed",
+                        state="failed",
+                        message_key=f"assistant.{state.value}",
+                    ),
+                    audit=self._audit(
+                        system,
+                        f"assistant_message.{state.value}",
+                        case_id=started.case_id,
+                        review_run_id=started.review_run_id,
+                        detail={"assistant_job_id": assistant_job_id},
+                    ),
+                    expected_lease_id=lease_id,
+                )
+            except Exception as state_error:
+                _warn_terminal_state_not_persisted(
+                    boundary="assistant_terminal",
+                    error=state_error,
+                )
+            raise
 
     def decide(
         self,

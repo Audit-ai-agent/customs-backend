@@ -82,7 +82,7 @@ def _write_local_uat_signer_registry(
             }
         ],
     }
-    path = root / "_secrets" / "uat" / "assertion-signing-key-registry.json"
+    path = root / "_local" / "secrets" / "uat" / "assertion-signing-key-registry.json"
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path, trust_sha256
@@ -124,6 +124,23 @@ def test_local_uat_signer_loader_accepts_only_the_exact_active_uat_approver(
             path,
             expected_trust_store_sha256=trust_sha256,
             today=date(2028, 1, 1),
+        )
+
+
+def test_local_uat_signer_rejects_retired_workspace_secret_root(tmp_path: Path) -> None:
+    path, trust_sha256 = _write_local_uat_signer_registry(tmp_path)
+    retired = tmp_path / "_secrets" / "uat" / path.name
+    retired.parent.mkdir(parents=True)
+    retired.write_bytes(path.read_bytes())
+
+    with pytest.raises(
+        AssertionSigningConfigurationError,
+        match="fixture path is invalid",
+    ):
+        load_local_uat_assertion_signer(
+            retired,
+            expected_trust_store_sha256=trust_sha256,
+            today=date(2026, 7, 24),
         )
 
 

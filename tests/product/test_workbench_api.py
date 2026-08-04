@@ -123,7 +123,10 @@ def _agent_result_with_audited_claude_calls(request: AgentReviewRequest) -> dict
 
 
 def _agent_result_with_bound_issue_and_finding(
-    request: AgentReviewRequest, *, duplicate_issue_fact: bool = False
+    request: AgentReviewRequest,
+    *,
+    duplicate_issue_fact: bool = False,
+    repeat_occurrences: bool = False,
 ) -> dict:
     result = build_agent_v3_result(request)
     issue = {
@@ -185,8 +188,30 @@ def _agent_result_with_bound_issue_and_finding(
         "confidence_basis": "structured_requirement_policy",
         "source": None,
     }
-    issue_reference = f"issue_{canonical_digest({'index': 0, 'issue': issue})}"
-    finding_reference = f"finding_{canonical_digest({'index': 0, 'finding': finding})}"
+    issues = [issue]
+    findings = [finding]
+    if repeat_occurrences:
+        issues.append(
+            {
+                **issue,
+                "message": "두 번째 Invoice 번호 불일치도 확인해야 합니다.",
+                "observed_value": "INV-SECOND",
+            }
+        )
+        findings.append(
+            {
+                **finding,
+                "message": "두 번째 품목의 요건서류도 확인해야 합니다.",
+            }
+        )
+    issue_references = [
+        f"issue_{canonical_digest({'index': index, 'issue': item})}"
+        for index, item in enumerate(issues)
+    ]
+    finding_references = [
+        f"finding_{canonical_digest({'index': index, 'finding': item})}"
+        for index, item in enumerate(findings)
+    ]
 
     def fact(kind: str, reference_id: str, label: str, value: str) -> dict:
         payload = {
@@ -202,7 +227,10 @@ def _agent_result_with_bound_issue_and_finding(
             "source_sha256": canonical_digest(payload),
         }
 
-    issue_fact = fact("issue", issue_reference, issue["issue_code"], issue["message"])
+    issue_facts = [
+        fact("issue", reference, item["issue_code"], item["message"])
+        for item, reference in zip(issues, issue_references, strict=True)
+    ]
     status = "needs_review"
     outcome_value = {
         "status": status,
@@ -218,8 +246,11 @@ def _agent_result_with_bound_issue_and_finding(
             if item["kind"] not in {"evidence", "outcome"}
         ],
         fact("evidence", evidence_id, evidence["title"], evidence["text"]),
-        issue_fact,
-        fact("finding", finding_reference, finding["finding_code"], finding["message"]),
+        *issue_facts,
+        *[
+            fact("finding", reference, item["finding_code"], item["message"])
+            for item, reference in zip(findings, finding_references, strict=True)
+        ],
         fact(
             "outcome",
             outcome_reference,
@@ -235,13 +266,13 @@ def _agent_result_with_bound_issue_and_finding(
     ]
     entries.sort(key=lambda item: (item["kind"], item["reference_id"]))
     if duplicate_issue_fact:
-        entries.append(dict(issue_fact))
+        entries.append(dict(issue_facts[0]))
     result["fact_ledger"] = {
         "ledger_id": f"ledger_{canonical_digest(entries)}",
         "entries": entries,
     }
-    result["validation_issues"] = [issue]
-    result["regulatory_findings"] = [finding]
+    result["validation_issues"] = issues
+    result["regulatory_findings"] = findings
     result["retrieval_results"][0]["requirements_found"] = True
     result["retrieval_results"][0]["evidence"] = [evidence]
     result["rag_evidence"] = [evidence]
@@ -257,16 +288,22 @@ def _agent_result_with_bound_issue_and_finding(
         "unmet_reason_codes": ["issues_detected"],
     }
     result["required_actions"] = [
-        {
-            "action_code": f"resolve_{issue['issue_code'].casefold()}",
-            "message": issue["message"],
-            "source_reference_ids": [issue_reference],
-        },
-        {
-            "action_code": f"resolve_{finding['finding_code'].casefold()}",
-            "message": finding["message"],
-            "source_reference_ids": [finding_reference, evidence_id],
-        },
+        *[
+            {
+                "action_code": f"resolve_{item['issue_code'].casefold()}",
+                "message": item["message"],
+                "source_reference_ids": [reference],
+            }
+            for item, reference in zip(issues, issue_references, strict=True)
+        ],
+        *[
+            {
+                "action_code": f"resolve_{item['finding_code'].casefold()}",
+                "message": item["message"],
+                "source_reference_ids": [reference, evidence_id],
+            }
+            for item, reference in zip(findings, finding_references, strict=True)
+        ],
         {
             "action_code": "obtain_production_release_approval",
             "message": (
@@ -278,15 +315,17 @@ def _agent_result_with_bound_issue_and_finding(
     result["report"]["overall_status"] = status
     result["report"]["summary"].update(
         {
-            "total_issues": 2,
+            "total_issues": len(issues) + len(findings),
             "critical": 0,
             "high": 0,
-            "medium": 1,
-            "low": 1,
+            "medium": len(issues),
+            "low": len(findings),
         }
     )
-    result["report"]["issues"] = [{**issue, "recommendation": "Invoice 번호를 확인하세요."}]
-    result["report"]["regulatory_findings"] = [finding]
+    result["report"]["issues"] = [
+        {**item, "recommendation": "Invoice 번호를 확인하세요."} for item in issues
+    ]
+    result["report"]["regulatory_findings"] = findings
     result["report"]["rag_evidence"] = [
         {**evidence, "raw_scores": [{"method": "exact_hs", "score": 1.0}]}
     ]
@@ -310,23 +349,25 @@ def _agent_result_with_bound_issue_and_finding(
             "document_consistency": [
                 claim(
                     (
-                        f"문서 검토 원인({issue['issue_code']}): {issue['message']} "
+                        f"문서 검토 원인({item['issue_code']}): {item['message']} "
                         "이 검증 문제가 해결되기 전에는 관련 문서의 정합성을 확정할 수 없습니다."
                     ),
-                    [{"kind": "issue", "reference_id": issue_reference}],
+                    [{"kind": "issue", "reference_id": reference}],
                 )
+                for item, reference in zip(issues, issue_references, strict=True)
             ],
             "regulatory_review": [
                 claim(
                     (
-                        f"규정 검토 원인({finding['finding_code']}): {finding['message']} "
+                        f"규정 검토 원인({item['finding_code']}): {item['message']} "
                         "이 요건이 충족되기 전에는 규정 검토를 완료할 수 없습니다."
                     ),
                     [
-                        {"kind": "finding", "reference_id": finding_reference},
+                        {"kind": "finding", "reference_id": reference},
                         {"kind": "evidence", "reference_id": evidence_id},
                     ],
                 )
+                for item, reference in zip(findings, finding_references, strict=True)
             ],
             "required_actions": [
                 claim(
@@ -590,7 +631,10 @@ def test_delivery_uncertainty_blocks_new_call_until_approver_reconciliation(work
         json={},
         headers={**_auth(), "Idempotency-Key": "uncertain-first"},
     ).json()["job"]
-    with pytest.raises(TimeoutError, match="response lost"):
+    with pytest.raises(
+        JobExecutionNotRunnableError,
+        match="automatic retry is prohibited",
+    ):
         container.service.execute_job(org_id="org-a", job_id=job["job_id"])
     different = client.post(
         url,
@@ -655,6 +699,58 @@ def test_public_issue_and_finding_references_are_exactly_ledger_bound(workbench)
     ).json()["job"]
     with pytest.raises(ConflictError, match="policy boundary"):
         container.service.execute_job(org_id="org-a", job_id=second_job["job_id"])
+
+
+def test_repeated_issue_and_finding_codes_keep_occurrence_references_in_full_envelope() -> None:
+    from tests.product.test_commercial_agent_experience import (
+        _experience_from_result,
+        _review_request,
+    )
+
+    from customs_backend.domain import AgentReviewResultV3
+    from customs_backend.experience import (
+        ReviewExperienceEnvelopeV1,
+        build_canonical_experience_claim_catalog,
+        validate_presentation_against_result,
+    )
+
+    result = _agent_result_with_bound_issue_and_finding(
+        _review_request(),
+        repeat_occurrences=True,
+    )
+    typed_result = AgentReviewResultV3.model_validate(result)
+    envelope = ReviewExperienceEnvelopeV1.model_validate(_experience_from_result(result))
+    validate_presentation_against_result(envelope)
+    claims = build_canonical_experience_claim_catalog(typed_result)
+
+    issue_references = {
+        citation.reference_id
+        for claim in claims
+        for citation in claim.citation_references
+        if citation.kind == "issue"
+    }
+    finding_references = {
+        citation.reference_id
+        for claim in claims
+        for citation in claim.citation_references
+        if citation.kind == "finding"
+    }
+    assert len(issue_references) == 2
+    assert len(finding_references) == 2
+    assert issue_references.issubset(
+        {
+            str(item["reference_id"])
+            for item in typed_result.fact_ledger["entries"]
+            if item["kind"] == "issue"
+        }
+    )
+    assert finding_references.issubset(
+        {
+            str(item["reference_id"])
+            for item in typed_result.fact_ledger["entries"]
+            if item["kind"] == "finding"
+        }
+    )
 
 
 def test_enqueue_rejects_more_than_agent_release_primary_document_limit_atomically(workbench):
@@ -822,9 +918,11 @@ def test_worker_restart_preserves_job_and_forces_auto_completion_gate(workbench)
     assert stored_provider_result is not None
     assert provenance["request_id"] == stored_provider_result["retrieval_request"]["request_id"]
     assert provenance["query_intent"] == "required_import_documents"
+    provider_item = stored_provider_result["retrieval_results"][0]
+    provider_evidence = stored_provider_result["rag_evidence"][0]
     assert provenance["items"] == [
         {
-            "item_id": run.result_detail["retrieval_results"][0]["item_id"],
+            "item_id": provider_item["item_id"],
             "query_description": "Synthetic no-requirement line item",
             "requested_hs_code": "0303540000",
             "hs_resolution": "exact",
@@ -835,10 +933,12 @@ def test_worker_restart_preserves_job_and_forces_auto_completion_gate(workbench)
     ]
     assert provenance["ranked_evidence"] == [
         {
-            "evidence_id": run.result_detail["rag_evidence"][0]["evidence_id"],
-            "item_id": run.result_detail["retrieval_results"][0]["item_id"],
+            "evidence_id": provider_evidence["evidence_id"],
+            "item_id": provider_item["item_id"],
             "rank": 1,
             "source_type": "hsk_entry",
+            "title": "Synthetic HSK classification evidence",
+            "excerpt": "The synthetic item is bound to HSK 0303540000 for contract testing.",
             "retrieval_methods": ["exact_hs"],
             "score": 1.0,
             "raw_scores": {"exact_hs": 1.0},
@@ -849,6 +949,8 @@ def test_worker_restart_preserves_job_and_forces_auto_completion_gate(workbench)
             "source_uri": "https://example.invalid/hsk/0303540000",
         }
     ]
+    assert "retrieval_results" not in run.result_detail
+    assert "rag_evidence" not in run.result_detail
     assert container.repository.get_provider_result("org-a", run.review_run_id) is not None
     assert (
         restarted.execute_job(org_id="org-a", job_id=queued["job_id"]).result_digest
@@ -2094,7 +2196,10 @@ def test_external_agent_failure_closes_durable_call_once_barrier(workbench):
         json={},
         headers={**_auth(), "Idempotency-Key": "bounded-retries"},
     ).json()["job"]
-    with pytest.raises(RuntimeError, match="provider unavailable"):
+    with pytest.raises(
+        JobExecutionNotRunnableError,
+        match="automatic retry is prohibited",
+    ):
         container.service.execute_job(org_id="org-a", job_id=job["job_id"])
     stored = container.repository.get_job("org-a", job["job_id"])
     assert stored is not None
@@ -2151,7 +2256,10 @@ def test_external_revision_failure_uses_the_same_call_once_barrier(workbench):
         raise TimeoutError("revision delivery response lost")
 
     container.service.agent = CallableAgentClient(_agent_result, revise=fail_revision)
-    with pytest.raises(TimeoutError, match="revision delivery response lost"):
+    with pytest.raises(
+        JobExecutionNotRunnableError,
+        match="automatic retry is prohibited",
+    ):
         container.service.execute_job(org_id="org-a", job_id=child_job["job_id"])
     stored = container.repository.get_job("org-a", child_job["job_id"])
     assert stored is not None
@@ -2345,7 +2453,12 @@ def test_proven_pre_execution_503_exhausts_at_three_and_never_calls_fourth(workb
 @pytest.mark.parametrize(
     ("failure", "expected_exception", "expected_status", "expected_call_state"),
     [
-        ("timeout", httpx.ReadTimeout, "delivery_uncertain", "delivery_uncertain"),
+        (
+            "timeout",
+            JobExecutionNotRunnableError,
+            "delivery_uncertain",
+            "delivery_uncertain",
+        ),
         (
             "http-502",
             AgentResponseRejectedError,

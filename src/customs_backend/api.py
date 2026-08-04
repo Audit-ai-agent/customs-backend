@@ -4,7 +4,7 @@ import json
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any, Literal, Never
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
@@ -46,6 +46,7 @@ from customs_backend.domain import (
     JobStatus,
     MAX_SUPPORTING_DOCUMENTS_PER_CASE,
     Principal,
+    ReleaseIdentityV3,
     ReviewEnqueueRequest,
     RevisionProposalCreate,
     ReviewRunRecord,
@@ -66,12 +67,31 @@ from customs_backend.ports import (
     TokenVerifier,
     WorkbenchRepository,
 )
+from customs_backend.experience import (
+    AssistantConversationRecord,
+    AgentUatCapabilityAttestationV1,
+    AssistantJobEnqueueResponse,
+    AssistantJobRecord,
+    AssistantJobView,
+    AssistantMessageCreateV2,
+    AssistantMessageRecord,
+    ConversationCreateV2,
+    JobExperienceView,
+    PublicReviewExperienceV1,
+)
+from customs_backend.experience_contract import (
+    expected_meaning_catalog_sha256,
+    validate_agent_experience_contract_bundle,
+    validate_agent_experience_payload,
+)
 from customs_backend.release import (
     AgentReleasePin,
     AgentServicePin,
     EvidenceRuntimeReleaseIdentityV3,
+    LocalUatRuntimeBindingV1,
     ReleaseConfigurationError,
     load_auto_completion_approval,
+    load_local_uat_runtime_binding,
     validate_agent_contract_bundle,
 )
 from customs_backend.repository import InMemoryWorkbenchRepository, PostgresWorkbenchRepository
@@ -198,6 +218,47 @@ class JobResponse(BaseModel):
     idempotency_reused: bool
 
 
+class JobExperienceResponse(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    job: JobExperienceView
+    idempotency_reused: bool
+
+
+class AssistantConversationListResponse(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    items: list[AssistantConversationRecord]
+
+
+class AssistantMessageListResponse(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    items: list[AssistantMessageRecord]
+
+
+class AssistantJobListResponse(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    items: list[AssistantJobView]
+
+
+def _assistant_job_view(job: AssistantJobRecord) -> AssistantJobView:
+    return AssistantJobView(
+        assistant_job_id=job.assistant_job_id,
+        request_binding_sha256=job.agent_request_sha256,
+        conversation_id=job.conversation_id,
+        review_run_id=job.review_run_id,
+        case_id=job.case_id,
+        state=job.state,
+        events=job.events,
+        answer_message_id=job.answer_message_id,
+        error_code=job.error_code,
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+    )
+
+
 class JobEventsResponse(BaseModel):
     items: list[StageEvent]
 
@@ -315,6 +376,16 @@ class UatMetadataResponse(BaseModel):
     production_release: Literal[False] = False
 
 
+class UatMetadataV2Response(UatMetadataResponse):
+    model_config = {"extra": "forbid"}
+
+    enhanced_agent_experience: bool = False
+    uat_adaptive_active: bool = False
+    agent_experience_api_version: Literal["disabled", "3.0"] = "disabled"
+    assistant_api_version: Literal["disabled", "2.0"] = "disabled"
+    actual_stage_streaming: bool = False
+
+
 @dataclass(frozen=True, slots=True)
 class _UatEvidencePolicyIdentityPin:
     requirement_policy_release: str
@@ -381,13 +452,52 @@ class Container:
     agent: AgentClient
     token_verifier: TokenVerifier
     service: WorkbenchService
+    local_uat_runtime_binding: LocalUatRuntimeBindingV1 | None = None
     uat_evidence_trace_reader: UatEvidenceTraceReader | None = None
+
+
+def _binding_requires_static_service_pin(
+    binding: LocalUatRuntimeBindingV1 | None,
+) -> bool:
+    """Keep the static release pin at the candidate boundary only.
+
+    A short-lived development binding already pins the live wheel, source tree,
+    model, contracts, capability and Evidence runtime.  Requiring the packaged
+    release pin as well would force every local edit through the release-pin
+    update chain that this binding is specifically intended to avoid.
+    """
+
+    return binding is not None and binding.mode != "development"
 
 
 def build_container(settings: Settings) -> Container:
     if settings.process_role != "runtime":
         raise ReleaseConfigurationError("the HTTP/worker container requires the runtime role")
     validate_agent_contract_bundle()
+    local_uat_runtime_binding = (
+        load_local_uat_runtime_binding(
+            settings.uat_runtime_binding_path,
+            expected_file_sha256=settings.uat_runtime_binding_sha256,
+        )
+        if settings.uat_runtime_binding_path is not None
+        and settings.uat_runtime_binding_sha256 is not None
+        else None
+    )
+    if (
+        settings.environment == "local_uat"
+        and settings.enhanced_agent_experience
+        and local_uat_runtime_binding is None
+    ):
+        raise ReleaseConfigurationError(
+            "enhanced local UAT runtime requires one exact runtime binding file"
+        )
+    if (
+        local_uat_runtime_binding is not None
+        and local_uat_runtime_binding.loopback_origin.rstrip("/") != settings.public_base_url
+    ):
+        raise ReleaseConfigurationError(
+            "local UAT runtime binding origin differs from the Backend public origin"
+        )
     verifier = OidcJwtVerifier(
         issuer=settings.oidc_issuer,
         audience=settings.oidc_audience,
@@ -462,6 +572,10 @@ def build_container(settings: Settings) -> Container:
         if all(value is not None for value in service_pin_values.values())
         else None
     )
+    if _binding_requires_static_service_pin(local_uat_runtime_binding) and service_pin is None:
+        raise ReleaseConfigurationError(
+            "candidate UAT runtime binding requires the packaged Agent service contract pin"
+        )
     release_values = {
         "model_revision": settings.agent_expected_model_revision,
         "evidence_snapshot_id": settings.agent_expected_evidence_snapshot_id,
@@ -608,6 +722,12 @@ def build_container(settings: Settings) -> Container:
         job_lease_seconds=settings.job_lease_seconds,
         job_max_attempts=settings.job_max_attempts,
         outbox_lease_seconds=settings.outbox_lease_seconds,
+        enhanced_agent_experience=settings.enhanced_agent_experience,
+        uat_adaptive_active=settings.uat_adaptive_active,
+        evidence_profile=settings.uat_evidence_profile,
+        expected_uat_capability_sha256=(settings.uat_expected_capability_sha256),
+        local_uat_runtime_binding=local_uat_runtime_binding,
+        uat_evidence_trace_reader=uat_evidence_trace_reader,
     )
     return Container(
         settings,
@@ -617,6 +737,7 @@ def build_container(settings: Settings) -> Container:
         agent,
         verifier,
         service,
+        local_uat_runtime_binding,
         uat_evidence_trace_reader,
     )
 
@@ -631,6 +752,15 @@ class _UnavailableAgentClient:
     def revise(self, request: Any) -> dict[str, Any]:
         self._fail()
 
+    def revise_experience(self, request: Any) -> dict[str, Any]:
+        self._fail()
+
+    def review_experience(self, request: Any) -> dict[str, Any]:
+        self._fail()
+
+    def review_experience_stream(self, request: Any, *, on_event: Any) -> dict[str, Any]:
+        self._fail()
+
     def answer(
         self,
         *,
@@ -640,7 +770,16 @@ class _UnavailableAgentClient:
     ) -> Any:
         self._fail()
 
+    def answer_v2(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._fail()
+
+    def answer_v2_stream(self, payload: dict[str, Any], *, on_event: Any) -> dict[str, Any]:
+        self._fail()
+
     def metadata(self) -> dict[str, Any]:
+        self._fail()
+
+    def experience_metadata(self) -> dict[str, Any]:
         self._fail()
 
     def uat_readiness(self) -> dict[str, Any]:
@@ -656,7 +795,7 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
     actual_container = container or build_container(actual_settings)
     app = FastAPI(
         title="Customs Review Workbench API",
-        version="1.0.0",
+        version="2.0.0",
         description=(
             "Internal, text-only workbench. Browser clients call this API only; "
             "Agent and Evidence credentials are never exposed."
@@ -678,7 +817,7 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
     @app.middleware("http")
     async def no_store_authenticated_api(request: Request, call_next):
         response = await call_next(request)
-        if request.url.path.startswith("/api/v1/"):
+        if request.url.path.startswith(("/api/v1/", "/api/v2/")):
             response.headers["Cache-Control"] = "no-store"
             response.headers["Pragma"] = "no-cache"
         return response
@@ -807,6 +946,113 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             "dependencies": dependency_status,
         }
 
+    def validate_uat_capability_attestation(
+        payload: dict[str, Any],
+    ) -> AgentUatCapabilityAttestationV1:
+        if not actual_container.settings.enhanced_agent_experience:
+            raise ReleaseConfigurationError("enhanced Agent experience is disabled")
+        try:
+            validate_agent_experience_payload(
+                "agent-uat-capability-v1",
+                payload["uat_capability_attestation"],
+            )
+            capability = AgentUatCapabilityAttestationV1.model_validate(
+                payload["uat_capability_attestation"]
+            )
+        except (KeyError, TypeError, ValueError):
+            raise ReleaseConfigurationError("Agent UAT capability is invalid") from None
+        contract_lock = validate_agent_experience_contract_bundle().lock
+        runtime_binding = actual_container.local_uat_runtime_binding
+        if runtime_binding is not None:
+            runtime_binding.require_active()
+        capability_now = datetime.now(UTC)
+        common_identity_differs = (
+            payload.get("uat_capability_sha256") != capability.capability_sha256
+            or payload.get("uat_capability_sha256")
+            != actual_container.settings.uat_expected_capability_sha256
+            or (
+                runtime_binding is not None
+                and payload.get("uat_capability_sha256") != runtime_binding.capability_sha256
+            )
+            or not isinstance(payload.get("uat_capability_file_sha256"), str)
+            or any(
+                character not in "0123456789abcdef"
+                for character in payload["uat_capability_file_sha256"]
+            )
+            or len(payload["uat_capability_file_sha256"]) != 64
+            or payload.get("uat_capability_file_sha256")
+            != actual_container.settings.uat_expected_capability_file_sha256
+            or (
+                runtime_binding is not None
+                and payload.get("uat_capability_file_sha256")
+                != runtime_binding.capability_file_sha256
+            )
+            or payload.get("uat_capability_expires_at") != capability.expires_at.isoformat()
+            or payload.get("agent_commit") != capability.agent_commit
+            or capability.expires_at <= capability_now
+            or capability.issued_at > capability_now + timedelta(minutes=5)
+            or capability.expires_at > capability_now + timedelta(hours=24, minutes=5)
+            or capability.adaptive_active != actual_container.settings.uat_adaptive_active
+            or capability.evidence_profile != actual_container.settings.uat_evidence_profile
+            or capability.evidence_runtime_v3_sha256
+            != actual_container.settings.uat_evidence_runtime_v3_sha256
+            or (
+                runtime_binding is not None
+                and capability.evidence_runtime_v3_sha256
+                != runtime_binding.evidence_runtime_v3_sha256
+            )
+        )
+        binding_identity_differs = runtime_binding is not None and (
+            capability.agent_commit != runtime_binding.agent.commit
+            or capability.prompt_bundle_sha256 != runtime_binding.agent.prompt_bundle_sha256
+            or capability.schema_bundle_sha256 != runtime_binding.agent.schema_bundle_sha256
+            or capability.tool_registry_id != runtime_binding.agent.tool_registry_id
+            or capability.tool_registry_sha256 != runtime_binding.agent.tool_registry_sha256
+        )
+        candidate_lock_differs = (
+            runtime_binding is None or runtime_binding.mode == "candidate"
+        ) and (
+            capability.agent_commit != contract_lock.provider_commit
+            or capability.prompt_bundle_sha256 != contract_lock.experience_prompt_bundle_sha256
+            or capability.schema_bundle_sha256 != contract_lock.experience_schema_bundle_sha256
+            or capability.tool_registry_id != contract_lock.uat_tool_registry_id
+            or capability.tool_registry_sha256 != contract_lock.uat_tool_registry_sha256
+            or (
+                runtime_binding is not None
+                and runtime_binding.agent.meaning_catalog_sha256
+                != expected_meaning_catalog_sha256()
+            )
+        )
+        if common_identity_differs or binding_identity_differs or candidate_lock_differs:
+            raise ReleaseConfigurationError("Agent UAT capability identity differs")
+        return capability
+
+    def validate_enhanced_capability(
+        payload: dict[str, Any],
+    ) -> AgentUatCapabilityAttestationV1:
+        expected_keys = {
+            "service_api_version": "internal-agent-service/v3",
+            "enhanced_experience_enabled": True,
+            "uat_adaptive_active": actual_container.settings.uat_adaptive_active,
+            "auto_completion_enabled": False,
+            "uat_capability_status": "valid",
+        }
+        schemas = payload.get("schemas")
+        contract_lock = validate_agent_experience_contract_bundle().lock
+        if (
+            any(payload.get(key) != value for key, value in expected_keys.items())
+            or payload.get("meaning_catalog_sha256") != expected_meaning_catalog_sha256()
+            or (
+                actual_container.local_uat_runtime_binding is not None
+                and payload.get("meaning_catalog_sha256")
+                != actual_container.local_uat_runtime_binding.agent.meaning_catalog_sha256
+            )
+            or not isinstance(schemas, dict)
+            or schemas.get("service_openapi_sha256") != contract_lock.provider_openapi_sha256
+        ):
+            raise ReleaseConfigurationError("Agent enhanced-experience mode differs")
+        return validate_uat_capability_attestation(payload)
+
     def validated_local_uat_agent_metadata() -> tuple[
         dict[str, Any], EvidenceRuntimeReleaseIdentityV3
     ]:
@@ -823,6 +1069,10 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             "shadow": "shadow",
             "diagnostic_active": "active",
         }[actual_container.settings.uat_planner_mode]
+        expected_execution_mode = {
+            "shadow": "shadow",
+            "diagnostic_active": "uat_active",
+        }[actual_container.settings.uat_planner_mode]
         if (
             agent_metadata.get("status") != "ready"
             or agent_metadata.get("service_api_version") != "internal-agent-service/v2"
@@ -831,7 +1081,8 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             or not isinstance(transport_limits, dict)
             or transport_limits.get("text_only") is not True
             or not isinstance(agentic_limits, dict)
-            or agentic_limits.get("effective_execution_mode") != expected_planner_mode
+            or agentic_limits.get("planner_mode") != expected_planner_mode
+            or agentic_limits.get("effective_execution_mode") != expected_execution_mode
             or not isinstance(model_identity, dict)
             or not isinstance(model_identity.get("id"), str)
             or not model_identity["id"]
@@ -899,8 +1150,48 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             raise ReleaseConfigurationError(
                 "Agent UAT assertion fixture is forbidden for this profile"
             )
+        runtime_binding = actual_container.local_uat_runtime_binding
+        if runtime_binding is not None:
+            runtime_binding.require_active()
+            bound_agent_metadata = agent_metadata.get("agent")
+            bound_runtime_release = agent_metadata.get("runtime_release")
+            if not isinstance(bound_agent_metadata, dict):
+                raise ReleaseConfigurationError("Agent UAT build metadata is invalid")
+            try:
+                bound_runtime_identity = ReleaseIdentityV3.model_validate(bound_runtime_release)
+            except (TypeError, ValueError):
+                raise ReleaseConfigurationError("Agent UAT runtime metadata is invalid") from None
+            if (
+                bound_agent_metadata.get("build_sha") != runtime_binding.agent.commit
+                or bound_agent_metadata.get("source_snapshot_sha256")
+                != runtime_binding.agent.working_tree_sha256
+                or bound_agent_metadata.get("wheel_sha256") != runtime_binding.agent.wheel_sha256
+                or not runtime_binding.matches_service_metadata_runtime(bound_runtime_identity)
+            ):
+                raise ReleaseConfigurationError("Agent UAT metadata differs from runtime binding")
         if actual_container.service.service_pin is not None:
-            actual_container.service.service_pin.validate_local_uat_metadata(agent_metadata)
+            if runtime_binding is not None and runtime_binding.mode == "development":
+                actual_container.service.service_pin.validate_local_uat_development_metadata(
+                    agent_metadata,
+                    binding=runtime_binding,
+                )
+            else:
+                actual_container.service.service_pin.validate_local_uat_metadata(agent_metadata)
+        if actual_container.settings.enhanced_agent_experience:
+            experience_metadata = actual_container.agent.experience_metadata()
+            capability = validate_enhanced_capability(experience_metadata)
+            if (
+                not isinstance(experience_metadata.get("agentic_limits"), dict)
+                or experience_metadata["agentic_limits"].get("effective_execution_mode")
+                != "uat_active"
+                or experience_metadata["agentic_limits"].get("planner_mode") != "active"
+                or experience_metadata["agentic_limits"].get(
+                    "active_execution_authorized_by_release"
+                )
+                is not False
+                or capability.auto_completion_enabled is not False
+            ):
+                raise ReleaseConfigurationError("Agent enhanced-experience limits are invalid")
         return agent_metadata, evidence_identity
 
     def local_uat_evidence_scope() -> Literal[
@@ -955,6 +1246,15 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         try:
             agent_metadata, evidence_identity = validated_local_uat_agent_metadata()
             agent_uat_readiness = actual_container.agent.uat_readiness()
+            if actual_container.settings.enhanced_agent_experience:
+                readiness_capability = validate_uat_capability_attestation(agent_uat_readiness)
+                metadata_capability = validate_enhanced_capability(
+                    actual_container.agent.experience_metadata()
+                )
+                if readiness_capability != metadata_capability:
+                    raise ReleaseConfigurationError(
+                        "Agent metadata/readiness capability identity drifted"
+                    )
             if (
                 agent_uat_readiness.get("status") != "uat-ready"
                 or agent_uat_readiness.get("diagnostic_only") is not True
@@ -1015,6 +1315,8 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             "evidence_runtime_v3_sha256": evidence_identity.runtime_release_v3_sha256,
             "agent_status": agent_metadata["status"],
             "agent_uat_status": agent_uat_readiness["status"],
+            "enhanced_agent_experience": (actual_container.settings.enhanced_agent_experience),
+            "uat_adaptive_active": actual_container.settings.uat_adaptive_active,
             "dependencies": dependency_status,
         }
 
@@ -1038,6 +1340,37 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             evidence_dataset=local_uat_evidence_dataset(),
             supported_review_as_of=evidence_identity.base_runtime_release.supported_review_as_of,
             planner_mode=actual_container.settings.uat_planner_mode,
+        )
+
+    @app.get("/api/v2/uat/metadata", response_model=UatMetadataV2Response)
+    def uat_metadata_v2() -> UatMetadataV2Response:
+        if actual_container.settings.environment != "local_uat":
+            raise HTTPException(status_code=404, detail="local UAT metadata is unavailable")
+        try:
+            _agent_metadata, evidence_identity = validated_local_uat_agent_metadata()
+        except Exception:
+            raise HTTPException(
+                status_code=503,
+                detail="local UAT Agent metadata is invalid or unavailable",
+            ) from None
+        return UatMetadataV2Response(
+            evidence_profile=actual_container.settings.uat_evidence_profile,
+            evidence_scope=local_uat_evidence_scope(),
+            evidence_scope_label=local_uat_evidence_scope(),
+            evidence_data_source=actual_container.settings.uat_evidence_data_source,
+            evidence_policy_mode=actual_container.settings.uat_evidence_policy_mode,
+            evidence_dataset=local_uat_evidence_dataset(),
+            supported_review_as_of=evidence_identity.base_runtime_release.supported_review_as_of,
+            planner_mode=actual_container.settings.uat_planner_mode,
+            enhanced_agent_experience=(actual_container.settings.enhanced_agent_experience),
+            uat_adaptive_active=actual_container.settings.uat_adaptive_active,
+            agent_experience_api_version=(
+                "3.0" if actual_container.settings.enhanced_agent_experience else "disabled"
+            ),
+            assistant_api_version=(
+                "2.0" if actual_container.settings.enhanced_agent_experience else "disabled"
+            ),
+            actual_stage_streaming=(actual_container.settings.enhanced_agent_experience),
         )
 
     @app.get("/api/v1/auth/config", response_model=AuthConfigResponse)
@@ -1462,6 +1795,247 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
     ) -> ChatListResponse:
         service.get_run(principal, review_run_id)
         return ChatListResponse(items=service.repository.list_chat(principal.org_id, review_run_id))
+
+    @app.post(
+        "/api/v2/cases/{case_id}/reviews",
+        response_model=JobExperienceResponse,
+        status_code=202,
+    )
+    def enqueue_experience_review_endpoint(
+        case_id: str,
+        body: ReviewEnqueueRequest,
+        idempotency_key: IdempotencyKey,
+        principal: Principal = Depends(writers),
+        service: WorkbenchService = Depends(_service),
+    ) -> JobExperienceResponse:
+        service.require_enhanced_experience()
+        job, created = service.enqueue_review(
+            principal,
+            case_id,
+            body,
+            idempotency_key,
+            experience_api_version="3.0",
+            evidence_profile=service.evidence_profile,
+        )
+        return JobExperienceResponse(
+            job=service.get_job_experience(principal, job.job_id),
+            idempotency_reused=not created,
+        )
+
+    @app.get("/api/v2/jobs/{job_id}", response_model=JobExperienceView)
+    def get_experience_job_endpoint(
+        job_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> JobExperienceView:
+        return service.get_job_experience(principal, job_id)
+
+    @app.get("/api/v2/jobs/{job_id}/events/stream")
+    def stream_experience_job_events_endpoint(
+        job_id: str,
+        last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> StreamingResponse:
+        service.get_job_experience(principal, job_id)
+
+        def generate():
+            try:
+                next_sequence = max(int(last_event_id or "0") + 1, 1)
+            except ValueError:
+                next_sequence = 1
+            deadline = time.monotonic() + 600
+            heartbeat_at = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                events = service.repository.list_stage_events(principal.org_id, job_id)
+                for event in events:
+                    if event.sequence < next_sequence:
+                        continue
+                    yield (
+                        f"id: {event.sequence}\n"
+                        "event: review-stage\n"
+                        f"data: {json.dumps(event.model_dump(mode='json'), separators=(',', ':'))}\n\n"
+                    )
+                    next_sequence = event.sequence + 1
+                job = service.repository.get_job(principal.org_id, job_id)
+                if job is None or (
+                    job.status
+                    in {
+                        JobStatus.succeeded,
+                        JobStatus.failed,
+                        JobStatus.delivery_uncertain,
+                        JobStatus.response_received_rejected,
+                        JobStatus.response_persistence_uncertain,
+                    }
+                    and all(event.sequence < next_sequence for event in events)
+                ):
+                    return
+                if time.monotonic() >= heartbeat_at:
+                    yield ": keep-alive\n\n"
+                    heartbeat_at = time.monotonic() + 15
+                time.sleep(0.5)
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-store",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.get(
+        "/api/v2/review-runs/{review_run_id}/experience",
+        response_model=PublicReviewExperienceV1,
+    )
+    def get_review_experience_endpoint(
+        review_run_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> PublicReviewExperienceV1:
+        return service.get_public_review_experience(principal, review_run_id)
+
+    @app.post(
+        "/api/v2/review-runs/{review_run_id}/assistant/conversations",
+        response_model=AssistantConversationRecord,
+        status_code=201,
+    )
+    def create_assistant_conversation_endpoint(
+        review_run_id: str,
+        body: ConversationCreateV2,
+        principal: Principal = Depends(chat_users),
+        service: WorkbenchService = Depends(_service),
+    ) -> AssistantConversationRecord:
+        return service.create_assistant_conversation(principal, review_run_id, body)
+
+    @app.get(
+        "/api/v2/review-runs/{review_run_id}/assistant/conversations",
+        response_model=AssistantConversationListResponse,
+    )
+    def list_assistant_conversations_endpoint(
+        review_run_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> AssistantConversationListResponse:
+        return AssistantConversationListResponse(
+            items=service.list_assistant_conversations(principal, review_run_id)
+        )
+
+    @app.post(
+        "/api/v2/assistant/conversations/{conversation_id}/messages",
+        response_model=AssistantJobEnqueueResponse,
+        status_code=202,
+    )
+    def enqueue_assistant_message_endpoint(
+        conversation_id: str,
+        body: AssistantMessageCreateV2,
+        idempotency_key: IdempotencyKey,
+        principal: Principal = Depends(chat_users),
+        service: WorkbenchService = Depends(_service),
+    ) -> AssistantJobEnqueueResponse:
+        job, user_message, created = service.enqueue_assistant_message(
+            principal,
+            conversation_id,
+            body,
+            idempotency_key,
+        )
+        return AssistantJobEnqueueResponse(
+            job=_assistant_job_view(job),
+            user_message=user_message,
+            idempotency_reused=not created,
+        )
+
+    @app.get(
+        "/api/v2/assistant/conversations/{conversation_id}/messages",
+        response_model=AssistantMessageListResponse,
+    )
+    def list_assistant_messages_endpoint(
+        conversation_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> AssistantMessageListResponse:
+        return AssistantMessageListResponse(
+            items=service.list_assistant_messages(principal, conversation_id)
+        )
+
+    @app.get("/api/v2/assistant/jobs/{assistant_job_id}", response_model=AssistantJobView)
+    def get_assistant_job_endpoint(
+        assistant_job_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> AssistantJobView:
+        return _assistant_job_view(service.get_assistant_job(principal, assistant_job_id))
+
+    @app.get(
+        "/api/v2/assistant/conversations/{conversation_id}/jobs",
+        response_model=AssistantJobListResponse,
+    )
+    def list_assistant_jobs_endpoint(
+        conversation_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> AssistantJobListResponse:
+        return AssistantJobListResponse(
+            items=[
+                _assistant_job_view(job)
+                for job in service.list_assistant_jobs(principal, conversation_id)
+            ]
+        )
+
+    @app.get("/api/v2/assistant/jobs/{assistant_job_id}/events/stream")
+    def stream_assistant_job_events_endpoint(
+        assistant_job_id: str,
+        last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> StreamingResponse:
+        service.get_assistant_job(principal, assistant_job_id)
+
+        def generate():
+            try:
+                next_sequence = max(int(last_event_id or "0") + 1, 1)
+            except ValueError:
+                next_sequence = 1
+            deadline = time.monotonic() + 300
+            heartbeat_at = time.monotonic() + 15
+            terminal = {
+                "succeeded",
+                "failed",
+                "delivery_uncertain",
+                "response_received_rejected",
+                "response_persistence_uncertain",
+            }
+            while time.monotonic() < deadline:
+                try:
+                    job = service.get_assistant_job(principal, assistant_job_id)
+                except NotFoundError:
+                    return
+                for event in job.events:
+                    if event.sequence < next_sequence:
+                        continue
+                    yield (
+                        f"id: {event.sequence}\n"
+                        "event: assistant-stage\n"
+                        f"data: {json.dumps(event.model_dump(mode='json'), separators=(',', ':'))}\n\n"
+                    )
+                    next_sequence = event.sequence + 1
+                if job.state.value in terminal and all(
+                    event.sequence < next_sequence for event in job.events
+                ):
+                    return
+                if time.monotonic() >= heartbeat_at:
+                    yield ": keep-alive\n\n"
+                    heartbeat_at = time.monotonic() + 15
+                time.sleep(0.5)
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-store",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.get("/api/v1/cases/{case_id}/audit", response_model=AuditListResponse)
     def list_audit_endpoint(

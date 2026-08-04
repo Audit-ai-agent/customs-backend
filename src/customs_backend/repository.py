@@ -41,6 +41,15 @@ from customs_backend.domain import (
     VerificationAssertionRecord,
     utc_now,
 )
+from customs_backend.experience import (
+    REVIEW_TIMED_STAGE_CODES,
+    AssistantConversationRecord,
+    AssistantJobRecord,
+    AssistantJobState,
+    AssistantMessageRecord,
+    AssistantStageEvent,
+    ReviewPresentationRecord,
+)
 from customs_backend.ports import ConflictError, QuotaExceededError
 
 _ACTIVE_JOB_STATUSES = {
@@ -52,6 +61,76 @@ _ACTIVE_JOB_STATUSES = {
 _ACTIVE_JOB_STATUS_VALUES = tuple(item.value for item in _ACTIVE_JOB_STATUSES)
 _CHAT_QUOTA_STATES = frozenset(ChatInteractionState)
 _CHAT_QUOTA_STATE_VALUES = tuple(item.value for item in _CHAT_QUOTA_STATES)
+_REVIEW_TIMED_STAGE_CODE_SET = frozenset(REVIEW_TIMED_STAGE_CODES)
+
+
+def _review_stage_duration_sample(events: list[StageEvent]) -> dict[str, int]:
+    """Aggregate retries inside one successful review into one stage sample."""
+
+    sample: dict[str, int] = {}
+    for event in events:
+        if event.stage not in _REVIEW_TIMED_STAGE_CODE_SET:
+            continue
+        duration = event.detail.get("duration_ms")
+        if isinstance(duration, bool) or not isinstance(duration, int) or duration < 0:
+            continue
+        sample[event.stage] = sample.get(event.stage, 0) + duration
+    return sample
+
+
+def _review_total_duration_ms(events: list[StageEvent]) -> int | None:
+    durations: list[int] = []
+    for event in events:
+        duration = event.detail.get("duration_ms")
+        if isinstance(duration, bool) or not isinstance(duration, int) or duration < 0:
+            continue
+        durations.append(duration)
+    return sum(durations) if durations else None
+
+
+def _updated_assistant_job(
+    record: AssistantJobRecord,
+    **updates: Any,
+) -> AssistantJobRecord:
+    payload = record.model_dump(mode="python")
+    payload.update(updates)
+    return AssistantJobRecord.model_validate(payload)
+
+
+def _validate_assistant_event_append(
+    record: AssistantJobRecord,
+    event: AssistantStageEvent,
+) -> None:
+    if (
+        event.assistant_job_id != record.assistant_job_id
+        or event.sequence != len(record.events) + 1
+        or len(record.events) >= 100
+    ):
+        raise ConflictError("assistant event is not the next bounded job event")
+
+
+def _assistant_completion_events(
+    record: AssistantJobRecord,
+    events: tuple[AssistantStageEvent, AssistantStageEvent],
+) -> list[AssistantStageEvent]:
+    persistence_completed, terminal_completed = events
+    if (
+        not record.events
+        or record.events[-1].stage_code != "persistence"
+        or record.events[-1].state != "started"
+        or persistence_completed.stage_code != "persistence"
+        or persistence_completed.state != "completed"
+        or terminal_completed.stage_code != "completed"
+        or terminal_completed.state != "completed"
+    ):
+        raise ConflictError("assistant completion events do not prove persistence")
+    accumulated = list(record.events)
+    current = record
+    for event in events:
+        _validate_assistant_event_append(current, event)
+        accumulated.append(event)
+        current = _updated_assistant_job(current, events=accumulated)
+    return accumulated
 
 
 class InMemoryWorkbenchRepository:
@@ -73,6 +152,10 @@ class InMemoryWorkbenchRepository:
         self._audits: dict[str, AuditRecord] = {}
         self._outbox: dict[str, OutboxRecord] = {}
         self._events: dict[str, list[StageEvent]] = {}
+        self._review_presentations: dict[str, ReviewPresentationRecord] = {}
+        self._assistant_conversations: dict[str, AssistantConversationRecord] = {}
+        self._assistant_jobs: dict[str, AssistantJobRecord] = {}
+        self._assistant_messages: dict[str, AssistantMessageRecord] = {}
 
     def health(self) -> bool:
         return True
@@ -656,6 +739,71 @@ class InMemoryWorkbenchRepository:
                 return []
             return self._copy(self._events.get(job_id, []))
 
+    def recent_review_durations_ms(
+        self,
+        *,
+        org_id: str,
+        evidence_profile: str,
+        document_count: int,
+        limit: int = 30,
+    ) -> list[int]:
+        bounded_limit = max(0, min(limit, 30))
+        if bounded_limit == 0:
+            return []
+        with self._lock:
+            jobs = sorted(
+                (
+                    item
+                    for item in self._jobs.values()
+                    if item.org_id == org_id
+                    and item.status == JobStatus.succeeded
+                    and item.request.get("experience_api_version") == "3.0"
+                    and item.request.get("evidence_profile") == evidence_profile
+                    and item.request.get("document_count") == document_count
+                ),
+                key=lambda item: (
+                    item.agent_call_started_at or item.updated_at,
+                    item.job_id,
+                ),
+                reverse=True,
+            )[:bounded_limit]
+            values: list[int] = []
+            for job in jobs:
+                duration = _review_total_duration_ms(self._events.get(job.job_id, []))
+                if duration is not None:
+                    values.append(duration)
+            return values
+
+    def recent_review_stage_durations_ms(
+        self,
+        *,
+        org_id: str,
+        evidence_profile: str,
+        document_count: int,
+        limit: int = 30,
+    ) -> list[dict[str, int]]:
+        bounded_limit = max(0, min(limit, 30))
+        if bounded_limit == 0:
+            return []
+        with self._lock:
+            jobs = sorted(
+                (
+                    item
+                    for item in self._jobs.values()
+                    if item.org_id == org_id
+                    and item.status == JobStatus.succeeded
+                    and item.request.get("experience_api_version") == "3.0"
+                    and item.request.get("evidence_profile") == evidence_profile
+                    and item.request.get("document_count") == document_count
+                ),
+                key=lambda item: (
+                    item.agent_call_started_at or item.updated_at,
+                    item.job_id,
+                ),
+                reverse=True,
+            )[:bounded_limit]
+            return [_review_stage_duration_sample(self._events.get(job.job_id, [])) for job in jobs]
+
     def save_run(self, run: ReviewRunRecord, audit: AuditRecord) -> ReviewRunRecord:
         with self._lock:
             existing = self._runs.get(run.review_run_id)
@@ -688,6 +836,7 @@ class InMemoryWorkbenchRepository:
         run_audit: AuditRecord,
         job_audit: AuditRecord,
         expected_lease_id: str,
+        presentation: ReviewPresentationRecord | None = None,
     ) -> ReviewRunRecord:
         with self._lock:
             current = self._jobs.get(job.job_id)
@@ -716,6 +865,19 @@ class InMemoryWorkbenchRepository:
                 raise ConflictError("immutable review run already contains another result")
             self._runs[selected_run.review_run_id] = self._copy(selected_run)
             self._provider_results[selected_run.review_run_id] = dict(provider_result)
+            if presentation is not None:
+                if (
+                    presentation.review_run_id != run.review_run_id
+                    or presentation.org_id != run.org_id
+                    or presentation.case_id != run.case_id
+                    or presentation.bound_provider_result_sha256 != run.provider_result_sha256
+                    or presentation.bound_effective_result_digest != run.result_digest
+                ):
+                    raise ConflictError("experience presentation is not bound to its effective Run")
+                if presentation.bound_effective_result_digest == selected_run.result_digest:
+                    self._review_presentations[selected_run.review_run_id] = self._copy(
+                        presentation
+                    )
             self._jobs[job.job_id] = self._copy(job)
             self._events.setdefault(job.job_id, []).append(self._copy(event))
             self._audits[run_audit.audit_id] = self._copy(run_audit)
@@ -1101,6 +1263,335 @@ class InMemoryWorkbenchRepository:
             ]
             return self._copy(sorted(values, key=lambda item: item.created_at))
 
+    def get_review_presentation(
+        self, org_id: str, review_run_id: str
+    ) -> ReviewPresentationRecord | None:
+        with self._lock:
+            run = self._runs.get(review_run_id)
+            value = self._review_presentations.get(review_run_id)
+            return self._copy(value) if run and run.org_id == org_id and value else None
+
+    def create_assistant_conversation(
+        self, record: AssistantConversationRecord, audit: AuditRecord
+    ) -> AssistantConversationRecord:
+        with self._lock:
+            run = self._runs.get(record.review_run_id)
+            if (
+                run is None
+                or run.org_id != record.org_id
+                or run.case_id != record.case_id
+                or run.provider_result_sha256 != record.bound_result_sha256
+                or run.result_digest != record.bound_effective_result_digest
+            ):
+                raise ConflictError("assistant conversation is not bound to the current Run")
+            existing = self._assistant_conversations.get(record.conversation_id)
+            if existing is not None:
+                if existing != record:
+                    raise ConflictError("conversation ID already binds another record")
+                return self._copy(existing)
+            self._assistant_conversations[record.conversation_id] = self._copy(record)
+            self._audits[audit.audit_id] = self._copy(audit)
+            return self._copy(record)
+
+    def get_assistant_conversation(
+        self, org_id: str, conversation_id: str
+    ) -> AssistantConversationRecord | None:
+        with self._lock:
+            value = self._assistant_conversations.get(conversation_id)
+            return self._copy(value) if value and value.org_id == org_id else None
+
+    def list_assistant_conversations(
+        self, org_id: str, review_run_id: str
+    ) -> list[AssistantConversationRecord]:
+        with self._lock:
+            values = [
+                item
+                for item in self._assistant_conversations.values()
+                if item.org_id == org_id and item.review_run_id == review_run_id
+            ]
+            return self._copy(sorted(values, key=lambda item: item.created_at))
+
+    def enqueue_assistant_message(
+        self,
+        *,
+        conversation: AssistantConversationRecord,
+        user_message: AssistantMessageRecord,
+        job: AssistantJobRecord,
+        outbox: OutboxRecord,
+        audit: AuditRecord,
+        expected_case_revision: int,
+        actor_window_started_at: datetime,
+        actor_window_limit: int,
+        review_run_limit: int,
+    ) -> tuple[AssistantJobRecord, AssistantMessageRecord, bool]:
+        with self._lock:
+            current = self._assistant_conversations.get(conversation.conversation_id)
+            if current != conversation:
+                raise ConflictError("assistant conversation binding is stale")
+            case = self._cases.get(conversation.case_id)
+            run = self._runs.get(conversation.review_run_id)
+            if (
+                case is None
+                or run is None
+                or case.org_id != conversation.org_id
+                or run.org_id != conversation.org_id
+                or run.case_id != conversation.case_id
+                or case.revision != expected_case_revision
+                or run.case_revision != expected_case_revision
+                or run.provider_result_sha256 != conversation.bound_result_sha256
+                or run.result_digest != conversation.bound_effective_result_digest
+            ):
+                raise ConflictError("assistant Case or review result binding is stale")
+            existing = next(
+                (
+                    item
+                    for item in self._assistant_jobs.values()
+                    if item.org_id == job.org_id and item.idempotency_key == job.idempotency_key
+                ),
+                None,
+            )
+            if existing is not None:
+                if existing.idempotency_request_digest != job.idempotency_request_digest:
+                    raise ConflictError("assistant idempotency key was reused")
+                stored_message = self._assistant_messages.get(existing.user_message_id)
+                if stored_message is None:
+                    raise ConflictError("assistant job references a missing user message")
+                return self._copy(existing), self._copy(stored_message), False
+            counted = [
+                item
+                for item in self._assistant_jobs.values()
+                if item.org_id == job.org_id and item.review_run_id == job.review_run_id
+            ]
+            if len(counted) >= review_run_limit:
+                raise QuotaExceededError("assistant quota for this review run is exhausted")
+            recent_by_actor = sum(
+                item.created_by == job.created_by and item.created_at >= actor_window_started_at
+                for item in counted
+            )
+            if recent_by_actor >= actor_window_limit:
+                raise QuotaExceededError("assistant rate limit exceeded; retry after one minute")
+            if any(
+                item.conversation_id == conversation.conversation_id
+                and item.state in {AssistantJobState.queued, AssistantJobState.running}
+                for item in self._assistant_jobs.values()
+            ):
+                raise ConflictError("assistant conversation already has an active job")
+            messages = sorted(
+                (
+                    item
+                    for item in self._assistant_messages.values()
+                    if item.org_id == job.org_id
+                    and item.conversation_id == conversation.conversation_id
+                ),
+                key=lambda item: (item.created_at, item.message_id),
+            )
+            expected_parent = messages[-1].message_id if messages else None
+            if user_message.parent_message_id != expected_parent:
+                raise ConflictError("assistant message parent is stale")
+            if (
+                user_message.conversation_id != conversation.conversation_id
+                or user_message.review_run_id != conversation.review_run_id
+                or user_message.case_id != conversation.case_id
+                or user_message.org_id != conversation.org_id
+                or user_message.bound_result_sha256 != conversation.bound_result_sha256
+                or job.user_message_id != user_message.message_id
+                or job.conversation_id != conversation.conversation_id
+            ):
+                raise ConflictError("assistant message or job binding is invalid")
+            self._assistant_messages[user_message.message_id] = self._copy(user_message)
+            self._assistant_jobs[job.assistant_job_id] = self._copy(job)
+            self._outbox[outbox.outbox_id] = self._copy(outbox)
+            self._audits[audit.audit_id] = self._copy(audit)
+            return self._copy(job), self._copy(user_message), True
+
+    def get_assistant_job(self, org_id: str, assistant_job_id: str) -> AssistantJobRecord | None:
+        with self._lock:
+            value = self._assistant_jobs.get(assistant_job_id)
+            return self._copy(value) if value and value.org_id == org_id else None
+
+    def get_assistant_job_by_idempotency_key(
+        self, org_id: str, idempotency_key: str
+    ) -> AssistantJobRecord | None:
+        with self._lock:
+            value = next(
+                (
+                    item
+                    for item in self._assistant_jobs.values()
+                    if item.org_id == org_id and item.idempotency_key == idempotency_key
+                ),
+                None,
+            )
+            return self._copy(value) if value else None
+
+    def list_assistant_jobs(self, org_id: str, conversation_id: str) -> list[AssistantJobRecord]:
+        with self._lock:
+            values = [
+                item
+                for item in self._assistant_jobs.values()
+                if item.org_id == org_id and item.conversation_id == conversation_id
+            ]
+            return self._copy(
+                sorted(values, key=lambda item: (item.created_at, item.assistant_job_id))
+            )
+
+    def claim_assistant_job(
+        self,
+        *,
+        org_id: str,
+        assistant_job_id: str,
+        lease_id: str,
+        lease_expires_at: datetime,
+        event: AssistantStageEvent,
+    ) -> AssistantJobRecord:
+        with self._lock:
+            value = self._assistant_jobs.get(assistant_job_id)
+            if value is None or value.org_id != org_id:
+                raise ConflictError("assistant job does not exist")
+            if value.state != AssistantJobState.queued:
+                raise ConflictError("assistant job is not runnable")
+            now = utc_now()
+            if lease_expires_at <= now:
+                raise ConflictError("assistant job lease must expire in the future")
+            _validate_assistant_event_append(value, event)
+            started = _updated_assistant_job(
+                value,
+                state=AssistantJobState.running,
+                call_started_at=now,
+                lease_id=lease_id,
+                lease_expires_at=lease_expires_at,
+                events=[*value.events, event],
+                updated_at=now,
+            )
+            self._assistant_jobs[assistant_job_id] = self._copy(started)
+            return self._copy(started)
+
+    def append_assistant_event(
+        self,
+        *,
+        org_id: str,
+        assistant_job_id: str,
+        expected_lease_id: str,
+        event: AssistantStageEvent,
+    ) -> AssistantJobRecord:
+        with self._lock:
+            value = self._assistant_jobs.get(assistant_job_id)
+            if (
+                value is None
+                or value.org_id != org_id
+                or value.state != AssistantJobState.running
+                or value.lease_id != expected_lease_id
+            ):
+                raise ConflictError("assistant job is not running")
+            _validate_assistant_event_append(value, event)
+            updated = _updated_assistant_job(
+                value,
+                events=[*value.events, event],
+                updated_at=utc_now(),
+            )
+            self._assistant_jobs[assistant_job_id] = self._copy(updated)
+            return self._copy(updated)
+
+    def complete_assistant_job(
+        self,
+        *,
+        job: AssistantJobRecord,
+        answer_message: AssistantMessageRecord,
+        events: tuple[AssistantStageEvent, AssistantStageEvent],
+        audit: AuditRecord,
+        expected_lease_id: str,
+        expected_case_revision: int,
+    ) -> AssistantJobRecord:
+        with self._lock:
+            current = self._assistant_jobs.get(job.assistant_job_id)
+            if current is None or current.org_id != job.org_id:
+                raise ConflictError("assistant job does not exist")
+            if current.state != AssistantJobState.running or current.lease_id != expected_lease_id:
+                raise ConflictError("assistant job is not running")
+            case = self._cases.get(current.case_id)
+            run = self._runs.get(current.review_run_id)
+            conversation = self._assistant_conversations.get(current.conversation_id)
+            if (
+                case is None
+                or run is None
+                or conversation is None
+                or case.revision != expected_case_revision
+                or run.case_revision != expected_case_revision
+                or run.provider_result_sha256 != conversation.bound_result_sha256
+                or run.result_digest != conversation.bound_effective_result_digest
+            ):
+                raise ConflictError("assistant Case or review result changed during the call")
+            if (
+                answer_message.role != "assistant"
+                or answer_message.conversation_id != current.conversation_id
+                or answer_message.parent_message_id != current.user_message_id
+                or job.answer_message_id != answer_message.message_id
+                or job.state != AssistantJobState.succeeded
+            ):
+                raise ConflictError("assistant result is not bound to its job")
+            completed_events = _assistant_completion_events(current, events)
+            completed = _updated_assistant_job(
+                job,
+                events=completed_events,
+                lease_id=None,
+                lease_expires_at=None,
+                updated_at=utc_now(),
+            )
+            self._assistant_messages[answer_message.message_id] = self._copy(answer_message)
+            self._assistant_jobs[job.assistant_job_id] = self._copy(completed)
+            self._audits[audit.audit_id] = self._copy(audit)
+            return self._copy(completed)
+
+    def mark_assistant_job_terminal(
+        self,
+        *,
+        org_id: str,
+        assistant_job_id: str,
+        state: AssistantJobState,
+        error_code: str,
+        event: AssistantStageEvent,
+        audit: AuditRecord,
+        expected_lease_id: str,
+    ) -> AssistantJobRecord:
+        with self._lock:
+            value = self._assistant_jobs.get(assistant_job_id)
+            if value is None or value.org_id != org_id:
+                raise ConflictError("assistant job does not exist")
+            if (
+                value.state != AssistantJobState.running
+                or value.lease_id != expected_lease_id
+                or state
+                in {
+                    AssistantJobState.queued,
+                    AssistantJobState.running,
+                    AssistantJobState.succeeded,
+                }
+            ):
+                raise ConflictError("assistant job terminal transition is stale")
+            _validate_assistant_event_append(value, event)
+            terminal = _updated_assistant_job(
+                value,
+                state=state,
+                error_code=error_code,
+                lease_id=None,
+                lease_expires_at=None,
+                events=[*value.events, event],
+                updated_at=utc_now(),
+            )
+            self._assistant_jobs[assistant_job_id] = self._copy(terminal)
+            self._audits[audit.audit_id] = self._copy(audit)
+            return self._copy(terminal)
+
+    def list_assistant_messages(
+        self, org_id: str, conversation_id: str
+    ) -> list[AssistantMessageRecord]:
+        with self._lock:
+            values = [
+                item
+                for item in self._assistant_messages.values()
+                if item.org_id == org_id and item.conversation_id == conversation_id
+            ]
+            return self._copy(sorted(values, key=lambda item: (item.created_at, item.message_id)))
+
     def list_audit(self, org_id: str, case_id: str) -> list[AuditRecord]:
         with self._lock:
             values = [
@@ -1235,6 +1726,71 @@ class _RunRow(Base):
     review_disposition: Mapped[str] = mapped_column(String)
     assurance_level: Mapped[str] = mapped_column(String)
     provider_result_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    record_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class _ReviewPresentationRow(Base):
+    __tablename__ = "review_presentations"
+    __table_args__ = (UniqueConstraint("org_id", "review_run_id"), {"schema": "operations"})
+    presentation_id: Mapped[str] = mapped_column(String, primary_key=True)
+    review_run_id: Mapped[str] = mapped_column(
+        ForeignKey("operations.product_review_runs.review_run_id"), index=True
+    )
+    case_id: Mapped[str] = mapped_column(String, index=True)
+    org_id: Mapped[str] = mapped_column(String, index=True)
+    bound_provider_result_sha256: Mapped[str] = mapped_column(String)
+    bound_effective_result_digest: Mapped[str] = mapped_column(String)
+    created_at: Mapped[Any] = mapped_column(DateTime(timezone=True), index=True)
+    record_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class _AssistantConversationRow(Base):
+    __tablename__ = "assistant_conversations"
+    __table_args__ = {"schema": "operations"}
+    conversation_id: Mapped[str] = mapped_column(String, primary_key=True)
+    review_run_id: Mapped[str] = mapped_column(
+        ForeignKey("operations.product_review_runs.review_run_id"), index=True
+    )
+    case_id: Mapped[str] = mapped_column(String, index=True)
+    org_id: Mapped[str] = mapped_column(String, index=True)
+    bound_result_sha256: Mapped[str] = mapped_column(String)
+    bound_effective_result_digest: Mapped[str] = mapped_column(String)
+    created_at: Mapped[Any] = mapped_column(DateTime(timezone=True), index=True)
+    record_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class _AssistantJobRow(Base):
+    __tablename__ = "assistant_jobs"
+    __table_args__ = (
+        UniqueConstraint("org_id", "idempotency_key"),
+        {"schema": "operations"},
+    )
+    assistant_job_id: Mapped[str] = mapped_column(String, primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("operations.assistant_conversations.conversation_id"), index=True
+    )
+    review_run_id: Mapped[str] = mapped_column(String, index=True)
+    case_id: Mapped[str] = mapped_column(String, index=True)
+    org_id: Mapped[str] = mapped_column(String, index=True)
+    idempotency_key: Mapped[str] = mapped_column(String)
+    idempotency_request_digest: Mapped[str] = mapped_column(String)
+    created_by: Mapped[str] = mapped_column(String, index=True)
+    state: Mapped[str] = mapped_column(String, index=True)
+    created_at: Mapped[Any] = mapped_column(DateTime(timezone=True), index=True)
+    record_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class _AssistantMessageRow(Base):
+    __tablename__ = "assistant_messages"
+    __table_args__ = {"schema": "operations"}
+    message_id: Mapped[str] = mapped_column(String, primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("operations.assistant_conversations.conversation_id"), index=True
+    )
+    review_run_id: Mapped[str] = mapped_column(String, index=True)
+    org_id: Mapped[str] = mapped_column(String, index=True)
+    role: Mapped[str] = mapped_column(String)
+    created_at: Mapped[Any] = mapped_column(DateTime(timezone=True), index=True)
     record_json: Mapped[dict[str, Any]] = mapped_column(JSON)
 
 
@@ -2319,6 +2875,93 @@ class PostgresWorkbenchRepository:
             ).all()
             return [StageEvent.model_validate(row.record_json) for row in rows]
 
+    def recent_review_durations_ms(
+        self,
+        *,
+        org_id: str,
+        evidence_profile: str,
+        document_count: int,
+        limit: int = 30,
+    ) -> list[int]:
+        bounded_limit = max(0, min(limit, 30))
+        if bounded_limit == 0:
+            return []
+        with Session(self._engine) as session:
+            jobs = session.scalars(
+                select(_JobRow)
+                .where(
+                    _JobRow.org_id == org_id,
+                    _JobRow.status == JobStatus.succeeded.value,
+                    _JobRow.record_json["request"]["experience_api_version"].as_string() == "3.0",
+                    _JobRow.record_json["request"]["evidence_profile"].as_string()
+                    == evidence_profile,
+                    _JobRow.record_json["request"]["document_count"].as_integer() == document_count,
+                )
+                .order_by(_JobRow.agent_call_started_at.desc(), _JobRow.job_id.desc())
+                .limit(bounded_limit)
+            ).all()
+            if not jobs:
+                return []
+            job_ids = [row.job_id for row in jobs]
+            event_rows = session.scalars(
+                select(_StageEventRow)
+                .where(
+                    _StageEventRow.org_id == org_id,
+                    _StageEventRow.job_id.in_(job_ids),
+                )
+                .order_by(_StageEventRow.job_id, _StageEventRow.sequence)
+            ).all()
+            events_by_job: dict[str, list[StageEvent]] = {job_id: [] for job_id in job_ids}
+            for row in event_rows:
+                events_by_job[row.job_id].append(StageEvent.model_validate(row.record_json))
+            values: list[int] = []
+            for job_id in job_ids:
+                duration = _review_total_duration_ms(events_by_job[job_id])
+                if duration is not None:
+                    values.append(duration)
+            return values
+
+    def recent_review_stage_durations_ms(
+        self,
+        *,
+        org_id: str,
+        evidence_profile: str,
+        document_count: int,
+        limit: int = 30,
+    ) -> list[dict[str, int]]:
+        bounded_limit = max(0, min(limit, 30))
+        if bounded_limit == 0:
+            return []
+        with Session(self._engine) as session:
+            jobs = session.scalars(
+                select(_JobRow)
+                .where(
+                    _JobRow.org_id == org_id,
+                    _JobRow.status == JobStatus.succeeded.value,
+                    _JobRow.record_json["request"]["experience_api_version"].as_string() == "3.0",
+                    _JobRow.record_json["request"]["evidence_profile"].as_string()
+                    == evidence_profile,
+                    _JobRow.record_json["request"]["document_count"].as_integer() == document_count,
+                )
+                .order_by(_JobRow.agent_call_started_at.desc(), _JobRow.job_id.desc())
+                .limit(bounded_limit)
+            ).all()
+            if not jobs:
+                return []
+            job_ids = [row.job_id for row in jobs]
+            event_rows = session.scalars(
+                select(_StageEventRow)
+                .where(
+                    _StageEventRow.org_id == org_id,
+                    _StageEventRow.job_id.in_(job_ids),
+                )
+                .order_by(_StageEventRow.job_id, _StageEventRow.sequence)
+            ).all()
+            events_by_job: dict[str, list[StageEvent]] = {job_id: [] for job_id in job_ids}
+            for row in event_rows:
+                events_by_job[row.job_id].append(StageEvent.model_validate(row.record_json))
+            return [_review_stage_duration_sample(events_by_job[job_id]) for job_id in job_ids]
+
     def save_run(self, run: ReviewRunRecord, audit: AuditRecord) -> ReviewRunRecord:
         with Session(self._engine) as session, session.begin():
             existing = session.get(_RunRow, run.review_run_id)
@@ -2367,6 +3010,7 @@ class PostgresWorkbenchRepository:
         run_audit: AuditRecord,
         job_audit: AuditRecord,
         expected_lease_id: str,
+        presentation: ReviewPresentationRecord | None = None,
     ) -> ReviewRunRecord:
         with Session(self._engine) as session, session.begin():
             job_row = session.scalar(
@@ -2428,6 +3072,36 @@ class PostgresWorkbenchRepository:
                     record_json=self._dump(selected_run),
                 )
             )
+            if presentation is not None:
+                # These mapped rows deliberately have no ORM relationship; the
+                # database foreign key is authoritative. Flush the immutable Run
+                # first so SQLAlchemy cannot choose the child insert before it.
+                session.flush()
+                if (
+                    presentation.review_run_id != run.review_run_id
+                    or presentation.org_id != run.org_id
+                    or presentation.case_id != run.case_id
+                    or presentation.bound_provider_result_sha256 != run.provider_result_sha256
+                    or presentation.bound_effective_result_digest != run.result_digest
+                ):
+                    raise ConflictError("experience presentation is not bound to its effective Run")
+                if presentation.bound_effective_result_digest == selected_run.result_digest:
+                    session.add(
+                        _ReviewPresentationRow(
+                            presentation_id=presentation.presentation_id,
+                            review_run_id=presentation.review_run_id,
+                            case_id=presentation.case_id,
+                            org_id=presentation.org_id,
+                            bound_provider_result_sha256=(
+                                presentation.bound_provider_result_sha256
+                            ),
+                            bound_effective_result_digest=(
+                                presentation.bound_effective_result_digest
+                            ),
+                            created_at=presentation.created_at,
+                            record_json=self._dump(presentation),
+                        )
+                    )
             job_row.status = job.status.value
             job_row.lease_id = job.lease_id
             job_row.lease_expires_at = job.lease_expires_at
@@ -3023,6 +3697,525 @@ class PostgresWorkbenchRepository:
                 )
             ).all()
             return [ChatRecord.model_validate(row.record_json) for row in rows]
+
+    def get_review_presentation(
+        self, org_id: str, review_run_id: str
+    ) -> ReviewPresentationRecord | None:
+        with Session(self._engine) as session:
+            row = session.scalar(
+                select(_ReviewPresentationRow).where(
+                    _ReviewPresentationRow.org_id == org_id,
+                    _ReviewPresentationRow.review_run_id == review_run_id,
+                )
+            )
+            return ReviewPresentationRecord.model_validate(row.record_json) if row else None
+
+    def create_assistant_conversation(
+        self, record: AssistantConversationRecord, audit: AuditRecord
+    ) -> AssistantConversationRecord:
+        with Session(self._engine) as session, session.begin():
+            run = session.scalar(
+                select(_RunRow).where(
+                    _RunRow.org_id == record.org_id,
+                    _RunRow.review_run_id == record.review_run_id,
+                )
+            )
+            if run is None:
+                raise ConflictError("assistant conversation Run does not exist")
+            stored_run = ReviewRunRecord.model_validate(run.record_json)
+            if (
+                stored_run.case_id != record.case_id
+                or stored_run.provider_result_sha256 != record.bound_result_sha256
+                or stored_run.result_digest != record.bound_effective_result_digest
+            ):
+                raise ConflictError("assistant conversation is not bound to the current Run")
+            existing = session.get(_AssistantConversationRow, record.conversation_id)
+            if existing is not None:
+                previous = AssistantConversationRecord.model_validate(existing.record_json)
+                if previous != record:
+                    raise ConflictError("conversation ID already binds another record")
+                return previous
+            session.add(
+                _AssistantConversationRow(
+                    conversation_id=record.conversation_id,
+                    review_run_id=record.review_run_id,
+                    case_id=record.case_id,
+                    org_id=record.org_id,
+                    bound_result_sha256=record.bound_result_sha256,
+                    bound_effective_result_digest=record.bound_effective_result_digest,
+                    created_at=record.created_at,
+                    record_json=self._dump(record),
+                )
+            )
+            self._audit(session, audit)
+        return record
+
+    def get_assistant_conversation(
+        self, org_id: str, conversation_id: str
+    ) -> AssistantConversationRecord | None:
+        with Session(self._engine) as session:
+            row = session.scalar(
+                select(_AssistantConversationRow).where(
+                    _AssistantConversationRow.org_id == org_id,
+                    _AssistantConversationRow.conversation_id == conversation_id,
+                )
+            )
+            return AssistantConversationRecord.model_validate(row.record_json) if row else None
+
+    def list_assistant_conversations(
+        self, org_id: str, review_run_id: str
+    ) -> list[AssistantConversationRecord]:
+        with Session(self._engine) as session:
+            rows = session.scalars(
+                select(_AssistantConversationRow)
+                .where(
+                    _AssistantConversationRow.org_id == org_id,
+                    _AssistantConversationRow.review_run_id == review_run_id,
+                )
+                .order_by(_AssistantConversationRow.created_at)
+            ).all()
+            return [AssistantConversationRecord.model_validate(row.record_json) for row in rows]
+
+    def enqueue_assistant_message(
+        self,
+        *,
+        conversation: AssistantConversationRecord,
+        user_message: AssistantMessageRecord,
+        job: AssistantJobRecord,
+        outbox: OutboxRecord,
+        audit: AuditRecord,
+        expected_case_revision: int,
+        actor_window_started_at: datetime,
+        actor_window_limit: int,
+        review_run_limit: int,
+    ) -> tuple[AssistantJobRecord, AssistantMessageRecord, bool]:
+        with Session(self._engine) as session, session.begin():
+            # Conversations are append-only, so the runtime role intentionally
+            # has no UPDATE privilege and therefore cannot use SELECT FOR UPDATE.
+            # Serialize one conversation's parent check and active-job insert
+            # with a transaction-scoped advisory lock instead.
+            for lock_key in (
+                f"assistant-quota-run:{job.org_id}:{job.review_run_id}",
+                f"assistant-quota-actor:{job.org_id}:{job.review_run_id}:{job.created_by}",
+                f"assistant-conversation:{conversation.org_id}:{conversation.conversation_id}",
+                f"assistant-idempotency:{job.org_id}:{job.idempotency_key}",
+            ):
+                session.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                    {"key": lock_key},
+                )
+            case_row = session.scalar(
+                select(_CaseRow)
+                .where(
+                    _CaseRow.org_id == conversation.org_id,
+                    _CaseRow.case_id == conversation.case_id,
+                )
+                .with_for_update()
+            )
+            run_row = session.scalar(
+                select(_RunRow).where(
+                    _RunRow.org_id == conversation.org_id,
+                    _RunRow.review_run_id == conversation.review_run_id,
+                    _RunRow.case_id == conversation.case_id,
+                )
+            )
+            conversation_row = session.scalar(
+                select(_AssistantConversationRow).where(
+                    _AssistantConversationRow.org_id == conversation.org_id,
+                    _AssistantConversationRow.conversation_id == conversation.conversation_id,
+                )
+            )
+            if conversation_row is None or (
+                AssistantConversationRecord.model_validate(conversation_row.record_json)
+                != conversation
+            ):
+                raise ConflictError("assistant conversation binding is stale")
+            if case_row is None or run_row is None:
+                raise ConflictError("assistant Case or review result is unavailable")
+            stored_run = ReviewRunRecord.model_validate(run_row.record_json)
+            if (
+                case_row.revision != expected_case_revision
+                or stored_run.case_revision != expected_case_revision
+                or stored_run.provider_result_sha256 != conversation.bound_result_sha256
+                or stored_run.result_digest != conversation.bound_effective_result_digest
+            ):
+                raise ConflictError("assistant Case or review result binding is stale")
+            existing = session.scalar(
+                select(_AssistantJobRow).where(
+                    _AssistantJobRow.org_id == job.org_id,
+                    _AssistantJobRow.idempotency_key == job.idempotency_key,
+                )
+            )
+            if existing is not None:
+                previous = AssistantJobRecord.model_validate(existing.record_json)
+                if previous.idempotency_request_digest != job.idempotency_request_digest:
+                    raise ConflictError("assistant idempotency key was reused")
+                message_row = session.get(_AssistantMessageRow, previous.user_message_id)
+                if message_row is None:
+                    raise ConflictError("assistant job references a missing user message")
+                return (
+                    previous,
+                    AssistantMessageRecord.model_validate(message_row.record_json),
+                    False,
+                )
+            quota_filters = (
+                _AssistantJobRow.org_id == job.org_id,
+                _AssistantJobRow.review_run_id == job.review_run_id,
+            )
+            run_count = session.scalar(
+                select(func.count()).select_from(_AssistantJobRow).where(*quota_filters)
+            )
+            if int(run_count or 0) >= review_run_limit:
+                raise QuotaExceededError("assistant quota for this review run is exhausted")
+            actor_window_count = session.scalar(
+                select(func.count())
+                .select_from(_AssistantJobRow)
+                .where(
+                    *quota_filters,
+                    _AssistantJobRow.created_by == job.created_by,
+                    _AssistantJobRow.created_at >= actor_window_started_at,
+                )
+            )
+            if int(actor_window_count or 0) >= actor_window_limit:
+                raise QuotaExceededError("assistant rate limit exceeded; retry after one minute")
+            active = session.scalar(
+                select(_AssistantJobRow).where(
+                    _AssistantJobRow.conversation_id == conversation.conversation_id,
+                    _AssistantJobRow.state.in_(
+                        [AssistantJobState.queued.value, AssistantJobState.running.value]
+                    ),
+                )
+            )
+            if active is not None:
+                raise ConflictError("assistant conversation already has an active job")
+            latest = session.scalar(
+                select(_AssistantMessageRow)
+                .where(
+                    _AssistantMessageRow.org_id == job.org_id,
+                    _AssistantMessageRow.conversation_id == conversation.conversation_id,
+                )
+                .order_by(
+                    _AssistantMessageRow.created_at.desc(),
+                    _AssistantMessageRow.message_id.desc(),
+                )
+                .limit(1)
+            )
+            expected_parent = latest.message_id if latest else None
+            if user_message.parent_message_id != expected_parent:
+                raise ConflictError("assistant message parent is stale")
+            if (
+                user_message.conversation_id != conversation.conversation_id
+                or user_message.review_run_id != conversation.review_run_id
+                or user_message.case_id != conversation.case_id
+                or user_message.org_id != conversation.org_id
+                or user_message.bound_result_sha256 != conversation.bound_result_sha256
+                or job.user_message_id != user_message.message_id
+                or job.conversation_id != conversation.conversation_id
+            ):
+                raise ConflictError("assistant message or job binding is invalid")
+            session.add(
+                _AssistantMessageRow(
+                    message_id=user_message.message_id,
+                    conversation_id=user_message.conversation_id,
+                    review_run_id=user_message.review_run_id,
+                    org_id=user_message.org_id,
+                    role=user_message.role,
+                    created_at=user_message.created_at,
+                    record_json=self._dump(user_message),
+                )
+            )
+            session.add(
+                _AssistantJobRow(
+                    assistant_job_id=job.assistant_job_id,
+                    conversation_id=job.conversation_id,
+                    review_run_id=job.review_run_id,
+                    case_id=job.case_id,
+                    org_id=job.org_id,
+                    idempotency_key=job.idempotency_key,
+                    idempotency_request_digest=job.idempotency_request_digest,
+                    created_by=job.created_by,
+                    state=job.state.value,
+                    created_at=job.created_at,
+                    record_json=self._dump(job),
+                )
+            )
+            session.add(
+                _OutboxRow(
+                    outbox_id=outbox.outbox_id,
+                    org_id=outbox.org_id,
+                    aggregate_id=outbox.aggregate_id,
+                    topic=outbox.topic,
+                    published_at=outbox.published_at,
+                    lease_id=outbox.lease_id,
+                    lease_expires_at=outbox.lease_expires_at,
+                    attempt_count=outbox.attempt_count,
+                    record_json=self._dump(outbox),
+                )
+            )
+            self._audit(session, audit)
+        return job, user_message, True
+
+    def get_assistant_job(self, org_id: str, assistant_job_id: str) -> AssistantJobRecord | None:
+        with Session(self._engine) as session:
+            row = session.scalar(
+                select(_AssistantJobRow).where(
+                    _AssistantJobRow.org_id == org_id,
+                    _AssistantJobRow.assistant_job_id == assistant_job_id,
+                )
+            )
+            return AssistantJobRecord.model_validate(row.record_json) if row else None
+
+    def get_assistant_job_by_idempotency_key(
+        self, org_id: str, idempotency_key: str
+    ) -> AssistantJobRecord | None:
+        with Session(self._engine) as session:
+            row = session.scalar(
+                select(_AssistantJobRow).where(
+                    _AssistantJobRow.org_id == org_id,
+                    _AssistantJobRow.idempotency_key == idempotency_key,
+                )
+            )
+            return AssistantJobRecord.model_validate(row.record_json) if row else None
+
+    def list_assistant_jobs(self, org_id: str, conversation_id: str) -> list[AssistantJobRecord]:
+        with Session(self._engine) as session:
+            rows = session.scalars(
+                select(_AssistantJobRow)
+                .where(
+                    _AssistantJobRow.org_id == org_id,
+                    _AssistantJobRow.conversation_id == conversation_id,
+                )
+                .order_by(
+                    _AssistantJobRow.created_at,
+                    _AssistantJobRow.assistant_job_id,
+                )
+            ).all()
+            return [AssistantJobRecord.model_validate(row.record_json) for row in rows]
+
+    def claim_assistant_job(
+        self,
+        *,
+        org_id: str,
+        assistant_job_id: str,
+        lease_id: str,
+        lease_expires_at: datetime,
+        event: AssistantStageEvent,
+    ) -> AssistantJobRecord:
+        with Session(self._engine) as session, session.begin():
+            row = session.scalar(
+                select(_AssistantJobRow)
+                .where(
+                    _AssistantJobRow.org_id == org_id,
+                    _AssistantJobRow.assistant_job_id == assistant_job_id,
+                )
+                .with_for_update()
+            )
+            if row is None:
+                raise ConflictError("assistant job does not exist")
+            value = AssistantJobRecord.model_validate(row.record_json)
+            if value.state != AssistantJobState.queued:
+                raise ConflictError("assistant job is not runnable")
+            now = utc_now()
+            if lease_expires_at <= now:
+                raise ConflictError("assistant job lease must expire in the future")
+            _validate_assistant_event_append(value, event)
+            started = _updated_assistant_job(
+                value,
+                state=AssistantJobState.running,
+                call_started_at=now,
+                lease_id=lease_id,
+                lease_expires_at=lease_expires_at,
+                events=[*value.events, event],
+                updated_at=now,
+            )
+            row.state = started.state.value
+            row.record_json = self._dump(started)
+        return started
+
+    def append_assistant_event(
+        self,
+        *,
+        org_id: str,
+        assistant_job_id: str,
+        expected_lease_id: str,
+        event: AssistantStageEvent,
+    ) -> AssistantJobRecord:
+        with Session(self._engine) as session, session.begin():
+            row = session.scalar(
+                select(_AssistantJobRow)
+                .where(
+                    _AssistantJobRow.org_id == org_id,
+                    _AssistantJobRow.assistant_job_id == assistant_job_id,
+                )
+                .with_for_update()
+            )
+            if row is None:
+                raise ConflictError("assistant job does not exist")
+            value = AssistantJobRecord.model_validate(row.record_json)
+            if value.state != AssistantJobState.running or value.lease_id != expected_lease_id:
+                raise ConflictError("assistant job is not running")
+            _validate_assistant_event_append(value, event)
+            updated = _updated_assistant_job(
+                value,
+                events=[*value.events, event],
+                updated_at=utc_now(),
+            )
+            row.record_json = self._dump(updated)
+        return updated
+
+    def complete_assistant_job(
+        self,
+        *,
+        job: AssistantJobRecord,
+        answer_message: AssistantMessageRecord,
+        events: tuple[AssistantStageEvent, AssistantStageEvent],
+        audit: AuditRecord,
+        expected_lease_id: str,
+        expected_case_revision: int,
+    ) -> AssistantJobRecord:
+        with Session(self._engine) as session, session.begin():
+            row = session.scalar(
+                select(_AssistantJobRow)
+                .where(
+                    _AssistantJobRow.org_id == job.org_id,
+                    _AssistantJobRow.assistant_job_id == job.assistant_job_id,
+                )
+                .with_for_update()
+            )
+            if row is None:
+                raise ConflictError("assistant job does not exist")
+            current = AssistantJobRecord.model_validate(row.record_json)
+            if current.state != AssistantJobState.running or current.lease_id != expected_lease_id:
+                raise ConflictError("assistant job is not running")
+            case_row = session.scalar(
+                select(_CaseRow)
+                .where(
+                    _CaseRow.org_id == current.org_id,
+                    _CaseRow.case_id == current.case_id,
+                )
+                .with_for_update()
+            )
+            run_row = session.scalar(
+                select(_RunRow).where(
+                    _RunRow.org_id == current.org_id,
+                    _RunRow.review_run_id == current.review_run_id,
+                    _RunRow.case_id == current.case_id,
+                )
+            )
+            conversation_row = session.scalar(
+                select(_AssistantConversationRow).where(
+                    _AssistantConversationRow.org_id == current.org_id,
+                    _AssistantConversationRow.conversation_id == current.conversation_id,
+                )
+            )
+            if case_row is None or run_row is None or conversation_row is None:
+                raise ConflictError("assistant Case or review result is unavailable")
+            stored_run = ReviewRunRecord.model_validate(run_row.record_json)
+            conversation = AssistantConversationRecord.model_validate(conversation_row.record_json)
+            if (
+                case_row.revision != expected_case_revision
+                or stored_run.case_revision != expected_case_revision
+                or stored_run.provider_result_sha256 != conversation.bound_result_sha256
+                or stored_run.result_digest != conversation.bound_effective_result_digest
+            ):
+                raise ConflictError("assistant Case or review result changed during the call")
+            if (
+                answer_message.role != "assistant"
+                or answer_message.conversation_id != current.conversation_id
+                or answer_message.parent_message_id != current.user_message_id
+                or job.answer_message_id != answer_message.message_id
+                or job.state != AssistantJobState.succeeded
+            ):
+                raise ConflictError("assistant result is not bound to its job")
+            completed_events = _assistant_completion_events(current, events)
+            completed = _updated_assistant_job(
+                job,
+                events=completed_events,
+                lease_id=None,
+                lease_expires_at=None,
+                updated_at=utc_now(),
+            )
+            session.add(
+                _AssistantMessageRow(
+                    message_id=answer_message.message_id,
+                    conversation_id=answer_message.conversation_id,
+                    review_run_id=answer_message.review_run_id,
+                    org_id=answer_message.org_id,
+                    role=answer_message.role,
+                    created_at=answer_message.created_at,
+                    record_json=self._dump(answer_message),
+                )
+            )
+            row.state = completed.state.value
+            row.record_json = self._dump(completed)
+            self._audit(session, audit)
+        return completed
+
+    def mark_assistant_job_terminal(
+        self,
+        *,
+        org_id: str,
+        assistant_job_id: str,
+        state: AssistantJobState,
+        error_code: str,
+        event: AssistantStageEvent,
+        audit: AuditRecord,
+        expected_lease_id: str,
+    ) -> AssistantJobRecord:
+        with Session(self._engine) as session, session.begin():
+            row = session.scalar(
+                select(_AssistantJobRow)
+                .where(
+                    _AssistantJobRow.org_id == org_id,
+                    _AssistantJobRow.assistant_job_id == assistant_job_id,
+                )
+                .with_for_update()
+            )
+            if row is None:
+                raise ConflictError("assistant job does not exist")
+            value = AssistantJobRecord.model_validate(row.record_json)
+            if (
+                value.state != AssistantJobState.running
+                or value.lease_id != expected_lease_id
+                or state
+                in {
+                    AssistantJobState.queued,
+                    AssistantJobState.running,
+                    AssistantJobState.succeeded,
+                }
+            ):
+                raise ConflictError("assistant job terminal transition is stale")
+            _validate_assistant_event_append(value, event)
+            terminal = _updated_assistant_job(
+                value,
+                state=state,
+                error_code=error_code,
+                lease_id=None,
+                lease_expires_at=None,
+                events=[*value.events, event],
+                updated_at=utc_now(),
+            )
+            row.state = terminal.state.value
+            row.record_json = self._dump(terminal)
+            self._audit(session, audit)
+        return terminal
+
+    def list_assistant_messages(
+        self, org_id: str, conversation_id: str
+    ) -> list[AssistantMessageRecord]:
+        with Session(self._engine) as session:
+            rows = session.scalars(
+                select(_AssistantMessageRow)
+                .where(
+                    _AssistantMessageRow.org_id == org_id,
+                    _AssistantMessageRow.conversation_id == conversation_id,
+                )
+                .order_by(
+                    _AssistantMessageRow.created_at,
+                    _AssistantMessageRow.message_id,
+                )
+            ).all()
+            return [AssistantMessageRecord.model_validate(row.record_json) for row in rows]
 
     def list_audit(self, org_id: str, case_id: str) -> list[AuditRecord]:
         with Session(self._engine) as session:
