@@ -43,3 +43,10 @@ access token을 memory에만 둔다. Keycloak protocol endpoint를 제외한 제
 
 기존 `integration` 하네스와 `operational_db` v1 snapshot은 삭제하지 않는다.
 제품 테이블과 API는 additive로 나뉘어 전환기 재현성을 보존한다.
+
+## 후속 변경
+
+2026-08-04에 공유 Harness와 Git 밖 권한자 UAT 운영 번들로 전환하면서, 현재
+제품과 연결되지 않는 legacy `integration` 하네스·Agent 0.1.0 package pin·전용
+system test는 retired 되었다. `operational_db`와 현재 Agent HTTP 계약 경계는
+유지한다.
