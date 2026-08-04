@@ -90,13 +90,7 @@ def _trace_record() -> dict[str, Any]:
 
 
 def _write_trace(root: Path, records: list[dict[str, Any]]) -> Path:
-    path = (
-        root
-        / "_local"
-        / "state"
-        / "local-user-uat"
-        / "three-law-scenario-eval-trace.jsonl"
-    )
+    path = root / "_local" / "state" / "local-user-uat" / "three-law-scenario-eval-trace.jsonl"
     path.parent.mkdir(parents=True)
     path.write_text(
         "".join(
@@ -184,7 +178,7 @@ def test_trace_reader_returns_only_the_run_bound_safe_stage_projection(
         assert forbidden not in serialized
 
 
-def test_trace_reader_rejects_duplicate_or_failed_request_records(
+def test_trace_reader_rejects_duplicate_or_selected_failed_request_records(
     tmp_path: Path,
     isolated_trace_content_guard: None,
 ) -> None:
@@ -202,9 +196,57 @@ def test_trace_reader_rejects_duplicate_or_failed_request_records(
     failed = _trace_record()
     failed["retrieval"]["graph"]["succeeded"] = False
     failed_path = _write_trace(tmp_path / "failed", [failed])
+    failed_reader = UatEvidenceTraceReader(
+        failed_path,
+        expected_runtime_v3_sha256=_RUNTIME_SHA256,
+    )
+    with pytest.raises(UatEvidenceTraceError, match="unsuccessful graph stage"):
+        failed_reader.projection(
+            request_id=_REQUEST_ID,
+            knowledge_snapshot_id=_SNAPSHOT,
+        )
+
+
+def test_trace_reader_ignores_an_unrelated_failed_request_stage(
+    tmp_path: Path,
+    isolated_trace_content_guard: None,
+) -> None:
+    failed = _trace_record()
+    failed["request_id"] = "prior-run-retrieve-0"
+    failed["retrieval"]["graph"]["succeeded"] = False
+    current = _trace_record()
+    path = _write_trace(tmp_path, [failed, current])
+    reader = UatEvidenceTraceReader(
+        path,
+        expected_runtime_v3_sha256=_RUNTIME_SHA256,
+    )
+
+    projection = reader.projection(
+        request_id=_REQUEST_ID,
+        knowledge_snapshot_id=_SNAPSHOT,
+    )
+
+    assert projection.request_id == _REQUEST_ID
+    assert projection.retrieval.graph.succeeded is True
+
+
+def test_trace_reader_rejects_structurally_inconsistent_stage_observations(
+    tmp_path: Path,
+    isolated_trace_content_guard: None,
+) -> None:
+    inconsistent = _trace_record()
+    inconsistent["retrieval"]["graph"].update(
+        {
+            "attempted": False,
+            "succeeded": False,
+            "attempt_count": 1,
+        }
+    )
+    path = _write_trace(tmp_path, [inconsistent])
+
     with pytest.raises(UatEvidenceTraceError, match="record is invalid"):
         UatEvidenceTraceReader(
-            failed_path,
+            path,
             expected_runtime_v3_sha256=_RUNTIME_SHA256,
         )
 

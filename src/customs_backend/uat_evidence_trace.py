@@ -41,14 +41,17 @@ class _RawRetrievalStage(BaseModel):
     duration_ms: int = Field(ge=0, le=300_000)
 
     @model_validator(mode="after")
-    def successful_stage_is_consistent(self) -> "_RawRetrievalStage":
-        if (
-            not self.attempted
-            or not self.succeeded
-            or self.attempt_count < 1
-            or self.top_k_result_count > self.result_count
-        ):
+    def stage_observation_is_consistent(self) -> "_RawRetrievalStage":
+        if self.attempted != (self.attempt_count > 0):
+            raise ValueError("scenario retrieval stage attempt state is inconsistent")
+        if self.succeeded and not self.attempted:
+            raise ValueError("scenario retrieval stage success state is inconsistent")
+        if self.top_k_result_count > self.result_count:
             raise ValueError("scenario retrieval stage is incomplete")
+        if not self.attempted and (
+            self.result_count != 0 or self.top_k_result_count != 0 or self.duration_ms != 0
+        ):
+            raise ValueError("unattempted scenario retrieval stage contains observations")
         return self
 
 
@@ -241,6 +244,16 @@ class UatEvidenceTraceReader:
             != self._expected_runtime_v3_sha256
         ):
             raise UatEvidenceTraceError("local UAT Evidence trace runtime identity differs")
+
+        # A failed observation is still a structurally valid audit record. Only
+        # the request selected for this Run must prove every required stage.
+        for stage_name in ("structured", "dense", "bm25", "rerank", "graph"):
+            stage_observation = getattr(record.retrieval, stage_name)
+            if not stage_observation.attempted or not stage_observation.succeeded:
+                raise UatEvidenceTraceError(
+                    "local UAT Evidence trace selected request has an unsuccessful "
+                    f"{stage_name} stage"
+                )
 
         def stage(value: _RawRetrievalStage) -> UatEvidenceRetrievalStageResponse:
             return UatEvidenceRetrievalStageResponse(
