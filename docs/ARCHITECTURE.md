@@ -2,19 +2,9 @@
 
 ## 의도
 
-저장소는 기존 통합 검증 경로를 보존하면서 `customs_backend`을
-제품용 FastAPI modular monolith 경계로 추가한다. 전환기 `integration`은
-지우거나 제품 API로 위장하지 않는다.
+저장소는 `customs_backend`을 제품용 FastAPI modular monolith 경계로 소유한다.
 
 ```text
-legacy/historical local CLI/UI (unauthenticated, loopback-only)
-  -> customs-ai-agent==0.1.0 public package API
-  -> Evidence API v1 over localhost HTTP
-  -> immutable ReviewRunSnapshot
-  -> OperationalRepository
-       -> in-memory (unit/system tests)
-       -> PostgreSQL operations schema (live verification)
-
 Browser (OIDC Authorization Code + PKCE)
   -> /api/v1 FastAPI Resource Server
        -> PostgreSQL Case/Job/Run/HITL/Chat/Audit/Outbox
@@ -24,28 +14,15 @@ Browser (OIDC Authorization Code + PKCE)
                  -> private Evidence API
 ```
 
-위 0.1.0 경로는 분리 전 파일럿을 재현하는 보존 자산이며 현재 제품 pin이
-아니다. 제품 Backend candidate는 exact commit/wheel/source/code identity로 고정된
-`customs-ai-agent==0.3.0`의 private Agent HTTP V2와 V3 review contract만 소비한다.
+제품 Backend는 Agent의 private HTTP API와 V3 review contract만 소비한다.
+계약 source commit은 provenance이며, Backend는 checkout 또는 Agent commit을
+실행 gate로 고정하지 않는다.
 
-Production Compose에서는 `edge`, `backend-state`, `identity-state`, `agent-api`,
-`evidence-api`, 외부 `data-store-tls`, `agent-proxy`를 각각 분리한다. Backend는 Data store에
-도달할 수 없고 Agent는 Evidence API와 internal egress proxy에만 도달한다. `edge`도
-internal network이며 host ingress는 reverse proxy의 published TLS port로만 받는다.
-유일한 외부 bridge는 pinned Squid proxy가 소유하며 `api.anthropic.com:443` CONNECT 외
-요청은 거절한다. Keycloak도 애플리케이션 PostgreSQL과 별도 DB/volume을 쓴다.
-Keycloak reverse-proxy 경로는 `/oidc/`, Frontend Authorization Code callback은
-`/auth/callback`이다. 서로 다른 prefix를 사용해 인증 callback이 IdP proxy에
-흡수되는 routing collision을 막는다.
-
-Agent→Evidence는 별도 internal TLS reverse proxy를 지난다. Agent CA bundle은 공인
-root와 조직 내부 Evidence CA를 함께 포함해 Claude와 Evidence TLS를 모두 검증한다.
-Data는 V3 entrypoint만 실행하고 두 검수자가 서명한 requirement policy와 image lock에
-결박된 reviewer trust store를 read-only로 받는다. 누락·unreleased·hash drift이면
-Data→Agent→Backend readiness가 순서대로 닫힌다.
-Production Compose는 평문 local PostgreSQL/Qdrant/Neo4j를 기동하지 않는다.
-전용 external Docker network의 TLS store만 허용하며 Data의 ProductionSettings가
-PostgreSQL sslmode, Qdrant HTTPS/API key, Neo4j verified encrypted URI를 다시 검증한다.
+배포 topology와 Docker 이미지는 이 저장소가 소유하지 않는다. Backend는 Agent·Data
+store에 직접 접근하지 않고, Browser는 Backend API만 호출한다. 실제 Local UAT의
+network, Compose, TLS, credential 주입은 Git 밖 승인자 운영 번들이 조합한다.
+누락·unreleased·artifact hash drift이면 Data→Agent→Backend readiness가 순서대로
+닫힌다.
 
 ## 불변식
 

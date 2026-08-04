@@ -12,7 +12,7 @@ from customs_backend.ports import (
 from customs_backend.settings import get_settings
 
 
-# Configure the production Redis broker before decorators register actors.
+# Configure the selected runtime Redis broker before decorators register actors.
 _settings = get_settings()
 _container_instance = build_container(_settings)
 

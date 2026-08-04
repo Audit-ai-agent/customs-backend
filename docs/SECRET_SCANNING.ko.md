@@ -16,7 +16,7 @@ SHA-256입니다.
 - `provider_openapi_sha256`
 
 Gitleaks의 `generic-api-key` 규칙이 이 두 무결성 값을 API key로 오인합니다.
-TASK-0027에서는 해당 값이 처음 포함되거나 갱신된 4개 커밋의 8개 이력
+해당 값이 처음 포함되거나 갱신된 5개 커밋의 10개 이력
 fingerprint만 승인했습니다. 잠금 파일 전체, 현재 경로, 모든 SHA-256,
 `generic-api-key` 규칙 전체는 예외 처리하지 않았습니다.
 

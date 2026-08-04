@@ -57,7 +57,7 @@ class MinioObjectStore:
             from minio import Minio
             from minio.error import S3Error
         except ImportError as exc:  # pragma: no cover - deployment dependency
-            raise RuntimeError("install the production extra to use MinIO") from exc
+            raise RuntimeError("install the runtime extra to use MinIO") from exc
         self._client = Minio(
             endpoint,
             access_key=access_key,
@@ -134,7 +134,7 @@ class DramatiqJobPublisher:
         try:
             import dramatiq
         except ImportError as exc:  # pragma: no cover - deployment dependency
-            raise RuntimeError("install the production extra to use Dramatiq") from exc
+            raise RuntimeError("install the runtime extra to use Dramatiq") from exc
         self._dramatiq = dramatiq
         if broker is None:
             from dramatiq.brokers.redis import RedisBroker

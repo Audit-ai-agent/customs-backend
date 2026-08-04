@@ -697,7 +697,10 @@ def test_local_uat_container_selects_only_real_boundary_adapters(monkeypatch) ->
     }
 
 
-def _actual_agent_active_metadata() -> tuple[
+def _actual_agent_active_metadata(
+    *,
+    agent_commit: str | None = None,
+) -> tuple[
     dict[str, Any],
     dict[str, Any],
     dict[str, Any],
@@ -716,7 +719,7 @@ def _actual_agent_active_metadata() -> tuple[
         "loopback_only": True,
         "issued_at": issued_at.isoformat().replace("+00:00", "Z"),
         "expires_at": (issued_at + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
-        "agent_commit": contract.provider_commit,
+        "agent_commit": agent_commit or contract.provider_contract_source_commit,
         "agent_code_snapshot_sha256": "a" * 64,
         "model_id": "claude-sonnet-5",
         "prompt_bundle_sha256": contract.experience_prompt_bundle_sha256,
@@ -830,7 +833,12 @@ def _actual_agent_active_metadata() -> tuple[
     )
 
 
-def _local_uat_app(*, agent_status: str = "ready", enhanced: bool = False) -> TestClient:
+def _local_uat_app(
+    *,
+    agent_status: str = "ready",
+    enhanced: bool = False,
+    agent_commit: str | None = None,
+) -> TestClient:
     settings_overrides: dict[str, Any] = {}
     experience_metadata: dict[str, Any] | None = None
     if enhanced:
@@ -840,7 +848,7 @@ def _local_uat_app(*, agent_status: str = "ready", enhanced: bool = False) -> Te
             uat_readiness,
             capability_sha256,
             capability_file_sha256,
-        ) = _actual_agent_active_metadata()
+        ) = _actual_agent_active_metadata(agent_commit=agent_commit)
         settings_overrides = {
             "agent_base_url": "http://127.0.0.1:18080",
             "enhanced_agent_experience": True,
@@ -1063,6 +1071,22 @@ def test_local_uat_readiness_accepts_actual_agent_active_mode_metadata(
     assert ready.json()["enhanced_agent_experience"] is True
     assert ready.json()["uat_adaptive_active"] is True
     assert ready.json()["auto_completion_enabled"] is False
+
+
+def test_local_uat_readiness_accepts_runtime_commit_distinct_from_contract_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(OidcJwtVerifier, "health", lambda _self: True)
+    runtime_commit = "e" * 40
+
+    with _local_uat_app(enhanced=True, agent_commit=runtime_commit) as client:
+        ready = client.get("/health/uat-ready")
+
+    assert (
+        runtime_commit
+        != validate_agent_experience_contract_bundle().lock.provider_contract_source_commit
+    )
+    assert ready.status_code == 200
 
 
 @pytest.mark.parametrize(
