@@ -1,19 +1,6 @@
 {
   "components": {
     "schemas": {
-      "AgentCallState": {
-        "enum": [
-          "not_started",
-          "started",
-          "completed",
-          "delivery_uncertain",
-          "delivery_reconciled",
-          "response_received_rejected",
-          "response_persistence_uncertain"
-        ],
-        "title": "AgentCallState",
-        "type": "string"
-      },
       "Assessment": {
         "enum": [
           "no_issue_detected",
@@ -31,83 +18,6 @@
         ],
         "title": "AssuranceLevel",
         "type": "string"
-      },
-      "AuditListResponse": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/AuditRecord"
-            },
-            "title": "Items",
-            "type": "array"
-          }
-        },
-        "required": [
-          "items"
-        ],
-        "title": "AuditListResponse",
-        "type": "object"
-      },
-      "AuditRecord": {
-        "properties": {
-          "action": {
-            "title": "Action",
-            "type": "string"
-          },
-          "actor_id": {
-            "title": "Actor Id",
-            "type": "string"
-          },
-          "audit_id": {
-            "title": "Audit Id",
-            "type": "string"
-          },
-          "case_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Case Id"
-          },
-          "created_at": {
-            "format": "date-time",
-            "title": "Created At",
-            "type": "string"
-          },
-          "detail": {
-            "additionalProperties": true,
-            "title": "Detail",
-            "type": "object"
-          },
-          "org_id": {
-            "title": "Org Id",
-            "type": "string"
-          },
-          "review_run_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Review Run Id"
-          }
-        },
-        "required": [
-          "audit_id",
-          "org_id",
-          "actor_id",
-          "action",
-          "created_at"
-        ],
-        "title": "AuditRecord",
-        "type": "object"
       },
       "AuthConfigResponse": {
         "properties": {
@@ -135,6 +45,7 @@
             "title": "End Session Endpoint"
           },
           "flow": {
+            "const": "authorization_code_pkce_s256",
             "default": "authorization_code_pkce_s256",
             "title": "Flow",
             "type": "string"
@@ -148,6 +59,7 @@
             "type": "string"
           },
           "token_storage": {
+            "const": "memory_only",
             "default": "memory_only",
             "title": "Token Storage",
             "type": "string"
@@ -163,71 +75,9 @@
         "title": "AuthConfigResponse",
         "type": "object"
       },
-      "AutoCompletionProfileBinding": {
-        "additionalProperties": false,
-        "properties": {
-          "approval_digest": {
-            "anyOf": [
-              {
-                "pattern": "^[a-f0-9]{64}$",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Approval Digest"
-          },
-          "approved_document_types": {
-            "items": {
-              "enum": [
-                "CI",
-                "PL",
-                "BL",
-                "CO"
-              ],
-              "type": "string"
-            },
-            "maxItems": 4,
-            "title": "Approved Document Types",
-            "type": "array"
-          },
-          "approved_required_document_codes": {
-            "items": {
-              "type": "string"
-            },
-            "maxItems": 100,
-            "title": "Approved Required Document Codes",
-            "type": "array"
-          },
-          "profile_id": {
-            "anyOf": [
-              {
-                "maxLength": 256,
-                "minLength": 1,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Profile Id"
-          }
-        },
-        "title": "AutoCompletionProfileBinding",
-        "type": "object"
-      },
       "CaseCreate": {
         "additionalProperties": false,
         "properties": {
-          "assigned_reviewer_subjects": {
-            "items": {
-              "type": "string"
-            },
-            "maxItems": 100,
-            "title": "Assigned Reviewer Subjects",
-            "type": "array"
-          },
           "external_reference": {
             "anyOf": [
               {
@@ -276,14 +126,6 @@
       },
       "CaseRecord": {
         "properties": {
-          "assigned_reviewer_subjects": {
-            "items": {
-              "type": "string"
-            },
-            "maxItems": 100,
-            "title": "Assigned Reviewer Subjects",
-            "type": "array"
-          },
           "case_id": {
             "title": "Case Id",
             "type": "string"
@@ -298,6 +140,7 @@
             "type": "string"
           },
           "document_manifest_digest": {
+            "pattern": "^[a-f0-9]{64}$",
             "title": "Document Manifest Digest",
             "type": "string"
           },
@@ -321,14 +164,9 @@
             "title": "Org Id",
             "type": "string"
           },
-          "owner_subject": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Owner Subject",
-            "type": "string"
-          },
           "revision": {
             "default": 0,
+            "minimum": 0.0,
             "title": "Revision",
             "type": "integer"
           },
@@ -351,7 +189,6 @@
           "org_id",
           "title",
           "document_manifest_digest",
-          "owner_subject",
           "created_by",
           "created_at",
           "updated_at"
@@ -368,506 +205,61 @@
         "title": "CaseStatus",
         "type": "string"
       },
-      "ChatListResponse": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/ChatRecord"
-            },
-            "title": "Items",
-            "type": "array"
-          }
-        },
-        "required": [
-          "items"
-        ],
-        "title": "ChatListResponse",
-        "type": "object"
-      },
-      "ChatRecord": {
-        "additionalProperties": false,
-        "properties": {
-          "answer": {
-            "title": "Answer",
-            "type": "string"
-          },
-          "answer_status": {
-            "enum": [
-              "answered",
-              "insufficient_evidence",
-              "out_of_scope"
-            ],
-            "title": "Answer Status",
-            "type": "string"
-          },
-          "bound_result_digest": {
-            "title": "Bound Result Digest",
-            "type": "string"
-          },
-          "case_id": {
-            "title": "Case Id",
-            "type": "string"
-          },
-          "citations": {
-            "items": {
-              "additionalProperties": {
-                "type": "string"
-              },
-              "type": "object"
-            },
-            "title": "Citations",
-            "type": "array"
-          },
-          "created_at": {
-            "format": "date-time",
-            "title": "Created At",
-            "type": "string"
-          },
-          "created_by": {
-            "title": "Created By",
-            "type": "string"
-          },
-          "generation_mode": {
-            "enum": [
-              "claude",
-              "deterministic_fallback"
-            ],
-            "title": "Generation Mode",
-            "type": "string"
-          },
-          "idempotency_key": {
-            "maxLength": 512,
-            "minLength": 1,
-            "title": "Idempotency Key",
-            "type": "string"
-          },
-          "idempotency_request_digest": {
-            "pattern": "^[a-f0-9]{64}$",
-            "title": "Idempotency Request Digest",
-            "type": "string"
-          },
-          "message_id": {
-            "title": "Message Id",
-            "type": "string"
-          },
-          "model_execution_summary": {
-            "$ref": "#/components/schemas/ModelExecutionSummary"
-          },
-          "org_id": {
-            "title": "Org Id",
-            "type": "string"
-          },
-          "question": {
-            "title": "Question",
-            "type": "string"
-          },
-          "review_run_id": {
-            "title": "Review Run Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "message_id",
-          "review_run_id",
-          "case_id",
-          "org_id",
-          "question",
-          "answer",
-          "answer_status",
-          "generation_mode",
-          "model_execution_summary",
-          "bound_result_digest",
-          "idempotency_key",
-          "idempotency_request_digest",
-          "created_by",
-          "created_at"
-        ],
-        "title": "ChatRecord",
-        "type": "object"
-      },
       "CompletionEligibility": {
         "additionalProperties": false,
         "properties": {
           "eligible": {
+            "const": false,
             "default": false,
             "title": "Eligible",
             "type": "boolean"
-          },
-          "profile_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Profile Id"
-          },
-          "scope": {
-            "items": {
-              "type": "string"
-            },
-            "maxItems": 100,
-            "title": "Scope",
-            "type": "array"
           },
           "unmet_reason_codes": {
             "items": {
               "type": "string"
             },
-            "maxItems": 100,
+            "maxItems": 20,
+            "minItems": 1,
             "title": "Unmet Reason Codes",
             "type": "array"
           }
         },
+        "required": [
+          "unmet_reason_codes"
+        ],
         "title": "CompletionEligibility",
         "type": "object"
       },
-      "CorrectionOperation": {
-        "additionalProperties": false,
+      "DevelopmentSessionResponse": {
         "properties": {
-          "confidence": {
-            "default": 1.0,
-            "maximum": 1.0,
-            "minimum": 0.0,
-            "title": "Confidence",
-            "type": "number"
-          },
-          "document_id": {
-            "minLength": 1,
-            "title": "Document Id",
-            "type": "string"
-          },
-          "field_path": {
+          "access_token": {
             "maxLength": 512,
-            "minLength": 1,
-            "title": "Field Path",
+            "minLength": 32,
+            "title": "Access Token",
             "type": "string"
           },
-          "new_value": {
-            "title": "New Value"
-          },
-          "reason": {
-            "maxLength": 1000,
-            "minLength": 1,
-            "title": "Reason",
-            "type": "string"
-          }
-        },
-        "required": [
-          "document_id",
-          "field_path",
-          "new_value",
-          "reason"
-        ],
-        "title": "CorrectionOperation",
-        "type": "object"
-      },
-      "CorrectionProposalCreate": {
-        "additionalProperties": false,
-        "properties": {
-          "case_revision": {
-            "minimum": 0.0,
-            "title": "Case Revision",
+          "expires_in": {
+            "maximum": 86400.0,
+            "minimum": 60.0,
+            "title": "Expires In",
             "type": "integer"
           },
-          "corrections": {
-            "items": {
-              "$ref": "#/components/schemas/CorrectionOperation"
-            },
-            "maxItems": 100,
-            "minItems": 1,
-            "title": "Corrections",
-            "type": "array"
+          "session": {
+            "$ref": "#/components/schemas/SessionResponse"
           },
-          "parent_input_manifest_sha256": {
-            "pattern": "^[a-f0-9]{64}$",
-            "title": "Parent Input Manifest Sha256",
-            "type": "string"
-          },
-          "parent_result_digest": {
-            "pattern": "^[a-f0-9]{64}$",
-            "title": "Parent Result Digest",
+          "token_type": {
+            "const": "Bearer",
+            "default": "Bearer",
+            "title": "Token Type",
             "type": "string"
           }
         },
         "required": [
-          "parent_result_digest",
-          "parent_input_manifest_sha256",
-          "case_revision",
-          "corrections"
+          "access_token",
+          "expires_in",
+          "session"
         ],
-        "title": "CorrectionProposalCreate",
-        "type": "object"
-      },
-      "CorrectionProposalDecisionCreate": {
-        "additionalProperties": false,
-        "properties": {
-          "case_revision": {
-            "minimum": 0.0,
-            "title": "Case Revision",
-            "type": "integer"
-          },
-          "decision": {
-            "enum": [
-              "approve",
-              "reject"
-            ],
-            "title": "Decision",
-            "type": "string"
-          },
-          "parent_result_digest": {
-            "pattern": "^[a-f0-9]{64}$",
-            "title": "Parent Result Digest",
-            "type": "string"
-          },
-          "reason": {
-            "maxLength": 2000,
-            "minLength": 1,
-            "title": "Reason",
-            "type": "string"
-          }
-        },
-        "required": [
-          "decision",
-          "reason",
-          "parent_result_digest",
-          "case_revision"
-        ],
-        "title": "CorrectionProposalDecisionCreate",
-        "type": "object"
-      },
-      "CorrectionProposalDecisionResponse": {
-        "properties": {
-          "decision": {
-            "$ref": "#/components/schemas/HumanDecisionRecord"
-          },
-          "job": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/JobView"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "proposal": {
-            "$ref": "#/components/schemas/CorrectionProposalRecord"
-          }
-        },
-        "required": [
-          "proposal",
-          "decision"
-        ],
-        "title": "CorrectionProposalDecisionResponse",
-        "type": "object"
-      },
-      "CorrectionProposalListResponse": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/CorrectionProposalRecord"
-            },
-            "title": "Items",
-            "type": "array"
-          }
-        },
-        "required": [
-          "items"
-        ],
-        "title": "CorrectionProposalListResponse",
-        "type": "object"
-      },
-      "CorrectionProposalRecord": {
-        "additionalProperties": false,
-        "properties": {
-          "actions": {
-            "items": {
-              "$ref": "#/components/schemas/RevisionAction"
-            },
-            "maxItems": 100,
-            "title": "Actions",
-            "type": "array"
-          },
-          "case_id": {
-            "title": "Case Id",
-            "type": "string"
-          },
-          "case_revision": {
-            "minimum": 0.0,
-            "title": "Case Revision",
-            "type": "integer"
-          },
-          "child_job_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Child Job Id"
-          },
-          "corrections": {
-            "items": {
-              "$ref": "#/components/schemas/CorrectionOperation"
-            },
-            "maxItems": 100,
-            "title": "Corrections",
-            "type": "array"
-          },
-          "created_at": {
-            "format": "date-time",
-            "title": "Created At",
-            "type": "string"
-          },
-          "created_by": {
-            "title": "Created By",
-            "type": "string"
-          },
-          "decided_at": {
-            "anyOf": [
-              {
-                "format": "date-time",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Decided At"
-          },
-          "decided_by": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Decided By"
-          },
-          "decision_reason": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Decision Reason"
-          },
-          "idempotency_key": {
-            "maxLength": 512,
-            "minLength": 1,
-            "title": "Idempotency Key",
-            "type": "string"
-          },
-          "idempotency_request_digest": {
-            "pattern": "^[a-f0-9]{64}$",
-            "title": "Idempotency Request Digest",
-            "type": "string"
-          },
-          "org_id": {
-            "title": "Org Id",
-            "type": "string"
-          },
-          "parent_input_manifest_sha256": {
-            "pattern": "^[a-f0-9]{64}$",
-            "title": "Parent Input Manifest Sha256",
-            "type": "string"
-          },
-          "parent_result_digest": {
-            "pattern": "^[a-f0-9]{64}$",
-            "title": "Parent Result Digest",
-            "type": "string"
-          },
-          "proposal_id": {
-            "title": "Proposal Id",
-            "type": "string"
-          },
-          "review_run_id": {
-            "title": "Review Run Id",
-            "type": "string"
-          },
-          "status": {
-            "$ref": "#/components/schemas/CorrectionProposalStatus",
-            "default": "pending"
-          }
-        },
-        "required": [
-          "proposal_id",
-          "org_id",
-          "case_id",
-          "review_run_id",
-          "idempotency_key",
-          "idempotency_request_digest",
-          "parent_result_digest",
-          "parent_input_manifest_sha256",
-          "case_revision",
-          "created_by",
-          "created_at"
-        ],
-        "title": "CorrectionProposalRecord",
-        "type": "object"
-      },
-      "CorrectionProposalStatus": {
-        "enum": [
-          "pending",
-          "approved",
-          "rejected"
-        ],
-        "title": "CorrectionProposalStatus",
-        "type": "string"
-      },
-      "DecisionListResponse": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/HumanDecisionRecord"
-            },
-            "title": "Items",
-            "type": "array"
-          }
-        },
-        "required": [
-          "items"
-        ],
-        "title": "DecisionListResponse",
-        "type": "object"
-      },
-      "DeliveryReconciliationCreate": {
-        "additionalProperties": false,
-        "description": "Human evidence that an uncertain request was not processed by Agent.",
-        "properties": {
-          "evidence_reference_sha256": {
-            "pattern": "^[a-f0-9]{64}$",
-            "title": "Evidence Reference Sha256",
-            "type": "string"
-          },
-          "reason": {
-            "maxLength": 2000,
-            "minLength": 10,
-            "title": "Reason",
-            "type": "string"
-          },
-          "resolution": {
-            "const": "confirmed_not_processed",
-            "title": "Resolution",
-            "type": "string"
-          }
-        },
-        "required": [
-          "resolution",
-          "evidence_reference_sha256",
-          "reason"
-        ],
-        "title": "DeliveryReconciliationCreate",
+        "title": "DevelopmentSessionResponse",
         "type": "object"
       },
       "DocumentListResponse": {
@@ -918,128 +310,6 @@
         "title": "ExecutionStatus",
         "type": "string"
       },
-      "GroundedQuestion": {
-        "additionalProperties": false,
-        "properties": {
-          "bound_result_digest": {
-            "pattern": "^[a-f0-9]{64}$",
-            "title": "Bound Result Digest",
-            "type": "string"
-          },
-          "question": {
-            "maxLength": 2000,
-            "minLength": 1,
-            "title": "Question",
-            "type": "string"
-          }
-        },
-        "required": [
-          "question",
-          "bound_result_digest"
-        ],
-        "title": "GroundedQuestion",
-        "type": "object"
-      },
-      "HumanDecisionRecord": {
-        "properties": {
-          "case_id": {
-            "title": "Case Id",
-            "type": "string"
-          },
-          "created_at": {
-            "format": "date-time",
-            "title": "Created At",
-            "type": "string"
-          },
-          "decided_by": {
-            "title": "Decided By",
-            "type": "string"
-          },
-          "decision": {
-            "enum": [
-              "approve",
-              "reject"
-            ],
-            "title": "Decision",
-            "type": "string"
-          },
-          "decision_id": {
-            "title": "Decision Id",
-            "type": "string"
-          },
-          "idempotency_key": {
-            "anyOf": [
-              {
-                "maxLength": 512,
-                "minLength": 1,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Idempotency Key"
-          },
-          "idempotency_request_digest": {
-            "anyOf": [
-              {
-                "pattern": "^[a-f0-9]{64}$",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Idempotency Request Digest"
-          },
-          "org_id": {
-            "title": "Org Id",
-            "type": "string"
-          },
-          "proposal_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Proposal Id"
-          },
-          "reason": {
-            "title": "Reason",
-            "type": "string"
-          },
-          "review_run_id": {
-            "title": "Review Run Id",
-            "type": "string"
-          },
-          "target_revision_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Target Revision Id"
-          }
-        },
-        "required": [
-          "decision_id",
-          "review_run_id",
-          "case_id",
-          "org_id",
-          "decision",
-          "reason",
-          "decided_by",
-          "created_at"
-        ],
-        "title": "HumanDecisionRecord",
-        "type": "object"
-      },
       "InputDocumentManifestEntry": {
         "additionalProperties": false,
         "properties": {
@@ -1074,22 +344,6 @@
         "title": "InputDocumentManifestEntry",
         "type": "object"
       },
-      "JobEventsResponse": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/StageEvent"
-            },
-            "title": "Items",
-            "type": "array"
-          }
-        },
-        "required": [
-          "items"
-        ],
-        "title": "JobEventsResponse",
-        "type": "object"
-      },
       "JobResponse": {
         "properties": {
           "idempotency_reused": {
@@ -1112,23 +366,13 @@
           "queued",
           "running",
           "succeeded",
-          "failed",
-          "delivery_uncertain",
-          "response_received_rejected",
-          "response_persistence_uncertain"
+          "failed"
         ],
         "title": "JobStatus",
         "type": "string"
       },
       "JobView": {
         "properties": {
-          "agent_call_state": {
-            "$ref": "#/components/schemas/AgentCallState"
-          },
-          "attempt_count": {
-            "title": "Attempt Count",
-            "type": "integer"
-          },
           "case_id": {
             "title": "Case Id",
             "type": "string"
@@ -1157,25 +401,6 @@
             "title": "Job Id",
             "type": "string"
           },
-          "kind": {
-            "enum": [
-              "review",
-              "revision"
-            ],
-            "title": "Kind",
-            "type": "string"
-          },
-          "parent_run_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Parent Run Id"
-          },
           "review_run_id": {
             "title": "Review Run Id",
             "type": "string"
@@ -1192,119 +417,13 @@
         "required": [
           "job_id",
           "case_id",
-          "kind",
           "status",
           "review_run_id",
-          "attempt_count",
-          "agent_call_state",
           "created_by",
           "created_at",
           "updated_at"
         ],
         "title": "JobView",
-        "type": "object"
-      },
-      "ModelExecutionSummary": {
-        "additionalProperties": false,
-        "description": "Bounded, non-sensitive projection of provider model-call audit records.\n\nThis deliberately excludes document/request/message IDs, raw content, hashes,\nlatency detail, credentials, and provider responses.  ``audit_complete`` means\nonly that the provider-owned audit records are structurally complete and bound\nto the runtime identity; it is not a model-quality or Production-release claim.",
-        "properties": {
-          "audit_complete": {
-            "title": "Audit Complete",
-            "type": "boolean"
-          },
-          "call_count": {
-            "maximum": 1000.0,
-            "minimum": 0.0,
-            "title": "Call Count",
-            "type": "integer"
-          },
-          "input_tokens_total": {
-            "maximum": 1000000000000.0,
-            "minimum": 0.0,
-            "title": "Input Tokens Total",
-            "type": "integer"
-          },
-          "model_id": {
-            "anyOf": [
-              {
-                "maxLength": 128,
-                "minLength": 1,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Model Id"
-          },
-          "output_tokens_total": {
-            "maximum": 1000000000000.0,
-            "minimum": 0.0,
-            "title": "Output Tokens Total",
-            "type": "integer"
-          },
-          "prompt_hashes_complete": {
-            "title": "Prompt Hashes Complete",
-            "type": "boolean"
-          },
-          "provider": {
-            "anyOf": [
-              {
-                "const": "anthropic",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Provider"
-          },
-          "runtime_identity_match": {
-            "title": "Runtime Identity Match",
-            "type": "boolean"
-          },
-          "schema_hashes_complete": {
-            "title": "Schema Hashes Complete",
-            "type": "boolean"
-          },
-          "text_only": {
-            "title": "Text Only",
-            "type": "boolean"
-          },
-          "unmet_reason_codes": {
-            "items": {
-              "enum": [
-                "no_model_calls",
-                "provider_not_anthropic",
-                "model_id_incomplete_or_mixed",
-                "non_text_model_call",
-                "non_positive_input_tokens",
-                "non_positive_output_tokens",
-                "prompt_hash_incomplete",
-                "schema_hash_incomplete",
-                "runtime_identity_mismatch"
-              ],
-              "type": "string"
-            },
-            "maxItems": 9,
-            "title": "Unmet Reason Codes",
-            "type": "array"
-          }
-        },
-        "required": [
-          "provider",
-          "model_id",
-          "text_only",
-          "call_count",
-          "input_tokens_total",
-          "output_tokens_total",
-          "prompt_hashes_complete",
-          "schema_hashes_complete",
-          "runtime_identity_match",
-          "audit_complete",
-          "unmet_reason_codes"
-        ],
-        "title": "ModelExecutionSummary",
         "type": "object"
       },
       "ProblemDetailsV1": {
@@ -1416,18 +535,10 @@
             "type": "string"
           },
           "message": {
-            "maxLength": 2000,
+            "maxLength": 4000,
             "minLength": 1,
             "title": "Message",
             "type": "string"
-          },
-          "source_reference_ids": {
-            "items": {
-              "type": "string"
-            },
-            "maxItems": 100,
-            "title": "Source Reference Ids",
-            "type": "array"
           }
         },
         "required": [
@@ -1461,14 +572,6 @@
             ],
             "title": "Review As Of"
           },
-          "submitted_document_codes": {
-            "items": {
-              "type": "string"
-            },
-            "maxItems": 0,
-            "title": "Submitted Document Codes",
-            "type": "array"
-          },
           "trade_type": {
             "default": "import",
             "enum": [
@@ -1501,14 +604,6 @@
       "ReviewRunRecord": {
         "additionalProperties": false,
         "properties": {
-          "action_trace": {
-            "items": {
-              "additionalProperties": true,
-              "type": "object"
-            },
-            "title": "Action Trace",
-            "type": "array"
-          },
           "agent_input_manifest_sha256": {
             "pattern": "^[a-f0-9]{64}$",
             "title": "Agent Input Manifest Sha256",
@@ -1518,10 +613,8 @@
             "$ref": "#/components/schemas/Assessment"
           },
           "assurance_level": {
-            "$ref": "#/components/schemas/AssuranceLevel"
-          },
-          "auto_completion_profile": {
-            "$ref": "#/components/schemas/AutoCompletionProfileBinding"
+            "$ref": "#/components/schemas/AssuranceLevel",
+            "default": "diagnostic"
           },
           "case_id": {
             "title": "Case Id",
@@ -1544,14 +637,31 @@
             "title": "Created By",
             "type": "string"
           },
+          "evidence": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Evidence",
+            "type": "array"
+          },
           "execution_status": {
             "$ref": "#/components/schemas/ExecutionStatus"
+          },
+          "findings": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Findings",
+            "type": "array"
           },
           "input_document_manifest": {
             "items": {
               "$ref": "#/components/schemas/InputDocumentManifestEntry"
             },
-            "maxItems": 6,
+            "maxItems": 20,
+            "minItems": 1,
             "title": "Input Document Manifest",
             "type": "array"
           },
@@ -1561,35 +671,12 @@
             "type": "string"
           },
           "job_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Job Id"
-          },
-          "narrative_report": {
-            "additionalProperties": true,
-            "title": "Narrative Report",
-            "type": "object"
+            "title": "Job Id",
+            "type": "string"
           },
           "org_id": {
             "title": "Org Id",
             "type": "string"
-          },
-          "parent_run_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Parent Run Id"
           },
           "provider_result_sha256": {
             "pattern": "^[a-f0-9]{64}$",
@@ -1601,6 +688,11 @@
             "title": "Release Identity",
             "type": "object"
           },
+          "report": {
+            "additionalProperties": true,
+            "title": "Report",
+            "type": "object"
+          },
           "required_actions": {
             "items": {
               "$ref": "#/components/schemas/RequiredAction"
@@ -1608,241 +700,62 @@
             "title": "Required Actions",
             "type": "array"
           },
-          "result_detail": {
-            "additionalProperties": true,
-            "title": "Result Detail",
-            "type": "object"
-          },
           "result_digest": {
             "pattern": "^[a-f0-9]{64}$",
             "title": "Result Digest",
             "type": "string"
           },
           "review_as_of": {
-            "anyOf": [
-              {
-                "format": "date",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Review As Of"
+            "format": "date",
+            "title": "Review As Of",
+            "type": "string"
           },
           "review_disposition": {
-            "$ref": "#/components/schemas/ReviewDisposition"
+            "$ref": "#/components/schemas/ReviewDisposition",
+            "default": "human_review_required"
           },
           "review_run_id": {
             "title": "Review Run Id",
             "type": "string"
           },
-          "review_stage_trace": {
-            "items": {
-              "$ref": "#/components/schemas/ReviewStageTraceEntry"
-            },
-            "maxItems": 64,
-            "title": "Review Stage Trace",
-            "type": "array"
-          },
           "trade_type": {
-            "anyOf": [
-              {
-                "enum": [
-                  "import",
-                  "export"
-                ],
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
+            "enum": [
+              "import",
+              "export"
             ],
-            "title": "Trade Type"
+            "title": "Trade Type",
+            "type": "string"
           }
         },
         "required": [
           "review_run_id",
           "case_id",
           "org_id",
+          "job_id",
           "case_revision",
+          "review_as_of",
+          "trade_type",
+          "input_document_manifest",
           "input_manifest_digest",
           "agent_input_manifest_sha256",
           "provider_result_sha256",
           "result_digest",
           "execution_status",
           "assessment",
-          "review_disposition",
-          "assurance_level",
           "completion_eligibility",
-          "result_detail",
+          "report",
+          "evidence",
+          "findings",
+          "required_actions",
           "created_by",
           "created_at"
         ],
         "title": "ReviewRunRecord",
         "type": "object"
       },
-      "ReviewStageTraceEntry": {
-        "additionalProperties": false,
-        "properties": {
-          "reason_ids": {
-            "items": {
-              "type": "string"
-            },
-            "maxItems": 100,
-            "title": "Reason Ids",
-            "type": "array"
-          },
-          "sequence": {
-            "maximum": 64.0,
-            "minimum": 1.0,
-            "title": "Sequence",
-            "type": "integer"
-          },
-          "stage": {
-            "enum": [
-              "load_case",
-              "classify_documents",
-              "extract_documents",
-              "normalize_documents",
-              "pair_documents",
-              "validate_cross_documents",
-              "retrieve_regulations",
-              "compliance_review",
-              "generate_xai_report",
-              "route_to_human_or_complete",
-              "redact_sensitive_inputs"
-            ],
-            "title": "Stage",
-            "type": "string"
-          },
-          "status": {
-            "enum": [
-              "completed",
-              "needs_review",
-              "partial",
-              "failed"
-            ],
-            "title": "Status",
-            "type": "string"
-          }
-        },
-        "required": [
-          "sequence",
-          "stage",
-          "status"
-        ],
-        "title": "ReviewStageTraceEntry",
-        "type": "object"
-      },
-      "RevisionAction": {
-        "additionalProperties": false,
-        "description": "Typed, inert proposal action; it reaches Agent only after maker-checker approval.",
-        "properties": {
-          "confirmed_reference_id": {
-            "anyOf": [
-              {
-                "maxLength": 256,
-                "minLength": 1,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Confirmed Reference Id"
-          },
-          "correction": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/CorrectionOperation"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "decision": {
-            "enum": [
-              "confirm_field",
-              "correct_field",
-              "add_supporting_document",
-              "approve_review",
-              "reject_review"
-            ],
-            "title": "Decision",
-            "type": "string"
-          },
-          "reason": {
-            "maxLength": 2000,
-            "minLength": 1,
-            "title": "Reason",
-            "type": "string"
-          },
-          "supporting_document_id": {
-            "anyOf": [
-              {
-                "maxLength": 128,
-                "minLength": 1,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Supporting Document Id"
-          }
-        },
-        "required": [
-          "decision",
-          "reason"
-        ],
-        "title": "RevisionAction",
-        "type": "object"
-      },
-      "RevisionProposalCreate": {
-        "additionalProperties": false,
-        "properties": {
-          "actions": {
-            "items": {
-              "$ref": "#/components/schemas/RevisionAction"
-            },
-            "maxItems": 100,
-            "minItems": 1,
-            "title": "Actions",
-            "type": "array"
-          },
-          "case_revision": {
-            "minimum": 0.0,
-            "title": "Case Revision",
-            "type": "integer"
-          },
-          "parent_input_manifest_sha256": {
-            "pattern": "^[a-f0-9]{64}$",
-            "title": "Parent Input Manifest Sha256",
-            "type": "string"
-          },
-          "parent_result_digest": {
-            "pattern": "^[a-f0-9]{64}$",
-            "title": "Parent Result Digest",
-            "type": "string"
-          }
-        },
-        "required": [
-          "parent_result_digest",
-          "parent_input_manifest_sha256",
-          "case_revision",
-          "actions"
-        ],
-        "title": "RevisionProposalCreate",
-        "type": "object"
-      },
       "Role": {
         "enum": [
-          "reviewer",
-          "approver",
-          "auditor",
-          "admin"
+          "reviewer"
         ],
         "title": "Role",
         "type": "string"
@@ -1873,361 +786,6 @@
         "title": "SessionResponse",
         "type": "object"
       },
-      "StageEvent": {
-        "properties": {
-          "detail": {
-            "additionalProperties": true,
-            "title": "Detail",
-            "type": "object"
-          },
-          "event_id": {
-            "title": "Event Id",
-            "type": "string"
-          },
-          "job_id": {
-            "title": "Job Id",
-            "type": "string"
-          },
-          "message_code": {
-            "title": "Message Code",
-            "type": "string"
-          },
-          "occurred_at": {
-            "format": "date-time",
-            "title": "Occurred At",
-            "type": "string"
-          },
-          "sequence": {
-            "minimum": 1.0,
-            "title": "Sequence",
-            "type": "integer"
-          },
-          "stage": {
-            "enum": [
-              "queued",
-              "input_validation",
-              "agent_analysis",
-              "result_validation",
-              "persistence",
-              "document_analysis",
-              "normalization",
-              "validation",
-              "evidence",
-              "compliance",
-              "report",
-              "completed",
-              "failed"
-            ],
-            "title": "Stage",
-            "type": "string"
-          },
-          "state": {
-            "enum": [
-              "started",
-              "progress",
-              "completed",
-              "failed"
-            ],
-            "title": "State",
-            "type": "string"
-          }
-        },
-        "required": [
-          "event_id",
-          "job_id",
-          "sequence",
-          "stage",
-          "state",
-          "message_code",
-          "occurred_at"
-        ],
-        "title": "StageEvent",
-        "type": "object"
-      },
-      "SupportingDocumentCreate": {
-        "additionalProperties": false,
-        "properties": {
-          "document_code": {
-            "maxLength": 128,
-            "minLength": 1,
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
-            "title": "Document Code",
-            "type": "string"
-          },
-          "document_id": {
-            "maxLength": 128,
-            "minLength": 1,
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
-            "title": "Document Id",
-            "type": "string"
-          },
-          "document_number": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Document Number",
-            "type": "string"
-          },
-          "hs_codes": {
-            "items": {
-              "type": "string"
-            },
-            "maxItems": 100,
-            "title": "Hs Codes",
-            "type": "array"
-          },
-          "issued_on": {
-            "format": "date",
-            "title": "Issued On",
-            "type": "string"
-          },
-          "issuer": {
-            "maxLength": 512,
-            "minLength": 1,
-            "title": "Issuer",
-            "type": "string"
-          },
-          "source_sha256": {
-            "pattern": "^[a-f0-9]{64}$",
-            "title": "Source Sha256",
-            "type": "string"
-          },
-          "subject_item_ids": {
-            "items": {
-              "type": "string"
-            },
-            "maxItems": 100,
-            "minItems": 1,
-            "title": "Subject Item Ids",
-            "type": "array"
-          },
-          "valid_until": {
-            "anyOf": [
-              {
-                "format": "date",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Valid Until"
-          }
-        },
-        "required": [
-          "document_id",
-          "document_code",
-          "issuer",
-          "document_number",
-          "issued_on",
-          "subject_item_ids",
-          "source_sha256"
-        ],
-        "title": "SupportingDocumentCreate",
-        "type": "object"
-      },
-      "SupportingDocumentListResponse": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/SupportingDocumentRecord"
-            },
-            "maxItems": 100,
-            "title": "Items",
-            "type": "array"
-          }
-        },
-        "required": [
-          "items"
-        ],
-        "title": "SupportingDocumentListResponse",
-        "type": "object"
-      },
-      "SupportingDocumentRecord": {
-        "additionalProperties": false,
-        "properties": {
-          "case_id": {
-            "title": "Case Id",
-            "type": "string"
-          },
-          "created_at": {
-            "format": "date-time",
-            "title": "Created At",
-            "type": "string"
-          },
-          "created_by": {
-            "title": "Created By",
-            "type": "string"
-          },
-          "document_code": {
-            "maxLength": 128,
-            "minLength": 1,
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
-            "title": "Document Code",
-            "type": "string"
-          },
-          "document_id": {
-            "maxLength": 128,
-            "minLength": 1,
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
-            "title": "Document Id",
-            "type": "string"
-          },
-          "document_number": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Document Number",
-            "type": "string"
-          },
-          "hs_codes": {
-            "items": {
-              "type": "string"
-            },
-            "maxItems": 100,
-            "title": "Hs Codes",
-            "type": "array"
-          },
-          "issued_on": {
-            "format": "date",
-            "title": "Issued On",
-            "type": "string"
-          },
-          "issuer": {
-            "maxLength": 512,
-            "minLength": 1,
-            "title": "Issuer",
-            "type": "string"
-          },
-          "org_id": {
-            "title": "Org Id",
-            "type": "string"
-          },
-          "source_sha256": {
-            "pattern": "^[a-f0-9]{64}$",
-            "title": "Source Sha256",
-            "type": "string"
-          },
-          "subject_item_ids": {
-            "items": {
-              "type": "string"
-            },
-            "maxItems": 100,
-            "minItems": 1,
-            "title": "Subject Item Ids",
-            "type": "array"
-          },
-          "valid_until": {
-            "anyOf": [
-              {
-                "format": "date",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Valid Until"
-          },
-          "verification_assertions": {
-            "items": {
-              "$ref": "#/components/schemas/VerificationAssertionRecord"
-            },
-            "maxItems": 20,
-            "title": "Verification Assertions",
-            "type": "array"
-          }
-        },
-        "required": [
-          "document_id",
-          "document_code",
-          "issuer",
-          "document_number",
-          "issued_on",
-          "subject_item_ids",
-          "source_sha256",
-          "case_id",
-          "org_id",
-          "created_by",
-          "created_at"
-        ],
-        "title": "SupportingDocumentRecord",
-        "type": "object"
-      },
-      "SupportingVerificationDecisionRecord": {
-        "additionalProperties": false,
-        "description": "Backend-owned immutable lineage whose digest is embedded in a receipt.",
-        "properties": {
-          "actor_id": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Actor Id",
-            "type": "string"
-          },
-          "actor_role": {
-            "const": "approver",
-            "default": "approver",
-            "title": "Actor Role",
-            "type": "string"
-          },
-          "case_id": {
-            "title": "Case Id",
-            "type": "string"
-          },
-          "decided_at": {
-            "format": "date-time",
-            "title": "Decided At",
-            "type": "string"
-          },
-          "decision": {
-            "const": "verify_supporting_document",
-            "default": "verify_supporting_document",
-            "title": "Decision",
-            "type": "string"
-          },
-          "document_id": {
-            "title": "Document Id",
-            "type": "string"
-          },
-          "policy_release": {
-            "maxLength": 128,
-            "minLength": 1,
-            "title": "Policy Release",
-            "type": "string"
-          },
-          "policy_source_sha256": {
-            "pattern": "^[a-f0-9]{64}$",
-            "title": "Policy Source Sha256",
-            "type": "string"
-          },
-          "schema_version": {
-            "const": "backend-supporting-document-human-decision/v1",
-            "default": "backend-supporting-document-human-decision/v1",
-            "title": "Schema Version",
-            "type": "string"
-          },
-          "source_sha256": {
-            "pattern": "^[a-f0-9]{64}$",
-            "title": "Source Sha256",
-            "type": "string"
-          },
-          "supporting_document_claims_sha256": {
-            "pattern": "^[a-f0-9]{64}$",
-            "title": "Supporting Document Claims Sha256",
-            "type": "string"
-          }
-        },
-        "required": [
-          "case_id",
-          "document_id",
-          "source_sha256",
-          "supporting_document_claims_sha256",
-          "actor_id",
-          "policy_source_sha256",
-          "policy_release",
-          "decided_at"
-        ],
-        "title": "SupportingVerificationDecisionRecord",
-        "type": "object"
-      },
       "TextDocumentCreate": {
         "additionalProperties": false,
         "properties": {
@@ -2243,7 +801,6 @@
               "PL",
               "BL",
               "CO",
-              "SUPPORTING",
               "UNKNOWN"
             ],
             "title": "Document Type",
@@ -2269,518 +826,6 @@
         ],
         "title": "TextDocumentCreate",
         "type": "object"
-      },
-      "UatEvidenceDatasetResponse": {
-        "additionalProperties": false,
-        "properties": {
-          "data_source": {
-            "enum": [
-              "SYNTHETIC_V3_NO_RAG_QUALITY",
-              "ACTUAL_POSTGRESQL_QDRANT_NEO4J_READ_ONLY",
-              "UNKNOWN"
-            ],
-            "title": "Data Source",
-            "type": "string"
-          },
-          "expected_production_law_count": {
-            "maximum": 10000.0,
-            "minimum": 1.0,
-            "title": "Expected Production Law Count",
-            "type": "integer"
-          },
-          "observed_article_count": {
-            "maximum": 10000000.0,
-            "minimum": 0.0,
-            "title": "Observed Article Count",
-            "type": "integer"
-          },
-          "observed_law_count": {
-            "maximum": 10000.0,
-            "minimum": 0.0,
-            "title": "Observed Law Count",
-            "type": "integer"
-          },
-          "rag_quality_evaluated": {
-            "const": false,
-            "default": false,
-            "title": "Rag Quality Evaluated",
-            "type": "boolean"
-          },
-          "store_counts": {
-            "$ref": "#/components/schemas/UatEvidenceStoreCountsResponse"
-          }
-        },
-        "required": [
-          "data_source",
-          "expected_production_law_count",
-          "observed_law_count",
-          "observed_article_count",
-          "store_counts"
-        ],
-        "title": "UatEvidenceDatasetResponse",
-        "type": "object"
-      },
-      "UatEvidenceRetrievalResponse": {
-        "additionalProperties": false,
-        "properties": {
-          "bm25": {
-            "$ref": "#/components/schemas/UatEvidenceRetrievalStageResponse"
-          },
-          "dense": {
-            "$ref": "#/components/schemas/UatEvidenceRetrievalStageResponse"
-          },
-          "graph": {
-            "$ref": "#/components/schemas/UatEvidenceRetrievalStageResponse"
-          },
-          "structured": {
-            "$ref": "#/components/schemas/UatEvidenceRetrievalStageResponse"
-          }
-        },
-        "required": [
-          "structured",
-          "dense",
-          "bm25",
-          "graph"
-        ],
-        "title": "UatEvidenceRetrievalResponse",
-        "type": "object"
-      },
-      "UatEvidenceRetrievalStageResponse": {
-        "additionalProperties": false,
-        "properties": {
-          "attempted": {
-            "const": true,
-            "default": true,
-            "title": "Attempted",
-            "type": "boolean"
-          },
-          "duration_ms": {
-            "maximum": 300000.0,
-            "minimum": 0.0,
-            "title": "Duration Ms",
-            "type": "integer"
-          },
-          "result_count": {
-            "maximum": 10000000.0,
-            "minimum": 0.0,
-            "title": "Result Count",
-            "type": "integer"
-          },
-          "succeeded": {
-            "const": true,
-            "default": true,
-            "title": "Succeeded",
-            "type": "boolean"
-          },
-          "top_k_count": {
-            "maximum": 10000.0,
-            "minimum": 0.0,
-            "title": "Top K Count",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "result_count",
-          "duration_ms",
-          "top_k_count"
-        ],
-        "title": "UatEvidenceRetrievalStageResponse",
-        "type": "object"
-      },
-      "UatEvidenceStoreCountsResponse": {
-        "additionalProperties": false,
-        "properties": {
-          "neo4j_article_count": {
-            "maximum": 10000000.0,
-            "minimum": 0.0,
-            "title": "Neo4J Article Count",
-            "type": "integer"
-          },
-          "postgresql_article_count": {
-            "maximum": 10000000.0,
-            "minimum": 0.0,
-            "title": "Postgresql Article Count",
-            "type": "integer"
-          },
-          "qdrant_point_count": {
-            "maximum": 10000000.0,
-            "minimum": 0.0,
-            "title": "Qdrant Point Count",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "postgresql_article_count",
-          "qdrant_point_count",
-          "neo4j_article_count"
-        ],
-        "title": "UatEvidenceStoreCountsResponse",
-        "type": "object"
-      },
-      "UatEvidenceTraceResponse": {
-        "additionalProperties": false,
-        "properties": {
-          "knowledge_snapshot_id": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Knowledge Snapshot Id",
-            "type": "string"
-          },
-          "request_id": {
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
-            "title": "Request Id",
-            "type": "string"
-          },
-          "retrieval": {
-            "$ref": "#/components/schemas/UatEvidenceRetrievalResponse"
-          },
-          "schema_version": {
-            "const": "customs-backend-uat-evidence-trace/v1",
-            "default": "customs-backend-uat-evidence-trace/v1",
-            "title": "Schema Version",
-            "type": "string"
-          }
-        },
-        "required": [
-          "request_id",
-          "knowledge_snapshot_id",
-          "retrieval"
-        ],
-        "title": "UatEvidenceTraceResponse",
-        "type": "object"
-      },
-      "UatMetadataResponse": {
-        "additionalProperties": false,
-        "properties": {
-          "assurance_ceiling": {
-            "const": "diagnostic",
-            "default": "diagnostic",
-            "title": "Assurance Ceiling",
-            "type": "string"
-          },
-          "auto_completion_enabled": {
-            "const": false,
-            "default": false,
-            "title": "Auto Completion Enabled",
-            "type": "boolean"
-          },
-          "claude_mode": {
-            "const": "actual",
-            "default": "actual",
-            "title": "Claude Mode",
-            "type": "string"
-          },
-          "evidence_data_source": {
-            "enum": [
-              "SYNTHETIC_V3_NO_RAG_QUALITY",
-              "ACTUAL_POSTGRESQL_QDRANT_NEO4J_READ_ONLY",
-              "UNKNOWN"
-            ],
-            "title": "Evidence Data Source",
-            "type": "string"
-          },
-          "evidence_dataset": {
-            "$ref": "#/components/schemas/UatEvidenceDatasetResponse"
-          },
-          "evidence_policy_mode": {
-            "enum": [
-              "SYNTHETIC_FIXTURE",
-              "ACTUAL_CODES_HUMAN_ONLY",
-              "SEALED_TEST_ONLY_ACTUAL_CCCT_HUMAN_ONLY",
-              "UNKNOWN"
-            ],
-            "title": "Evidence Policy Mode",
-            "type": "string"
-          },
-          "evidence_profile": {
-            "enum": [
-              "synthetic-v3",
-              "preserved-3law-v3-diagnostic",
-              "preserved-3law-v3-scenario-eval",
-              "unknown"
-            ],
-            "title": "Evidence Profile",
-            "type": "string"
-          },
-          "evidence_scope": {
-            "enum": [
-              "TEST_ONLY_V3",
-              "ACTUAL_3_LAW_RAG_3_OF_58",
-              "ACTUAL_3_LAW_RAG_SCENARIO_EVAL_3_OF_58",
-              "UNKNOWN"
-            ],
-            "title": "Evidence Scope",
-            "type": "string"
-          },
-          "evidence_scope_label": {
-            "enum": [
-              "TEST_ONLY_V3",
-              "ACTUAL_3_LAW_RAG_3_OF_58",
-              "ACTUAL_3_LAW_RAG_SCENARIO_EVAL_3_OF_58",
-              "UNKNOWN"
-            ],
-            "title": "Evidence Scope Label",
-            "type": "string"
-          },
-          "mode": {
-            "const": "local_uat",
-            "default": "local_uat",
-            "title": "Mode",
-            "type": "string"
-          },
-          "planner_mode": {
-            "enum": [
-              "shadow",
-              "diagnostic_active"
-            ],
-            "title": "Planner Mode",
-            "type": "string"
-          },
-          "production_release": {
-            "const": false,
-            "default": false,
-            "title": "Production Release",
-            "type": "boolean"
-          },
-          "supported_review_as_of": {
-            "format": "date",
-            "title": "Supported Review As Of",
-            "type": "string"
-          },
-          "text_only": {
-            "const": true,
-            "default": true,
-            "title": "Text Only",
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "evidence_profile",
-          "evidence_scope",
-          "evidence_scope_label",
-          "evidence_data_source",
-          "evidence_policy_mode",
-          "evidence_dataset",
-          "supported_review_as_of",
-          "planner_mode"
-        ],
-        "title": "UatMetadataResponse",
-        "type": "object"
-      },
-      "VerificationAssertionCreate": {
-        "additionalProperties": false,
-        "properties": {
-          "method": {
-            "const": "human_approver",
-            "default": "human_approver",
-            "title": "Method",
-            "type": "string"
-          }
-        },
-        "title": "VerificationAssertionCreate",
-        "type": "object"
-      },
-      "VerificationAssertionRecord": {
-        "additionalProperties": false,
-        "properties": {
-          "asserted_at": {
-            "format": "date-time",
-            "title": "Asserted At",
-            "type": "string"
-          },
-          "asserted_by": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Asserted By",
-            "type": "string"
-          },
-          "assertion_id": {
-            "pattern": "^assert_[a-f0-9]{64}$",
-            "title": "Assertion Id",
-            "type": "string"
-          },
-          "authority_id": {
-            "maxLength": 128,
-            "minLength": 1,
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]*$",
-            "title": "Authority Id",
-            "type": "string"
-          },
-          "authority_release": {
-            "maxLength": 128,
-            "minLength": 1,
-            "title": "Authority Release",
-            "type": "string"
-          },
-          "decision_record": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/SupportingVerificationDecisionRecord"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "method": {
-            "enum": [
-              "trusted_connector",
-              "human_approver",
-              "test_issuer"
-            ],
-            "title": "Method",
-            "type": "string"
-          },
-          "receipt": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/VerificationReceiptRecord"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "source_reference_sha256": {
-            "pattern": "^[a-f0-9]{64}$",
-            "title": "Source Reference Sha256",
-            "type": "string"
-          },
-          "subject_document_id": {
-            "maxLength": 128,
-            "minLength": 1,
-            "title": "Subject Document Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "assertion_id",
-          "method",
-          "subject_document_id",
-          "asserted_by",
-          "asserted_at",
-          "authority_id",
-          "authority_release",
-          "source_reference_sha256"
-        ],
-        "title": "VerificationAssertionRecord",
-        "type": "object"
-      },
-      "VerificationReceiptRecord": {
-        "additionalProperties": false,
-        "description": "Agent-owned V1 detached receipt wire, persisted without private key material.",
-        "properties": {
-          "authority_id": {
-            "maxLength": 128,
-            "minLength": 1,
-            "title": "Authority Id",
-            "type": "string"
-          },
-          "authority_release": {
-            "maxLength": 128,
-            "minLength": 1,
-            "title": "Authority Release",
-            "type": "string"
-          },
-          "case_id": {
-            "maxLength": 128,
-            "minLength": 1,
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
-            "title": "Case Id",
-            "type": "string"
-          },
-          "connector_result_sha256": {
-            "anyOf": [
-              {
-                "pattern": "^[a-f0-9]{64}$",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Connector Result Sha256"
-          },
-          "decision_record_sha256": {
-            "anyOf": [
-              {
-                "pattern": "^[a-f0-9]{64}$",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Decision Record Sha256"
-          },
-          "expires_at": {
-            "format": "date-time",
-            "title": "Expires At",
-            "type": "string"
-          },
-          "key_id": {
-            "maxLength": 128,
-            "minLength": 1,
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
-            "title": "Key Id",
-            "type": "string"
-          },
-          "method": {
-            "enum": [
-              "trusted_connector",
-              "human_approver"
-            ],
-            "title": "Method",
-            "type": "string"
-          },
-          "policy_release": {
-            "maxLength": 128,
-            "minLength": 1,
-            "title": "Policy Release",
-            "type": "string"
-          },
-          "policy_source_sha256": {
-            "pattern": "^[a-f0-9]{64}$",
-            "title": "Policy Source Sha256",
-            "type": "string"
-          },
-          "signature_base64url": {
-            "pattern": "^[A-Za-z0-9_-]{86}$",
-            "title": "Signature Base64Url",
-            "type": "string"
-          },
-          "signed_at": {
-            "format": "date-time",
-            "title": "Signed At",
-            "type": "string"
-          },
-          "supporting_document_claims_sha256": {
-            "pattern": "^[a-f0-9]{64}$",
-            "title": "Supporting Document Claims Sha256",
-            "type": "string"
-          },
-          "trust_domain": {
-            "const": "customs-ai-agent/supporting-document-verification/v1",
-            "title": "Trust Domain",
-            "type": "string"
-          }
-        },
-        "required": [
-          "trust_domain",
-          "case_id",
-          "method",
-          "authority_id",
-          "authority_release",
-          "key_id",
-          "supporting_document_claims_sha256",
-          "policy_source_sha256",
-          "policy_release",
-          "signed_at",
-          "expires_at",
-          "signature_base64url"
-        ],
-        "title": "VerificationReceiptRecord",
-        "type": "object"
       }
     },
     "securitySchemes": {
@@ -2791,7 +836,7 @@
     }
   },
   "info": {
-    "description": "Internal, text-only workbench. Browser clients call this API only; Agent and Evidence credentials are never exposed.",
+    "description": "Local text-review API. Results always require human review.",
     "title": "Customs Review Workbench API",
     "version": "1.0.0"
   },
@@ -2819,7 +864,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "401": {
             "content": {
@@ -2829,7 +874,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "403": {
             "content": {
@@ -2839,7 +884,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "404": {
             "content": {
@@ -2849,7 +894,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "409": {
             "content": {
@@ -2859,7 +904,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "413": {
             "content": {
@@ -2869,7 +914,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "422": {
             "content": {
@@ -2879,17 +924,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "503": {
             "content": {
@@ -2899,7 +934,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           }
         },
         "summary": "Auth Config"
@@ -2927,7 +962,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "401": {
             "content": {
@@ -2937,7 +972,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "403": {
             "content": {
@@ -2947,7 +982,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "404": {
             "content": {
@@ -2957,7 +992,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "409": {
             "content": {
@@ -2967,7 +1002,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "413": {
             "content": {
@@ -2977,7 +1012,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "422": {
             "content": {
@@ -2987,17 +1022,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "503": {
             "content": {
@@ -3007,7 +1032,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           }
         },
         "security": [
@@ -3048,7 +1073,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "401": {
             "content": {
@@ -3058,7 +1083,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "403": {
             "content": {
@@ -3068,7 +1093,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "404": {
             "content": {
@@ -3078,7 +1103,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "409": {
             "content": {
@@ -3088,7 +1113,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "413": {
             "content": {
@@ -3098,7 +1123,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "422": {
             "content": {
@@ -3108,17 +1133,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "503": {
             "content": {
@@ -3128,7 +1143,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           }
         },
         "security": [
@@ -3172,7 +1187,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "401": {
             "content": {
@@ -3182,7 +1197,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "403": {
             "content": {
@@ -3192,7 +1207,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "404": {
             "content": {
@@ -3202,7 +1217,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "409": {
             "content": {
@@ -3212,7 +1227,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "413": {
             "content": {
@@ -3222,7 +1237,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "422": {
             "content": {
@@ -3232,17 +1247,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "503": {
             "content": {
@@ -3252,7 +1257,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           }
         },
         "security": [
@@ -3261,130 +1266,6 @@
           }
         ],
         "summary": "Get Case Endpoint"
-      }
-    },
-    "/api/v1/cases/{case_id}/audit": {
-      "get": {
-        "operationId": "list_audit_endpoint_api_v1_cases__case_id__audit_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "case_id",
-            "required": true,
-            "schema": {
-              "title": "Case Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AuditListResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          }
-        },
-        "security": [
-          {
-            "HTTPBearer": []
-          }
-        ],
-        "summary": "List Audit Endpoint"
       }
     },
     "/api/v1/cases/{case_id}/documents": {
@@ -3420,7 +1301,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "401": {
             "content": {
@@ -3430,7 +1311,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "403": {
             "content": {
@@ -3440,7 +1321,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "404": {
             "content": {
@@ -3450,7 +1331,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "409": {
             "content": {
@@ -3460,7 +1341,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "413": {
             "content": {
@@ -3470,7 +1351,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "422": {
             "content": {
@@ -3480,17 +1361,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "503": {
             "content": {
@@ -3500,7 +1371,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           }
         },
         "security": [
@@ -3552,7 +1423,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "401": {
             "content": {
@@ -3562,7 +1433,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "403": {
             "content": {
@@ -3572,7 +1443,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "404": {
             "content": {
@@ -3582,7 +1453,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "409": {
             "content": {
@@ -3592,7 +1463,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "413": {
             "content": {
@@ -3602,7 +1473,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "422": {
             "content": {
@@ -3612,17 +1483,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "503": {
             "content": {
@@ -3632,7 +1493,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           }
         },
         "security": [
@@ -3685,7 +1546,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "401": {
             "content": {
@@ -3695,7 +1556,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "403": {
             "content": {
@@ -3705,7 +1566,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "404": {
             "content": {
@@ -3715,7 +1576,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "409": {
             "content": {
@@ -3725,7 +1586,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "413": {
             "content": {
@@ -3735,7 +1596,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "422": {
             "content": {
@@ -3745,17 +1606,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "503": {
             "content": {
@@ -3765,7 +1616,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           }
         },
         "security": [
@@ -3809,7 +1660,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "401": {
             "content": {
@@ -3819,7 +1670,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "403": {
             "content": {
@@ -3829,7 +1680,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "404": {
             "content": {
@@ -3839,7 +1690,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "409": {
             "content": {
@@ -3849,7 +1700,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "413": {
             "content": {
@@ -3859,7 +1710,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "422": {
             "content": {
@@ -3869,17 +1720,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "503": {
             "content": {
@@ -3889,7 +1730,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           }
         },
         "security": [
@@ -3955,7 +1796,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "401": {
             "content": {
@@ -3965,7 +1806,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "403": {
             "content": {
@@ -3975,7 +1816,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "404": {
             "content": {
@@ -3985,7 +1826,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "409": {
             "content": {
@@ -3995,7 +1836,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "413": {
             "content": {
@@ -4005,7 +1846,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "422": {
             "content": {
@@ -4015,17 +1856,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "503": {
             "content": {
@@ -4035,7 +1866,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           }
         },
         "security": [
@@ -4046,26 +1877,15 @@
         "summary": "Enqueue Review Endpoint"
       }
     },
-    "/api/v1/cases/{case_id}/supporting-documents": {
-      "get": {
-        "operationId": "list_supporting_documents_endpoint_api_v1_cases__case_id__supporting_documents_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "case_id",
-            "required": true,
-            "schema": {
-              "title": "Case Id",
-              "type": "string"
-            }
-          }
-        ],
+    "/api/v1/dev/session": {
+      "post": {
+        "operationId": "create_development_session_api_v1_dev_session_post",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SupportingDocumentListResponse"
+                  "$ref": "#/components/schemas/DevelopmentSessionResponse"
                 }
               }
             },
@@ -4079,7 +1899,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "401": {
             "content": {
@@ -4089,7 +1909,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "403": {
             "content": {
@@ -4099,7 +1919,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "404": {
             "content": {
@@ -4109,7 +1929,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "409": {
             "content": {
@@ -4119,7 +1939,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "413": {
             "content": {
@@ -4129,7 +1949,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "422": {
             "content": {
@@ -4139,17 +1959,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "503": {
             "content": {
@@ -4159,436 +1969,10 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           }
         },
-        "security": [
-          {
-            "HTTPBearer": []
-          }
-        ],
-        "summary": "List Supporting Documents Endpoint"
-      },
-      "post": {
-        "operationId": "add_supporting_document_endpoint_api_v1_cases__case_id__supporting_documents_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "case_id",
-            "required": true,
-            "schema": {
-              "title": "Case Id",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SupportingDocumentCreate"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SupportingDocumentRecord"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          }
-        },
-        "security": [
-          {
-            "HTTPBearer": []
-          }
-        ],
-        "summary": "Add Supporting Document Endpoint"
-      }
-    },
-    "/api/v1/cases/{case_id}/supporting-documents/{document_id}/assertions": {
-      "post": {
-        "operationId": "assert_supporting_document_endpoint_api_v1_cases__case_id__supporting_documents__document_id__assertions_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "case_id",
-            "required": true,
-            "schema": {
-              "title": "Case Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "document_id",
-            "required": true,
-            "schema": {
-              "title": "Document Id",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/VerificationAssertionCreate"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SupportingDocumentRecord"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          }
-        },
-        "security": [
-          {
-            "HTTPBearer": []
-          }
-        ],
-        "summary": "Assert Supporting Document Endpoint"
-      }
-    },
-    "/api/v1/correction-proposals/{proposal_id}/decisions": {
-      "post": {
-        "operationId": "decide_correction_proposal_endpoint_api_v1_correction_proposals__proposal_id__decisions_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "proposal_id",
-            "required": true,
-            "schema": {
-              "title": "Proposal Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "Idempotency-Key",
-            "required": true,
-            "schema": {
-              "maxLength": 128,
-              "minLength": 8,
-              "pattern": "^[A-Za-z0-9._:-]+$",
-              "title": "Idempotency-Key",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CorrectionProposalDecisionCreate"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CorrectionProposalDecisionResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          }
-        },
-        "security": [
-          {
-            "HTTPBearer": []
-          }
-        ],
-        "summary": "Decide Correction Proposal Endpoint"
+        "summary": "Create Development Session"
       }
     },
     "/api/v1/jobs/{job_id}": {
@@ -4624,7 +2008,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "401": {
             "content": {
@@ -4634,7 +2018,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "403": {
             "content": {
@@ -4644,7 +2028,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "404": {
             "content": {
@@ -4654,7 +2038,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "409": {
             "content": {
@@ -4664,7 +2048,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "413": {
             "content": {
@@ -4674,7 +2058,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "422": {
             "content": {
@@ -4684,17 +2068,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "503": {
             "content": {
@@ -4704,7 +2078,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           }
         },
         "security": [
@@ -4713,402 +2087,6 @@
           }
         ],
         "summary": "Get Job Endpoint"
-      }
-    },
-    "/api/v1/jobs/{job_id}/events": {
-      "get": {
-        "operationId": "get_job_events_endpoint_api_v1_jobs__job_id__events_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "job_id",
-            "required": true,
-            "schema": {
-              "title": "Job Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/JobEventsResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          }
-        },
-        "security": [
-          {
-            "HTTPBearer": []
-          }
-        ],
-        "summary": "Get Job Events Endpoint"
-      }
-    },
-    "/api/v1/jobs/{job_id}/events/stream": {
-      "get": {
-        "operationId": "stream_job_events_endpoint_api_v1_jobs__job_id__events_stream_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "job_id",
-            "required": true,
-            "schema": {
-              "title": "Job Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "Last-Event-ID",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Last-Event-Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          }
-        },
-        "security": [
-          {
-            "HTTPBearer": []
-          }
-        ],
-        "summary": "Stream Job Events Endpoint"
-      }
-    },
-    "/api/v1/jobs/{job_id}/reconciliation": {
-      "post": {
-        "operationId": "reconcile_delivery_uncertain_endpoint_api_v1_jobs__job_id__reconciliation_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "job_id",
-            "required": true,
-            "schema": {
-              "title": "Job Id",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/DeliveryReconciliationCreate"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/JobView"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          }
-        },
-        "security": [
-          {
-            "HTTPBearer": []
-          }
-        ],
-        "summary": "Reconcile Delivery Uncertain Endpoint"
       }
     },
     "/api/v1/review-runs/{review_run_id}": {
@@ -5144,7 +2122,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "401": {
             "content": {
@@ -5154,7 +2132,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "403": {
             "content": {
@@ -5164,7 +2142,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "404": {
             "content": {
@@ -5174,7 +2152,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "409": {
             "content": {
@@ -5184,7 +2162,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "413": {
             "content": {
@@ -5194,7 +2172,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "422": {
             "content": {
@@ -5204,17 +2182,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "503": {
             "content": {
@@ -5224,7 +2192,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           }
         },
         "security": [
@@ -5233,1082 +2201,6 @@
           }
         ],
         "summary": "Get Run Endpoint"
-      }
-    },
-    "/api/v1/review-runs/{review_run_id}/answers": {
-      "post": {
-        "operationId": "answer_endpoint_api_v1_review_runs__review_run_id__answers_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "review_run_id",
-            "required": true,
-            "schema": {
-              "title": "Review Run Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "Idempotency-Key",
-            "required": true,
-            "schema": {
-              "maxLength": 128,
-              "minLength": 8,
-              "pattern": "^[A-Za-z0-9._:-]+$",
-              "title": "Idempotency-Key",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/GroundedQuestion"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ChatRecord"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          }
-        },
-        "security": [
-          {
-            "HTTPBearer": []
-          }
-        ],
-        "summary": "Answer Endpoint"
-      }
-    },
-    "/api/v1/review-runs/{review_run_id}/correction-proposals": {
-      "get": {
-        "operationId": "list_correction_proposals_endpoint_api_v1_review_runs__review_run_id__correction_proposals_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "review_run_id",
-            "required": true,
-            "schema": {
-              "title": "Review Run Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CorrectionProposalListResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          }
-        },
-        "security": [
-          {
-            "HTTPBearer": []
-          }
-        ],
-        "summary": "List Correction Proposals Endpoint"
-      },
-      "post": {
-        "operationId": "create_correction_proposal_endpoint_api_v1_review_runs__review_run_id__correction_proposals_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "review_run_id",
-            "required": true,
-            "schema": {
-              "title": "Review Run Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "Idempotency-Key",
-            "required": true,
-            "schema": {
-              "maxLength": 128,
-              "minLength": 8,
-              "pattern": "^[A-Za-z0-9._:-]+$",
-              "title": "Idempotency-Key",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CorrectionProposalCreate"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CorrectionProposalRecord"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          }
-        },
-        "security": [
-          {
-            "HTTPBearer": []
-          }
-        ],
-        "summary": "Create Correction Proposal Endpoint"
-      }
-    },
-    "/api/v1/review-runs/{review_run_id}/decisions": {
-      "get": {
-        "operationId": "list_decisions_endpoint_api_v1_review_runs__review_run_id__decisions_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "review_run_id",
-            "required": true,
-            "schema": {
-              "title": "Review Run Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DecisionListResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          }
-        },
-        "security": [
-          {
-            "HTTPBearer": []
-          }
-        ],
-        "summary": "List Decisions Endpoint"
-      }
-    },
-    "/api/v1/review-runs/{review_run_id}/messages": {
-      "get": {
-        "operationId": "list_chat_endpoint_api_v1_review_runs__review_run_id__messages_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "review_run_id",
-            "required": true,
-            "schema": {
-              "title": "Review Run Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ChatListResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          }
-        },
-        "security": [
-          {
-            "HTTPBearer": []
-          }
-        ],
-        "summary": "List Chat Endpoint"
-      }
-    },
-    "/api/v1/review-runs/{review_run_id}/revision-proposals": {
-      "get": {
-        "operationId": "list_revision_proposals_endpoint_api_v1_review_runs__review_run_id__revision_proposals_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "review_run_id",
-            "required": true,
-            "schema": {
-              "title": "Review Run Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CorrectionProposalListResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          }
-        },
-        "security": [
-          {
-            "HTTPBearer": []
-          }
-        ],
-        "summary": "List Revision Proposals Endpoint"
-      },
-      "post": {
-        "operationId": "create_revision_proposal_endpoint_api_v1_review_runs__review_run_id__revision_proposals_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "review_run_id",
-            "required": true,
-            "schema": {
-              "title": "Review Run Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "Idempotency-Key",
-            "required": true,
-            "schema": {
-              "maxLength": 128,
-              "minLength": 8,
-              "pattern": "^[A-Za-z0-9._:-]+$",
-              "title": "Idempotency-Key",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RevisionProposalCreate"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CorrectionProposalRecord"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          }
-        },
-        "security": [
-          {
-            "HTTPBearer": []
-          }
-        ],
-        "summary": "Create Revision Proposal Endpoint"
-      }
-    },
-    "/api/v1/revision-proposals/{proposal_id}/decisions": {
-      "post": {
-        "operationId": "decide_revision_proposal_endpoint_api_v1_revision_proposals__proposal_id__decisions_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "proposal_id",
-            "required": true,
-            "schema": {
-              "title": "Proposal Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "Idempotency-Key",
-            "required": true,
-            "schema": {
-              "maxLength": 128,
-              "minLength": 8,
-              "pattern": "^[A-Za-z0-9._:-]+$",
-              "title": "Idempotency-Key",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CorrectionProposalDecisionCreate"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CorrectionProposalDecisionResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          }
-        },
-        "security": [
-          {
-            "HTTPBearer": []
-          }
-        ],
-        "summary": "Decide Revision Proposal Endpoint"
       }
     },
     "/api/v1/session": {
@@ -6333,7 +2225,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "401": {
             "content": {
@@ -6343,7 +2235,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "403": {
             "content": {
@@ -6353,7 +2245,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "404": {
             "content": {
@@ -6363,7 +2255,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "409": {
             "content": {
@@ -6373,7 +2265,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "413": {
             "content": {
@@ -6383,7 +2275,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "422": {
             "content": {
@@ -6393,17 +2285,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           },
           "503": {
             "content": {
@@ -6413,7 +2295,7 @@
                 }
               }
             },
-            "description": "Problem Details V1 fail-closed response."
+            "description": "Fail-closed problem response."
           }
         },
         "security": [
@@ -6422,238 +2304,6 @@
           }
         ],
         "summary": "Session"
-      }
-    },
-    "/api/v1/uat/metadata": {
-      "get": {
-        "operationId": "uat_metadata_api_v1_uat_metadata_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/UatMetadataResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          }
-        },
-        "summary": "Uat Metadata"
-      }
-    },
-    "/api/v1/uat/review-runs/{review_run_id}/evidence-trace": {
-      "get": {
-        "operationId": "get_uat_evidence_trace_endpoint_api_v1_uat_review_runs__review_run_id__evidence_trace_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "review_run_id",
-            "required": true,
-            "schema": {
-              "title": "Review Run Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/UatEvidenceTraceResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "413": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsV1"
-                }
-              }
-            },
-            "description": "Problem Details V1 fail-closed response."
-          }
-        },
-        "security": [
-          {
-            "HTTPBearer": []
-          }
-        ],
-        "summary": "Get Uat Evidence Trace Endpoint"
       }
     }
   }

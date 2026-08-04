@@ -32,6 +32,8 @@ site-packages/
 *.key
 
 # Runtime artifacts and private data
+/_local/
+/_artifacts/
 outputs/
 artifacts/
 *.log

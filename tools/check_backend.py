@@ -24,8 +24,7 @@ PROFILES: Final[dict[str, tuple[tuple[str, ...], ...]]] = {
         (
             "-m",
             "pytest",
-            "packages/operational_db/tests",
-            "tests/unit",
+            "tests",
             "--no-header",
             "-q",
         ),
@@ -37,22 +36,7 @@ PROFILES: Final[dict[str, tuple[tuple[str, ...], ...]]] = {
             "pytest",
             "tests/product/test_contract_snapshot_gate.py",
             "tests/product/test_agent_http_boundary.py",
-            "--no-header",
-            "-q",
-        ),
-    ),
-    "candidate": (
-        (
-            "-m",
-            "pytest",
-            (
-                "tests/product/test_commercial_agent_experience.py::"
-                "test_v2_review_experience_and_multiturn_assistant_are_end_to_end_bound"
-            ),
-            (
-                "tests/product/test_workbench_api.py::"
-                "test_typed_revision_compiles_confirm_correct_support_and_terminal_decisions"
-            ),
+            "tests/product/test_local_profiles.py",
             "--no-header",
             "-q",
         ),

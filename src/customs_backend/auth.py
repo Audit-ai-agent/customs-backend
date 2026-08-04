@@ -5,10 +5,8 @@ from threading import RLock
 from time import monotonic
 from typing import Any
 
-import jwt
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jwt import PyJWKClient, PyJWKClientError
 
 from customs_backend.domain import Principal, Role
 from customs_backend.ports import AuthorizationError, TokenVerifier
@@ -26,11 +24,20 @@ class OidcJwtVerifier:
         org_claim: str = "org_id",
         roles_claim: str = "roles",
     ) -> None:
+        try:
+            import jwt
+            from jwt import PyJWKClient, PyJWKClientError
+        except ImportError as exc:  # pragma: no cover - functional-UAT dependency
+            raise RuntimeError(
+                "install the functional-uat extra to use the OIDC verifier"
+            ) from exc
         self._issuer = issuer
         self._audience = audience
         self._jwks_url = jwks_url
         self._org_claim = org_claim
         self._roles_claim = roles_claim
+        self._jwt = jwt
+        self._pyjwt_client_error = PyJWKClientError
         self._jwks = (
             PyJWKClient(
                 jwks_url,
@@ -62,8 +69,8 @@ class OidcJwtVerifier:
 
     def _signing_key(self, token: str) -> Any:
         try:
-            header = jwt.get_unverified_header(token)
-        except jwt.PyJWTError as exc:
+            header = self._jwt.get_unverified_header(token)
+        except self._jwt.PyJWTError as exc:
             raise AuthorizationError("invalid bearer token") from exc
         kid = header.get("kid")
         if not isinstance(kid, str) or not kid or len(kid) > 256:
@@ -111,7 +118,7 @@ class OidcJwtVerifier:
             raise AuthorizationError("OIDC verifier is not configured")
         try:
             signing_key = self._signing_key(token)
-            claims = jwt.decode(
+            claims = self._jwt.decode(
                 token,
                 signing_key.key,
                 algorithms=["RS256", "ES256"],
@@ -121,7 +128,7 @@ class OidcJwtVerifier:
                     "require": ["exp", "iat", "iss", "aud", "sub", self._org_claim],
                 },
             )
-        except (jwt.PyJWTError, PyJWKClientError) as exc:
+        except (self._jwt.PyJWTError, self._pyjwt_client_error) as exc:
             raise AuthorizationError("invalid bearer token") from exc
         subject = claims.get("sub")
         org_id = claims.get(self._org_claim)
