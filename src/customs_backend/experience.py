@@ -1118,6 +1118,15 @@ def build_canonical_experience_claim_catalog(
                 "scope_and_limits",
                 "limitation",
                 (
+                    "자연어 수정 요청은 값을 자동으로 변경하지 않으며, 수정 제안을 "
+                    "다른 담당자가 승인한 뒤 새 심사 회차에서만 반영합니다."
+                ),
+                [outcome],
+            ),
+            _canonical_claim(
+                "scope_and_limits",
+                "limitation",
+                (
                     "현재 UAT는 텍스트 문서만 처리하며 이미지·PDF의 OCR 결과는 심사 "
                     "입력으로 받지 않습니다."
                 ),
