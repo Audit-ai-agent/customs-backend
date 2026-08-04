@@ -21,8 +21,8 @@ uv sync --locked --group dev --extra unit --python 3.11
 ```
 
 다른 profile이 필요하면 동일한 방식으로 경로 끝의 `dev`를 `system`이나
-`production`으로 분리한다. Task가 끝나면 하네스가 해당 외부 환경을
-정리한다.
+`runtime`으로 분리한다. 실제 설치와 재사용은 공유 Harness의 `setup`이
+소유하며, 검사는 이미 준비된 환경을 변경하지 않는다.
 
 ## 경량 검사
 

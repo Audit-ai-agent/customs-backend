@@ -1012,8 +1012,7 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         candidate_lock_differs = (
             runtime_binding is None or runtime_binding.mode == "candidate"
         ) and (
-            capability.agent_commit != contract_lock.provider_commit
-            or capability.prompt_bundle_sha256 != contract_lock.experience_prompt_bundle_sha256
+            capability.prompt_bundle_sha256 != contract_lock.experience_prompt_bundle_sha256
             or capability.schema_bundle_sha256 != contract_lock.experience_schema_bundle_sha256
             or capability.tool_registry_id != contract_lock.uat_tool_registry_id
             or capability.tool_registry_sha256 != contract_lock.uat_tool_registry_sha256

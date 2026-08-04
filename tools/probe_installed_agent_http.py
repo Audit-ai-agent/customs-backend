@@ -5,6 +5,11 @@ The server process uses the installed wheel's real ASGI controller and real
 replaced only by explicit deterministic conformance adapters, so this Gate
 proves package, HTTP, V3 workflow, and Backend-consumer interoperability. It is
 not labelled as live Claude or Production Data conformance.
+
+The runtime Agent commit below is an internal capability/result consistency
+marker only. It is deliberately not compared with the Agent checkout HEAD or
+the packaged build-manifest provenance; interoperability is gated by the wheel
+and contract artifact digests instead.
 """
 
 from __future__ import annotations
@@ -56,16 +61,10 @@ def _git_output(checkout: Path, *arguments: str) -> str:
     return completed.stdout.strip()
 
 
-def _assert_clean_exact_agent_checkout(
-    checkout: Path,
-    *,
-    expected_git_sha: str,
-) -> Path:
+def _assert_clean_agent_checkout(checkout: Path) -> Path:
     resolved = checkout.expanduser().resolve(strict=True)
     if not resolved.is_dir():
         raise RuntimeError("Agent checkout is not a directory")
-    if _git_output(resolved, "rev-parse", "HEAD") != expected_git_sha:
-        raise RuntimeError("Agent checkout does not match the expected exact Git SHA")
     if _git_output(resolved, "status", "--porcelain=v1", "--untracked-files=all"):
         raise RuntimeError("Agent checkout is not clean")
     tracked_tool = "tools/local_uat_agent_service/app.py"
@@ -128,7 +127,6 @@ def _direct_url_sha256(distribution: Any, *, expected_wheel_sha256: str) -> str:
 def _assert_installed_agent_distribution(
     *,
     agent_checkout: Path,
-    expected_git_sha: str,
     expected_wheel_sha256: str,
 ) -> None:
     from importlib.metadata import PackageNotFoundError, distribution
@@ -156,9 +154,8 @@ def _assert_installed_agent_distribution(
     ):
         raise RuntimeError("Agent package was imported outside the isolated installed runtime")
 
-    manifest = load_packaged_build_manifest(required=True)
-    if manifest is None or manifest.git_sha != expected_git_sha:
-        raise RuntimeError("installed Agent build manifest Git identity is unexpected")
+    if load_packaged_build_manifest(required=True) is None:
+        raise RuntimeError("installed Agent build manifest is unavailable")
     if (
         _direct_url_sha256(
             installed_distribution,
@@ -203,16 +200,12 @@ def _serve(
     *,
     port: int,
     agent_checkout: Path,
-    expected_git_sha: str,
+    runtime_agent_commit: str,
     expected_wheel_sha256: str,
 ) -> None:
-    agent_checkout = _assert_clean_exact_agent_checkout(
-        agent_checkout,
-        expected_git_sha=expected_git_sha,
-    )
+    agent_checkout = _assert_clean_agent_checkout(agent_checkout)
     _assert_installed_agent_distribution(
         agent_checkout=agent_checkout,
-        expected_git_sha=expected_git_sha,
         expected_wheel_sha256=expected_wheel_sha256,
     )
 
@@ -343,7 +336,7 @@ def _serve(
     )
     issued_at = datetime.now(UTC)
     capability = issue_uat_capability(
-        agent_commit=expected_git_sha,
+        agent_commit=runtime_agent_commit,
         model_id=MODEL_ID,
         evidence_runtime_v3_sha256=evidence_identity.runtime_release_v3_sha256,
         issued_at=issued_at,
@@ -662,7 +655,7 @@ def _serve(
     runtime._retriever_v3 = DeterministicRetriever()
     runtime._secret_markers = ()
     runtime._assertion_verifier = SupportingDocumentAssertionVerifier(trust_store)
-    runtime._uat_expected_agent_commit = expected_git_sha
+    runtime._uat_expected_agent_commit = runtime_agent_commit
     runtime._uat_capability = capability
     uat_runtime = LocalUatDiagnosticRuntime(
         runtime,
@@ -674,7 +667,7 @@ def _serve(
         evidence_base_url="http://127.0.0.1:8010",
         evidence_allowed_origins=frozenset({"http://127.0.0.1:8010"}),
         environment="test",
-        build_sha=expected_git_sha,
+        build_sha=runtime_agent_commit,
         wheel_sha256=expected_wheel_sha256,
         host="127.0.0.1",
         port=port,
@@ -691,7 +684,7 @@ def _serve(
         "enhanced_experience_enabled": True,
         "uat_adaptive_active": True,
         "uat_capability_profile_sha256": capability_file_sha256,
-        "agent_commit": expected_git_sha,
+        "agent_commit": runtime_agent_commit,
     }
     manifest = LocalUatManifest(
         evidence_mode="preserved-3law-v3-scenario-eval",
@@ -704,7 +697,7 @@ def _serve(
         uat_adaptive_active=True,
         uat_capability_profile_path=None,
         uat_capability_profile_sha256=capability_file_sha256,
-        agent_commit=expected_git_sha,
+        agent_commit=runtime_agent_commit,
     )
     app = _compose_local_uat_app(
         manifest=manifest,
@@ -836,7 +829,7 @@ def _probe(
     *,
     agent_python: Path,
     agent_checkout: Path,
-    expected_git_sha: str,
+    runtime_agent_commit: str,
     expected_wheel_sha256: str,
 ) -> None:
     import httpx
@@ -878,8 +871,8 @@ def _probe(
             str(port),
             "--agent-checkout",
             str(agent_checkout),
-            "--expected-git-sha",
-            expected_git_sha,
+            "--runtime-agent-commit",
+            runtime_agent_commit,
             "--expected-wheel-sha256",
             expected_wheel_sha256,
         ],
@@ -904,8 +897,8 @@ def _probe(
         agent_identity = metadata.get("agent", {})
         if agent_identity.get("package_version") != "0.3.0":
             raise RuntimeError("installed Agent metadata has an unexpected package identity")
-        if agent_identity.get("build_sha") != expected_git_sha:
-            raise RuntimeError("installed Agent metadata has an unexpected Git identity")
+        if agent_identity.get("build_sha") != runtime_agent_commit:
+            raise RuntimeError("installed Agent metadata has an unexpected runtime identity")
         if agent_identity.get("wheel_sha256") != expected_wheel_sha256:
             raise RuntimeError("installed Agent metadata has an unexpected wheel identity")
 
@@ -913,8 +906,8 @@ def _probe(
         raw_parent = client.review(parent_request)
         validate_agent_v3_payload("review_result", raw_parent)
         parent = AgentReviewResultV3.model_validate(raw_parent)
-        if parent.runtime_release.agent_git_sha != expected_git_sha:
-            raise RuntimeError("V3 result does not carry the installed wheel Git identity")
+        if parent.runtime_release.agent_git_sha != runtime_agent_commit:
+            raise RuntimeError("V3 result does not carry the runtime Agent identity")
         if {str(item["document_id"]) for item in parent.document_results} != {
             item.document_id for item in parent_request.documents
         } or not parent.audit_trail:
@@ -937,7 +930,7 @@ def _probe(
         experience_agent = experience_metadata.get("agent")
         if not isinstance(experience_agent, dict) or (
             experience_agent.get("package_version") != AGENT_PACKAGE_VERSION
-            or experience_agent.get("build_sha") != expected_git_sha
+            or experience_agent.get("build_sha") != runtime_agent_commit
             or experience_agent.get("wheel_sha256") != expected_wheel_sha256
         ):
             raise RuntimeError("installed Agent V3 metadata artifact identity is unexpected")
@@ -961,14 +954,14 @@ def _probe(
         if (
             experience_metadata.get("enhanced_experience_enabled") is not True
             or experience_metadata.get("uat_capability_status") != "valid"
-            or experience_metadata.get("agent_commit") != expected_git_sha
+            or experience_metadata.get("agent_commit") != runtime_agent_commit
         ):
             raise RuntimeError("installed Agent V3 metadata capability state is unexpected")
         capability_payload = experience_metadata.get("uat_capability_attestation")
         validate_agent_experience_payload("agent-uat-capability-v1", capability_payload)
         metadata_capability = AgentUatCapabilityAttestationV1.model_validate(capability_payload)
         if (
-            metadata_capability.agent_commit != expected_git_sha
+            metadata_capability.agent_commit != runtime_agent_commit
             or metadata_capability.model_id != MODEL_ID
             or metadata_capability.adaptive_active is not True
             or metadata_capability.auto_completion_enabled is not False
@@ -1049,7 +1042,6 @@ def _probe(
                 capability.evidence_runtime_v3_sha256 == runtime.evidence_runtime_v3_sha256
             ),
             "auto_completion_enabled": capability.auto_completion_enabled is False,
-            "consumer_agent_commit": capability.agent_commit == contract.provider_commit,
             "prompt_bundle_sha256": (
                 capability.prompt_bundle_sha256 == contract.experience_prompt_bundle_sha256
             ),
@@ -1071,7 +1063,7 @@ def _probe(
         validate_presentation_against_result(envelope)
         if (
             envelope.canonical_result.review_run_id != experience_request.review_run_id
-            or envelope.canonical_result.runtime_release.agent_git_sha != expected_git_sha
+            or envelope.canonical_result.runtime_release.agent_git_sha != runtime_agent_commit
             or envelope.capability_attestation != metadata_capability
             or not envelope.user_presentation.sections
         ):
@@ -1258,7 +1250,7 @@ def main() -> None:
     parser.add_argument("--port", type=int)
     parser.add_argument("--agent-python", type=Path)
     parser.add_argument("--agent-checkout", type=Path, required=True)
-    parser.add_argument("--expected-git-sha", required=True)
+    parser.add_argument("--runtime-agent-commit", required=True)
     parser.add_argument("--expected-wheel-sha256", required=True)
     args = parser.parse_args()
     if args.serve:
@@ -1267,7 +1259,7 @@ def main() -> None:
         _serve(
             port=args.port,
             agent_checkout=args.agent_checkout,
-            expected_git_sha=args.expected_git_sha,
+            runtime_agent_commit=args.runtime_agent_commit,
             expected_wheel_sha256=args.expected_wheel_sha256,
         )
         return
@@ -1276,7 +1268,7 @@ def main() -> None:
     _probe(
         agent_python=args.agent_python,
         agent_checkout=args.agent_checkout,
-        expected_git_sha=args.expected_git_sha,
+        runtime_agent_commit=args.runtime_agent_commit,
         expected_wheel_sha256=args.expected_wheel_sha256,
     )
 

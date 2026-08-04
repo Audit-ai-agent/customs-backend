@@ -4,7 +4,7 @@ Backend가 소유하는 Operational DB 패키지와, 현재 AI Agent → Evidenc
 Operational DB 경로를 재현하는 로컬 통합 검증 자산을 보존한 저장소다.
 
 `customs_backend` 패키지는 이 자산을 건드리지 않고 추가한 내부
-심사자용 text-only Production-candidate Backend다. OIDC/RBAC, Case/Document,
+심사자용 text-only Backend다. OIDC/RBAC, Case/Document,
 멱등 Job, immutable Review Run, 승인된 CorrectionProposal 기반 child revision,
 SupportingDocument 검증, HITL, grounded Chat, Audit/Outbox, 재연결 가능한 SSE 진행
 계약을 `/api/v1`로 제공한다. Job의 immutable 입력과 Agent 원본 응답은 서버 측
@@ -22,16 +22,17 @@ private persistence에만 보관하고 Browser 응답에는 allowlist된 view만
 - `tools/local-agent-demo`: localhost 전용 UI 실행 안내
 - `tests/system`: Agent·Evidence·Operational DB 조합 행동 검증
 - `src/customs_backend`: 인증된 제품 API·Application Service·Port/Adapter
-- `compose.production.yaml`: exact image pin을 요구하는 내부 Docker 배포 후보
 
 제품 경계는 Agent V3 request/result Schema hash와 runtime release identity가
-Backend consumer lock 및 배포 승인 manifest와 정확히 일치해야 ready가 된다.
+Backend consumer lock의 계약 산출물 SHA와 정확히 일치할 때만 통과한다. lock의
+`provider_contract_source_commit`은 계약 산출물을 만든 source provenance일 뿐,
+실행 중인 Agent commit을 고정하는 gate가 아니다.
 자동완료는 기본 OFF이며 승인된 exact release, 검증된 supporting document,
 완전한 Evidence, 열린 Gap/Issue/Finding 0건을 모두 충족해도 2인 도메인 승인
 manifest가 없으면 `human_review_required`로 강등한다.
-검수 승인은 Backend image에 고정된 서로 다른 Ed25519 reviewer key 2개로 서명해야
+검수 승인은 보호된 source revision에 고정된 서로 다른 Ed25519 reviewer key 2개로 서명해야
 하며, 현재 packaged trust store는 의도적으로 비어 있어 자동완료는 활성화할 수 없다.
-향후 키 등록은 runtime env 변경이 아니라 보호된 PR과 새 exact Backend image로 한다.
+향후 키 등록은 runtime env 변경이 아니라 보호된 PR로만 한다.
 
 Production candidate는 코드·계약용 `AgentServicePin`과 자동완료용
 `AgentReleasePin`을 분리한다. 전자는 build/wheel/source, V3/OpenAPI,
@@ -39,8 +40,8 @@ prompt/policy/tool, Data provider code build를 exact 고정하고 현재 releas
 상태가 정직하게 `unreleased`인지 검증한다. 후자는 승인된 model
 revision, Data V2/V3 runtime, profile/trust를 추가로 결박한다. 따라서
 현재 candidate는 가상 approved 해시 없이 프로세스와 Case/HITL
-control-plane을 구성할 수 있지만, 실행 전체 `/health/ready`는 503이며
-reverse-proxy는 리뷰 트래픽을 열지 않는다.
+control-plane을 구성할 수 있지만, 실행 전체 `/health/ready`는 503으로
+닫힌다. 이 저장소는 배포 Compose·이미지·운영 환경파일을 제공하지 않는다.
 
 Data 플랫폼의 Evidence API JSON Schema, Gold set, RAG 평가기는 이 저장소에
 복제하지 않는다. Data 제공자가 canonical 계약과 평가를 소유하고,
@@ -56,13 +57,12 @@ uv run --no-sync python tools/check_backend.py quick
 uv run --no-sync python tools/check_backend.py contract
 ```
 
-GitHub PR은 shallow checkout에서 `quick`과 `contract`만 실행한다.
-의존성 audit는 `uv.lock`이 변경된 PR에서만 별도로 실행한다.
+GitHub PR은 `quick`과 `contract`만 실행한다. 의존성 audit는 같은 workflow에서
+`uv.lock`이 변경된 경우에만 실행한다.
 전체 migration·package·container·SBOM/Trivy·cross-repository Agent 인증은
 일반 PR의 활성 Gate가 아니다. Chat·HITL·child Run을 변경한 경우에만
 `uv run --no-sync python tools/check_backend.py candidate`로 대표 흐름을 한 번
-확인한다. 실제 Production 배포 인증은 배포 범위가 확정된 뒤 별도로
-수행한다.
+확인한다.
 
 OpenAPI v1을 재생성하려면:
 
@@ -70,12 +70,10 @@ OpenAPI v1을 재생성하려면:
 uv run --locked python tools/export_product_openapi.py
 ```
 
-제품 설정·migration·Docker 운영은
-[`docs/PRODUCT_BACKEND_RUNBOOK.ko.md`](docs/PRODUCT_BACKEND_RUNBOOK.ko.md)를 따른다.
-Production 안전장치를 유지한 채 사용자 관점의 로컬 실행을 조합할 때는
+사용자 관점의 로컬 실행을 조합할 때는
 [`docs/LOCAL_UAT_BACKEND.ko.md`](docs/LOCAL_UAT_BACKEND.ko.md)의 명시적
-`local_uat` 경계와 `deploy/uat/*.env.example`을 사용한다. 네 저장소 Compose와
-실제 secret은 이 저장소가 아니라 개인 `_engineering` harness가 소유한다.
+`local_uat` 경계와 `deploy/uat/*.env.example`을 사용한다. 실제 Compose,
+비밀값, 데이터는 Git 밖의 승인자 전용 UAT 운영 번들이 소유한다.
 
 Operational DB migration:
 

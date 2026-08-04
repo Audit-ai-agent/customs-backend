@@ -96,11 +96,9 @@ class MeaningCatalogV1(BaseModel):
     general_guidance: dict[str, str]
 
 
-class ExperienceContractLock(BaseModel):
+class _ExperienceContractLockFields(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["customs-backend-agent-experience-consumer-lock/v1"]
-    provider_commit: str = Field(pattern=r"^[a-f0-9]{40}$")
     provider_manifest_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     provider_asset_manifest_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     provider_openapi_lock_file_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
@@ -116,6 +114,22 @@ class ExperienceContractLock(BaseModel):
     uat_tool_registry_id: Literal["customs-agent-tools/text-uat-v2"]
     uat_tool_registry_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     schemas: dict[str, ExperienceSchemaIdentity]
+
+
+class _ExperienceContractLockV1(_ExperienceContractLockFields):
+    """Legacy on-disk consumer lock accepted only while reading existing clones."""
+
+    schema_version: Literal["customs-backend-agent-experience-consumer-lock/v1"]
+    provider_commit: str = Field(pattern=r"^[a-f0-9]{40}$")
+
+
+class ExperienceContractLock(_ExperienceContractLockFields):
+    """Artifact-first consumer lock written by current tooling."""
+
+    schema_version: Literal["customs-backend-agent-experience-consumer-lock/v2"]
+    # Provenance only. Runtime compatibility is established by the contract
+    # artifact digests and by the capability/result identities below.
+    provider_contract_source_commit: str = Field(pattern=r"^[a-f0-9]{40}$")
 
     @property
     def prompt_identities(self) -> dict[str, str]:
@@ -167,9 +181,23 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return value
 
 
+def _normalize_experience_contract_lock(
+    payload: dict[str, Any],
+) -> ExperienceContractLock:
+    """Read v1 locks without carrying their commit pin into runtime policy."""
+
+    if payload.get("schema_version") == "customs-backend-agent-experience-consumer-lock/v1":
+        legacy = _ExperienceContractLockV1.model_validate(payload)
+        normalized = legacy.model_dump()
+        normalized["schema_version"] = "customs-backend-agent-experience-consumer-lock/v2"
+        normalized["provider_contract_source_commit"] = normalized.pop("provider_commit")
+        return ExperienceContractLock.model_validate(normalized)
+    return ExperienceContractLock.model_validate(payload)
+
+
 @lru_cache(maxsize=1)
 def validate_agent_experience_contract_bundle() -> ExperienceContractBundle:
-    lock = ExperienceContractLock.model_validate(
+    lock = _normalize_experience_contract_lock(
         _decode_object(_resource_bytes(_LOCK_RESOURCE), name="experience consumer lock")
     )
     if (

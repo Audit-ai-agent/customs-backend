@@ -2169,7 +2169,6 @@ def validate_presentation_against_result(envelope: ReviewExperienceEnvelopeV1) -
         or runtime.tool_registry_id != contract_lock.provider_runtime_tool_registry_id
         or capability.evidence_runtime_v3_sha256 != runtime.evidence_runtime_v3_sha256
         or capability.auto_completion_enabled is not False
-        or capability.agent_commit != contract_lock.provider_commit
         or capability.prompt_bundle_sha256 != contract_lock.experience_prompt_bundle_sha256
         or capability.schema_bundle_sha256 != contract_lock.experience_schema_bundle_sha256
         or capability.tool_registry_id != contract_lock.uat_tool_registry_id

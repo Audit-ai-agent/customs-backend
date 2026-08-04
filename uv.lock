@@ -306,7 +306,7 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-production = [
+runtime = [
     { name = "dramatiq", extra = ["redis"] },
     { name = "minio" },
     { name = "uvicorn", extra = ["standard"] },
@@ -336,12 +336,12 @@ dev = [
 requires-dist = [
     { name = "alembic", specifier = ">=1.14,<2" },
     { name = "cryptography", specifier = ">=44,<50" },
-    { name = "dramatiq", extras = ["redis"], marker = "extra == 'production'", specifier = ">=1.17,<3" },
+    { name = "dramatiq", extras = ["redis"], marker = "extra == 'runtime'", specifier = ">=1.17,<3" },
     { name = "fastapi", specifier = ">=0.115,<1" },
     { name = "httpx", specifier = ">=0.27,<1" },
     { name = "jsonschema", specifier = ">=4.23,<5" },
     { name = "langgraph", marker = "extra == 'system'", specifier = "==1.2.9" },
-    { name = "minio", marker = "extra == 'production'", specifier = ">=7.2,<8" },
+    { name = "minio", marker = "extra == 'runtime'", specifier = ">=7.2,<8" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" },
     { name = "pydantic", specifier = ">=2.7,<3" },
     { name = "pydantic", marker = "extra == 'system'", specifier = "==2.13.4" },
@@ -352,10 +352,10 @@ requires-dist = [
     { name = "python-dotenv", marker = "extra == 'system'", specifier = "==1.2.2" },
     { name = "rapidfuzz", marker = "extra == 'system'", specifier = "==3.14.5" },
     { name = "sqlalchemy", specifier = ">=2.0,<3" },
-    { name = "uvicorn", extras = ["standard"], marker = "extra == 'production'", specifier = ">=0.30,<1" },
+    { name = "uvicorn", extras = ["standard"], marker = "extra == 'runtime'", specifier = ">=0.30,<1" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'system'", specifier = ">=0.30,<1" },
 ]
-provides-extras = ["unit", "system", "production"]
+provides-extras = ["unit", "system", "runtime"]
 
 [package.metadata.requires-dev]
 dev = [

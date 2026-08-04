@@ -369,10 +369,16 @@ def _as_exact_code_owned_presentation(raw: dict[str, Any], *, attempt_count: int
     _refresh_presentation_integrity(raw)
 
 
-def _experience_from_result(result: dict[str, Any]) -> dict[str, Any]:
+def _experience_from_result(
+    result: dict[str, Any],
+    *,
+    agent_git_sha: str | None = None,
+) -> dict[str, Any]:
     lock = validate_agent_experience_contract_bundle().lock
     result["runtime_release"]["evidence_runtime_v3_sha256"] = _EVIDENCE_RUNTIME_SHA
-    result["runtime_release"]["agent_git_sha"] = lock.provider_commit
+    result["runtime_release"]["agent_git_sha"] = (
+        agent_git_sha or lock.provider_contract_source_commit
+    )
     result["runtime_release"]["result_schema_sha256"] = lock.provider_review_result_v3.file_sha256
     result["runtime_release"]["tool_registry_id"] = lock.provider_runtime_tool_registry_id
     _rehash_result(result)
@@ -1528,6 +1534,22 @@ def test_experience_pins_distinct_production_and_uat_tool_registries() -> None:
         envelope.canonical_result.runtime_release.tool_registry_id
         != envelope.capability_attestation.tool_registry_id
     )
+    validate_presentation_against_result(envelope)
+
+
+def test_experience_binds_the_runtime_commit_without_pinning_contract_provenance() -> None:
+    lock = validate_agent_experience_contract_bundle().lock
+    runtime_commit = "e" * 40
+    envelope = ReviewExperienceEnvelopeV1.model_validate(
+        _experience_from_result(
+            build_agent_v3_result(_review_request(), auto_complete=False),
+            agent_git_sha=runtime_commit,
+        )
+    )
+
+    assert runtime_commit != lock.provider_contract_source_commit
+    assert envelope.capability_attestation.agent_commit == runtime_commit
+    assert envelope.canonical_result.runtime_release.agent_git_sha == runtime_commit
     validate_presentation_against_result(envelope)
 
 

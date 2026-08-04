@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from customs_backend import experience_contract
 from tools import verify_contract_snapshots as VERIFIER
+
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def _git(root: Path, *arguments: str) -> None:
@@ -89,3 +94,17 @@ def test_contract_snapshot_gate_fails_closed(tmp_path: Path, failure: str) -> No
             contract_validator=lambda: None,
             experience_contract_validator=lambda: None,
         )
+
+
+def test_legacy_experience_lock_is_normalized_to_artifact_first_v2() -> None:
+    lock_path = ROOT / "src/customs_backend/agent_experience_contract.lock.json"
+    legacy = json.loads(lock_path.read_text(encoding="utf-8"))
+    source_commit = legacy.pop("provider_contract_source_commit")
+    legacy["schema_version"] = "customs-backend-agent-experience-consumer-lock/v1"
+    legacy["provider_commit"] = source_commit
+
+    normalized = experience_contract._normalize_experience_contract_lock(legacy)
+
+    assert normalized.schema_version == "customs-backend-agent-experience-consumer-lock/v2"
+    assert normalized.provider_contract_source_commit == source_commit
+    assert "provider_commit" not in normalized.model_dump()

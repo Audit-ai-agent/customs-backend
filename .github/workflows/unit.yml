@@ -2,14 +2,34 @@ name: backend-checks
 
 on:
   pull_request:
-    paths-ignore:
-      - "docs/**"
-      - "**/*.md"
+    paths:
+      - ".github/workflows/unit.yml"
+      - ".gitleaks.toml"
+      - ".gitleaksignore"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "alembic.ini"
+      - "src/**"
+      - "tests/**"
+      - "tools/**"
+      - "migrations/**"
+      - "packages/**"
+      - "deploy/uat/**"
   push:
     branches: [main]
-    paths-ignore:
-      - "docs/**"
-      - "**/*.md"
+    paths:
+      - ".github/workflows/unit.yml"
+      - ".gitleaks.toml"
+      - ".gitleaksignore"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "alembic.ini"
+      - "src/**"
+      - "tests/**"
+      - "tools/**"
+      - "migrations/**"
+      - "packages/**"
+      - "deploy/uat/**"
 
 permissions:
   contents: read
@@ -59,3 +79,45 @@ jobs:
         run: |
           git diff --check
           test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Detect a lockfile change
+        id: lockfile
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            base_sha="${{ github.event.pull_request.base.sha }}"
+          else
+            base_sha="${{ github.event.before }}"
+          fi
+
+          if [[ -z "${base_sha}" || "${base_sha}" =~ ^0+$ ]]; then
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          auth_header="$(printf 'x-access-token:%s' "${GITHUB_TOKEN}" | base64 --wrap=0)"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth_header}" \
+            fetch --no-tags --depth=1 origin "${base_sha}"
+          if git diff --quiet "${base_sha}" HEAD -- uv.lock; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Install the locked audit toolchain
+        if: steps.lockfile.outputs.changed == 'true'
+        run: uv sync --locked --group dev --python "${PYTHON_VERSION}"
+
+      - name: Audit the changed locked dependency graph
+        if: steps.lockfile.outputs.changed == 'true'
+        shell: bash
+        run: |
+          uv export --quiet --locked --all-groups --all-extras \
+            --no-emit-project --no-emit-local --no-sources \
+            --format requirements.txt \
+            --output-file "${RUNNER_TEMP}/backend-locked-requirements.txt"
+          uv run --no-sync pip-audit \
+            --requirement "${RUNNER_TEMP}/backend-locked-requirements.txt" \
+            --require-hashes --disable-pip --strict --progress-spinner off

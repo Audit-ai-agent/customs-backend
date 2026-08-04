@@ -46,7 +46,7 @@
 - `unknown`: 원천을 확인하지 못한 안전한 기본값. UAT 결과를 증거로
   채택하기 전에 명시적인 profile로 다시 실행한다.
 
-Backend는 Harness가 봉인된 Data 진단 manifest에서 주입한
+Backend는 승인자 UAT 운영 번들이 봉인된 Data 진단 manifest에서 주입한
 `CUSTOMS_BACKEND_UAT_EVIDENCE_*` 관측값을 시작 시 검증한다. 실제 3법령
 프로필은 `3/58`, PostgreSQL 조문 수, Qdrant point 수, Neo4j 조문 수가
 모두 결박되고 세 저장소 수가 일치해야 시작된다. `/api/v1/uat/metadata`는
@@ -59,7 +59,7 @@ Backend→Agent timeout은 실제 Agent 실행 budget보다 큰 `435`초 이상�
 시작을 거절한다. 기존 진단 프로필은 `ACTUAL_CODES_HUMAN_ONLY`, 합성 프로필은
 `SYNTHETIC_FIXTURE` 정책 모드를 계속 사용한다.
 
-Scenario-eval에서 사람 승인 assertion을 만드는 경우에만 Harness가 `_local/secrets`
+Scenario-eval에서 사람 승인 assertion을 만드는 경우에만 승인자 UAT 운영 번들이 `_local/secrets`
 밖으로 노출되지 않는 private Ed25519 registry와 Agent용 public trust store를
 생성한다. Backend는 `uat-approver`의 exact authority, active 한 개 key,
 public trust SHA를 시작 시 결박한다. 정책 fixture도 exact CCCT
@@ -79,15 +79,14 @@ Knowledge snapshot을 먼저 확인한 뒤 외부 JSONL의 exact 한 행만 결�
 ## 설정 소유권
 
 이 저장소는 `deploy/uat/*.env.example`로 Backend 설정 계약만 소유한다.
-실제 secret과 네 저장소를 조합하는 Compose/기동 스크립트는 개인
-`_engineering` harness가 소유한다. 생성한 실제 env를 이 저장소에 두거나
-커밋하지 않는다.
+실제 secret과 네 저장소를 조합하는 Compose/기동 스크립트는 Git 밖의 승인자
+UAT 운영 번들이 소유한다. 생성한 실제 env를 이 저장소에 두거나 커밋하지 않는다.
 
 Runtime, migration, outbox에는 각각 분리된 env를 사용한다. Worker는 runtime
 env를 사용하므로 동일한 PostgreSQL, MinIO, Redis, OIDC, Agent HTTP 경계를
 선택한다. Outbox dispatcher에는 DB와 Redis 외 secret을 주지 않는다.
 
-Evidence 프로필은 Review 요청의 사용자 입력이 아니다. Harness가 Data·Agent·Backend를
+Evidence 프로필은 Review 요청의 사용자 입력이 아니다. 승인자 UAT 운영 번들이 Data·Agent·Backend를
 시작할 때 한 프로필을 선택하고 세 프로세스의 readiness identity가 정확히 일치해야
 한다. 브라우저에는 현재 활성 프로필만 안전한 metadata로 공개하며 임의 URL, token,
 process 재시작 API는 제공하지 않는다. 다른 프로필을 확인하려면 Harness가 기존 UAT를

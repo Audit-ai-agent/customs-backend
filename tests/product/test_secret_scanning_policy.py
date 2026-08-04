@@ -13,6 +13,7 @@ REVIEWED_COMMITS = {
     "8fbbfd6b66a58bfa9394f4fcdcc3f510ccffe7e7",
     "4dfce1f082e6f74a08da2f2f79d21ff8ca1ee4a1",
     "0efa95649d8218c3836f0244e4a2085b067b5ab7",
+    "60c2070d05acf081668644d6bd16d145e02ea537",
 }
 REVIEWED_LINES = {24, 25}
 EXPECTED_EXPERIENCE_LOCK_IGNORES = {
@@ -50,13 +51,16 @@ def test_experience_lock_ignores_are_limited_to_reviewed_findings() -> None:
     experience_entries = {entry for entry in entries if EXPERIENCE_LOCK_PATH in entry}
 
     assert experience_entries == EXPECTED_EXPERIENCE_LOCK_IGNORES
-    assert len(entries) == 12
+    assert len(entries) == 14
 
 
 def test_current_experience_lock_lines_are_public_sha256_provenance() -> None:
     lock_file = ROOT / EXPERIENCE_LOCK_PATH
     lines = lock_file.read_text(encoding="utf-8").splitlines()
     payload = json.loads(lock_file.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == "customs-backend-agent-experience-consumer-lock/v2"
+    assert "provider_commit" not in payload
+    assert "provider_contract_source_commit" in payload
     expected_keys = {
         24: "provider_openapi_lock_file_sha256",
         25: "provider_openapi_sha256",

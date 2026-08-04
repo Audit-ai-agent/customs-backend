@@ -35,7 +35,7 @@ system = [
   "rapidfuzz==3.14.5",
   "uvicorn[standard]>=0.30,<1",
 ]
-production = [
+runtime = [
   "dramatiq[redis]>=1.17,<3",
   "minio>=7.2,<8",
   "uvicorn[standard]>=0.30,<1",
