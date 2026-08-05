@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -35,6 +38,11 @@ from customs_backend.ports import (
     WorkbenchRepository,
 )
 from customs_backend.repository import InMemoryWorkbenchRepository
+from customs_backend.scenario_transcript import (
+    FunctionalTranscriptController,
+    ScenarioTranscriptRoot,
+    workspace_transcript_root,
+)
 from customs_backend.service import WorkbenchService
 from customs_backend.settings import Settings, get_settings
 
@@ -169,7 +177,9 @@ class RequestBodyLimitMiddleware:
 
     @staticmethod
     async def _reject(scope: Scope, receive: Receive, send: Send) -> None:
-        response = _error_response(413, "request_body_too_large", instance=str(scope.get("path", "/")))
+        response = _error_response(
+            413, "request_body_too_large", instance=str(scope.get("path", "/"))
+        )
         await response(scope, receive, send)
 
 
@@ -181,6 +191,53 @@ class Container:
     agent: AgentClient
     token_verifier: TokenVerifier
     service: WorkbenchService
+    transcript: FunctionalTranscriptController | None = None
+
+
+_SECRET_ENVIRONMENT_NAME = re.compile(
+    r"(?:authorization|cookie|token|api[_-]?key|secret|password|credential|dsn)", re.IGNORECASE
+)
+
+
+def _transcript_secret_values(settings: Settings) -> tuple[str, ...]:
+    """Collect local configured values for in-memory redaction only."""
+
+    values: list[str] = []
+    for value in (
+        settings.agent_service_token,
+        settings.dev_session_token,
+        settings.database_url,
+        settings.minio_access_key,
+        settings.minio_secret_key,
+    ):
+        if value is not None:
+            values.append(value.get_secret_value())
+    values.extend(
+        value
+        for name, value in os.environ.items()
+        if value and _SECRET_ENVIRONMENT_NAME.search(name)
+    )
+    return tuple(values)
+
+
+def _build_transcript_controller(settings: Settings) -> FunctionalTranscriptController | None:
+    """Create the automatic functional recorder or an explicit dev trace writer."""
+
+    if settings.environment == "functional-uat":
+        root = workspace_transcript_root()
+        profile = "functional-uat"
+    elif settings.environment == "local-development":
+        configured = os.environ.get("CUSTOMS_SCENARIO_TRANSCRIPT_ROOT", "").strip()
+        if not configured:
+            return None
+        root = Path(configured)
+        profile = "dev-fixture"
+    else:
+        return None
+    return FunctionalTranscriptController(
+        root=ScenarioTranscriptRoot.create(root, secret_values=_transcript_secret_values(settings)),
+        profile=profile,
+    )
 
 
 def _build_local_profile_container(settings: Settings) -> Container:
@@ -196,11 +253,13 @@ def _build_local_profile_container(settings: Settings) -> Container:
     validate_agent_contract_bundle()
     if settings.agent_service_token is None or settings.service_mode is None:
         raise BackendConfigurationError("Backend Agent service configuration is incomplete")
+    transcript = _build_transcript_controller(settings)
     agent: AgentClient = HttpAgentClient(
         base_url=settings.agent_base_url,
         service_token=settings.agent_service_token.get_secret_value(),
         timeout_seconds=settings.agent_timeout_seconds,
         service_mode=settings.service_mode,
+        review_trace=transcript.record_backend_agent if transcript is not None else None,
     )
     if settings.environment == "local-development":
         if settings.dev_session_token is None:
@@ -254,6 +313,7 @@ def _build_local_profile_container(settings: Settings) -> Container:
         agent=agent,
         token_verifier=verifier,
         service=service,
+        transcript=transcript,
     )
 
 
@@ -284,6 +344,34 @@ def _verifier_ready(verifier: TokenVerifier) -> bool:
 def create_app(*, container: Container | None = None, settings: Settings | None = None) -> FastAPI:
     actual_settings = settings or get_settings()
     actual_container = container or build_container(actual_settings)
+    # Detailed Browser traffic is a functional-UAT record only.  A developer
+    # can still opt in to the compact internal trace through the local profile,
+    # but ordinary dev-fixture Browser use must not start retaining bodies.
+    public_transcript = (
+        actual_container.transcript
+        if actual_container.settings.environment == "functional-uat"
+        else None
+    )
+
+    def record_public_exchange(
+        *,
+        case_id: str,
+        method: str,
+        path: str,
+        request_body: Mapping[str, Any] | None,
+        response_status: int,
+        response_body: Mapping[str, Any] | None,
+    ) -> None:
+        if public_transcript is not None:
+            public_transcript.record_public(
+                case_id=case_id,
+                method=method,
+                path=path,
+                request_body=request_body,
+                response_status=response_status,
+                response_body=response_body,
+            )
+
     app = FastAPI(
         title="Customs Review Workbench API",
         version="1.0.0",
@@ -336,7 +424,9 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             503: "dependency_not_ready",
         }
         return _error_response(
-            exc.status_code, codes.get(exc.status_code, "http_error"), instance=request.url.path,
+            exc.status_code,
+            codes.get(exc.status_code, "http_error"),
+            instance=request.url.path,
             headers=exc.headers,
         )
 
@@ -359,8 +449,10 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             agent_ready = isinstance(actual_container.agent.metadata(), dict)
         except Exception:
             agent_ready = False
-        if not _verifier_ready(actual_container.token_verifier) or not agent_ready or not all(
-            dependencies.values()
+        if (
+            not _verifier_ready(actual_container.token_verifier)
+            or not agent_ready
+            or not all(dependencies.values())
         ):
             raise HTTPException(status_code=503, detail="required dependency is not ready")
         return {
@@ -439,7 +531,16 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         principal: Principal = Depends(writers),
         service: WorkbenchService = Depends(_service),
     ) -> CaseRecord:
-        return service.create_case(principal, body)
+        result = service.create_case(principal, body)
+        record_public_exchange(
+            case_id=result.case_id,
+            method="POST",
+            path="/api/v1/cases",
+            request_body=body.model_dump(mode="json"),
+            response_status=201,
+            response_body=result.model_dump(mode="json"),
+        )
+        return result
 
     @app.get("/api/v1/cases", response_model=CaseListResponse)
     def list_cases_endpoint(
@@ -465,10 +566,21 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         service: WorkbenchService = Depends(_service),
     ) -> DocumentViewResponse:
         _case, record = service.add_document(principal, case_id, body)
-        return DocumentViewResponse(
-            record=DocumentViewResponse.PublicDocumentRecord.model_validate(record.model_dump(mode="json")),
+        result = DocumentViewResponse(
+            record=DocumentViewResponse.PublicDocumentRecord.model_validate(
+                record.model_dump(mode="json")
+            ),
             content_text=body.content_text,
         )
+        record_public_exchange(
+            case_id=case_id,
+            method="POST",
+            path=f"/api/v1/cases/{case_id}/documents",
+            request_body=body.model_dump(mode="json"),
+            response_status=201,
+            response_body=result.model_dump(mode="json"),
+        )
+        return result
 
     @app.get("/api/v1/cases/{case_id}/documents", response_model=DocumentListResponse)
     def list_documents_endpoint(
@@ -513,13 +625,39 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         principal: Principal = Depends(writers),
         service: WorkbenchService = Depends(_service),
     ) -> JobResponse:
+        public_request = body.model_dump(mode="json", exclude_none=True)
         if actual_container.settings.environment == "functional-uat":
             required_as_of = actual_container.settings.functional_uat_as_of
             if body.review_as_of is not None and body.review_as_of != required_as_of:
-                raise HTTPException(status_code=422, detail="functional UAT uses its configured review date")
+                raise HTTPException(
+                    status_code=422, detail="functional UAT uses its configured review date"
+                )
             body = body.model_copy(update={"review_as_of": required_as_of})
         job, created = service.review(principal, case_id, body, idempotency_key)
-        return JobResponse(job=JobView.model_validate(job.model_dump(mode="json")), idempotency_reused=not created)
+        result = JobResponse(
+            job=JobView.model_validate(job.model_dump(mode="json")), idempotency_reused=not created
+        )
+        if public_transcript is not None:
+            if created:
+                public_transcript.bind_review(
+                    case_id=case_id,
+                    review_run_id=job.review_run_id,
+                    job_id=job.job_id,
+                    review_request=public_request,
+                    response_status=202,
+                    response_body=result.model_dump(mode="json"),
+                    job_status=job.status.value,
+                )
+            else:
+                record_public_exchange(
+                    case_id=case_id,
+                    method="POST",
+                    path=f"/api/v1/cases/{case_id}/reviews",
+                    request_body=public_request,
+                    response_status=202,
+                    response_body=result.model_dump(mode="json"),
+                )
+        return result
 
     @app.get("/api/v1/jobs/{job_id}", response_model=JobView)
     def get_job_endpoint(
@@ -527,7 +665,23 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         principal: Principal = Depends(readers),
         service: WorkbenchService = Depends(_service),
     ) -> JobView:
-        return JobView.model_validate(service.get_job(principal, job_id).model_dump(mode="json"))
+        job = service.get_job(principal, job_id)
+        result = JobView.model_validate(job.model_dump(mode="json"))
+        record_public_exchange(
+            case_id=job.case_id,
+            method="GET",
+            path=f"/api/v1/jobs/{job_id}",
+            request_body=None,
+            response_status=200,
+            response_body=result.model_dump(mode="json"),
+        )
+        if public_transcript is not None and job.status == JobStatus.failed:
+            public_transcript.finalize(
+                job.review_run_id,
+                status="failed",
+                fields={"job_id": job.job_id, "job_status": job.status.value},
+            )
+        return result
 
     @app.get("/api/v1/cases/{case_id}/review-runs", response_model=ReviewRunListResponse)
     def list_runs_endpoint(
@@ -543,7 +697,29 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         principal: Principal = Depends(readers),
         service: WorkbenchService = Depends(_service),
     ) -> ReviewRunRecord:
-        return service.get_run(principal, review_run_id)
+        result = service.get_run(principal, review_run_id)
+        record_public_exchange(
+            case_id=result.case_id,
+            method="GET",
+            path=f"/api/v1/review-runs/{review_run_id}",
+            request_body=None,
+            response_status=200,
+            response_body=result.model_dump(mode="json"),
+        )
+        if public_transcript is not None:
+            public_transcript.finalize(
+                review_run_id,
+                status="completed",
+                fields={
+                    "case_id": result.case_id,
+                    "job_id": result.job_id,
+                    "execution_status": result.execution_status.value,
+                    "assessment": result.assessment.value,
+                    "human_review_required": result.review_disposition.value
+                    == "human_review_required",
+                },
+            )
+        return result
 
     return app
 
