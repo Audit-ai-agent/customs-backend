@@ -1,27 +1,12 @@
 from __future__ import annotations
 
-import json
 import re
 import tomllib
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPERIENCE_LOCK_PATH = "src/customs_backend/agent_experience_contract.lock.json"
-REVIEWED_COMMITS = {
-    "79fd7a543af0d203a8f1689a82fe41bcca7ac398",
-    "8fbbfd6b66a58bfa9394f4fcdcc3f510ccffe7e7",
-    "4dfce1f082e6f74a08da2f2f79d21ff8ca1ee4a1",
-    "0efa95649d8218c3836f0244e4a2085b067b5ab7",
-    "60c2070d05acf081668644d6bd16d145e02ea537",
-}
-REVIEWED_LINES = {24, 25}
-EXPECTED_EXPERIENCE_LOCK_IGNORES = {
-    f"{commit}:{EXPERIENCE_LOCK_PATH}:generic-api-key:{line}"
-    for commit in REVIEWED_COMMITS
-    for line in REVIEWED_LINES
-}
-FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{40}:[^:*]+:generic-api-key:[1-9][0-9]*$")
+FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{40}:[^:*]+:[^:*]+:[1-9][0-9]*$")
 
 
 def _ignore_entries() -> set[str]:
@@ -42,34 +27,24 @@ def test_secret_scan_has_no_broad_allowlist() -> None:
 def test_every_ignore_is_bound_to_an_exact_commit_fingerprint() -> None:
     entries = _ignore_entries()
 
-    assert entries
     assert all(FINGERPRINT_PATTERN.fullmatch(entry) for entry in entries)
 
 
-def test_experience_lock_ignores_are_limited_to_reviewed_findings() -> None:
+def test_current_backend_needs_no_secret_scan_exception() -> None:
+    assert _ignore_entries() == set()
+
+
+def test_ignore_file_has_no_entry_for_currently_tracked_runtime_input() -> None:
     entries = _ignore_entries()
-    experience_entries = {entry for entry in entries if EXPERIENCE_LOCK_PATH in entry}
 
-    assert experience_entries == EXPECTED_EXPERIENCE_LOCK_IGNORES
-    assert len(entries) == 14
+    assert all("_local" not in entry and "_artifacts" not in entry for entry in entries)
 
 
-def test_current_experience_lock_lines_are_public_sha256_provenance() -> None:
-    lock_file = ROOT / EXPERIENCE_LOCK_PATH
-    lines = lock_file.read_text(encoding="utf-8").splitlines()
-    payload = json.loads(lock_file.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == "customs-backend-agent-experience-consumer-lock/v2"
-    assert "provider_commit" not in payload
-    assert "provider_contract_source_commit" in payload
-    expected_keys = {
-        24: "provider_openapi_lock_file_sha256",
-        25: "provider_openapi_sha256",
-    }
+def test_ci_verifies_the_pinned_gitleaks_archive_before_scanning() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "unit.yml").read_text(encoding="utf-8")
 
-    for line_number, key in expected_keys.items():
-        match = re.fullmatch(
-            rf'\s*"{key}":\s*"([0-9a-f]{{64}})",?',
-            lines[line_number - 1],
-        )
-        assert match is not None
-        assert payload[key] == match.group(1)
+    assert "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb" in workflow
+    assert "sha256sum --check --status" in workflow
+    assert "git archive --format=tar HEAD" in workflow
+    assert './gitleaks dir "$scan_root" --config .gitleaks.toml --redact --no-banner --exit-code 1' in workflow
+    assert "GITHUB_TOKEN" not in workflow

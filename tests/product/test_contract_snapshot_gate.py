@@ -1,25 +1,16 @@
 from __future__ import annotations
 
-import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from customs_backend import experience_contract
-from tools import verify_contract_snapshots as VERIFIER
-
-
-ROOT = Path(__file__).resolve().parents[2]
+from tools import verify_contract_snapshots as verifier
 
 
 def _git(root: Path, *arguments: str) -> None:
     subprocess.run(
-        ["git", *arguments],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
+        ["git", *arguments], cwd=root, check=True, capture_output=True, text=True
     )
 
 
@@ -27,25 +18,9 @@ def _repository(tmp_path: Path) -> tuple[Path, bytes]:
     openapi = b'{"openapi":"3.1.0"}\n'
     files = {
         "docs/openapi-v1.json": openapi,
-        "docs/openapi-v2.json": openapi,
-        "src/customs_backend/agent_contract.lock.json": b"{}\n",
-        "src/customs_backend/agent_experience_contract.lock.json": b"{}\n",
         "src/customs_backend/contracts/agent/v3/review-request.schema.json": b"{}\n",
         "src/customs_backend/contracts/agent/v3/review-result.schema.json": b"{}\n",
     }
-    for filename in (
-        "manifest.json",
-        "asset-manifest.json",
-        "meaning-catalog-v1.json",
-        "meaning-catalog-v2.json",
-        "openapi.lock.json",
-        "agent-uat-capability-v1.schema.json",
-        "assistant-answer-v2.schema.json",
-        "case-conversation-request-v2.schema.json",
-        "review-experience-envelope-v1.schema.json",
-        "review-stage-event-v1.schema.json",
-    ):
-        files[f"src/customs_backend/contracts/agent/service/v3/{filename}"] = b"{}\n"
     for relative, content in files.items():
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -54,17 +29,17 @@ def _repository(tmp_path: Path) -> tuple[Path, bytes]:
     _git(tmp_path, "config", "user.email", "contract-gate@example.invalid")
     _git(tmp_path, "config", "user.name", "Contract Gate")
     _git(tmp_path, "add", ".")
-    _git(tmp_path, "commit", "-m", "seed snapshots")
+    _git(tmp_path, "commit", "-m", "seed")
     return tmp_path, openapi
 
 
-def test_contract_snapshot_gate_accepts_tracked_clean_exact_bytes(tmp_path: Path) -> None:
+def test_contract_snapshot_gate_accepts_clean_exact_bytes(tmp_path: Path) -> None:
     root, openapi = _repository(tmp_path)
-    VERIFIER.verify_contract_snapshots(
+
+    verifier.verify_contract_snapshots(
         root,
         openapi_renderer=lambda: openapi,
         contract_validator=lambda: None,
-        experience_contract_validator=lambda: None,
     )
 
 
@@ -72,39 +47,22 @@ def test_contract_snapshot_gate_accepts_tracked_clean_exact_bytes(tmp_path: Path
 def test_contract_snapshot_gate_fails_closed(tmp_path: Path, failure: str) -> None:
     root, openapi = _repository(tmp_path)
 
-    def exact_renderer() -> bytes:
+    def renderer() -> bytes:
         return openapi
 
-    renderer = exact_renderer
     if failure == "untracked":
-        _git(root, "rm", "--cached", "docs/openapi-v2.json")
+        _git(root, "rm", "--cached", "docs/openapi-v1.json")
     elif failure == "dirty":
-        (root / "src/customs_backend/agent_contract.lock.json").write_bytes(b'{"dirty":true}\n')
+        (root / "src/customs_backend/contracts/agent/v3/review-request.schema.json").write_bytes(
+            b'{"dirty":true}\n'
+        )
     else:
-
-        def drift_renderer() -> bytes:
+        def renderer() -> bytes:
             return b'{"openapi":"different"}\n'
 
-        renderer = drift_renderer
-
-    with pytest.raises(VERIFIER.ContractSnapshotVerificationError):
-        VERIFIER.verify_contract_snapshots(
+    with pytest.raises(verifier.ContractSnapshotVerificationError):
+        verifier.verify_contract_snapshots(
             root,
             openapi_renderer=renderer,
             contract_validator=lambda: None,
-            experience_contract_validator=lambda: None,
         )
-
-
-def test_legacy_experience_lock_is_normalized_to_artifact_first_v2() -> None:
-    lock_path = ROOT / "src/customs_backend/agent_experience_contract.lock.json"
-    legacy = json.loads(lock_path.read_text(encoding="utf-8"))
-    source_commit = legacy.pop("provider_contract_source_commit")
-    legacy["schema_version"] = "customs-backend-agent-experience-consumer-lock/v1"
-    legacy["provider_commit"] = source_commit
-
-    normalized = experience_contract._normalize_experience_contract_lock(legacy)
-
-    assert normalized.schema_version == "customs-backend-agent-experience-consumer-lock/v2"
-    assert normalized.provider_contract_source_commit == source_commit
-    assert "provider_commit" not in normalized.model_dump()

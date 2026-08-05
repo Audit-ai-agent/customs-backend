@@ -1,0 +1,78 @@
+services:
+  operations-db:
+    image: postgres@sha256:92620daddcd947f8d5ab5ba66e848702fe443d87fed30c4cea8e389fd78dfc55
+    environment:
+      POSTGRES_USER: customs
+      POSTGRES_PASSWORD: ${CUSTOMS_FUNCTIONAL_POSTGRES_PASSWORD:?run customs-backend-profile-init first}
+      POSTGRES_DB: customs
+    ports:
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - operations-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U customs -d customs"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    labels:
+      com.audit-ai-agent.profile: functional-uat
+
+  redis:
+    image: redis@sha256:b2b95679e3b46fb51864949ed25ea976fc3a6bcc00a40a1bc00d568cb2822e50
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    labels:
+      com.audit-ai-agent.profile: functional-uat
+
+  minio:
+    image: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${CUSTOMS_FUNCTIONAL_MINIO_ROOT_USER:?run customs-backend-profile-init first}
+      MINIO_ROOT_PASSWORD: ${CUSTOMS_FUNCTIONAL_MINIO_ROOT_PASSWORD:?run customs-backend-profile-init first}
+    ports:
+      - "127.0.0.1:19000:9000"
+      - "127.0.0.1:19001:9001"
+    volumes:
+      - minio:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    labels:
+      com.audit-ai-agent.profile: functional-uat
+
+  keycloak:
+    image: quay.io/keycloak/keycloak@sha256:6a7217a100bd3e5de4063a27a538ef999a3c5a88c4b4ec0ffc0a642aee7b2597
+    command: ["start-dev", "--import-realm", "--hostname-strict=false"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: local-functional-admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${CUSTOMS_FUNCTIONAL_KEYCLOAK_ADMIN_PASSWORD:?run customs-backend-profile-init first}
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "127.0.0.1:18088:8080"
+    volumes:
+      - type: bind
+        source: ${CUSTOMS_FUNCTIONAL_REALM_FILE:?run customs-backend-profile-init first}
+        target: /opt/keycloak/data/import/customs-realm.json
+        read_only: true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    labels:
+      com.audit-ai-agent.profile: functional-uat
+
+volumes:
+  operations-db:
+    labels:
+      com.audit-ai-agent.profile: functional-uat
+  minio:
+    labels:
+      com.audit-ai-agent.profile: functional-uat

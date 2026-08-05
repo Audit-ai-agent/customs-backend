@@ -2,9 +2,9 @@
 
 ``git diff`` alone does not report an untracked snapshot.  This verifier first
 requires every expected file to be present in Git's index, then requires the
-three contract path groups to be clean (including untracked files), validates
-the packaged Agent lock/Schema hashes, and finally compares a freshly rendered
-OpenAPI document byte-for-byte with the tracked snapshot.
+two contract path groups to be clean (including untracked files), validates
+the packaged Agent schemas, and finally compares a freshly rendered OpenAPI
+document byte-for-byte with the tracked snapshot.
 """
 
 from __future__ import annotations
@@ -13,8 +13,7 @@ import subprocess  # nosec B404 - fixed Git executable and fixed argv only
 from collections.abc import Callable
 from pathlib import Path
 
-from customs_backend.experience_contract import validate_agent_experience_contract_bundle
-from customs_backend.release import validate_agent_contract_bundle
+from customs_backend.agent_contract import validate_agent_contract_bundle
 
 if __package__:
     from tools.export_product_openapi import render_product_openapi
@@ -23,43 +22,19 @@ else:
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LEGACY_OPENAPI_PATH = Path("docs/openapi-v1.json")
-OPENAPI_PATH = Path("docs/openapi-v2.json")
-AGENT_LOCK_PATH = Path("src/customs_backend/agent_contract.lock.json")
+OPENAPI_PATH = Path("docs/openapi-v1.json")
 AGENT_SCHEMA_DIRECTORY = Path("src/customs_backend/contracts/agent/v3")
 AGENT_SCHEMA_PATHS = (
     AGENT_SCHEMA_DIRECTORY / "review-request.schema.json",
     AGENT_SCHEMA_DIRECTORY / "review-result.schema.json",
 )
-EXPERIENCE_LOCK_PATH = Path("src/customs_backend/agent_experience_contract.lock.json")
-EXPERIENCE_SCHEMA_DIRECTORY = Path("src/customs_backend/contracts/agent/service/v3")
-EXPERIENCE_SCHEMA_PATHS = (
-    EXPERIENCE_SCHEMA_DIRECTORY / "manifest.json",
-    EXPERIENCE_SCHEMA_DIRECTORY / "asset-manifest.json",
-    EXPERIENCE_SCHEMA_DIRECTORY / "meaning-catalog-v1.json",
-    EXPERIENCE_SCHEMA_DIRECTORY / "meaning-catalog-v2.json",
-    EXPERIENCE_SCHEMA_DIRECTORY / "openapi.lock.json",
-    EXPERIENCE_SCHEMA_DIRECTORY / "agent-uat-capability-v1.schema.json",
-    EXPERIENCE_SCHEMA_DIRECTORY / "assistant-answer-v2.schema.json",
-    EXPERIENCE_SCHEMA_DIRECTORY / "case-conversation-request-v2.schema.json",
-    EXPERIENCE_SCHEMA_DIRECTORY / "review-experience-envelope-v1.schema.json",
-    EXPERIENCE_SCHEMA_DIRECTORY / "review-stage-event-v1.schema.json",
-)
 TRACKED_FILES = (
-    LEGACY_OPENAPI_PATH,
     OPENAPI_PATH,
-    AGENT_LOCK_PATH,
-    EXPERIENCE_LOCK_PATH,
     *AGENT_SCHEMA_PATHS,
-    *EXPERIENCE_SCHEMA_PATHS,
 )
 CONTRACT_PATH_GROUPS = (
-    LEGACY_OPENAPI_PATH,
     OPENAPI_PATH,
-    AGENT_LOCK_PATH,
-    EXPERIENCE_LOCK_PATH,
     AGENT_SCHEMA_DIRECTORY,
-    EXPERIENCE_SCHEMA_DIRECTORY,
 )
 
 
@@ -88,7 +63,6 @@ def verify_contract_snapshots(
     *,
     openapi_renderer: Callable[[], bytes] = render_product_openapi,
     contract_validator: Callable[[], object] = validate_agent_contract_bundle,
-    experience_contract_validator: Callable[[], object] = validate_agent_experience_contract_bundle,
 ) -> None:
     resolved_root = root.resolve(strict=True)
     git_root_result = _git(resolved_root, "rev-parse", "--show-toplevel")
@@ -136,11 +110,8 @@ def verify_contract_snapshots(
             "contract snapshot paths are not clean:\n" + status.stdout.rstrip()
         )
 
-    # This validates the provider-owned request/result bytes against the
-    # packaged consumer lock.  It is deliberately done after the Git checks so
-    # an untracked lock cannot masquerade as a valid package resource.
+    # Validate the packaged request/result schemas after the Git checks.
     contract_validator()
-    experience_contract_validator()
 
     stored_openapi = (resolved_root / OPENAPI_PATH).read_bytes()
     rendered_openapi = openapi_renderer()
@@ -150,7 +121,7 @@ def verify_contract_snapshots(
         raise ContractSnapshotVerificationError("OpenAPI snapshot has multiple final newlines")
     if rendered_openapi != stored_openapi:
         raise ContractSnapshotVerificationError(
-            "generated OpenAPI bytes differ from docs/openapi-v2.json"
+            "generated OpenAPI bytes differ from docs/openapi-v1.json"
         )
 
     final_status = _git(
