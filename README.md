@@ -94,8 +94,10 @@ uv run --no-sync customs-ai-agent-functional-uat-serve
 ```
 
 Data의 `functional-uat-3law build --as-of 2026-08-05`와 serve를 먼저 완료하고, Agent
-터미널에서 개인 `ANTHROPIC_API_KEY`를 승인된 비밀 도구로 그 프로세스에만 주입한 뒤
-`..\customs-ai-agent`에서 위 명령을 실행한다. 키값은 파일·Git·출력에 남기지 않는다.
+터미널에서 Git이 무시하는 `../_local/secrets/.env`에 개인
+`ANTHROPIC_API_KEY=personal-key` 한 줄을 만든 뒤 `..\customs-ai-agent`에서 위 명령을
+실행한다. Functional-UAT Agent importer만 그 파일을 현재 세션에 읽고 값을 출력하지
+않는다. 해당 파일은 Git·Docker image·공유 ZIP·채팅에 넣지 않는다.
 심사 기준일은 `2026-08-05`로 고정한다. `GET /health/functional-uat-ready`가
 Backend의 로컬 의존성과 Agent HTTP 준비 상태를 확인한다. 실행을 끝내면 같은 compose
 명령에 `down`을 붙여 로컬 컨테이너만 종료한다.
