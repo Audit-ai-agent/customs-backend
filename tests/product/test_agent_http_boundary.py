@@ -127,3 +127,63 @@ def test_non_successful_review_is_rejected_without_a_retry_protocol() -> None:
             client.review(_request())
     finally:
         client.close()
+
+
+def test_review_trace_records_success_body_but_never_transport_headers() -> None:
+    events: list[tuple[str, str, dict[str, object]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"accepted": True},
+            headers={"X-Customs-Service-Mode": "functional-uat"},
+            request=request,
+        )
+
+    client = HttpAgentClient(
+        base_url="http://127.0.0.1:8090",
+        service_token="live-service-token-value",
+        service_mode="functional-uat",
+        review_trace=lambda run_id, event, payload: events.append((run_id, event, payload)),
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        assert client.review(_request()) == {"accepted": True}
+    finally:
+        client.close()
+
+    assert [event for _run_id, event, _payload in events] == ["review_request", "review_response"]
+    assert all(run_id == "run-boundary" for run_id, _event, _payload in events)
+    assert events[0][2]["path"] == "/internal/agent/v2/reviews"
+    assert events[1][2]["response_body"] == {"accepted": True}
+    assert "authorization" not in events[0][2]
+    assert "live-service-token-value" not in json.dumps(events)
+
+
+def test_review_trace_never_records_non_success_response_body() -> None:
+    events: list[tuple[str, str, dict[str, object]]] = []
+    client = HttpAgentClient(
+        base_url="http://127.0.0.1:8090",
+        service_token="test-token",
+        service_mode="local-development",
+        review_trace=lambda run_id, event, payload: events.append((run_id, event, payload)),
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                503,
+                json={"provider_error": "raw secret failure response"},
+                headers={"X-Customs-Service-Mode": "local-development"},
+                request=request,
+            )
+        ),
+    )
+    try:
+        with pytest.raises(AgentResponseRejectedError, match="HTTP 503"):
+            client.review(_request())
+    finally:
+        client.close()
+
+    assert [event for _run_id, event, _payload in events] == ["review_request", "review_failure"]
+    failure = events[1][2]
+    assert failure["response_status"] == 503
+    assert "response_body" not in failure
+    assert "raw secret failure response" not in json.dumps(events)

@@ -56,6 +56,41 @@ Data 서비스는 이 Agent보다 먼저 해당 저장소의 `dev-fixture` 명�
 값을 출력하지 않는다. Frontend는 loopback에서
 `POST /api/v1/dev/session`을 한 번 호출해 받은 token을 메모리에만 보관한다.
 
+## 상세 dev-fixture 시나리오 transcript
+
+기본 개발·CI·일반 로그에는 문서 본문이나 API body를 남기지 않는다. 합성 시나리오의
+실제 입력·응답을 검토해야 할 때만, **Agent와 Backend를 각각 시작하기 전에** 두
+터미널에서 아래를 설정한다. 이 값은 현재 PC의 Git 밖 `_local` 경로만 허용한다.
+
+```powershell
+$TranscriptRoot = Join-Path (Resolve-Path ..).Path '_local\state\scenario-runs'
+New-Item -ItemType Directory -Force -Path $TranscriptRoot | Out-Null
+$env:CUSTOMS_SCENARIO_TRANSCRIPT_ROOT = $TranscriptRoot
+```
+
+Data → Agent → Backend → Frontend를 시작한 뒤, Backend 터미널에서 다음을 실행한다.
+
+```powershell
+uv run --locked --no-sync --group dev python tools/run_dev_fixture_scenarios.py `
+  --base-url http://127.0.0.1:5173/api/v1
+```
+
+이 실행기는 Frontend Vite proxy를 통해 다섯 현재 지원 시나리오를 실행하고, 각
+`_local/state/scenario-runs/<review-run-id>/`에 아래를 남긴다.
+
+- `scenario.json`: 합성 문서 원문·실제 review 요청
+- `public-api.jsonl`: Frontend proxy → Backend API의 request/response body
+- `backend-agent.jsonl`: Backend → Agent 실제 HTTP body (Backend만 기록)
+- `agent-data.jsonl`: Agent → Data 실제 HTTP body (Agent만 기록)
+- `claude.jsonl`: dev-fixture의 Claude 미호출 표시
+- `summary.json`: 기대값·실제 판정·안전 assertion
+
+세션/서비스 token, Authorization·Cookie 헤더, API key, 비밀번호, DSN 및
+credential-shaped 값은 모두 `[REDACTED]` 처리한다. 이 transcript는 Git, `_artifacts`,
+채팅, PR, 공유 ZIP에 넣지 않는다. 실제 Claude가 필요한 functional-UAT에서는 opt-in
+환경변수 없이도 같은 고정 경로를 자동으로 사용한다. 별도의 실제 UAT 실행과 개인
+권한은 여전히 필요하다.
+
 ## 실제 기능 확인
 
 이 모드는 실제 Agent/Data 흐름을 호출한다. 법령 원문, Law API 권한, Claude key, 모델
@@ -106,6 +141,36 @@ Backend의 로컬 의존성과 Agent HTTP 준비 상태를 확인한다. 실행�
 Git, 채팅, 공유 압축 파일에 포함하지 않는다.
 초기화기는 POSIX에서 owner-only (`0600`) 권한을 적용한다. Windows에서는 현재 사용자
 workspace의 상속 ACL을 유지하므로, 해당 workspace를 다른 계정과 공유하지 않는다.
+
+### Functional-UAT 상세 transcript
+
+`functional-uat`에서는 Backend와 Agent가 시작할 때 별도 opt-in 없이 고정된
+`../_local/state/scenario-runs/`을 함께 사용한다. Case 생성, 문서 등록, 심사, Job/결과
+조회가 끝나면 실제 review run마다 다음 여섯 파일이 자동으로 남는다.
+
+```text
+_local/state/scenario-runs/<review-run-id>/
+  scenario.json
+  public-api.jsonl        # Backend 소유
+  backend-agent.jsonl     # Backend 소유
+  agent-data.jsonl        # Agent 소유
+  claude.jsonl            # Agent 소유
+  summary.json
+```
+
+문서 본문, 공개 API body, Backend↔Agent·Agent↔Data body와 Claude prompt/완료 텍스트는
+비밀을 제거한 뒤에만 이 PC의 `_local`에 기록한다. Authorization/Cookie/세션·서비스
+token/API key/DSN/provider 원문 오류는 기록하지 않는다. 기록 경로·파일 생성·비밀
+제거에 실패하면 해당 Functional-UAT는 불완전한 실패로 취급한다.
+
+내용을 화면에 출력하지 않고 구조·종료 상태·redaction만 확인하려면 다음을 실행한다.
+
+```powershell
+uv run --no-sync python tools/verify_scenario_transcript.py --run-id <review-run-id>
+```
+
+상세 transcript는 Git, `_artifacts`, PR, 채팅, 공유 ZIP에 넣지 않는다. 현재 UAT의
+간단한 실행 요약 manifest만 별도의 `_artifacts/functional-uat/`에 둘 수 있다.
 
 ## 검사
 

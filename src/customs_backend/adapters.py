@@ -9,7 +9,11 @@ from typing import Any
 
 import httpx
 
-from customs_backend.domain import AgentReviewRequest, MAX_TEXT_DOCUMENT_UTF8_BYTES, canonical_json_bytes
+from customs_backend.domain import (
+    AgentReviewRequest,
+    MAX_TEXT_DOCUMENT_UTF8_BYTES,
+    canonical_json_bytes,
+)
 from customs_backend.ports import AgentResponseRejectedError
 
 
@@ -103,9 +107,11 @@ class HttpAgentClient:
         service_token: str,
         timeout_seconds: float = 180.0,
         service_mode: str | None = None,
+        review_trace: Callable[[str, str, dict[str, Any]], None] | None = None,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self._service_mode = service_mode
+        self._review_trace = review_trace
         headers = {"Authorization": f"Bearer {service_token}"}
         if service_mode is not None:
             headers["X-Customs-Service-Mode"] = service_mode
@@ -117,14 +123,21 @@ class HttpAgentClient:
             transport=transport,
         )
 
+    def _trace_review(self, review_run_id: str, event: str, payload: dict[str, Any]) -> None:
+        if self._review_trace is not None:
+            self._review_trace(review_run_id, event, payload)
+
     def _require_service_mode(self, response: httpx.Response) -> None:
-        if self._service_mode is not None and response.headers.get(
-            "X-Customs-Service-Mode"
-        ) != self._service_mode:
+        if (
+            self._service_mode is not None
+            and response.headers.get("X-Customs-Service-Mode") != self._service_mode
+        ):
             raise AgentResponseRejectedError("Agent service mode differs from Backend mode")
 
     @staticmethod
-    def _decode_object(response: httpx.Response, *, maximum_bytes: int, label: str) -> dict[str, Any]:
+    def _decode_object(
+        response: httpx.Response, *, maximum_bytes: int, label: str
+    ) -> dict[str, Any]:
         content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().casefold()
         if content_type != "application/json":
             raise AgentResponseRejectedError(f"Agent {label} returned a non-JSON content type")
@@ -155,18 +168,54 @@ class HttpAgentClient:
         return value
 
     def review(self, request: AgentReviewRequest) -> dict[str, Any]:
-        encoded = canonical_json_bytes(request.to_agent_wire())
+        wire = request.to_agent_wire()
+        encoded = canonical_json_bytes(wire)
         if len(encoded) > 2 * 1024 * 1024:
             raise ValueError("Agent request exceeds the 2 MiB transport limit")
-        response = self._client.post(
-            "/internal/agent/v2/reviews", content=encoded, headers={"Content-Type": "application/json"}
-        )
-        self._require_service_mode(response)
+        request_payload = {
+            "method": "POST",
+            "path": "/internal/agent/v2/reviews",
+            "request_body": wire,
+        }
+        self._trace_review(request.review_run_id, "review_request", request_payload)
         try:
+            response = self._client.post(
+                "/internal/agent/v2/reviews",
+                content=encoded,
+                headers={"Content-Type": "application/json"},
+            )
+        except httpx.HTTPError as exc:
+            self._trace_review(
+                request.review_run_id,
+                "review_failure",
+                {**request_payload, "error_code": type(exc).__name__},
+            )
+            raise
+        try:
+            self._require_service_mode(response)
             response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise AgentResponseRejectedError(f"Agent review returned HTTP {response.status_code}") from exc
-        return self._decode_object(response, maximum_bytes=16_000_000, label="review")
+            result = self._decode_object(response, maximum_bytes=16_000_000, label="review")
+        except (AgentResponseRejectedError, httpx.HTTPStatusError) as exc:
+            self._trace_review(
+                request.review_run_id,
+                "review_failure",
+                {
+                    **request_payload,
+                    "response_status": response.status_code,
+                    "error_code": type(exc).__name__,
+                },
+            )
+            if isinstance(exc, httpx.HTTPStatusError):
+                raise AgentResponseRejectedError(
+                    f"Agent review returned HTTP {response.status_code}"
+                ) from exc
+            raise
+        self._trace_review(
+            request.review_run_id,
+            "review_response",
+            {**request_payload, "response_status": response.status_code, "response_body": result},
+        )
+        return result
 
     def metadata(self) -> dict[str, Any]:
         response = self._client.get("/internal/agent/v2/metadata")
@@ -174,7 +223,9 @@ class HttpAgentClient:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise AgentResponseRejectedError(f"Agent metadata returned HTTP {response.status_code}") from exc
+            raise AgentResponseRejectedError(
+                f"Agent metadata returned HTTP {response.status_code}"
+            ) from exc
         return self._decode_object(response, maximum_bytes=1_000_000, label="metadata")
 
     def close(self) -> None:
