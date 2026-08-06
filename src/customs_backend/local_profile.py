@@ -168,6 +168,10 @@ def _functional_uat(*, realm_path: Path) -> tuple[list[tuple[str, str]], dict[st
             {
                 "username": reviewer_username,
                 "enabled": True,
+                "firstName": "Functional",
+                "lastName": "Reviewer",
+                "email": "local-functional-reviewer@localhost",
+                "emailVerified": True,
                 "attributes": {"org_id": ["local-functional"]},
                 "realmRoles": ["reviewer"],
                 "credentials": [
@@ -177,6 +181,10 @@ def _functional_uat(*, realm_path: Path) -> tuple[list[tuple[str, str]], dict[st
             {
                 "username": approver_username,
                 "enabled": True,
+                "firstName": "Functional",
+                "lastName": "Approver",
+                "email": "local-functional-approver@localhost",
+                "emailVerified": True,
                 "attributes": {"org_id": ["local-functional"]},
                 "realmRoles": ["approver"],
                 "credentials": [

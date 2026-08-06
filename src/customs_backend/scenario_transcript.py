@@ -49,6 +49,9 @@ _REQUIRED_STREAMS = (
     "claude.jsonl",
     "summary.json",
 )
+_FAILED_BEFORE_DATA_STREAMS = tuple(
+    name for name in _REQUIRED_STREAMS if name != "agent-data.jsonl"
+)
 _WRITE_LOCK = threading.Lock()
 
 
@@ -403,13 +406,19 @@ class FunctionalTranscriptController:
     def finalize(self, review_run_id: str, *, status: str, fields: Mapping[str, Any]) -> None:
         with self._state_lock:
             run = self.root.open_or_create_run(review_run_id, allow_terminal_summary=True)
+            required_streams: tuple[str, ...] = _REQUIRED_STREAMS
+            if status == "failed" and not (run.directory / "agent-data.jsonl").is_file():
+                # An extraction failure can safely end a review before the
+                # Agent has any reason to call Data.  Keep that receipt
+                # truthful without relaxing successful-run requirements.
+                required_streams = _FAILED_BEFORE_DATA_STREAMS
             payload = {
                 "schema_version": "scenario-transcript/v1",
                 "profile": self.profile,
                 "review_run_id": review_run_id,
                 "status": status,
                 "completed_at": datetime.now(timezone.utc).isoformat(),
-                "required_streams": list(_REQUIRED_STREAMS),
+                "required_streams": list(required_streams),
                 **dict(fields),
             }
             if (run.directory / "summary.json").is_file():
@@ -424,11 +433,6 @@ def verify_run(root: Path, review_run_id: str) -> dict[str, Any]:
     directory = _validate_root(root) / review_run_id
     if _SAFE_RUN_ID.fullmatch(review_run_id) is None or not directory.is_dir():
         raise ScenarioTranscriptError("scenario_transcript_run_missing")
-    missing = [name for name in _REQUIRED_STREAMS if not (directory / name).is_file()]
-    if missing:
-        raise ScenarioTranscriptError(
-            "scenario_transcript_required_stream_missing:" + ",".join(missing)
-        )
     try:
         scenario = json.loads((directory / "scenario.json").read_text(encoding="utf-8"))
         summary = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
@@ -453,8 +457,23 @@ def verify_run(root: Path, review_run_id: str) -> dict[str, Any]:
         raise ScenarioTranscriptError("scenario_transcript_not_terminal")
     if _has_unredacted_secret(scenario) or _has_unredacted_secret(summary):
         raise ScenarioTranscriptError("scenario_transcript_redaction_failed")
+    status = summary["status"]
+    required_streams: tuple[str, ...] = _REQUIRED_STREAMS
+    if status == "failed" and not (directory / "agent-data.jsonl").is_file():
+        if (
+            not isinstance(scenario.get("job_id"), str)
+            or summary.get("job_id") != scenario["job_id"]
+            or summary.get("job_status") != "failed"
+        ):
+            raise ScenarioTranscriptError("scenario_transcript_failed_receipt_invalid")
+        required_streams = _FAILED_BEFORE_DATA_STREAMS
+    missing = [name for name in required_streams if not (directory / name).is_file()]
+    if missing:
+        raise ScenarioTranscriptError(
+            "scenario_transcript_required_stream_missing:" + ",".join(missing)
+        )
     counts: dict[str, int] = {}
-    for name in _REQUIRED_STREAMS[1:-1]:
+    for name in required_streams[1:-1]:
         try:
             records = [
                 json.loads(line)
@@ -474,6 +493,15 @@ def verify_run(root: Path, review_run_id: str) -> dict[str, Any]:
         ):
             raise ScenarioTranscriptError("scenario_transcript_stream_invalid:" + name)
         counts[name] = len(records)
+        if (
+            status == "failed"
+            and name == "backend-agent.jsonl"
+            and not {
+                "review_request",
+                "review_failure",
+            }.issubset({str(record["event"]) for record in records})
+        ):
+            raise ScenarioTranscriptError("scenario_transcript_failed_receipt_invalid")
     return {
         "review_run_id": review_run_id,
         "profile": scenario.get("profile"),
