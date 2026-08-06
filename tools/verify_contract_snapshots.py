@@ -3,8 +3,8 @@
 ``git diff`` alone does not report an untracked snapshot.  This verifier first
 requires every expected file to be present in Git's index, then requires the
 two contract path groups to be clean (including untracked files), validates
-the packaged Agent schemas, and finally compares a freshly rendered OpenAPI
-document byte-for-byte with the tracked snapshot.
+the packaged Agent review and assistant schemas, and finally compares a
+freshly rendered OpenAPI document byte-for-byte with the tracked snapshot.
 """
 
 from __future__ import annotations
@@ -27,6 +27,8 @@ AGENT_SCHEMA_DIRECTORY = Path("src/customs_backend/contracts/agent/v3")
 AGENT_SCHEMA_PATHS = (
     AGENT_SCHEMA_DIRECTORY / "review-request.schema.json",
     AGENT_SCHEMA_DIRECTORY / "review-result.schema.json",
+    AGENT_SCHEMA_DIRECTORY / "assistant-answer-request.schema.json",
+    AGENT_SCHEMA_DIRECTORY / "assistant-answer-response.schema.json",
 )
 TRACKED_FILES = (
     OPENAPI_PATH,

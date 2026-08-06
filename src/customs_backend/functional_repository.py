@@ -7,6 +7,11 @@ from typing import Any
 
 from customs_backend.domain import (
     CaseRecord,
+    ConversationMessageExchange,
+    ConversationMessageRecord,
+    ConversationRecord,
+    CorrectionProposalDecisionRecord,
+    CorrectionProposalRecord,
     DocumentRecord,
     FindingDecisionRecord,
     FindingDecisionStatus,
@@ -87,6 +92,27 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
                 key: ReviewRunRecord.model_validate(value)
                 for key, value in dict(state.get("runs", {})).items()
             }
+            self._conversations = {
+                key: ConversationRecord.model_validate(value)
+                for key, value in dict(state.get("conversations", {})).items()
+            }
+            self._messages = {
+                key: ConversationMessageRecord.model_validate(value)
+                for key, value in dict(state.get("messages", {})).items()
+            }
+            self._chat_idempotency = {
+                (str(item[0]), str(item[1]), str(item[2])): (
+                    str(item[3]),
+                    str(item[4]),
+                    str(item[5]),
+                )
+                for item in list(state.get("chat_idempotency", []))
+                if isinstance(item, list) and len(item) == 6
+            }
+            self._correction_proposals = {
+                key: CorrectionProposalRecord.model_validate(value)
+                for key, value in dict(state.get("correction_proposals", {})).items()
+            }
         except (TypeError, ValueError) as exc:
             raise RuntimeError("functional Backend state is invalid") from exc
 
@@ -99,6 +125,24 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
             "jobs": {key: value.model_dump(mode="json") for key, value in self._jobs.items()},
             "idempotency": [[org, key, job_id] for (org, key), job_id in self._idempotency.items()],
             "runs": {key: value.model_dump(mode="json") for key, value in self._runs.items()},
+            "conversations": {
+                key: value.model_dump(mode="json") for key, value in self._conversations.items()
+            },
+            "messages": {
+                key: value.model_dump(mode="json") for key, value in self._messages.items()
+            },
+            "chat_idempotency": [
+                [org, conversation_id, key, request_digest, user_message_id, assistant_message_id]
+                for (org, conversation_id, key), (
+                    request_digest,
+                    user_message_id,
+                    assistant_message_id,
+                ) in self._chat_idempotency.items()
+            ],
+            "correction_proposals": {
+                key: value.model_dump(mode="json")
+                for key, value in self._correction_proposals.items()
+            },
         }
         payload = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         with self._connect() as connection, connection.cursor() as cursor:
@@ -153,6 +197,23 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
         self._persist()
         return value
 
+    def complete_review_and_apply_correction_proposals(
+        self,
+        *,
+        job: JobRecord,
+        run: ReviewRunRecord,
+        correction_proposal_ids: list[str],
+        applied_by: str,
+    ) -> ReviewRunRecord:
+        value = super().complete_review_and_apply_correction_proposals(
+            job=job,
+            run=run,
+            correction_proposal_ids=correction_proposal_ids,
+            applied_by=applied_by,
+        )
+        self._persist()
+        return value
+
     def record_finding_decision(
         self,
         *,
@@ -170,6 +231,51 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
             status=status,
             reason=reason,
             decided_by=decided_by,
+        )
+        self._persist()
+        return value
+
+    def create_conversation(self, record: ConversationRecord) -> ConversationRecord:
+        value = super().create_conversation(record)
+        self._persist()
+        return value
+
+    def append_message_exchange(
+        self,
+        *,
+        user_message: ConversationMessageRecord,
+        assistant_message: ConversationMessageRecord,
+        idempotency_key: str,
+        idempotency_request_digest: str,
+    ) -> tuple[ConversationMessageExchange, bool]:
+        value = super().append_message_exchange(
+            user_message=user_message,
+            assistant_message=assistant_message,
+            idempotency_key=idempotency_key,
+            idempotency_request_digest=idempotency_request_digest,
+        )
+        if value[1]:
+            self._persist()
+        return value
+
+    def create_correction_proposal(
+        self, record: CorrectionProposalRecord
+    ) -> CorrectionProposalRecord:
+        value = super().create_correction_proposal(record)
+        self._persist()
+        return value
+
+    def decide_correction_proposal(
+        self,
+        *,
+        org_id: str,
+        correction_proposal_id: str,
+        decision: CorrectionProposalDecisionRecord,
+    ) -> CorrectionProposalRecord:
+        value = super().decide_correction_proposal(
+            org_id=org_id,
+            correction_proposal_id=correction_proposal_id,
+            decision=decision,
         )
         self._persist()
         return value

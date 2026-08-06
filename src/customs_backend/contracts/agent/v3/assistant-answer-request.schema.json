@@ -1,0 +1,29 @@
+{
+  "$id": "https://schemas.customs.local/agent/v3/assistant-answer-request.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One bounded, synchronous grounded assistant turn. Backend owns persisted conversations and sends no more than eight recent verified turns.",
+  "$defs": {
+    "RecentTurn": {
+      "additionalProperties": false,
+      "properties": {
+        "role": {"type": "string", "enum": ["user", "assistant"]},
+        "content": {"type": "string", "minLength": 1, "maxLength": 4000}
+      },
+      "required": ["role", "content"],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "schema_version": {"const": "1.0", "type": "string"},
+    "case_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"},
+    "review_run_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"},
+    "conversation_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"},
+    "review_result": {"$ref": "review-result.schema.json"},
+    "question": {"type": "string", "minLength": 1, "maxLength": 4000},
+    "recent_turns": {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/RecentTurn"}}
+  },
+  "required": ["schema_version", "case_id", "review_run_id", "conversation_id", "review_result", "question", "recent_turns"],
+  "title": "Customs AI Agent grounded assistant answer request",
+  "type": "object"
+}

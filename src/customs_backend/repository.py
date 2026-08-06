@@ -7,6 +7,13 @@ from typing import Any
 
 from customs_backend.domain import (
     CaseRecord,
+    ConversationMessageExchange,
+    ConversationMessageRecord,
+    ConversationRecord,
+    CorrectionProposalDecisionRecord,
+    CorrectionProposalHistoryEntry,
+    CorrectionProposalRecord,
+    CorrectionProposalStatus,
     CaseStatus,
     DocumentRecord,
     FindingDecisionHistoryEntry,
@@ -29,6 +36,10 @@ class InMemoryWorkbenchRepository:
         self._jobs: dict[str, JobRecord] = {}
         self._idempotency: dict[tuple[str, str], str] = {}
         self._runs: dict[str, ReviewRunRecord] = {}
+        self._conversations: dict[str, ConversationRecord] = {}
+        self._messages: dict[str, ConversationMessageRecord] = {}
+        self._chat_idempotency: dict[tuple[str, str, str], tuple[str, str, str]] = {}
+        self._correction_proposals: dict[str, CorrectionProposalRecord] = {}
 
     def health(self) -> bool:
         return True
@@ -139,6 +150,22 @@ class InMemoryWorkbenchRepository:
             )
             return self._copy(job), True
 
+    def get_review_job_by_idempotency(self, org_id: str, idempotency_key: str) -> JobRecord | None:
+        """Return the persisted job behind an idempotency key, if any.
+
+        A revision has to perform this lookup before inspecting the current
+        correction-proposal state.  A successful child run marks its inputs as
+        applied, but an HTTP retry with the original key must still replay that
+        original job rather than being treated as a new revision attempt.
+        """
+
+        with self._lock:
+            job_id = self._idempotency.get((org_id, idempotency_key))
+            if job_id is None:
+                return None
+            job = self._jobs.get(job_id)
+            return self._copy(job) if job is not None and job.org_id == org_id else None
+
     def update_job(self, job: JobRecord) -> JobRecord:
         with self._lock:
             existing = self._jobs.get(job.job_id)
@@ -147,22 +174,79 @@ class InMemoryWorkbenchRepository:
             self._jobs[job.job_id] = self._copy(job)
             return self._copy(job)
 
+    def _complete_review_locked(self, job: JobRecord, run: ReviewRunRecord) -> ReviewRunRecord:
+        current = self._jobs.get(job.job_id)
+        case = self._cases.get(job.case_id)
+        if (
+            current is None
+            or current.org_id != job.org_id
+            or case is None
+            or case.revision != job.case_revision
+        ):
+            raise ConflictError("job does not exist")
+        existing = self._runs.get(run.review_run_id)
+        if existing is not None and existing.result_digest != run.result_digest:
+            raise ConflictError("review run already contains another result")
+        self._jobs[job.job_id] = self._copy(job)
+        self._runs[run.review_run_id] = self._copy(run)
+        return self._copy(run)
+
     def complete_review(self, job: JobRecord, run: ReviewRunRecord) -> ReviewRunRecord:
         with self._lock:
-            current = self._jobs.get(job.job_id)
-            case = self._cases.get(job.case_id)
-            if (
-                current is None
-                or current.org_id != job.org_id
-                or case is None
-                or case.revision != job.case_revision
+            return self._complete_review_locked(job, run)
+
+    def complete_review_and_apply_correction_proposals(
+        self,
+        *,
+        job: JobRecord,
+        run: ReviewRunRecord,
+        correction_proposal_ids: list[str],
+        applied_by: str,
+    ) -> ReviewRunRecord:
+        """Atomically make a child result visible and bind its approved inputs.
+
+        Applying first would falsely mark a correction if the Agent fails;
+        completing first would let two concurrent revisions consume the same
+        proposal.  The aggregate lock keeps those two state changes together.
+        """
+
+        with self._lock:
+            if run.parent_review_run_id is None or set(run.applied_correction_proposal_ids) != set(
+                correction_proposal_ids
             ):
-                raise ConflictError("job does not exist")
-            existing = self._runs.get(run.review_run_id)
-            if existing is not None and existing.result_digest != run.result_digest:
-                raise ConflictError("review run already contains another result")
-            self._jobs[job.job_id] = self._copy(job)
-            self._runs[run.review_run_id] = self._copy(run)
+                raise ConflictError("child review is not bound to approved corrections")
+            records: list[CorrectionProposalRecord] = []
+            for proposal_id in correction_proposal_ids:
+                record = self._correction_proposals.get(proposal_id)
+                if (
+                    record is None
+                    or record.org_id != job.org_id
+                    or record.review_run_id != run.parent_review_run_id
+                    or record.status != CorrectionProposalStatus.approved
+                    or record.applied_review_run_id is not None
+                ):
+                    raise ConflictError("approved correction proposal is no longer available")
+                records.append(record)
+            self._complete_review_locked(job, run)
+            now = utc_now()
+            for record in records:
+                updated = record.model_copy(
+                    update={
+                        "applied_review_run_id": run.review_run_id,
+                        "applied_by": applied_by,
+                        "applied_at": now,
+                        "history": [
+                            *record.history,
+                            CorrectionProposalHistoryEntry(
+                                event="applied",
+                                reason="Approved correction was applied to a child review run.",
+                                actor=applied_by,
+                                occurred_at=now,
+                            ),
+                        ],
+                    }
+                )
+                self._correction_proposals[record.correction_proposal_id] = self._copy(updated)
             return self._copy(run)
 
     def record_finding_decision(
@@ -223,6 +307,188 @@ class InMemoryWorkbenchRepository:
                 run.model_copy(update={"reviewer_decisions": decisions})
             )
             return self._copy(decision)
+
+    def create_conversation(self, record: ConversationRecord) -> ConversationRecord:
+        with self._lock:
+            if record.conversation_id in self._conversations:
+                raise ConflictError("conversation_id already exists")
+            run = self._runs.get(record.review_run_id)
+            if run is None or run.org_id != record.org_id:
+                raise ConflictError("review run does not exist")
+            self._conversations[record.conversation_id] = self._copy(record)
+            return self._copy(record)
+
+    def get_conversation(self, org_id: str, conversation_id: str) -> ConversationRecord | None:
+        with self._lock:
+            record = self._conversations.get(conversation_id)
+            return self._copy(record) if record is not None and record.org_id == org_id else None
+
+    def list_conversations(self, org_id: str, review_run_id: str) -> list[ConversationRecord]:
+        with self._lock:
+            records = [
+                value
+                for value in self._conversations.values()
+                if value.org_id == org_id and value.review_run_id == review_run_id
+            ]
+            return self._copy(
+                sorted(
+                    records,
+                    key=lambda value: (value.updated_at, value.conversation_id),
+                    reverse=True,
+                )
+            )
+
+    def list_messages(self, org_id: str, conversation_id: str) -> list[ConversationMessageRecord]:
+        with self._lock:
+            conversation = self._conversations.get(conversation_id)
+            if conversation is None or conversation.org_id != org_id:
+                return []
+            records = [
+                value
+                for value in self._messages.values()
+                if value.conversation_id == conversation_id
+            ]
+            return self._copy(
+                sorted(records, key=lambda value: (value.created_at, value.message_id))
+            )
+
+    def _exchange(
+        self, user_message_id: str, assistant_message_id: str
+    ) -> ConversationMessageExchange:
+        try:
+            return ConversationMessageExchange(
+                user_message=self._copy(self._messages[user_message_id]),
+                assistant_message=self._copy(self._messages[assistant_message_id]),
+            )
+        except KeyError as exc:
+            raise ConflictError("conversation exchange is incomplete") from exc
+
+    def get_message_exchange(
+        self,
+        *,
+        org_id: str,
+        conversation_id: str,
+        idempotency_key: str,
+        idempotency_request_digest: str,
+    ) -> ConversationMessageExchange | None:
+        with self._lock:
+            stored = self._chat_idempotency.get((org_id, conversation_id, idempotency_key))
+            if stored is None:
+                return None
+            request_digest, user_message_id, assistant_message_id = stored
+            if request_digest != idempotency_request_digest:
+                raise ConflictError("idempotency key was reused with another message")
+            return self._exchange(user_message_id, assistant_message_id)
+
+    def append_message_exchange(
+        self,
+        *,
+        user_message: ConversationMessageRecord,
+        assistant_message: ConversationMessageRecord,
+        idempotency_key: str,
+        idempotency_request_digest: str,
+    ) -> tuple[ConversationMessageExchange, bool]:
+        with self._lock:
+            conversation = self._conversations.get(user_message.conversation_id)
+            if (
+                conversation is None
+                or conversation.conversation_id != assistant_message.conversation_id
+            ):
+                raise ConflictError("conversation does not exist")
+            if (
+                user_message.message_id in self._messages
+                or assistant_message.message_id in self._messages
+            ):
+                raise ConflictError("message_id already exists")
+            key = (conversation.org_id, conversation.conversation_id, idempotency_key)
+            existing = self._chat_idempotency.get(key)
+            if existing is not None:
+                existing_digest, user_id, assistant_id = existing
+                if existing_digest != idempotency_request_digest:
+                    raise ConflictError("idempotency key was reused with another message")
+                return self._exchange(user_id, assistant_id), False
+            if user_message.role.value != "user" or assistant_message.role.value != "assistant":
+                raise ConflictError("conversation exchange roles are invalid")
+            self._messages[user_message.message_id] = self._copy(user_message)
+            self._messages[assistant_message.message_id] = self._copy(assistant_message)
+            self._chat_idempotency[key] = (
+                idempotency_request_digest,
+                user_message.message_id,
+                assistant_message.message_id,
+            )
+            self._conversations[conversation.conversation_id] = self._copy(
+                conversation.model_copy(update={"updated_at": assistant_message.created_at})
+            )
+            return self._exchange(user_message.message_id, assistant_message.message_id), True
+
+    def create_correction_proposal(
+        self, record: CorrectionProposalRecord
+    ) -> CorrectionProposalRecord:
+        with self._lock:
+            if record.correction_proposal_id in self._correction_proposals:
+                raise ConflictError("correction proposal already exists")
+            run = self._runs.get(record.review_run_id)
+            if (
+                run is None
+                or run.org_id != record.org_id
+                or run.case_id != record.case_id
+                or run.result_digest != record.parent_result_digest
+                or run.agent_input_manifest_sha256 != record.parent_input_manifest_sha256
+            ):
+                raise ConflictError("correction proposal is not bound to its parent review")
+            self._correction_proposals[record.correction_proposal_id] = self._copy(record)
+            return self._copy(record)
+
+    def get_correction_proposal(
+        self, org_id: str, correction_proposal_id: str
+    ) -> CorrectionProposalRecord | None:
+        with self._lock:
+            record = self._correction_proposals.get(correction_proposal_id)
+            return self._copy(record) if record is not None and record.org_id == org_id else None
+
+    def list_correction_proposals(
+        self, org_id: str, review_run_id: str
+    ) -> list[CorrectionProposalRecord]:
+        with self._lock:
+            records = [
+                value
+                for value in self._correction_proposals.values()
+                if value.org_id == org_id and value.review_run_id == review_run_id
+            ]
+            return self._copy(
+                sorted(records, key=lambda value: (value.created_at, value.correction_proposal_id))
+            )
+
+    def decide_correction_proposal(
+        self,
+        *,
+        org_id: str,
+        correction_proposal_id: str,
+        decision: CorrectionProposalDecisionRecord,
+    ) -> CorrectionProposalRecord:
+        with self._lock:
+            record = self._correction_proposals.get(correction_proposal_id)
+            if record is None or record.org_id != org_id:
+                raise ConflictError("correction proposal does not exist")
+            if record.status != CorrectionProposalStatus.proposed or record.decision is not None:
+                raise ConflictError("correction proposal has already been decided")
+            updated = record.model_copy(
+                update={
+                    "status": CorrectionProposalStatus(decision.status),
+                    "decision": decision,
+                    "history": [
+                        *record.history,
+                        CorrectionProposalHistoryEntry(
+                            event=decision.status,
+                            reason=decision.reason,
+                            actor=decision.decided_by,
+                            occurred_at=decision.decided_at,
+                        ),
+                    ],
+                }
+            )
+            self._correction_proposals[correction_proposal_id] = self._copy(updated)
+            return self._copy(updated)
 
     def get_job(self, org_id: str, job_id: str) -> JobRecord | None:
         with self._lock:

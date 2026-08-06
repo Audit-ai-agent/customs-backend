@@ -54,7 +54,8 @@ def _dev_fixture() -> list[tuple[str, str]]:
         ("CUSTOMS_BACKEND_AGENT_SERVICE_TOKEN", agent_service_token),
         ("CUSTOMS_AGENT_SERVICE_BEARER_TOKEN", agent_service_token),
         ("CUSTOMS_AGENT_SERVICE_MODE", "local-development"),
-        ("CUSTOMS_BACKEND_DEV_SESSION_TOKEN", _random_secret()),
+        ("CUSTOMS_BACKEND_DEV_REVIEWER_SESSION_TOKEN", _random_secret()),
+        ("CUSTOMS_BACKEND_DEV_APPROVER_SESSION_TOKEN", _random_secret()),
     ]
 
 
@@ -65,6 +66,8 @@ def _functional_uat(*, realm_path: Path) -> tuple[list[tuple[str, str]], dict[st
     keycloak_admin_password = _random_secret()
     reviewer_username = "local-functional-reviewer"
     reviewer_password = _random_secret()
+    approver_username = "local-functional-approver"
+    approver_password = _random_secret()
     agent_service_token = _random_secret()
     values = [
         ("CUSTOMS_BACKEND_ENVIRONMENT", "functional-uat"),
@@ -106,12 +109,14 @@ def _functional_uat(*, realm_path: Path) -> tuple[list[tuple[str, str]], dict[st
         ("CUSTOMS_FUNCTIONAL_KEYCLOAK_ADMIN_PASSWORD", keycloak_admin_password),
         ("CUSTOMS_FUNCTIONAL_REVIEWER_USERNAME", reviewer_username),
         ("CUSTOMS_FUNCTIONAL_REVIEWER_PASSWORD", reviewer_password),
+        ("CUSTOMS_FUNCTIONAL_APPROVER_USERNAME", approver_username),
+        ("CUSTOMS_FUNCTIONAL_APPROVER_PASSWORD", approver_password),
         ("CUSTOMS_FUNCTIONAL_REALM_FILE", realm_path.as_posix()),
     ]
     realm: dict[str, object] = {
         "realm": "customs",
         "enabled": True,
-        "roles": {"realm": [{"name": "reviewer"}]},
+        "roles": {"realm": [{"name": "reviewer"}, {"name": "approver"}]},
         "clients": [
             {
                 "clientId": "customs-workbench-spa",
@@ -168,7 +173,16 @@ def _functional_uat(*, realm_path: Path) -> tuple[list[tuple[str, str]], dict[st
                 "credentials": [
                     {"type": "password", "temporary": False, "value": reviewer_password}
                 ],
-            }
+            },
+            {
+                "username": approver_username,
+                "enabled": True,
+                "attributes": {"org_id": ["local-functional"]},
+                "realmRoles": ["approver"],
+                "credentials": [
+                    {"type": "password", "temporary": False, "value": approver_password}
+                ],
+            },
         ],
     }
     return values, realm

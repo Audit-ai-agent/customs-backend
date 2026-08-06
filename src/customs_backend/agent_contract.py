@@ -1,4 +1,4 @@
-"""Backend consumer validation for the packaged Agent V3/V3.1 schemas."""
+"""Backend consumer validation for the packaged Agent V3.2 schemas."""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ from typing import Any, Literal
 
 from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import SchemaError, ValidationError
+from referencing import Registry, Resource
+from referencing.jsonschema import DRAFT202012
 
 
 class BackendConfigurationError(RuntimeError):
@@ -19,10 +21,27 @@ class AgentContractPayloadError(ValueError):
     """A request or response does not match the packaged Agent schema."""
 
 
-AgentContractKind = Literal["review_request", "review_result"]
+AgentContractKind = Literal[
+    "review_request",
+    "review_result",
+    "assistant_answer_request",
+    "assistant_answer_response",
+]
 _SCHEMA_PATHS: dict[AgentContractKind, tuple[str, ...]] = {
     "review_request": ("contracts", "agent", "v3", "review-request.schema.json"),
     "review_result": ("contracts", "agent", "v3", "review-result.schema.json"),
+    "assistant_answer_request": (
+        "contracts",
+        "agent",
+        "v3",
+        "assistant-answer-request.schema.json",
+    ),
+    "assistant_answer_response": (
+        "contracts",
+        "agent",
+        "v3",
+        "assistant-answer-response.schema.json",
+    ),
 }
 
 
@@ -53,7 +72,7 @@ def _strict_json_object(raw: bytes, *, label: str) -> dict[str, Any]:
     return value
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=4)
 def load_agent_contract_schema(kind: AgentContractKind) -> dict[str, Any]:
     try:
         raw = resources.files("customs_backend").joinpath(*_SCHEMA_PATHS[kind]).read_bytes()
@@ -70,13 +89,32 @@ def load_agent_contract_schema(kind: AgentContractKind) -> dict[str, Any]:
 def validate_agent_contract_bundle() -> None:
     load_agent_contract_schema("review_request")
     load_agent_contract_schema("review_result")
+    load_agent_contract_schema("assistant_answer_request")
+    load_agent_contract_schema("assistant_answer_response")
+
+
+@lru_cache(maxsize=4)
+def _agent_contract_validator(kind: AgentContractKind) -> Draft202012Validator:
+    """Build a local-only registry for the assistant request's relative ref."""
+
+    registry = Registry()
+    for candidate in _SCHEMA_PATHS:
+        schema = load_agent_contract_schema(candidate)
+        schema_id = schema.get("$id")
+        if not isinstance(schema_id, str) or not schema_id:
+            raise BackendConfigurationError("Agent V3 contract schema has no canonical identifier")
+        registry = registry.with_resource(
+            schema_id,
+            Resource.from_contents(schema, default_specification=DRAFT202012),
+        )
+    return Draft202012Validator(
+        load_agent_contract_schema(kind), registry=registry, format_checker=FormatChecker()
+    )
 
 
 def validate_agent_v3_payload(kind: AgentContractKind, payload: object) -> None:
     try:
-        Draft202012Validator(
-            load_agent_contract_schema(kind), format_checker=FormatChecker()
-        ).validate(payload)
+        _agent_contract_validator(kind).validate(payload)
     except ValidationError:
         raise AgentContractPayloadError(
             f"Agent V3 {kind} does not satisfy the packaged schema"

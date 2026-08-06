@@ -15,6 +15,24 @@ Bearer token과 `X-Customs-Service-Mode`가 정확히 같은 경우에만 통신
 Backend는 저장소 `.env`를 읽지 않으며, 아래에서 명시적으로 import한 현재 터미널의
 profile 값만 사용한다.
 
+## 검토 역할과 보정 이력
+
+심사 작업은 두 역할로 분리한다. 이 구분은 자동 승인 기능이 아니라, 한 사람이 자신의
+입력값을 확정하지 않도록 하는 최소한의 사람 검토 경계다.
+
+| 역할 | 할 수 있는 일 |
+| --- | --- |
+| `reviewer` | 사건·텍스트 문서·심사를 만들고, finding 판단과 보정 제안을 작성한다. |
+| `approver` | 모든 결과와 대화를 읽고, 다른 사람이 작성한 보정 제안을 승인 또는 반려한 뒤 재심사를 시작한다. |
+
+보정 제안은 부모 Review Run의 문서 hash와 결과 digest에 묶인다. 승인된 제안으로 만든
+재심사는 부모 문서나 기존 결과를 바꾸지 않고 새 Review Run을 만든다. 자식 심사가
+성공한 경우에만 제안에 적용 이력이 남으며, 결과는 계속 `human_review_required`다.
+
+각 Review Run에는 여러 개의 짧은 질의 대화를 만들 수 있다. Browser는 Backend만
+호출하고, Backend는 해당 Run의 검증된 결과와 최근 여덟 turn만 Agent에 전달한다.
+대화 응답의 문서 사실·비교·법령 근거 인용은 기존 Run의 참조 ID만 사용할 수 있다.
+
 ## 기본 개발
 
 Python 3.11과 `uv`가 필요하다. 한 번 설치하고, 생성된 로컬 profile을 Backend와 Agent
@@ -33,6 +51,10 @@ uv run --no-sync customs-backend-profile-init --profile dev-fixture
 . .\tools\Import-LocalProfile.ps1 -Profile dev-fixture -Scope backend
 uv run --no-sync customs-backend-api
 ```
+
+이전 단일 개발 세션 profile이 이미 있다면 역할 분리를 적용하기 위해 위 초기화 명령에
+`--force`를 한 번 붙여 다시 생성한다. 이 동작은 Git 파일이나 사건·문서 데이터를
+바꾸지 않고, 해당 PC의 로컬 개발 token만 새로 만든다.
 
 Backend의 표준 loopback 주소는 `http://127.0.0.1:18081`이다. Windows에서 자주
 예약되는 80xx 범위를 피한 값이며, Frontend의 기본 proxy도 같은 주소를 사용한다.
@@ -56,8 +78,16 @@ uv run --no-sync customs-ai-agent-dev-serve
 
 Data 서비스는 이 Agent보다 먼저 해당 저장소의 `dev-fixture` 명령으로 시작한다. Agent
 터미널에서는 `..\customs-ai-agent`로 이동한 뒤, 위의 Agent 명령을 실행한다. 이 명령은
-값을 출력하지 않는다. Frontend는 loopback에서
-`POST /api/v1/dev/session`을 한 번 호출해 받은 token을 메모리에만 보관한다.
+값을 출력하지 않는다. Frontend는 loopback에서 `POST /api/v1/dev/session`을 호출해 받은
+token을 메모리에만 보관한다. 기본 요청은 reviewer 세션이며, 보정 승인 화면 확인에는
+다음처럼 명시적으로 approver 세션을 요청한다.
+
+```json
+{"actor":"approver"}
+```
+
+profile 초기화기는 reviewer와 approver의 서로 다른 로컬 token을 생성한다. 이 값은
+`_local/profiles/dev-fixture/backend.env`에만 있으며 Git이나 화면 로그에 기록하지 않는다.
 
 ## 상세 dev-fixture 시나리오 transcript
 
@@ -110,17 +140,20 @@ docker compose --project-name customs-functional-uat --env-file $Profile `
 uv run --no-sync customs-backend-api
 ```
 
-로컬 Keycloak 화면에서는 사용자 이름 `local-functional-reviewer`를 사용한다. 비밀번호는
-화면에 출력하지 않고, 본인 PC에서만 아래 명시적 명령으로 클립보드에 복사한다.
+로컬 Keycloak에는 `local-functional-reviewer`와 `local-functional-approver` 계정이 각각
+생성된다. 비밀번호는 화면에 출력하지 않고, 본인 PC에서만 아래 명시적 명령으로
+클립보드에 복사한다.
 
 ```powershell
 .\tools\Copy-FunctionalUatPassword.ps1
+# approver 로그인에만 필요할 때
+.\tools\Copy-FunctionalUatPassword.ps1 -Actor approver
 # local Keycloak form에 붙여넣은 뒤 즉시 비운다.
 Set-Clipboard -Value ''
 ```
 
-이 명령은 reviewer 비밀번호 하나만 읽으며 DB·MinIO·Keycloak 관리자·Agent·Data 값은
-읽거나 출력하지 않는다. 비밀번호와 clipboard 내용은 Git·채팅·공유 파일에 넣지 않는다.
+이 명령은 선택한 로그인 비밀번호 하나만 읽으며 DB·MinIO·Keycloak 관리자·Agent·Data
+값은 읽거나 출력하지 않는다. 비밀번호와 clipboard 내용은 Git·채팅·공유 파일에 넣지 않는다.
 
 Agent의 실제 Data 연결은 같은 bearer/mode 값과 함께 Agent의 좁은 importer가 읽는다.
 

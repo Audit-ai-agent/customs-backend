@@ -37,6 +37,7 @@ DocumentType = Literal["CI", "PL", "BL", "CO", "UNKNOWN"]
 
 class Role(str, Enum):
     reviewer = "reviewer"
+    approver = "approver"
 
 
 class Principal(BaseModel):
@@ -239,6 +240,245 @@ class FindingDecisionRecord(BaseModel):
     history: list[FindingDecisionHistoryEntry] = Field(min_length=1, max_length=100)
 
 
+class ConversationCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = Field(default=None, max_length=200)
+
+    @field_validator("title")
+    @classmethod
+    def normalise_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
+class ConversationRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    conversation_id: str
+    review_run_id: str
+    org_id: str
+    title: str | None = None
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class ConversationMessageRole(str, Enum):
+    user = "user"
+    assistant = "assistant"
+
+
+class AnswerScope(str, Enum):
+    case_grounded = "case_grounded"
+    evidence_grounded = "evidence_grounded"
+    general_customs_guidance = "general_customs_guidance"
+    clarification_needed = "clarification_needed"
+    insufficient_evidence = "insufficient_evidence"
+    out_of_scope = "out_of_scope"
+
+
+class CitationKind(str, Enum):
+    fact = "fact"
+    comparison = "comparison"
+    evidence = "evidence"
+
+
+class MessageCitation(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: CitationKind
+    reference_id: str = Field(min_length=1, max_length=256)
+
+
+class CorrectionDraft(BaseModel):
+    """A non-binding assistant suggestion which a reviewer may copy into a proposal."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    document_id: str = Field(min_length=1, max_length=128)
+    item_id: str | None = Field(default=None, max_length=256)
+    fact_id: str | None = Field(default=None, max_length=256)
+    field_name: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    new_value: str = Field(min_length=1, max_length=2000)
+    unit: str | None = Field(default=None, max_length=64)
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class ConversationMessageCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("content")
+    @classmethod
+    def non_blank_content(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("message content is required")
+        return value.strip()
+
+
+class ConversationMessageRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str
+    conversation_id: str
+    role: ConversationMessageRole
+    content: str = Field(min_length=1, max_length=4000)
+    answer_scope: AnswerScope | None = None
+    citations: list[MessageCitation] = Field(default_factory=list, max_length=100)
+    suggested_questions: list[str] = Field(default_factory=list, max_length=3)
+    correction_draft: CorrectionDraft | None = None
+    created_by: str
+    created_at: datetime
+
+
+class ConversationMessageExchange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_message: ConversationMessageRecord
+    assistant_message: ConversationMessageRecord
+
+
+class AgentConversationTurn(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    role: ConversationMessageRole
+    content: str = Field(min_length=1, max_length=4000)
+
+
+class AgentAssistantAnswerRequest(BaseModel):
+    """Typed internal request.  The canonical JSON schema is packaged separately."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"] = "1.0"
+    case_id: str = Field(min_length=1, max_length=128)
+    review_run_id: str = Field(min_length=1, max_length=128)
+    conversation_id: str = Field(min_length=1, max_length=128)
+    review_result: dict[str, Any]
+    question: str = Field(min_length=1, max_length=4000)
+    recent_turns: list[AgentConversationTurn] = Field(default_factory=list, max_length=8)
+
+    def to_agent_wire(self) -> dict[str, Any]:
+        return self.model_dump(mode="json")
+
+
+class AgentAssistantAnswerResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"]
+    case_id: str = Field(min_length=1, max_length=128)
+    review_run_id: str = Field(min_length=1, max_length=128)
+    conversation_id: str = Field(min_length=1, max_length=128)
+    answer_scope: AnswerScope
+    direct_answer: str = Field(min_length=1, max_length=4000)
+    citations: list[MessageCitation] = Field(default_factory=list, max_length=100)
+    suggested_questions: list[str] = Field(default_factory=list, max_length=3)
+    correction_draft: CorrectionDraft | None = None
+    engine: dict[str, Any]
+
+
+class CorrectionProposalStatus(str, Enum):
+    proposed = "proposed"
+    approved = "approved"
+    rejected = "rejected"
+
+
+class CorrectionProposalCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    document_id: str = Field(min_length=1, max_length=128)
+    field_name: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    new_value: str = Field(min_length=1, max_length=2000)
+    unit: str | None = Field(default=None, max_length=64)
+    fact_id: str | None = Field(default=None, max_length=256)
+    item_id: str | None = Field(default=None, max_length=256)
+    finding_id: str | None = Field(default=None, max_length=256)
+    reason: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("new_value", "reason")
+    @classmethod
+    def correction_text_is_non_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("correction text is required")
+        return value.strip()
+
+
+class CorrectionProposalDecisionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["approved", "rejected"]
+    reason: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("reason")
+    @classmethod
+    def decision_reason_is_non_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("decision reason is required")
+        return value.strip()
+
+
+class CorrectionProposalDecisionRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: Literal["approved", "rejected"]
+    reason: str = Field(min_length=1, max_length=2000)
+    decided_by: str = Field(min_length=1, max_length=256)
+    decided_at: datetime
+
+
+class CorrectionProposalHistoryEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    event: Literal["proposed", "approved", "rejected", "applied"]
+    reason: str = Field(min_length=1, max_length=2000)
+    actor: str = Field(min_length=1, max_length=256)
+    occurred_at: datetime
+
+
+class CorrectionProposalRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    correction_proposal_id: str
+    review_run_id: str
+    case_id: str
+    org_id: str
+    parent_result_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    parent_input_manifest_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    document_id: str
+    field_name: str
+    new_value: str
+    unit: str | None = None
+    fact_id: str | None = None
+    item_id: str | None = None
+    finding_id: str | None = None
+    reason: str
+    status: CorrectionProposalStatus = CorrectionProposalStatus.proposed
+    created_by: str
+    created_at: datetime
+    decision: CorrectionProposalDecisionRecord | None = None
+    applied_review_run_id: str | None = None
+    applied_by: str | None = None
+    applied_at: datetime | None = None
+    history: list[CorrectionProposalHistoryEntry] = Field(min_length=1, max_length=10)
+
+
+class RevisionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    proposal_ids: list[str] = Field(min_length=1, max_length=50)
+
+    @field_validator("proposal_ids")
+    @classmethod
+    def proposal_ids_are_unique(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("proposal_ids must be unique")
+        return value
+
+
 class InputDocumentManifestEntry(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -254,6 +494,8 @@ class ReviewRunRecord(BaseModel):
     case_id: str
     org_id: str
     job_id: str
+    parent_review_run_id: str | None = None
+    applied_correction_proposal_ids: list[str] = Field(default_factory=list, max_length=100)
     case_revision: int = Field(ge=0)
     review_as_of: date
     trade_type: Literal["import", "export"]
@@ -264,8 +506,8 @@ class ReviewRunRecord(BaseModel):
     result_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     execution_status: ExecutionStatus
     assessment: Assessment
-    # This is the Agent contract version, not a Backend API version.  Defaults
-    # keep historic local functional-UAT state readable after the V3.1 rollout.
+    # This is the Agent contract version, not a Backend API version. Defaults
+    # keep historic local functional-UAT state readable after the V3.2 rollout.
     agent_schema_version: str = Field(default="3.0", min_length=1, max_length=32)
     agent_status: str = Field(default="needs_review", min_length=1, max_length=64)
     agent_engine: dict[str, Any] | None = None
@@ -278,7 +520,7 @@ class ReviewRunRecord(BaseModel):
     evidence: list[dict[str, Any]]
     findings: list[dict[str, Any]]
     required_actions: list[RequiredAction]
-    # V3.1 workflow detail is returned by the Agent and is immutable for a
+    # V3.2 workflow detail is returned by the Agent and is immutable for a
     # completed run.  It is intentionally separate from reviewer decisions.
     workflow: dict[str, Any] = Field(default_factory=dict)
     document_analyses: list[dict[str, Any]] = Field(default_factory=list)
@@ -310,8 +552,24 @@ class AgentDocumentInput(BaseModel):
         return self.model_dump(mode="json", exclude_none=True)
 
 
+class AgentHumanCorrection(BaseModel):
+    """Approved reviewer input carried only into a child Agent review pass."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    correction_proposal_id: str = Field(min_length=1, max_length=128)
+    document_id: str = Field(min_length=1, max_length=128)
+    item_id: str | None = Field(default=None, max_length=256)
+    fact_id: str | None = Field(default=None, max_length=256)
+    field_name: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    new_value: str = Field(min_length=1, max_length=2000)
+    unit: str | None = Field(default=None, max_length=64)
+    reason: str = Field(min_length=1, max_length=2000)
+    source_kind: Literal["human_provided"] = "human_provided"
+
+
 class AgentReviewRequest(BaseModel):
-    """The exact compact input sent to the Agent V3 endpoint."""
+    """The exact compact input sent to the Agent V3.2 endpoint."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -323,9 +581,55 @@ class AgentReviewRequest(BaseModel):
     review_as_of: date
     trade_type: Literal["import", "export"]
     jurisdiction: Literal["KR"] = "KR"
+    parent_review_run_id: str | None = Field(default=None, max_length=128)
+    applied_correction_proposal_ids: list[str] = Field(default_factory=list, max_length=50)
+    human_corrections: list[AgentHumanCorrection] = Field(default_factory=list, max_length=50)
+
+    @model_validator(mode="after")
+    def correction_context_is_bound(self) -> "AgentReviewRequest":
+        correction_ids = [item.correction_proposal_id for item in self.human_corrections]
+        if self.parent_review_run_id is None:
+            if self.applied_correction_proposal_ids or correction_ids:
+                raise ValueError("correction context requires a parent review run")
+            return self
+        if not self.applied_correction_proposal_ids or not correction_ids:
+            raise ValueError("a child review requires approved correction context")
+        if len(set(self.applied_correction_proposal_ids)) != len(
+            self.applied_correction_proposal_ids
+        ):
+            raise ValueError("applied correction proposal identifiers must be unique")
+        if set(correction_ids) != set(self.applied_correction_proposal_ids):
+            raise ValueError(
+                "human corrections must exactly match the approved proposal identifiers"
+            )
+        input_document_ids = {document.document_id for document in self.documents}
+        if any(item.document_id not in input_document_ids for item in self.human_corrections):
+            raise ValueError("a human correction must target an immutable input document")
+        return self
 
     def to_agent_wire(self) -> dict[str, Any]:
-        return self.model_dump(mode="json", exclude_none=True)
+        wire: dict[str, Any] = {
+            "review_run_id": self.review_run_id,
+            "case_id": self.case_id,
+            "documents": [item.to_agent_wire() for item in self.documents],
+            "review_as_of": self.review_as_of.isoformat(),
+            "trade_type": self.trade_type,
+            "jurisdiction": self.jurisdiction,
+        }
+        if self.parent_review_run_id is not None:
+            # Omit unset optional target references to keep correction context
+            # compact; the canonical Agent schema also accepts explicit nulls.
+            wire.update(
+                {
+                    "parent_review_run_id": self.parent_review_run_id,
+                    "applied_correction_proposal_ids": self.applied_correction_proposal_ids,
+                    "human_corrections": [
+                        item.model_dump(mode="json", exclude_none=True)
+                        for item in self.human_corrections
+                    ],
+                }
+            )
+        return wire
 
     @property
     def input_manifest_sha256(self) -> str:

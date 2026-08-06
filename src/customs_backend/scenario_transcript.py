@@ -14,6 +14,7 @@ import json
 import os
 import re
 import threading
+import uuid
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -124,7 +125,15 @@ def _has_unredacted_secret(value: Any) -> bool:
         return any(_has_unredacted_secret(item) for item in value)
     if not isinstance(value, str):
         return False
-    return any(pattern.search(value) is not None for pattern, _replacement in _TEXT_REDACTIONS)
+    # The key/value-shaped expression intentionally also matches a redacted
+    # value (for example ``ANTHROPIC_API_KEY=[REDACTED]``).  That is a safe
+    # retained field name, not an exposed credential.
+    return any(
+        "[REDACTED]" not in match.group(0)
+        for pattern, _replacement in _TEXT_REDACTIONS
+        for match in [pattern.search(value)]
+        if match is not None
+    )
 
 
 def _validate_root(path: Path) -> Path:
@@ -188,6 +197,40 @@ class ScenarioTranscriptRun:
         except OSError as exc:
             raise ScenarioTranscriptError("scenario_transcript_write_failed") from exc
 
+    def replace_summary(self, payload: Mapping[str, Any]) -> None:
+        """Atomically refresh a terminal summary without freezing its run.
+
+        A functional-UAT run can continue with grounded conversations,
+        correction decisions, and child revisions after the first detailed
+        result is read.  The summary is therefore a safe checkpoint, not a
+        write barrier for the surrounding transcript streams.
+        """
+
+        encoded = json.dumps(
+            self.redactor.value(dict(payload)),
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+        target = self.directory / "summary.json"
+        temporary = self.directory / f".summary.{uuid.uuid4().hex}.tmp"
+        try:
+            with _WRITE_LOCK:
+                with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+                    handle.write(encoded + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, target)
+        except OSError as exc:
+            raise ScenarioTranscriptError("scenario_transcript_write_failed") from exc
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     def _write_jsonl(self, path: Path, record: Mapping[str, Any]) -> None:
         encoded = json.dumps(
             record,
@@ -218,7 +261,9 @@ class ScenarioTranscriptRoot:
             directory=_validate_root(root), redactor=TranscriptRedactor.from_values(secret_values)
         )
 
-    def open_or_create_run(self, review_run_id: str) -> ScenarioTranscriptRun:
+    def open_or_create_run(
+        self, review_run_id: str, *, allow_terminal_summary: bool = False
+    ) -> ScenarioTranscriptRun:
         if _SAFE_RUN_ID.fullmatch(review_run_id) is None:
             raise ScenarioTranscriptError("scenario_transcript_run_id_invalid")
         candidate = self.directory / review_run_id
@@ -229,7 +274,7 @@ class ScenarioTranscriptRoot:
             raise ScenarioTranscriptError("scenario_transcript_run_unavailable") from exc
         if resolved.parent != self.directory:
             raise ScenarioTranscriptError("scenario_transcript_run_invalid")
-        if (resolved / "summary.json").exists():
+        if (resolved / "summary.json").exists() and not allow_terminal_summary:
             raise ScenarioTranscriptError("scenario_transcript_run_finalized")
         return ScenarioTranscriptRun(directory=resolved, redactor=self.redactor)
 
@@ -246,15 +291,41 @@ class FunctionalTranscriptController:
     root: ScenarioTranscriptRoot
     profile: str = "functional-uat"
     _pending_public: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-    _run_by_case: dict[str, str] = field(default_factory=dict)
-    _finalized: set[str] = field(default_factory=set)
+    _latest_run_by_case: dict[str, str] = field(default_factory=dict)
+    _state_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+    def _append(
+        self, review_run_id: str, stream: str, event: str, payload: Mapping[str, Any]
+    ) -> None:
+        with self._state_lock:
+            run = self.root.open_or_create_run(review_run_id, allow_terminal_summary=True)
+            run.append(stream, event, payload)
+            self._refresh_summary_checkpoint(review_run_id)
+
+    def _refresh_summary_checkpoint(self, review_run_id: str) -> None:
+        """Keep an existing terminal checkpoint honest after later activity."""
+
+        directory = self.root.directory / review_run_id
+        summary_path = directory / "summary.json"
+        if not summary_path.is_file():
+            return
+        try:
+            existing = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ScenarioTranscriptError("scenario_transcript_json_invalid") from exc
+        if not isinstance(existing, Mapping):
+            raise ScenarioTranscriptError("scenario_transcript_json_invalid")
+        self.root.open_or_create_run(review_run_id, allow_terminal_summary=True).replace_summary(
+            {
+                **dict(existing),
+                "last_recorded_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
 
     def record_backend_agent(
         self, review_run_id: str, event: str, payload: Mapping[str, Any]
     ) -> None:
-        if review_run_id in self._finalized or self.root.is_finalized(review_run_id):
-            return
-        self.root.open_or_create_run(review_run_id).append("backend-agent", event, payload)
+        self._append(review_run_id, "backend-agent", event, payload)
 
     def record_public(
         self,
@@ -265,6 +336,7 @@ class FunctionalTranscriptController:
         request_body: Mapping[str, Any] | None,
         response_status: int,
         response_body: Mapping[str, Any] | None,
+        review_run_id: str | None = None,
     ) -> None:
         event = {
             "method": method,
@@ -273,13 +345,13 @@ class FunctionalTranscriptController:
             "response_status": response_status,
             "response_body": dict(response_body) if response_body is not None else None,
         }
-        review_run_id = self._run_by_case.get(case_id)
-        if review_run_id is None:
-            self._pending_public.setdefault(case_id, []).append(event)
-            return
-        if review_run_id in self._finalized or self.root.is_finalized(review_run_id):
-            return
-        self.root.open_or_create_run(review_run_id).append("public-api", "http_exchange", event)
+        with self._state_lock:
+            if review_run_id is None:
+                review_run_id = self._latest_run_by_case.get(case_id)
+            if review_run_id is None:
+                self._pending_public.setdefault(case_id, []).append(event)
+                return
+            self._append(review_run_id, "public-api", "http_exchange", event)
 
     def bind_review(
         self,
@@ -291,51 +363,47 @@ class FunctionalTranscriptController:
         response_status: int,
         response_body: Mapping[str, Any],
         job_status: str,
+        public_path: str | None = None,
     ) -> None:
-        run = self.root.open_or_create_run(review_run_id)
-        if review_run_id in self._finalized or self.root.is_finalized(review_run_id):
-            raise ScenarioTranscriptError("scenario_transcript_run_finalized")
-        self._run_by_case[case_id] = review_run_id
-        run.write_json(
-            "scenario.json",
-            {
-                "schema_version": "scenario-transcript/v1",
-                "profile": self.profile,
-                "case_id": case_id,
-                "review_run_id": review_run_id,
-                "job_id": job_id,
-                "started_at": datetime.now(timezone.utc).isoformat(),
-                "review_request": dict(review_request),
-            },
-        )
-        for event in self._pending_public.pop(case_id, []):
-            run.append("public-api", "http_exchange", event)
-        run.append(
-            "public-api",
-            "http_exchange",
-            {
-                "method": "POST",
-                "path": f"/api/v1/cases/{case_id}/reviews",
-                "request_body": dict(review_request),
-                "response_status": response_status,
-                "response_body": dict(response_body),
-            },
-        )
-        if job_status == "failed":
-            self.finalize(
-                review_run_id,
-                status="failed",
-                fields={"job_id": job_id, "job_status": job_status},
+        with self._state_lock:
+            run = self.root.open_or_create_run(review_run_id)
+            self._latest_run_by_case[case_id] = review_run_id
+            run.write_json(
+                "scenario.json",
+                {
+                    "schema_version": "scenario-transcript/v1",
+                    "profile": self.profile,
+                    "case_id": case_id,
+                    "review_run_id": review_run_id,
+                    "job_id": job_id,
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                    "review_request": dict(review_request),
+                },
             )
+            for event in self._pending_public.pop(case_id, []):
+                run.append("public-api", "http_exchange", event)
+            run.append(
+                "public-api",
+                "http_exchange",
+                {
+                    "method": "POST",
+                    "path": public_path or f"/api/v1/cases/{case_id}/reviews",
+                    "request_body": dict(review_request),
+                    "response_status": response_status,
+                    "response_body": dict(response_body),
+                },
+            )
+            if job_status == "failed":
+                self.finalize(
+                    review_run_id,
+                    status="failed",
+                    fields={"job_id": job_id, "job_status": job_status},
+                )
 
     def finalize(self, review_run_id: str, *, status: str, fields: Mapping[str, Any]) -> None:
-        if review_run_id in self._finalized or self.root.is_finalized(review_run_id):
-            self._finalized.add(review_run_id)
-            return
-        run = self.root.open_or_create_run(review_run_id)
-        run.write_json(
-            "summary.json",
-            {
+        with self._state_lock:
+            run = self.root.open_or_create_run(review_run_id, allow_terminal_summary=True)
+            payload = {
                 "schema_version": "scenario-transcript/v1",
                 "profile": self.profile,
                 "review_run_id": review_run_id,
@@ -343,9 +411,11 @@ class FunctionalTranscriptController:
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "required_streams": list(_REQUIRED_STREAMS),
                 **dict(fields),
-            },
-        )
-        self._finalized.add(review_run_id)
+            }
+            if (run.directory / "summary.json").is_file():
+                run.replace_summary(payload)
+            else:
+                run.write_json("summary.json", payload)
 
 
 def verify_run(root: Path, review_run_id: str) -> dict[str, Any]:

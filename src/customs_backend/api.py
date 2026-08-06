@@ -22,10 +22,22 @@ from customs_backend.auth import StaticTokenVerifier, principal_dependency, requ
 from customs_backend.domain import (
     CaseCreate,
     CaseRecord,
+    ConversationCreate,
+    ConversationMessageCreate,
+    ConversationMessageExchange,
+    ConversationMessageRecord,
+    ConversationRecord,
+    CorrectionProposalCreate,
+    CorrectionProposalDecisionCreate,
+    CorrectionProposalDecisionRecord,
+    CorrectionProposalHistoryEntry,
+    CorrectionProposalRecord,
+    CorrectionProposalStatus,
     FindingDecisionRecord,
     FindingDecisionRequest,
     JobStatus,
     Principal,
+    RevisionCreate,
     ReviewEnqueueRequest,
     ReviewRunRecord,
     Role,
@@ -33,6 +45,7 @@ from customs_backend.domain import (
 )
 from customs_backend.ports import (
     AgentClient,
+    AuthorizationError,
     ConflictError,
     NotFoundError,
     ObjectStore,
@@ -80,6 +93,12 @@ class DevelopmentSessionResponse(BaseModel):
     session: SessionResponse
 
 
+class DevelopmentSessionRequest(BaseModel):
+    """Explicit local identity selection; the endpoint is loopback-only."""
+
+    actor: Literal["reviewer", "approver"] = "reviewer"
+
+
 class AuthConfigResponse(BaseModel):
     issuer: str
     audience: str
@@ -119,6 +138,82 @@ class DocumentListResponse(BaseModel):
     items: list[DocumentViewResponse]
 
 
+class ConversationView(BaseModel):
+    conversation_id: str
+    review_run_id: str
+    title: str | None = None
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_record(cls, record: ConversationRecord) -> "ConversationView":
+        return cls(
+            conversation_id=record.conversation_id,
+            review_run_id=record.review_run_id,
+            title=record.title,
+            created_by=record.created_by,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+        )
+
+
+class ConversationListResponse(BaseModel):
+    items: list[ConversationView]
+
+
+class ConversationMessageListResponse(BaseModel):
+    items: list[ConversationMessageRecord]
+
+
+class CorrectionProposalView(BaseModel):
+    correction_proposal_id: str
+    review_run_id: str
+    document_id: str
+    field_name: str
+    new_value: str
+    unit: str | None = None
+    fact_id: str | None = None
+    item_id: str | None = None
+    finding_id: str | None = None
+    reason: str
+    status: CorrectionProposalStatus
+    created_by: str
+    created_at: datetime
+    decision: CorrectionProposalDecisionRecord | None = None
+    applied_review_run_id: str | None = None
+    applied_by: str | None = None
+    applied_at: datetime | None = None
+    history: list[CorrectionProposalHistoryEntry]
+
+    @classmethod
+    def from_record(cls, record: CorrectionProposalRecord) -> "CorrectionProposalView":
+        return cls(
+            correction_proposal_id=record.correction_proposal_id,
+            review_run_id=record.review_run_id,
+            document_id=record.document_id,
+            field_name=record.field_name,
+            new_value=record.new_value,
+            unit=record.unit,
+            fact_id=record.fact_id,
+            item_id=record.item_id,
+            finding_id=record.finding_id,
+            reason=record.reason,
+            status=record.status,
+            created_by=record.created_by,
+            created_at=record.created_at,
+            decision=record.decision,
+            applied_review_run_id=record.applied_review_run_id,
+            applied_by=record.applied_by,
+            applied_at=record.applied_at,
+            history=record.history,
+        )
+
+
+class CorrectionProposalListResponse(BaseModel):
+    items: list[CorrectionProposalView]
+
+
 class ReviewRunSummary(BaseModel):
     """Compact case-history projection; use the detail endpoint for facts."""
 
@@ -133,6 +228,8 @@ class ReviewRunSummary(BaseModel):
     result_digest: str
     finding_count: int = Field(ge=0)
     reviewer_decision_count: int = Field(ge=0)
+    parent_review_run_id: str | None = None
+    applied_correction_proposal_ids: list[str] = Field(default_factory=list, max_length=50)
     created_at: datetime
 
     @classmethod
@@ -149,6 +246,8 @@ class ReviewRunSummary(BaseModel):
             result_digest=run.result_digest,
             finding_count=len(run.findings),
             reviewer_decision_count=len(run.reviewer_decisions),
+            parent_review_run_id=run.parent_review_run_id,
+            applied_correction_proposal_ids=list(run.applied_correction_proposal_ids),
             created_at=run.created_at,
         )
 
@@ -244,7 +343,8 @@ def _transcript_secret_values(settings: Settings) -> tuple[str, ...]:
     values: list[str] = []
     for value in (
         settings.agent_service_token,
-        settings.dev_session_token,
+        settings.dev_reviewer_session_token,
+        settings.dev_approver_session_token,
         settings.database_url,
         settings.minio_access_key,
         settings.minio_secret_key,
@@ -301,17 +401,27 @@ def _build_local_profile_container(settings: Settings) -> Container:
         review_trace=transcript.record_backend_agent if transcript is not None else None,
     )
     if settings.environment == "local-development":
-        if settings.dev_session_token is None:
-            raise BackendConfigurationError("local development session token is unavailable")
+        reviewer_token = settings.dev_reviewer_session_token
+        approver_token = settings.dev_approver_session_token
+        if reviewer_token is None or approver_token is None:
+            raise BackendConfigurationError("local development session identities are unavailable")
         repository: WorkbenchRepository = InMemoryWorkbenchRepository()
         object_store: ObjectStore = InMemoryObjectStore()
-        principal = Principal(
-            subject=settings.dev_session_subject,
+        reviewer = Principal(
+            subject=settings.dev_reviewer_subject,
             org_id=settings.dev_session_org_id,
             roles=frozenset({Role.reviewer}),
         )
+        approver = Principal(
+            subject=settings.dev_approver_subject,
+            org_id=settings.dev_session_org_id,
+            roles=frozenset({Role.approver}),
+        )
         verifier: TokenVerifier = StaticTokenVerifier(
-            {settings.dev_session_token.get_secret_value(): principal}
+            {
+                reviewer_token.get_secret_value(): reviewer,
+                approver_token.get_secret_value(): approver,
+            }
         )
     else:
         # Keep functional-only dependencies optional for the default developer
@@ -400,6 +510,7 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         request_body: Mapping[str, Any] | None,
         response_status: int,
         response_body: Mapping[str, Any] | None,
+        review_run_id: str | None = None,
     ) -> None:
         if public_transcript is not None:
             public_transcript.record_public(
@@ -409,6 +520,7 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
                 request_body=request_body,
                 response_status=response_status,
                 response_body=response_body,
+                review_run_id=review_run_id,
             )
 
     app = FastAPI(
@@ -440,6 +552,10 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
     @app.exception_handler(ConflictError)
     async def conflict_handler(request: Request, _exc: ConflictError):
         return _error_response(409, "stale_or_conflicting_state", instance=request.url.path)
+
+    @app.exception_handler(AuthorizationError)
+    async def authorization_handler(request: Request, _exc: AuthorizationError):
+        return _error_response(403, "permission_denied", instance=request.url.path)
 
     @app.exception_handler(ValueError)
     async def value_handler(request: Request, _exc: ValueError):
@@ -533,13 +649,21 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         )
 
     @app.post("/api/v1/dev/session", response_model=DevelopmentSessionResponse)
-    def create_development_session(request: Request) -> DevelopmentSessionResponse:
+    def create_development_session(
+        request: Request,
+        body: DevelopmentSessionRequest | None = None,
+    ) -> DevelopmentSessionResponse:
         if actual_container.settings.environment != "local-development":
             raise HTTPException(status_code=404, detail="development session is unavailable")
         client = request.client
         if client is None or client.host not in {"127.0.0.1", "::1"}:
             raise HTTPException(status_code=404, detail="development session is unavailable")
-        token = actual_container.settings.dev_session_token
+        actor = "reviewer" if body is None else body.actor
+        token = (
+            actual_container.settings.dev_reviewer_session_token
+            if actor == "reviewer"
+            else actual_container.settings.dev_approver_session_token
+        )
         if token is None:
             raise HTTPException(status_code=503, detail="development session is unavailable")
         principal = actual_container.token_verifier.verify(token.get_secret_value())
@@ -562,7 +686,8 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         )
 
     writers = require_roles(Role.reviewer)
-    readers = require_roles(Role.reviewer)
+    readers = require_roles(Role.reviewer, Role.approver)
+    approvers = require_roles(Role.approver)
 
     @app.post("/api/v1/cases", response_model=CaseRecord, status_code=201)
     def create_case_endpoint(
@@ -695,6 +820,7 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
                     request_body=public_request,
                     response_status=202,
                     response_body=result.model_dump(mode="json"),
+                    review_run_id=job.review_run_id,
                 )
         return result
 
@@ -713,6 +839,7 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             request_body=None,
             response_status=200,
             response_body=result.model_dump(mode="json"),
+            review_run_id=job.review_run_id,
         )
         if public_transcript is not None and job.status == JobStatus.failed:
             public_transcript.finalize(
@@ -746,6 +873,7 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             request_body=None,
             response_status=200,
             response_body=result.model_dump(mode="json"),
+            review_run_id=review_run_id,
         )
         if public_transcript is not None:
             public_transcript.finalize(
@@ -782,7 +910,248 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             request_body=body.model_dump(mode="json"),
             response_status=200,
             response_body=result.model_dump(mode="json"),
+            review_run_id=review_run_id,
         )
+        return result
+
+    @app.post(
+        "/api/v1/review-runs/{review_run_id}/assistant/conversations",
+        response_model=ConversationView,
+        response_model_exclude_none=True,
+        status_code=201,
+    )
+    def create_assistant_conversation_endpoint(
+        review_run_id: str,
+        body: ConversationCreate,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> ConversationView:
+        record = service.create_conversation(principal, review_run_id, body)
+        result = ConversationView.from_record(record)
+        run = service.get_run(principal, review_run_id)
+        record_public_exchange(
+            case_id=run.case_id,
+            method="POST",
+            path=f"/api/v1/review-runs/{review_run_id}/assistant/conversations",
+            request_body=body.model_dump(mode="json", exclude_none=True),
+            response_status=201,
+            response_body=result.model_dump(mode="json", exclude_none=True),
+            review_run_id=review_run_id,
+        )
+        return result
+
+    @app.get(
+        "/api/v1/review-runs/{review_run_id}/assistant/conversations",
+        response_model=ConversationListResponse,
+        response_model_exclude_none=True,
+    )
+    def list_assistant_conversations_endpoint(
+        review_run_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> ConversationListResponse:
+        result = ConversationListResponse(
+            items=[
+                ConversationView.from_record(record)
+                for record in service.list_conversations(principal, review_run_id)
+            ]
+        )
+        run = service.get_run(principal, review_run_id)
+        record_public_exchange(
+            case_id=run.case_id,
+            method="GET",
+            path=f"/api/v1/review-runs/{review_run_id}/assistant/conversations",
+            request_body=None,
+            response_status=200,
+            response_body=result.model_dump(mode="json", exclude_none=True),
+            review_run_id=review_run_id,
+        )
+        return result
+
+    @app.post(
+        "/api/v1/assistant/conversations/{conversation_id}/messages",
+        response_model=ConversationMessageExchange,
+        response_model_exclude_none=True,
+    )
+    def send_assistant_message_endpoint(
+        conversation_id: str,
+        body: ConversationMessageCreate,
+        idempotency_key: IdempotencyKey,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> ConversationMessageExchange:
+        run = service.get_conversation_run(principal, conversation_id)
+        result = service.send_conversation_message(
+            principal, conversation_id, body, idempotency_key
+        )
+        record_public_exchange(
+            case_id=run.case_id,
+            method="POST",
+            path=f"/api/v1/assistant/conversations/{conversation_id}/messages",
+            request_body=body.model_dump(mode="json"),
+            response_status=200,
+            response_body=result.model_dump(mode="json", exclude_none=True),
+            review_run_id=run.review_run_id,
+        )
+        return result
+
+    @app.get(
+        "/api/v1/assistant/conversations/{conversation_id}/messages",
+        response_model=ConversationMessageListResponse,
+        response_model_exclude_none=True,
+    )
+    def list_assistant_messages_endpoint(
+        conversation_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> ConversationMessageListResponse:
+        result = ConversationMessageListResponse(
+            items=service.list_conversation_messages(principal, conversation_id)
+        )
+        run = service.get_conversation_run(principal, conversation_id)
+        record_public_exchange(
+            case_id=run.case_id,
+            method="GET",
+            path=f"/api/v1/assistant/conversations/{conversation_id}/messages",
+            request_body=None,
+            response_status=200,
+            response_body=result.model_dump(mode="json", exclude_none=True),
+            review_run_id=run.review_run_id,
+        )
+        return result
+
+    @app.post(
+        "/api/v1/review-runs/{review_run_id}/correction-proposals",
+        response_model=CorrectionProposalView,
+        response_model_exclude_none=True,
+        status_code=201,
+    )
+    def create_correction_proposal_endpoint(
+        review_run_id: str,
+        body: CorrectionProposalCreate,
+        principal: Principal = Depends(writers),
+        service: WorkbenchService = Depends(_service),
+    ) -> CorrectionProposalView:
+        result = CorrectionProposalView.from_record(
+            service.create_correction_proposal(principal, review_run_id, body)
+        )
+        run = service.get_run(principal, review_run_id)
+        record_public_exchange(
+            case_id=run.case_id,
+            method="POST",
+            path=f"/api/v1/review-runs/{review_run_id}/correction-proposals",
+            request_body=body.model_dump(mode="json", exclude_none=True),
+            response_status=201,
+            response_body=result.model_dump(mode="json", exclude_none=True),
+            review_run_id=review_run_id,
+        )
+        return result
+
+    @app.get(
+        "/api/v1/review-runs/{review_run_id}/correction-proposals",
+        response_model=CorrectionProposalListResponse,
+        response_model_exclude_none=True,
+    )
+    def list_correction_proposals_endpoint(
+        review_run_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> CorrectionProposalListResponse:
+        result = CorrectionProposalListResponse(
+            items=[
+                CorrectionProposalView.from_record(record)
+                for record in service.list_correction_proposals(principal, review_run_id)
+            ]
+        )
+        run = service.get_run(principal, review_run_id)
+        record_public_exchange(
+            case_id=run.case_id,
+            method="GET",
+            path=f"/api/v1/review-runs/{review_run_id}/correction-proposals",
+            request_body=None,
+            response_status=200,
+            response_body=result.model_dump(mode="json", exclude_none=True),
+            review_run_id=review_run_id,
+        )
+        return result
+
+    @app.put(
+        "/api/v1/correction-proposals/{correction_proposal_id}/decision",
+        response_model=CorrectionProposalView,
+        response_model_exclude_none=True,
+    )
+    def decide_correction_proposal_endpoint(
+        correction_proposal_id: str,
+        body: CorrectionProposalDecisionCreate,
+        principal: Principal = Depends(approvers),
+        service: WorkbenchService = Depends(_service),
+    ) -> CorrectionProposalView:
+        result = CorrectionProposalView.from_record(
+            service.decide_correction_proposal(principal, correction_proposal_id, body)
+        )
+        run = service.get_run(principal, result.review_run_id)
+        record_public_exchange(
+            case_id=run.case_id,
+            method="PUT",
+            path=f"/api/v1/correction-proposals/{correction_proposal_id}/decision",
+            request_body=body.model_dump(mode="json"),
+            response_status=200,
+            response_body=result.model_dump(mode="json", exclude_none=True),
+            review_run_id=run.review_run_id,
+        )
+        return result
+
+    @app.post(
+        "/api/v1/review-runs/{review_run_id}/revisions",
+        response_model=JobResponse,
+        status_code=202,
+    )
+    def create_revision_endpoint(
+        review_run_id: str,
+        body: RevisionCreate,
+        idempotency_key: IdempotencyKey,
+        principal: Principal = Depends(approvers),
+        service: WorkbenchService = Depends(_service),
+    ) -> JobResponse:
+        job, created = service.create_revision(principal, review_run_id, body, idempotency_key)
+        result = JobResponse(
+            job=JobView.model_validate(job.model_dump(mode="json")), idempotency_reused=not created
+        )
+        public_request = body.model_dump(mode="json")
+        public_path = f"/api/v1/review-runs/{review_run_id}/revisions"
+        if public_transcript is not None and created:
+            # The request belongs to the parent review, while the initial job
+            # envelope is also the first public event of the new child run.
+            # Keep both links explicit instead of routing by case identity.
+            record_public_exchange(
+                case_id=job.case_id,
+                method="POST",
+                path=public_path,
+                request_body=public_request,
+                response_status=202,
+                response_body=result.model_dump(mode="json"),
+                review_run_id=review_run_id,
+            )
+            public_transcript.bind_review(
+                case_id=job.case_id,
+                review_run_id=job.review_run_id,
+                job_id=job.job_id,
+                review_request=public_request,
+                response_status=202,
+                response_body=result.model_dump(mode="json"),
+                job_status=job.status.value,
+                public_path=public_path,
+            )
+        else:
+            record_public_exchange(
+                case_id=job.case_id,
+                method="POST",
+                path=public_path,
+                request_body=public_request,
+                response_status=202,
+                response_body=result.model_dump(mode="json"),
+                review_run_id=job.review_run_id,
+            )
         return result
 
     return app
