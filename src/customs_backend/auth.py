@@ -28,9 +28,7 @@ class OidcJwtVerifier:
             import jwt
             from jwt import PyJWKClient, PyJWKClientError
         except ImportError as exc:  # pragma: no cover - functional-UAT dependency
-            raise RuntimeError(
-                "install the functional-uat extra to use the OIDC verifier"
-            ) from exc
+            raise RuntimeError("install the functional-uat extra to use the OIDC verifier") from exc
         self._issuer = issuer
         self._audience = audience
         self._jwks_url = jwks_url

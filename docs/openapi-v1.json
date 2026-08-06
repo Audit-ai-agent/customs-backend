@@ -310,6 +310,120 @@
         "title": "ExecutionStatus",
         "type": "string"
       },
+      "FindingDecisionHistoryEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "decided_at": {
+            "format": "date-time",
+            "title": "Decided At",
+            "type": "string"
+          },
+          "decided_by": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Decided By",
+            "type": "string"
+          },
+          "reason": {
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/FindingDecisionStatus"
+          }
+        },
+        "required": [
+          "status",
+          "reason",
+          "decided_by",
+          "decided_at"
+        ],
+        "title": "FindingDecisionHistoryEntry",
+        "type": "object"
+      },
+      "FindingDecisionRecord": {
+        "additionalProperties": false,
+        "description": "Current finding decision plus every prior reviewer decision.",
+        "properties": {
+          "decided_at": {
+            "format": "date-time",
+            "title": "Decided At",
+            "type": "string"
+          },
+          "decided_by": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Decided By",
+            "type": "string"
+          },
+          "finding_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Finding Id",
+            "type": "string"
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/FindingDecisionHistoryEntry"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "History",
+            "type": "array"
+          },
+          "reason": {
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/FindingDecisionStatus"
+          }
+        },
+        "required": [
+          "finding_id",
+          "status",
+          "reason",
+          "decided_by",
+          "decided_at",
+          "history"
+        ],
+        "title": "FindingDecisionRecord",
+        "type": "object"
+      },
+      "FindingDecisionRequest": {
+        "additionalProperties": false,
+        "description": "A reviewer-owned decision which never changes the Agent result.",
+        "properties": {
+          "reason": {
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/FindingDecisionStatus"
+          }
+        },
+        "required": [
+          "status",
+          "reason"
+        ],
+        "title": "FindingDecisionRequest",
+        "type": "object"
+      },
+      "FindingDecisionStatus": {
+        "enum": [
+          "confirmed",
+          "needs_information",
+          "resolved"
+        ],
+        "title": "FindingDecisionStatus",
+        "type": "string"
+      },
       "InputDocumentManifestEntry": {
         "additionalProperties": false,
         "properties": {
@@ -508,6 +622,40 @@
           "media_type": {
             "title": "Media Type",
             "type": "string"
+          },
+          "replaces_document_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Replaces Document Id"
+          },
+          "superseded_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Superseded At"
+          },
+          "superseded_by_document_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Superseded By Document Id"
           }
         },
         "required": [
@@ -533,6 +681,14 @@
             "minLength": 1,
             "title": "Action Code",
             "type": "string"
+          },
+          "finding_ids": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 2000,
+            "title": "Finding Ids",
+            "type": "array"
           },
           "message": {
             "maxLength": 4000,
@@ -589,7 +745,7 @@
         "properties": {
           "items": {
             "items": {
-              "$ref": "#/components/schemas/ReviewRunRecord"
+              "$ref": "#/components/schemas/ReviewRunSummary"
             },
             "title": "Items",
             "type": "array"
@@ -604,9 +760,47 @@
       "ReviewRunRecord": {
         "additionalProperties": false,
         "properties": {
+          "agent_engine": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Engine"
+          },
           "agent_input_manifest_sha256": {
             "pattern": "^[a-f0-9]{64}$",
             "title": "Agent Input Manifest Sha256",
+            "type": "string"
+          },
+          "agent_jurisdiction": {
+            "const": "KR",
+            "default": "KR",
+            "title": "Agent Jurisdiction",
+            "type": "string"
+          },
+          "agent_requires_human_review": {
+            "const": true,
+            "default": true,
+            "title": "Agent Requires Human Review",
+            "type": "boolean"
+          },
+          "agent_schema_version": {
+            "default": "3.0",
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Agent Schema Version",
+            "type": "string"
+          },
+          "agent_status": {
+            "default": "needs_review",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Agent Status",
             "type": "string"
           },
           "assessment": {
@@ -625,6 +819,14 @@
             "title": "Case Revision",
             "type": "integer"
           },
+          "comparisons": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Comparisons",
+            "type": "array"
+          },
           "completion_eligibility": {
             "$ref": "#/components/schemas/CompletionEligibility"
           },
@@ -636,6 +838,14 @@
           "created_by": {
             "title": "Created By",
             "type": "string"
+          },
+          "document_analyses": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Document Analyses",
+            "type": "array"
           },
           "evidence": {
             "items": {
@@ -718,6 +928,13 @@
             "title": "Review Run Id",
             "type": "string"
           },
+          "reviewer_decisions": {
+            "items": {
+              "$ref": "#/components/schemas/FindingDecisionRecord"
+            },
+            "title": "Reviewer Decisions",
+            "type": "array"
+          },
           "trade_type": {
             "enum": [
               "import",
@@ -725,6 +942,11 @@
             ],
             "title": "Trade Type",
             "type": "string"
+          },
+          "workflow": {
+            "additionalProperties": true,
+            "title": "Workflow",
+            "type": "object"
           }
         },
         "required": [
@@ -751,6 +973,83 @@
           "created_at"
         ],
         "title": "ReviewRunRecord",
+        "type": "object"
+      },
+      "ReviewRunSummary": {
+        "description": "Compact case-history projection; use the detail endpoint for facts.",
+        "properties": {
+          "assessment": {
+            "title": "Assessment",
+            "type": "string"
+          },
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "execution_status": {
+            "title": "Execution Status",
+            "type": "string"
+          },
+          "finding_count": {
+            "minimum": 0.0,
+            "title": "Finding Count",
+            "type": "integer"
+          },
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          },
+          "result_digest": {
+            "title": "Result Digest",
+            "type": "string"
+          },
+          "review_as_of": {
+            "format": "date",
+            "title": "Review As Of",
+            "type": "string"
+          },
+          "review_disposition": {
+            "title": "Review Disposition",
+            "type": "string"
+          },
+          "review_run_id": {
+            "title": "Review Run Id",
+            "type": "string"
+          },
+          "reviewer_decision_count": {
+            "minimum": 0.0,
+            "title": "Reviewer Decision Count",
+            "type": "integer"
+          },
+          "trade_type": {
+            "enum": [
+              "import",
+              "export"
+            ],
+            "title": "Trade Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "review_run_id",
+          "case_id",
+          "job_id",
+          "review_as_of",
+          "trade_type",
+          "execution_status",
+          "assessment",
+          "review_disposition",
+          "result_digest",
+          "finding_count",
+          "reviewer_decision_count",
+          "created_at"
+        ],
+        "title": "ReviewRunSummary",
         "type": "object"
       },
       "Role": {
@@ -817,6 +1116,20 @@
             "default": "text/plain",
             "title": "Media Type",
             "type": "string"
+          },
+          "replaces_document_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Replaces Document Id"
           }
         },
         "required": [
@@ -2201,6 +2514,139 @@
           }
         ],
         "summary": "Get Run Endpoint"
+      }
+    },
+    "/api/v1/review-runs/{review_run_id}/findings/{finding_id}/decision": {
+      "put": {
+        "operationId": "record_finding_decision_endpoint_api_v1_review_runs__review_run_id__findings__finding_id__decision_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "review_run_id",
+            "required": true,
+            "schema": {
+              "title": "Review Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "finding_id",
+            "required": true,
+            "schema": {
+              "title": "Finding Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FindingDecisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FindingDecisionRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Record Finding Decision Endpoint"
       }
     },
     "/api/v1/session": {

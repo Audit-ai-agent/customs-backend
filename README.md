@@ -34,6 +34,9 @@ uv run --no-sync customs-backend-profile-init --profile dev-fixture
 uv run --no-sync customs-backend-api
 ```
 
+Backend의 표준 loopback 주소는 `http://127.0.0.1:18081`이다. Windows에서 자주
+예약되는 80xx 범위를 피한 값이며, Frontend의 기본 proxy도 같은 주소를 사용한다.
+
 `backend.env`는 아래 두 Agent 연결 값을 같은 무작위 값으로 생성한다. loader의
 `backend` 범위는 `CUSTOMS_BACKEND_*`만 주입한다. Agent는 자체
 `Import-AgentProfile.ps1`로 아래 Agent 두 값과 Data Evidence token만 좁게 읽는다.
@@ -75,7 +78,7 @@ uv run --locked --no-sync --group dev python tools/run_dev_fixture_scenarios.py 
   --base-url http://127.0.0.1:5173/api/v1
 ```
 
-이 실행기는 Frontend Vite proxy를 통해 다섯 현재 지원 시나리오를 실행하고, 각
+이 실행기는 Frontend Vite proxy를 통해 여섯 현재 지원 시나리오를 실행하고, 각
 `_local/state/scenario-runs/<review-run-id>/`에 아래를 남긴다.
 
 - `scenario.json`: 합성 문서 원문·실제 review 요청

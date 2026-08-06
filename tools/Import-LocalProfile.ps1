@@ -79,4 +79,24 @@ if ($imported -eq 0) {
     throw 'Local profile contains no usable settings.'
 }
 
+# Existing ignored profiles may have been created before the Agent loopback
+# port moved out of the Windows-reserved 80xx range.  Preserve their tokens
+# and all other values, but use the current local topology at process start.
+if (
+    $Scope -eq 'backend' -and
+    $env:CUSTOMS_BACKEND_AGENT_BASE_URL -ceq 'http://127.0.0.1:8090'
+) {
+    $env:CUSTOMS_BACKEND_AGENT_BASE_URL = 'http://127.0.0.1:18090'
+}
+
+# Existing ignored profiles may likewise contain the prior Backend default in
+# the Windows-reserved 80xx range.  This narrow compatibility mapping keeps
+# locally generated secrets intact without accepting a non-loopback URL.
+if (
+    $Scope -eq 'backend' -and
+    $env:CUSTOMS_BACKEND_PUBLIC_BASE_URL -ceq 'http://127.0.0.1:8080'
+) {
+    $env:CUSTOMS_BACKEND_PUBLIC_BASE_URL = 'http://127.0.0.1:18081'
+}
+
 Write-Host "Imported local $Profile $Scope profile values."

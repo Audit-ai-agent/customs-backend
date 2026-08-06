@@ -5,7 +5,14 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from customs_backend.domain import CaseRecord, DocumentRecord, JobRecord, ReviewRunRecord
+from customs_backend.domain import (
+    CaseRecord,
+    DocumentRecord,
+    FindingDecisionRecord,
+    FindingDecisionStatus,
+    JobRecord,
+    ReviewRunRecord,
+)
 from customs_backend.repository import InMemoryWorkbenchRepository
 
 
@@ -48,7 +55,9 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
 
     def _restore(self) -> None:
         with self._connect() as connection, connection.cursor() as cursor:
-            cursor.execute("SELECT state_json FROM functional_uat.backend_state WHERE singleton = true")
+            cursor.execute(
+                "SELECT state_json FROM functional_uat.backend_state WHERE singleton = true"
+            )
             row = cursor.fetchone()
         if row is None:
             raise RuntimeError("functional Backend state row is missing")
@@ -141,5 +150,26 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
 
     def complete_review(self, job: JobRecord, run: ReviewRunRecord) -> ReviewRunRecord:
         value = super().complete_review(job, run)
+        self._persist()
+        return value
+
+    def record_finding_decision(
+        self,
+        *,
+        org_id: str,
+        review_run_id: str,
+        finding_id: str,
+        status: FindingDecisionStatus,
+        reason: str,
+        decided_by: str,
+    ) -> FindingDecisionRecord:
+        value = super().record_finding_decision(
+            org_id=org_id,
+            review_run_id=review_run_id,
+            finding_id=finding_id,
+            status=status,
+            reason=reason,
+            decided_by=decided_by,
+        )
         self._persist()
         return value

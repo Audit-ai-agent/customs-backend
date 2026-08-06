@@ -22,7 +22,7 @@ from customs_backend.service import WorkbenchService
 from customs_backend.settings import Settings
 
 
-def _client() -> TestClient:
+def _client(*, include_finding: bool = False) -> TestClient:
     settings = Settings(_env_file=None, environment="test")
     principal = Principal(
         subject="reviewer-1",
@@ -31,7 +31,9 @@ def _client() -> TestClient:
     )
     repository = InMemoryWorkbenchRepository()
     objects = InMemoryObjectStore()
-    agent = CallableAgentClient(build_agent_v3_result)
+    agent = CallableAgentClient(
+        lambda request: build_agent_v3_result(request, include_finding=include_finding)
+    )
     service = WorkbenchService(
         repository=repository,
         object_store=objects,
@@ -60,8 +62,8 @@ def _functional_settings() -> Settings:
     return Settings(
         _env_file=None,
         environment="functional-uat",
-        public_base_url="http://127.0.0.1:8080",
-        agent_base_url="http://127.0.0.1:8090",
+        public_base_url="http://127.0.0.1:18081",
+        agent_base_url="http://127.0.0.1:18090",
         agent_service_token="a" * 32,
         database_url="postgresql://customs:local@127.0.0.1/customs",
         minio_endpoint="127.0.0.1:19000",
@@ -122,10 +124,174 @@ def test_v1_case_document_review_flow_always_needs_human_review() -> None:
         assert runs.status_code == 200, runs.text
         assert len(runs.json()["items"]) == 1
         run = runs.json()["items"][0]
+        assert set(run) == {
+            "review_run_id",
+            "case_id",
+            "job_id",
+            "review_as_of",
+            "trade_type",
+            "execution_status",
+            "assessment",
+            "review_disposition",
+            "result_digest",
+            "finding_count",
+            "reviewer_decision_count",
+            "created_at",
+        }
         assert run["review_disposition"] == "human_review_required"
-        assert run["assurance_level"] == "diagnostic"
-        assert run["completion_eligibility"]["eligible"] is False
-        assert "human_review_required" in run["completion_eligibility"]["unmet_reason_codes"]
+        detail = client.get(f"/api/v1/review-runs/{run['review_run_id']}", headers=_auth())
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["assurance_level"] == "diagnostic"
+        assert detail.json()["completion_eligibility"]["eligible"] is False
+        assert (
+            "human_review_required" in detail.json()["completion_eligibility"]["unmet_reason_codes"]
+        )
+        assert detail.json()["agent_schema_version"] == "3.1"
+        assert detail.json()["agent_jurisdiction"] == "KR"
+        assert detail.json()["agent_requires_human_review"] is True
+        assert detail.json()["workflow"]["status"] == "completed"
+        assert detail.json()["document_analyses"]
+
+
+def test_document_replacement_preserves_old_run_and_excludes_superseded_input() -> None:
+    with _client() as client:
+        case = client.post("/api/v1/cases", json={"title": "Replacement"}, headers=_auth())
+        case_id = case.json()["case_id"]
+        original = client.post(
+            f"/api/v1/cases/{case_id}/documents",
+            json={
+                "document_type": "CI",
+                "filename": "invoice-v1.txt",
+                "content_text": "Commercial invoice version one",
+            },
+            headers=_auth(),
+        )
+        assert original.status_code == 201, original.text
+        original_id = original.json()["record"]["document_id"]
+        first = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={},
+            headers={**_auth(), "Idempotency-Key": "replacement-first-001"},
+        )
+        assert first.status_code == 202
+        first_run_id = first.json()["job"]["review_run_id"]
+
+        rejected = client.post(
+            f"/api/v1/cases/{case_id}/documents",
+            json={
+                "document_type": "PL",
+                "filename": "packing.txt",
+                "content_text": "Packing list",
+                "replaces_document_id": original_id,
+            },
+            headers=_auth(),
+        )
+        assert rejected.status_code == 409
+
+        replacement = client.post(
+            f"/api/v1/cases/{case_id}/documents",
+            json={
+                "document_type": "CI",
+                "filename": "invoice-v2.txt",
+                "content_text": "Commercial invoice corrected version two",
+                "replaces_document_id": original_id,
+            },
+            headers=_auth(),
+        )
+        assert replacement.status_code == 201, replacement.text
+        replacement_id = replacement.json()["record"]["document_id"]
+
+        documents = client.get(f"/api/v1/cases/{case_id}/documents", headers=_auth())
+        assert documents.status_code == 200
+        listed = {
+            item["record"]["document_id"]: item["record"] for item in documents.json()["items"]
+        }
+        assert listed[original_id]["superseded_by_document_id"] == replacement_id
+        assert listed[replacement_id]["replaces_document_id"] == original_id
+
+        second = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={},
+            headers={**_auth(), "Idempotency-Key": "test-key"},
+        )
+        assert second.status_code == 202
+        second_run_id = second.json()["job"]["review_run_id"]
+        first_detail = client.get(f"/api/v1/review-runs/{first_run_id}", headers=_auth()).json()
+        second_detail = client.get(f"/api/v1/review-runs/{second_run_id}", headers=_auth()).json()
+        assert [item["document_id"] for item in first_detail["input_document_manifest"]] == [
+            original_id
+        ]
+        assert [item["document_id"] for item in second_detail["input_document_manifest"]] == [
+            replacement_id
+        ]
+
+
+def test_reviewer_decisions_are_append_only_and_do_not_change_agent_result_digest() -> None:
+    with _client(include_finding=True) as client:
+        case = client.post("/api/v1/cases", json={"title": "Decision"}, headers=_auth())
+        case_id = case.json()["case_id"]
+        document = client.post(
+            f"/api/v1/cases/{case_id}/documents",
+            json={
+                "document_type": "CI",
+                "filename": "invoice.txt",
+                "content_text": "Commercial invoice INV-001",
+            },
+            headers=_auth(),
+        )
+        assert document.status_code == 201
+        review = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={},
+            headers={**_auth(), "Idempotency-Key": "decision-review-001"},
+        )
+        assert review.status_code == 202
+        run_id = review.json()["job"]["review_run_id"]
+        before = client.get(f"/api/v1/review-runs/{run_id}", headers=_auth()).json()
+        digest = before["result_digest"]
+
+        first = client.put(
+            f"/api/v1/review-runs/{run_id}/findings/finding_fixture_quantity/decision",
+            json={"status": "confirmed", "reason": "Invoice quantity was verified."},
+            headers=_auth(),
+        )
+        assert first.status_code == 200, first.text
+        assert first.json()["status"] == "confirmed"
+        assert first.json()["decided_by"] == "reviewer-1"
+        assert len(first.json()["history"]) == 1
+
+        second = client.put(
+            f"/api/v1/review-runs/{run_id}/findings/finding_fixture_quantity/decision",
+            json={"status": "resolved", "reason": "Corrected invoice was attached."},
+            headers=_auth(),
+        )
+        assert second.status_code == 200, second.text
+        assert second.json()["status"] == "resolved"
+        assert len(second.json()["history"]) == 2
+
+        after = client.get(f"/api/v1/review-runs/{run_id}", headers=_auth()).json()
+        assert after["result_digest"] == digest
+        assert after["completion_eligibility"]["eligible"] is False
+        assert after["reviewer_decisions"][0]["status"] == "resolved"
+        assert len(after["reviewer_decisions"][0]["history"]) == 2
+        summary = client.get(f"/api/v1/cases/{case_id}/review-runs", headers=_auth()).json()[
+            "items"
+        ][0]
+        assert summary["finding_count"] == 1
+        assert summary["reviewer_decision_count"] == 1
+
+        blank = client.put(
+            f"/api/v1/review-runs/{run_id}/findings/finding_fixture_quantity/decision",
+            json={"status": "resolved", "reason": "   "},
+            headers=_auth(),
+        )
+        assert blank.status_code == 422
+        missing = client.put(
+            f"/api/v1/review-runs/{run_id}/findings/unknown/decision",
+            json={"status": "resolved", "reason": "No matching finding."},
+            headers=_auth(),
+        )
+        assert missing.status_code == 404
 
 
 def test_only_v1_browser_paths_are_public() -> None:

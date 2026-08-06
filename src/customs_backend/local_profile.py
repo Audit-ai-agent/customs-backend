@@ -49,8 +49,8 @@ def _dev_fixture() -> list[tuple[str, str]]:
     agent_service_token = _random_secret()
     return [
         ("CUSTOMS_BACKEND_ENVIRONMENT", "local-development"),
-        ("CUSTOMS_BACKEND_PUBLIC_BASE_URL", "http://127.0.0.1:8080"),
-        ("CUSTOMS_BACKEND_AGENT_BASE_URL", "http://127.0.0.1:8090"),
+        ("CUSTOMS_BACKEND_PUBLIC_BASE_URL", "http://127.0.0.1:18081"),
+        ("CUSTOMS_BACKEND_AGENT_BASE_URL", "http://127.0.0.1:18090"),
         ("CUSTOMS_BACKEND_AGENT_SERVICE_TOKEN", agent_service_token),
         ("CUSTOMS_AGENT_SERVICE_BEARER_TOKEN", agent_service_token),
         ("CUSTOMS_AGENT_SERVICE_MODE", "local-development"),
@@ -58,9 +58,7 @@ def _dev_fixture() -> list[tuple[str, str]]:
     ]
 
 
-def _functional_uat(
-    *, realm_path: Path
-) -> tuple[list[tuple[str, str]], dict[str, object]]:
+def _functional_uat(*, realm_path: Path) -> tuple[list[tuple[str, str]], dict[str, object]]:
     database_password = _random_secret()
     minio_user = "customs-functional-" + secrets.token_hex(6)
     minio_password = _random_secret()
@@ -70,8 +68,8 @@ def _functional_uat(
     agent_service_token = _random_secret()
     values = [
         ("CUSTOMS_BACKEND_ENVIRONMENT", "functional-uat"),
-        ("CUSTOMS_BACKEND_PUBLIC_BASE_URL", "http://127.0.0.1:8080"),
-        ("CUSTOMS_BACKEND_AGENT_BASE_URL", "http://127.0.0.1:8090"),
+        ("CUSTOMS_BACKEND_PUBLIC_BASE_URL", "http://127.0.0.1:18081"),
+        ("CUSTOMS_BACKEND_AGENT_BASE_URL", "http://127.0.0.1:18090"),
         ("CUSTOMS_BACKEND_AGENT_SERVICE_TOKEN", agent_service_token),
         ("CUSTOMS_AGENT_SERVICE_BEARER_TOKEN", agent_service_token),
         ("CUSTOMS_AGENT_SERVICE_MODE", "functional-uat"),

@@ -6,7 +6,7 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -22,6 +22,8 @@ from customs_backend.auth import StaticTokenVerifier, principal_dependency, requ
 from customs_backend.domain import (
     CaseCreate,
     CaseRecord,
+    FindingDecisionRecord,
+    FindingDecisionRequest,
     JobStatus,
     Principal,
     ReviewEnqueueRequest,
@@ -101,6 +103,9 @@ class DocumentViewResponse(BaseModel):
         character_count: int
         created_by: str
         created_at: datetime
+        replaces_document_id: str | None = None
+        superseded_by_document_id: str | None = None
+        superseded_at: datetime | None = None
 
     record: PublicDocumentRecord
     content_text: str | None = None
@@ -114,8 +119,42 @@ class DocumentListResponse(BaseModel):
     items: list[DocumentViewResponse]
 
 
+class ReviewRunSummary(BaseModel):
+    """Compact case-history projection; use the detail endpoint for facts."""
+
+    review_run_id: str
+    case_id: str
+    job_id: str
+    review_as_of: date
+    trade_type: Literal["import", "export"]
+    execution_status: str
+    assessment: str
+    review_disposition: str
+    result_digest: str
+    finding_count: int = Field(ge=0)
+    reviewer_decision_count: int = Field(ge=0)
+    created_at: datetime
+
+    @classmethod
+    def from_run(cls, run: ReviewRunRecord) -> "ReviewRunSummary":
+        return cls(
+            review_run_id=run.review_run_id,
+            case_id=run.case_id,
+            job_id=run.job_id,
+            review_as_of=run.review_as_of,
+            trade_type=run.trade_type,
+            execution_status=run.execution_status.value,
+            assessment=run.assessment.value,
+            review_disposition=run.review_disposition.value,
+            result_digest=run.result_digest,
+            finding_count=len(run.findings),
+            reviewer_decision_count=len(run.reviewer_decisions),
+            created_at=run.created_at,
+        )
+
+
 class ReviewRunListResponse(BaseModel):
-    items: list[ReviewRunRecord]
+    items: list[ReviewRunSummary]
 
 
 class JobView(BaseModel):
@@ -689,7 +728,9 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         principal: Principal = Depends(readers),
         service: WorkbenchService = Depends(_service),
     ) -> ReviewRunListResponse:
-        return ReviewRunListResponse(items=service.list_runs(principal, case_id))
+        return ReviewRunListResponse(
+            items=[ReviewRunSummary.from_run(run) for run in service.list_runs(principal, case_id)]
+        )
 
     @app.get("/api/v1/review-runs/{review_run_id}", response_model=ReviewRunRecord)
     def get_run_endpoint(
@@ -719,6 +760,29 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
                     == "human_review_required",
                 },
             )
+        return result
+
+    @app.put(
+        "/api/v1/review-runs/{review_run_id}/findings/{finding_id}/decision",
+        response_model=FindingDecisionRecord,
+    )
+    def record_finding_decision_endpoint(
+        review_run_id: str,
+        finding_id: str,
+        body: FindingDecisionRequest,
+        principal: Principal = Depends(writers),
+        service: WorkbenchService = Depends(_service),
+    ) -> FindingDecisionRecord:
+        result = service.record_finding_decision(principal, review_run_id, finding_id, body)
+        run = service.get_run(principal, review_run_id)
+        record_public_exchange(
+            case_id=run.case_id,
+            method="PUT",
+            path=(f"/api/v1/review-runs/{review_run_id}/findings/{finding_id}/decision"),
+            request_body=body.model_dump(mode="json"),
+            response_status=200,
+            response_body=result.model_dump(mode="json"),
+        )
         return result
 
     return app

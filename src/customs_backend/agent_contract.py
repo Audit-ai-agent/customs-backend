@@ -1,4 +1,4 @@
-"""Backend consumer validation for the packaged Agent V3 schemas."""
+"""Backend consumer validation for the packaged Agent V3/V3.1 schemas."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ class BackendConfigurationError(RuntimeError):
 
 
 class AgentContractPayloadError(ValueError):
-    """A request or response does not match the Agent V3 schema."""
+    """A request or response does not match the packaged Agent schema."""
 
 
 AgentContractKind = Literal["review_request", "review_result"]
@@ -58,12 +58,12 @@ def load_agent_contract_schema(kind: AgentContractKind) -> dict[str, Any]:
     try:
         raw = resources.files("customs_backend").joinpath(*_SCHEMA_PATHS[kind]).read_bytes()
     except OSError as exc:
-        raise BackendConfigurationError("Agent V3 schema is missing") from exc
+        raise BackendConfigurationError("Agent V3 contract schema is missing") from exc
     schema = _strict_json_object(raw, label=f"Agent V3 {kind} schema")
     try:
         Draft202012Validator.check_schema(schema)
     except SchemaError as exc:
-        raise BackendConfigurationError("Agent V3 schema is invalid") from exc
+        raise BackendConfigurationError("Agent V3 contract schema is invalid") from exc
     return schema
 
 
@@ -78,4 +78,6 @@ def validate_agent_v3_payload(kind: AgentContractKind, payload: object) -> None:
             load_agent_contract_schema(kind), format_checker=FormatChecker()
         ).validate(payload)
     except ValidationError:
-        raise AgentContractPayloadError(f"Agent V3 {kind} does not satisfy the packaged schema") from None
+        raise AgentContractPayloadError(
+            f"Agent V3 {kind} does not satisfy the packaged schema"
+        ) from None

@@ -15,6 +15,9 @@ def main() -> None:
     uvicorn.run(
         "customs_backend.main:app",
         host="127.0.0.1",
-        port=8080,
+        # Windows commonly reserves portions of the 80xx range.  Keep the
+        # supported loopback topology outside that range so a fresh clone can
+        # start without reclaiming a machine-level port reservation.
+        port=18081,
         reload=False,
     )
