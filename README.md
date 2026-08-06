@@ -212,6 +212,25 @@ uv run --no-sync python tools/verify_scenario_transcript.py --run-id <review-run
 상세 transcript는 Git, `_artifacts`, PR, 채팅, 공유 ZIP에 넣지 않는다. 현재 UAT의
 간단한 실행 요약 manifest만 별도의 `_artifacts/functional-uat/`에 둘 수 있다.
 
+### Browser E2E
+
+실제 Browser 화면까지 확인할 때는 네 제품 checkout이 모두 clean `main`이고 Data·Agent·Backend·Frontend가 이미
+loopback Functional-UAT로 준비된 상태에서 Backend의 로컬 wrapper만 실행한다.
+
+```powershell
+uv run --no-sync python tools/run_functional_uat_browser_e2e.py
+```
+
+이 명령은 `_local/profiles/functional-uat/backend.env`에서 reviewer·approver 로그인 정보만 메모리로 읽어
+Frontend의 Edge Playwright 여정을 호출한다. 비밀번호·token·Cookie·문서 본문·Claude 출력은 콘솔이나 Git에
+출력하지 않는다. 결과는 `_local/state/e2e-runs/<id>/receipt.json`의 안전한 요약과 기존
+`_local/state/scenario-runs/` transcript 검증으로만 남는다.
+
+Browser E2E는 Case 생성, 텍스트 문서 등록, 심사·근거·인용·대화, finding 판단·수정 제안, 독립 approver의
+승인, child Run, 문서 대체와 재심사 이력을 확인한다. 이는 실제 기능 연결 확인일 뿐 법률·업무 판단의 정답성이나
+Production 승인 검증은 아니다. 실패하면 서비스·Docker·law store를 시작·중지·초기화하거나 비밀을 출력하지 않고
+중단한다.
+
 ## 검사
 
 ```powershell
