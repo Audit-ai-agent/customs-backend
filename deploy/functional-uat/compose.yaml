@@ -51,7 +51,11 @@ services:
         target: /opt/keycloak/data/import/customs-realm.json
         read_only: true
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/health/ready"]
+      test:
+        [
+          "CMD-SHELL",
+          "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/9000; printf \"GET /health/ready HTTP/1.0\\r\\n\\r\\n\" >&3; IFS= read -r line <&3; [[ \"$${line}\" == *\" 200 \"* ]]'",
+        ]
       interval: 5s
       timeout: 3s
       retries: 30
