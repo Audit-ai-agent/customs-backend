@@ -144,6 +144,126 @@ def test_complete_functional_run_is_verified_without_echoing_bodies(tmp_path: Pa
     assert isinstance(summary.get("last_recorded_at"), str)
 
 
+def _write_failure_before_data_receipt(
+    tmp_path: Path, *, include_failure_event: bool = True
+) -> Path:
+    root_path = _root(tmp_path)
+    root = ScenarioTranscriptRoot.create(root_path)
+    run = root.open_or_create_run("run-before-data")
+    run.write_json(
+        "scenario.json",
+        {
+            "schema_version": "scenario-transcript/v1",
+            "profile": "functional-uat",
+            "review_run_id": "run-before-data",
+            "job_id": "job-before-data",
+        },
+    )
+    run.write_json(
+        "summary.json",
+        {
+            "schema_version": "scenario-transcript/v1",
+            "profile": "functional-uat",
+            "review_run_id": "run-before-data",
+            "status": "failed",
+            "job_id": "job-before-data",
+            "job_status": "failed",
+        },
+    )
+    record = {
+        "schema_version": "scenario-transcript/v1",
+        "event": "http_exchange",
+        "payload": {"status": "recorded"},
+    }
+    (run.directory / "public-api.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+    backend_events = [
+        {
+            "schema_version": "scenario-transcript/v1",
+            "event": "review_request",
+            "payload": {"status": "recorded"},
+        }
+    ]
+    if include_failure_event:
+        backend_events.append(
+            {
+                "schema_version": "scenario-transcript/v1",
+                "event": "review_failure",
+                "payload": {"error_code": "safe_failure"},
+            }
+        )
+    (run.directory / "backend-agent.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in backend_events), encoding="utf-8"
+    )
+    (run.directory / "claude.jsonl").write_text(
+        json.dumps(
+            {
+                "schema_version": "scenario-transcript/v1",
+                "event": "request_failed",
+                "payload": {"error_code": "safe_failure"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return root_path
+
+
+def test_verifier_allows_a_proven_early_agent_failure_without_data_stream(tmp_path: Path) -> None:
+    root_path = _write_failure_before_data_receipt(tmp_path)
+
+    assert verify_run(root_path, "run-before-data") == {
+        "review_run_id": "run-before-data",
+        "profile": "functional-uat",
+        "status": "failed",
+        "streams": {
+            "public-api.jsonl": 1,
+            "backend-agent.jsonl": 2,
+            "claude.jsonl": 1,
+        },
+    }
+
+
+def test_verifier_rejects_an_early_failure_without_backend_failure_event(tmp_path: Path) -> None:
+    root_path = _write_failure_before_data_receipt(tmp_path, include_failure_event=False)
+
+    with pytest.raises(ScenarioTranscriptError, match="failed_receipt_invalid"):
+        verify_run(root_path, "run-before-data")
+
+
+def test_verifier_keeps_completed_runs_strict_when_data_stream_is_missing(tmp_path: Path) -> None:
+    root = ScenarioTranscriptRoot.create(_root(tmp_path))
+    run = root.open_or_create_run("run-completed-without-data")
+    run.write_json(
+        "scenario.json",
+        {
+            "schema_version": "scenario-transcript/v1",
+            "profile": "functional-uat",
+            "review_run_id": "run-completed-without-data",
+        },
+    )
+    run.write_json(
+        "summary.json",
+        {
+            "schema_version": "scenario-transcript/v1",
+            "profile": "functional-uat",
+            "review_run_id": "run-completed-without-data",
+            "status": "completed",
+        },
+    )
+    record = json.dumps(
+        {
+            "schema_version": "scenario-transcript/v1",
+            "event": "recorded",
+            "payload": {"status": "recorded"},
+        }
+    )
+    for stream in ("public-api", "backend-agent", "claude"):
+        (run.directory / f"{stream}.jsonl").write_text(record + "\n", encoding="utf-8")
+
+    with pytest.raises(ScenarioTranscriptError, match="required_stream_missing:agent-data.jsonl"):
+        verify_run(_root(tmp_path), "run-completed-without-data")
+
+
 def test_revision_bind_records_its_actual_public_path(tmp_path: Path) -> None:
     controller = FunctionalTranscriptController(root=ScenarioTranscriptRoot.create(_root(tmp_path)))
     controller.bind_review(
