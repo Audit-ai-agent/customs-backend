@@ -264,6 +264,9 @@ def test_functional_profile_uses_oidc_code_flow_and_two_local_roles(tmp_path) ->
     assert environment["CUSTOMS_AGENT_SERVICE_MODE"] == "functional-uat"
     assert realm["roles"] == {"realm": [{"name": "reviewer"}, {"name": "approver"}]}
     assert [user["realmRoles"] for user in realm["users"]] == [["reviewer"], ["approver"]]
+    assert [user["firstName"] for user in realm["users"]] == ["Functional", "Functional"]
+    assert [user["lastName"] for user in realm["users"]] == ["Reviewer", "Approver"]
+    assert all(user["emailVerified"] is True for user in realm["users"])
     client = realm["clients"][0]
     assert client["standardFlowEnabled"] is True
     assert client["directAccessGrantsEnabled"] is False
