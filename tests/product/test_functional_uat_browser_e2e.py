@@ -44,6 +44,11 @@ def test_receipt_accepts_only_the_safe_browser_summary_shape(tmp_path: Path) -> 
     assert receipt.review_run_ids == RUN_IDS
 
 
+def test_corepack_command_is_executable_on_windows_and_posix() -> None:
+    assert browser_e2e._corepack_command("nt") == "corepack.cmd"
+    assert browser_e2e._corepack_command("posix") == "corepack"
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -193,7 +198,12 @@ def test_run_invokes_frontend_without_forwarding_output_or_unrelated_secret(
         "checks_verified": 16,
         "transcripts_verified": 3,
     }
-    assert observed["arguments"] == ("corepack", "npm", "run", "functional-uat:browser")
+    assert observed["arguments"] == (
+        browser_e2e._corepack_command(),
+        "npm",
+        "run",
+        "functional-uat:browser",
+    )
     kwargs = observed["kwargs"]
     assert kwargs["stdout"] is subprocess.DEVNULL
     assert kwargs["stderr"] is subprocess.DEVNULL
