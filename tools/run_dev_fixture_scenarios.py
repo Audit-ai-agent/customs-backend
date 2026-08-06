@@ -236,6 +236,7 @@ class PublicApiScenarioClient:
         *,
         body: Mapping[str, Any] | None = None,
         idempotency_key: str | None = None,
+        access_token: str | None = None,
         authenticate: bool = True,
         record: bool = True,
     ) -> dict[str, Any]:
@@ -243,9 +244,10 @@ class PublicApiScenarioClient:
         if body is not None:
             headers["Content-Type"] = "application/json"
         if authenticate:
-            if self._access_token is None:
+            active_token = access_token or self._access_token
+            if active_token is None:
                 raise ScenarioExecutionError("development session access token is unavailable")
-            headers["Authorization"] = f"Bearer {self._access_token}"
+            headers["Authorization"] = f"Bearer {active_token}"
         if idempotency_key is not None:
             headers["Idempotency-Key"] = idempotency_key
         try:
@@ -267,14 +269,26 @@ class PublicApiScenarioClient:
             raise ScenarioExecutionError(f"{method} {path} returned HTTP {response.status_code}")
         return response_body
 
-    def begin_development_session(self) -> None:
+    def begin_development_session(
+        self, *, actor: str = "reviewer", set_default: bool = True
+    ) -> str:
         # A transcript never retains authentication/session endpoints, even
         # after its token field has been redacted.
-        response = self.request("POST", "/dev/session", authenticate=False, record=False)
+        if actor not in {"reviewer", "approver"}:
+            raise ScenarioExecutionError("development session actor is invalid")
+        response = self.request(
+            "POST",
+            "/dev/session",
+            body={"actor": actor},
+            authenticate=False,
+            record=False,
+        )
         token = response.get("access_token")
         if not isinstance(token, str) or len(token) < 32:
             raise ScenarioExecutionError("development session returned an invalid access token")
-        self._access_token = token
+        if set_default:
+            self._access_token = token
+        return token
 
 
 def _codes(value: Any, field: str) -> tuple[str, ...]:
@@ -334,7 +348,7 @@ def _assert_outcome(scenario: Scenario, job: Mapping[str, Any], run: Mapping[str
         or not isinstance(comparisons, list)
         or not comparisons
     ):
-        raise ScenarioExecutionError(f"{scenario.name}: structured V3.1 workflow is incomplete")
+        raise ScenarioExecutionError(f"{scenario.name}: structured V3.2 workflow is incomplete")
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -357,10 +371,127 @@ def _assert_internal_transcript(run: ScenarioTranscriptRun) -> None:
     if not {"review_request", "review_response"}.issubset(events):
         raise ScenarioExecutionError("Backend-to-Agent transcript is incomplete")
     exchanges = [record for record in agent_data if record.get("event") == "http_exchange"]
-    if len(exchanges) != 2:
-        raise ScenarioExecutionError("Agent-to-Data transcript must contain readiness and retrieve")
+    if len(exchanges) not in {2, 3}:
+        raise ScenarioExecutionError(
+            "Agent-to-Data transcript must contain review readiness/retrieve and at most one chat lookup"
+        )
     if not any(record.get("event") == "not_called" for record in claude):
         raise ScenarioExecutionError("dev-fixture must record that Claude was not called")
+
+
+def _contains_run_reference(value: object, review_run_id: str) -> bool:
+    """Match an exact run ID in one buffered public API event.
+
+    The runner keeps the parent and child review records separate.  A path
+    alone is not trusted as a delimiter because it can contain arbitrary Case
+    text; the typed response/request bodies carry the generated review IDs.
+    """
+
+    if isinstance(value, Mapping):
+        return any(_contains_run_reference(item, review_run_id) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_run_reference(item, review_run_id) for item in value)
+    return isinstance(value, str) and value == review_run_id
+
+
+def _append_public_events(run: ScenarioTranscriptRun, events: Sequence[Mapping[str, Any]]) -> None:
+    for event in events:
+        run.append("public-api", "http_exchange", event)
+
+
+def _run_assistant_revision_journey(
+    *,
+    api: PublicApiScenarioClient,
+    parent_run: Mapping[str, Any],
+    document_id: str,
+    scenario_name: str,
+) -> dict[str, Any]:
+    """Exercise the bounded Agentic workflow through the public HTTP boundary.
+
+    This is intentionally one small, deterministic journey per fixture case:
+    it verifies that a reviewer can ask a grounded follow-up and propose a
+    correction, while a distinct loopback approver authorizes the resulting
+    child review.  It never treats the child result as an approval.
+    """
+
+    parent_run_id = parent_run.get("review_run_id")
+    if not isinstance(parent_run_id, str):
+        raise ScenarioExecutionError(f"{scenario_name}: parent review identity is invalid")
+    conversation = api.request(
+        "POST",
+        f"/review-runs/{parent_run_id}/assistant/conversations",
+        body={"title": "Fixture review follow-up"},
+    )
+    conversation_id = conversation.get("conversation_id")
+    if not isinstance(conversation_id, str):
+        raise ScenarioExecutionError(f"{scenario_name}: conversation identity is invalid")
+    api.request("GET", f"/review-runs/{parent_run_id}/assistant/conversations")
+    exchange = api.request(
+        "POST",
+        f"/assistant/conversations/{conversation_id}/messages",
+        body={"content": "What should the reviewer inspect next in this text-only case?"},
+        idempotency_key=f"scenario-assistant-{scenario_name}",
+    )
+    assistant_message = exchange.get("assistant_message")
+    if not isinstance(assistant_message, Mapping) or assistant_message.get("role") != "assistant":
+        raise ScenarioExecutionError(f"{scenario_name}: assistant response is invalid")
+    api.request("GET", f"/assistant/conversations/{conversation_id}/messages")
+    proposal = api.request(
+        "POST",
+        f"/review-runs/{parent_run_id}/correction-proposals",
+        body={
+            "document_id": document_id,
+            "field_name": "invoice_number",
+            "new_value": "FIXTURE-CORRECTED",
+            "reason": "Synthetic fixture correction for an independently reviewed child run.",
+        },
+    )
+    proposal_id = proposal.get("correction_proposal_id")
+    if not isinstance(proposal_id, str):
+        raise ScenarioExecutionError(f"{scenario_name}: correction proposal identity is invalid")
+    api.request("GET", f"/review-runs/{parent_run_id}/correction-proposals")
+    approver_token = api.begin_development_session(actor="approver", set_default=False)
+    decision = api.request(
+        "PUT",
+        f"/correction-proposals/{proposal_id}/decision",
+        body={"status": "approved", "reason": "Independent fixture approval for re-review."},
+        access_token=approver_token,
+    )
+    if decision.get("status") != "approved":
+        raise ScenarioExecutionError(f"{scenario_name}: correction was not independently approved")
+    child_job_envelope = api.request(
+        "POST",
+        f"/review-runs/{parent_run_id}/revisions",
+        body={"proposal_ids": [proposal_id]},
+        idempotency_key=f"scenario-revision-{scenario_name}",
+        access_token=approver_token,
+    )
+    child_job = child_job_envelope.get("job")
+    if not isinstance(child_job, Mapping):
+        raise ScenarioExecutionError(f"{scenario_name}: child review job is invalid")
+    child_job_id = child_job.get("job_id")
+    child_run_id = child_job.get("review_run_id")
+    if not isinstance(child_job_id, str) or not isinstance(child_run_id, str):
+        raise ScenarioExecutionError(f"{scenario_name}: child review identity is invalid")
+    child_job_detail = api.request("GET", f"/jobs/{child_job_id}", access_token=approver_token)
+    child_run = api.request("GET", f"/review-runs/{child_run_id}", access_token=approver_token)
+    if (
+        child_job_detail.get("status") != "succeeded"
+        or child_run.get("parent_review_run_id") != parent_run_id
+        or child_run.get("applied_correction_proposal_ids") != [proposal_id]
+        or child_run.get("review_disposition") != "human_review_required"
+    ):
+        raise ScenarioExecutionError(f"{scenario_name}: child review safety boundary is invalid")
+    return {
+        "conversation_id": conversation_id,
+        "correction_proposal_id": proposal_id,
+        "child_review_run_id": child_run_id,
+        "child_job_id": child_job_id,
+        "child_job_status": child_job_detail.get("status"),
+        "child_assessment": child_run.get("assessment"),
+        "child_human_review_required": child_run.get("review_disposition")
+        == "human_review_required",
+    }
 
 
 def _run_scenario(
@@ -391,6 +522,7 @@ def _run_scenario(
             api.request("GET", f"/cases/{case_id}/documents/{document_id}/content")
             fixture_documents.append(
                 {
+                    "document_id": document_id,
                     "document_type": fixture.document_type,
                     "filename": fixture.filename,
                     "content_text": fixture.content_text,
@@ -428,9 +560,28 @@ def _run_scenario(
         )
         job_detail = api.request("GET", f"/jobs/{job['job_id']}")
         run = api.request("GET", f"/review-runs/{review_run_id}")
-        for event in api.events:
-            transcript.append("public-api", "http_exchange", event)
         _assert_outcome(scenario, job_detail, run)
+        assistant_journey = _run_assistant_revision_journey(
+            api=api,
+            parent_run=run,
+            document_id=fixture_documents[0]["document_id"],
+            scenario_name=scenario.name,
+        )
+        child_review_run_id = assistant_journey["child_review_run_id"]
+        child_job_id = assistant_journey["child_job_id"]
+        correction_proposal_id = assistant_journey["correction_proposal_id"]
+        if not all(
+            isinstance(value, str)
+            for value in (child_review_run_id, child_job_id, correction_proposal_id)
+        ):
+            raise ScenarioExecutionError(f"{scenario.name}: child workflow identity is invalid")
+        child_events = [
+            event for event in api.events if _contains_run_reference(event, child_review_run_id)
+        ]
+        parent_events = [event for event in api.events if event not in child_events]
+        if not child_events:
+            raise ScenarioExecutionError(f"{scenario.name}: child public transcript is empty")
+        _append_public_events(transcript, parent_events)
         _assert_internal_transcript(transcript)
         summary = {
             "schema_version": "scenario-transcript/v1",
@@ -459,6 +610,7 @@ def _run_scenario(
                 )
                 if isinstance(run.get("completion_eligibility"), Mapping)
                 else None,
+                "assistant_workflow": assistant_journey,
             },
             "streams": [
                 "scenario.json",
@@ -469,6 +621,53 @@ def _run_scenario(
             ],
         }
         transcript.write_json("summary.json", summary)
+
+        child_transcript = transcript_root.open_or_create_run(child_review_run_id)
+        child_transcript.write_json(
+            "scenario.json",
+            {
+                "schema_version": "scenario-transcript/v1",
+                "profile": "dev-fixture",
+                "scenario": f"{scenario.name}: approved-correction-child",
+                "review_run_id": child_review_run_id,
+                "parent_review_run_id": review_run_id,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "review_request": {
+                    "parent_review_run_id": review_run_id,
+                    "proposal_ids": [correction_proposal_id],
+                },
+                "claude": {
+                    "called": False,
+                    "reason": "dev-fixture uses the deterministic document analyzer",
+                },
+            },
+        )
+        _append_public_events(child_transcript, child_events)
+        _assert_internal_transcript(child_transcript)
+        child_transcript.write_json(
+            "summary.json",
+            {
+                "schema_version": "scenario-transcript/v1",
+                "profile": "dev-fixture",
+                "scenario": f"{scenario.name}: approved-correction-child",
+                "review_run_id": child_review_run_id,
+                "parent_review_run_id": review_run_id,
+                "status": "passed",
+                "actual": {
+                    "job_id": child_job_id,
+                    "job_status": assistant_journey["child_job_status"],
+                    "assessment": assistant_journey["child_assessment"],
+                    "human_review_required": assistant_journey["child_human_review_required"],
+                },
+                "streams": [
+                    "scenario.json",
+                    "public-api.jsonl",
+                    "backend-agent.jsonl",
+                    "agent-data.jsonl",
+                    "claude.jsonl",
+                ],
+            },
+        )
         return {"scenario": scenario.name, "review_run_id": review_run_id, "status": "passed"}
     finally:
         api.close()

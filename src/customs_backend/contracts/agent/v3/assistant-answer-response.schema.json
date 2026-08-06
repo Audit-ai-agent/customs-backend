@@ -1,0 +1,55 @@
+{
+  "$id": "https://schemas.customs.local/agent/v3/assistant-answer-response.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One grounded assistant answer. It never mutates Case state, approves a correction, or makes a final customs decision.",
+  "$defs": {
+    "Citation": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"type": "string", "enum": ["fact", "comparison", "evidence"]},
+        "reference_id": {"type": "string", "minLength": 1, "maxLength": 256}
+      },
+      "required": ["kind", "reference_id"],
+      "type": "object"
+    },
+    "CorrectionDraft": {
+      "additionalProperties": false,
+      "properties": {
+        "document_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "item_id": {"type": ["string", "null"], "maxLength": 256},
+        "fact_id": {"type": ["string", "null"], "maxLength": 256},
+        "field_name": {"type": "string", "minLength": 1, "maxLength": 64},
+        "new_value": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "unit": {"type": ["string", "null"], "maxLength": 64},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 2000}
+      },
+      "required": ["document_id", "field_name", "new_value", "reason"],
+      "type": "object"
+    },
+    "Engine": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"type": "string", "enum": ["deterministic", "claude"]},
+        "model_id": {"type": "string", "minLength": 1, "maxLength": 256}
+      },
+      "required": ["kind", "model_id"],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "schema_version": {"const": "1.0", "type": "string"},
+    "case_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "review_run_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "conversation_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "answer_scope": {"type": "string", "enum": ["case_grounded", "evidence_grounded", "general_customs_guidance", "clarification_needed", "insufficient_evidence", "out_of_scope"]},
+    "direct_answer": {"type": "string", "minLength": 1, "maxLength": 4000},
+    "citations": {"type": "array", "maxItems": 32, "items": {"$ref": "#/$defs/Citation"}},
+    "suggested_questions": {"type": "array", "maxItems": 3, "items": {"type": "string", "minLength": 1, "maxLength": 4000}},
+    "correction_draft": {"anyOf": [{"$ref": "#/$defs/CorrectionDraft"}, {"type": "null"}]},
+    "engine": {"$ref": "#/$defs/Engine"}
+  },
+  "required": ["schema_version", "case_id", "review_run_id", "conversation_id", "answer_scope", "direct_answer", "citations", "suggested_questions", "correction_draft", "engine"],
+  "title": "Customs AI Agent grounded assistant answer response",
+  "type": "object"
+}

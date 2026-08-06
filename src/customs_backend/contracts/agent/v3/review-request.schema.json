@@ -2,7 +2,7 @@
   "$id": "https://schemas.customs.local/agent/v3/review-request.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
-  "description": "Text-only request for one human-review Agent pass.",
+  "description": "Text-only request for one human-review Agent pass. Approved human corrections are append-only context for a child run and never alter an original document.",
   "$defs": {
     "Document": {
       "additionalProperties": false,
@@ -14,6 +14,22 @@
       },
       "required": ["document_id", "filename", "content_text"],
       "type": "object"
+    },
+    "HumanCorrection": {
+      "additionalProperties": false,
+      "properties": {
+        "correction_proposal_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "document_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "item_id": {"type": ["string", "null"], "maxLength": 256},
+        "fact_id": {"type": ["string", "null"], "maxLength": 256},
+        "field_name": {"type": "string", "minLength": 1, "maxLength": 64},
+        "new_value": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "unit": {"type": ["string", "null"], "maxLength": 64},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "source_kind": {"const": "human_provided", "type": "string"}
+      },
+      "required": ["correction_proposal_id", "document_id", "field_name", "new_value", "reason", "source_kind"],
+      "type": "object"
     }
   },
   "properties": {
@@ -22,7 +38,10 @@
     "jurisdiction": {"const": "KR", "type": "string"},
     "review_as_of": {"type": "string", "format": "date"},
     "review_run_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"},
-    "trade_type": {"enum": ["import", "export"], "type": "string"}
+    "trade_type": {"enum": ["import", "export"], "type": "string"},
+    "parent_review_run_id": {"type": ["string", "null"], "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"},
+    "applied_correction_proposal_ids": {"type": "array", "maxItems": 50, "items": {"type": "string", "minLength": 1, "maxLength": 128}},
+    "human_corrections": {"type": "array", "maxItems": 50, "items": {"$ref": "#/$defs/HumanCorrection"}}
   },
   "required": ["case_id", "review_run_id", "review_as_of", "trade_type", "jurisdiction", "documents"],
   "title": "Customs AI Agent functional review request",

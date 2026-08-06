@@ -8,7 +8,7 @@ from customs_backend.domain import AgentReviewRequest, canonical_digest
 def build_agent_v3_result(
     request: AgentReviewRequest, *, include_finding: bool = False
 ) -> dict[str, Any]:
-    """A deterministic V3.1 response for Backend HTTP-contract tests only."""
+    """A deterministic V3.2 response for Backend HTTP-contract tests only."""
 
     analyses: list[dict[str, Any]] = []
     for document in request.documents:
@@ -32,6 +32,7 @@ def build_agent_v3_result(
                 "declared_type": document.declared_type,
                 "document_type": document_type,
                 "classification_source": {
+                    "source_kind": "document",
                     "document_id": document.document_id,
                     "quote": quote,
                     "occurrence": 0,
@@ -94,7 +95,7 @@ def build_agent_v3_result(
         actions[0]["finding_ids"] = ["finding_fixture_quantity"]
 
     result: dict[str, Any] = {
-        "schema_version": "3.1",
+        "schema_version": "3.2",
         "case_id": request.case_id,
         "review_run_id": request.review_run_id,
         "review_as_of": request.review_as_of.isoformat(),
@@ -109,6 +110,31 @@ def build_agent_v3_result(
             "overall_status": "needs_review",
             "summary": "Deterministic local fixture result.",
             "disclaimer": "A reviewer must make the final decision.",
+            "sections": [
+                {
+                    "section": section,
+                    "title": section.replace("_", " ").title(),
+                    "claims": [
+                        {
+                            "claim_id": f"claim_{section}",
+                            "text": "Deterministic fixture claim.",
+                            "fact_ids": [],
+                            "comparison_ids": [],
+                            "evidence_ids": [],
+                        }
+                    ],
+                }
+                for section in (
+                    "conclusion",
+                    "execution_process",
+                    "document_comparison",
+                    "issues_and_causes",
+                    "legal_evidence",
+                    "impact",
+                    "next_actions",
+                    "limitations",
+                )
+            ],
         },
         "workflow": {
             "status": "completed",
@@ -121,6 +147,18 @@ def build_agent_v3_result(
                 }
             ],
             "reextractions": [],
+            "planner": {
+                "cycle_count": 1,
+                "actions": [
+                    {
+                        "cycle": 1,
+                        "action": "generate_report",
+                        "status": "completed",
+                        "summary": "Fixture generated the bounded report.",
+                        "correction_proposal_ids": [],
+                    }
+                ],
+            },
         },
         "document_analyses": analyses,
         "comparisons": comparisons,

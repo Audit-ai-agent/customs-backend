@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 import uuid
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Literal, cast
 
 from pydantic import ValidationError
@@ -13,6 +14,10 @@ from pydantic import ValidationError
 from customs_backend.agent_contract import AgentContractPayloadError, validate_agent_v3_payload
 from customs_backend.domain import (
     AgentDocumentInput,
+    AgentAssistantAnswerRequest,
+    AgentAssistantAnswerResponse,
+    AgentConversationTurn,
+    AgentHumanCorrection,
     AgentReviewRequest,
     Assessment,
     AssuranceLevel,
@@ -20,6 +25,18 @@ from customs_backend.domain import (
     CaseRecord,
     CaseStatus,
     CompletionEligibility,
+    ConversationCreate,
+    ConversationMessageCreate,
+    ConversationMessageExchange,
+    ConversationMessageRecord,
+    ConversationMessageRole,
+    ConversationRecord,
+    CorrectionProposalCreate,
+    CorrectionProposalDecisionCreate,
+    CorrectionProposalDecisionRecord,
+    CorrectionProposalHistoryEntry,
+    CorrectionProposalRecord,
+    CorrectionProposalStatus,
     DocumentRecord,
     ExecutionStatus,
     FindingDecisionRecord,
@@ -31,6 +48,7 @@ from customs_backend.domain import (
     MAX_TEXT_DOCUMENT_UTF8_BYTES,
     Principal,
     RequiredAction,
+    RevisionCreate,
     ReviewDisposition,
     ReviewEnqueueRequest,
     ReviewRunRecord,
@@ -42,6 +60,8 @@ from customs_backend.domain import (
 )
 from customs_backend.ports import (
     AgentClient,
+    AgentResponseRejectedError,
+    AuthorizationError,
     ConflictError,
     NotFoundError,
     ObjectStore,
@@ -69,6 +89,18 @@ def _id(prefix: str) -> str:
 def _scoped_idempotency_key(principal: Principal, case_id: str, supplied_key: str) -> str:
     return "review_" + canonical_digest(
         {"subject": principal.subject, "case_id": case_id, "key": supplied_key}
+    )
+
+
+def _scoped_conversation_idempotency_key(
+    principal: Principal, conversation_id: str, supplied_key: str
+) -> str:
+    return "chat_" + canonical_digest(
+        {
+            "subject": principal.subject,
+            "conversation_id": conversation_id,
+            "key": supplied_key,
+        }
     )
 
 
@@ -137,13 +169,120 @@ def _result_digest(
         {
             "provider_result_sha256": provider_result_sha256,
             "input_manifest_digest": input_manifest_digest,
-            # The complete schema-validated Agent output covers V3.1 workflow,
+            # The complete schema-validated Agent output covers V3.2 workflow,
             # document facts, comparisons, stable references, and actions.
             # Reviewer-owned decisions are deliberately outside this digest.
             "agent_result": agent_result,
             "human_review_required": True,
         }
     )
+
+
+def _agent_result_snapshot(run: ReviewRunRecord) -> dict[str, Any]:
+    """Rebuild the immutable schema-owned Agent result for a chat turn.
+
+    This intentionally refuses a projection whose stored provider hash no
+    longer covers the reconstructed result.  Chat must not silently turn a
+    Backend-added value into an Agent-owned fact.
+    """
+
+    result: dict[str, Any] = {
+        "schema_version": run.agent_schema_version,
+        "case_id": run.case_id,
+        "review_run_id": run.review_run_id,
+        "review_as_of": run.review_as_of.isoformat(),
+        "trade_type": run.trade_type,
+        "jurisdiction": run.agent_jurisdiction,
+        "status": run.agent_status,
+        "requires_human_review": run.agent_requires_human_review,
+        "execution_status": run.execution_status.value,
+        "assessment": run.assessment.value,
+        "input_manifest_sha256": run.agent_input_manifest_sha256,
+        "report": run.report,
+        "workflow": run.workflow,
+        "document_analyses": run.document_analyses,
+        "comparisons": run.comparisons,
+        "evidence": run.evidence,
+        "findings": run.findings,
+        "required_actions": [item.model_dump(mode="json") for item in run.required_actions],
+        "result_sha256": run.provider_result_sha256,
+    }
+    if run.agent_engine is not None:
+        result["engine"] = run.agent_engine
+    if (
+        canonical_digest({key: value for key, value in result.items() if key != "result_sha256"})
+        != run.provider_result_sha256
+    ):
+        raise ConflictError("persisted Agent result is not hash-consistent for assistant context")
+    return result
+
+
+def _source_reference_sets(run: ReviewRunRecord) -> dict[str, set[str]]:
+    facts: set[str] = set()
+    for analysis in run.document_analyses:
+        if not isinstance(analysis, dict):
+            continue
+        for fact in analysis.get("facts", []):
+            if isinstance(fact, dict) and isinstance(fact.get("fact_id"), str):
+                facts.add(fact["fact_id"])
+        for line_item in analysis.get("line_items", []):
+            if not isinstance(line_item, dict):
+                continue
+            for fact in line_item.get("facts", []):
+                if isinstance(fact, dict) and isinstance(fact.get("fact_id"), str):
+                    facts.add(fact["fact_id"])
+    return {
+        "fact": facts,
+        "comparison": {
+            item["comparison_id"]
+            for item in run.comparisons
+            if isinstance(item, dict) and isinstance(item.get("comparison_id"), str)
+        },
+        "evidence": {
+            item["evidence_id"]
+            for item in run.evidence
+            if isinstance(item, dict) and isinstance(item.get("evidence_id"), str)
+        },
+    }
+
+
+def _known_correction_targets(
+    run: ReviewRunRecord,
+) -> tuple[set[str], dict[str, tuple[str, str | None, str]], set[tuple[str, str]], set[str]]:
+    """Return only references actually produced by the immutable Agent result."""
+
+    document_ids = {item.document_id for item in run.input_document_manifest}
+    facts: dict[str, tuple[str, str | None, str]] = {}
+    items: set[tuple[str, str]] = set()
+    for analysis in run.document_analyses:
+        if not isinstance(analysis, dict) or not isinstance(analysis.get("document_id"), str):
+            continue
+        document_id = analysis["document_id"]
+        for fact in analysis.get("facts", []):
+            if (
+                isinstance(fact, dict)
+                and isinstance(fact.get("fact_id"), str)
+                and isinstance(fact.get("name"), str)
+            ):
+                facts[fact["fact_id"]] = (document_id, None, fact["name"])
+        for item in analysis.get("line_items", []):
+            if not isinstance(item, dict) or not isinstance(item.get("item_id"), str):
+                continue
+            item_id = item["item_id"]
+            items.add((document_id, item_id))
+            for fact in item.get("facts", []):
+                if (
+                    isinstance(fact, dict)
+                    and isinstance(fact.get("fact_id"), str)
+                    and isinstance(fact.get("name"), str)
+                ):
+                    facts[fact["fact_id"]] = (document_id, item_id, fact["name"])
+    findings = {
+        item["finding_id"]
+        for item in run.findings
+        if isinstance(item, dict) and isinstance(item.get("finding_id"), str)
+    }
+    return document_ids, facts, items, findings
 
 
 def _agent_request_from_snapshot(
@@ -155,6 +294,14 @@ def _agent_request_from_snapshot(
         if trade_type not in {"import", "export"}:
             raise ValueError("invalid trade type")
         documents = [DocumentRecord.model_validate(value) for value in snapshot["documents"]]
+        parent_review_run_id = snapshot.get("parent_review_run_id")
+        if parent_review_run_id is not None and not isinstance(parent_review_run_id, str):
+            raise ValueError("invalid parent review run")
+        applied_correction_proposal_ids = list(snapshot.get("applied_correction_proposal_ids", []))
+        human_corrections = [
+            AgentHumanCorrection.model_validate(value)
+            for value in list(snapshot.get("human_corrections", []))
+        ]
     except (KeyError, TypeError, ValueError, ValidationError) as exc:
         raise ConflictError("review job has an invalid immutable input snapshot") from exc
     return AgentReviewRequest(
@@ -173,6 +320,9 @@ def _agent_request_from_snapshot(
             )
             for document in _review_documents(documents)
         ],
+        parent_review_run_id=parent_review_run_id,
+        applied_correction_proposal_ids=applied_correction_proposal_ids,
+        human_corrections=human_corrections,
     )
 
 
@@ -180,6 +330,14 @@ def _agent_request_from_snapshot(
 class DocumentView:
     record: DocumentRecord
     content_text: str
+
+
+class _AssistantTurnLock:
+    """Reference-counted keyed lock for one synchronous assistant exchange."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.waiters = 0
 
 
 class WorkbenchService:
@@ -191,14 +349,48 @@ class WorkbenchService:
         self.repository = repository
         self.object_store = object_store
         self.agent = agent
+        # The repository atomically stores a completed exchange, but the Agent
+        # call itself happens before that write.  Keep one bounded in-process
+        # reservation per idempotency key so two concurrent HTTP retries never
+        # generate two Agent turns for the same user message.
+        self._assistant_turn_locks: dict[tuple[str, str, str], _AssistantTurnLock] = {}
+        self._assistant_turn_locks_guard = threading.Lock()
+
+    def _acquire_assistant_turn_lock(
+        self, *, org_id: str, conversation_id: str, idempotency_key: str
+    ) -> tuple[tuple[str, str, str], "_AssistantTurnLock"]:
+        key = (org_id, conversation_id, idempotency_key)
+        with self._assistant_turn_locks_guard:
+            entry = self._assistant_turn_locks.get(key)
+            if entry is None:
+                entry = _AssistantTurnLock()
+                self._assistant_turn_locks[key] = entry
+            entry.waiters += 1
+        entry.lock.acquire()
+        return key, entry
+
+    def _release_assistant_turn_lock(
+        self, key: tuple[str, str, str], entry: "_AssistantTurnLock"
+    ) -> None:
+        entry.lock.release()
+        with self._assistant_turn_locks_guard:
+            entry.waiters -= 1
+            if entry.waiters == 0 and self._assistant_turn_locks.get(key) is entry:
+                del self._assistant_turn_locks[key]
 
     @staticmethod
     def _require_case_access(principal: Principal, record: CaseRecord) -> None:
-        if Role.reviewer in principal.roles:
+        if principal.roles.intersection({Role.reviewer, Role.approver}):
             return
         raise NotFoundError("case not found")
 
+    @staticmethod
+    def _require_role(principal: Principal, role: Role) -> None:
+        if role not in principal.roles:
+            raise AuthorizationError("the current role cannot perform this operation")
+
     def create_case(self, principal: Principal, request: CaseCreate) -> CaseRecord:
+        self._require_role(principal, Role.reviewer)
         now = utc_now()
         return self.repository.create_case(
             CaseRecord(
@@ -223,12 +415,15 @@ class WorkbenchService:
         return record
 
     def list_cases(self, principal: Principal) -> list[CaseRecord]:
+        if not principal.roles.intersection({Role.reviewer, Role.approver}):
+            raise NotFoundError("case not found")
         records = self.repository.list_cases(principal.org_id)
         return records
 
     def add_document(
         self, principal: Principal, case_id: str, request: TextDocumentCreate
     ) -> tuple[CaseRecord, DocumentRecord]:
+        self._require_role(principal, Role.reviewer)
         case = self.get_case(principal, case_id)
         if case.status == CaseStatus.closed:
             raise ConflictError("documents cannot be added to a closed case")
@@ -323,6 +518,7 @@ class WorkbenchService:
         request: ReviewEnqueueRequest,
         idempotency_key: str,
     ) -> tuple[JobRecord, bool]:
+        self._require_role(principal, Role.reviewer)
         case = self.get_case(principal, case_id)
         if case.status == CaseStatus.closed:
             raise ConflictError("reviews cannot be started for a closed case")
@@ -409,7 +605,7 @@ class WorkbenchService:
             {key: value for key, value in result.items() if key != "result_sha256"}
         )
         if provider_result_sha256 != expected_provider_result_sha256:
-            raise ConflictError("Agent result hash does not cover the complete V3.1 result")
+            raise ConflictError("Agent result hash does not cover the complete V3.2 result")
         comparison_ids = [
             str(item.get("comparison_id"))
             for item in comparisons
@@ -450,22 +646,12 @@ class WorkbenchService:
             or result.get("requires_human_review") is not True
         ):
             raise ConflictError("Agent result is not bound to the immutable review input")
-        human_action = RequiredAction(
-            action_code="human_review_required",
-            message="심사 결과는 담당자의 검토와 결정이 필요합니다.",
-        )
-        persisted_agent_result = result
-        if not any(action.action_code == human_action.action_code for action in actions):
-            actions.append(human_action)
-            # The Backend-owned mandatory human-review action becomes part of
-            # the persisted result projection and therefore its digest too.
-            persisted_agent_result = {
-                **result,
-                "required_actions": [
-                    *list(result["required_actions"]),
-                    human_action.model_dump(mode="json"),
-                ],
-            }
+        if not any(action.action_code == "human_review_required" for action in actions):
+            # The Agent owns every field protected by ``result_sha256``.  Do
+            # not append a Backend action after that hash is verified; reject
+            # the malformed response instead so a future assistant context
+            # cannot contain a hash-inconsistent synthetic result.
+            raise ConflictError("Agent result is missing the required human-review action")
         eligibility = CompletionEligibility(
             eligible=False, unmet_reason_codes=["human_review_required"]
         )
@@ -474,6 +660,10 @@ class WorkbenchService:
             case_id=case.case_id,
             org_id=job.org_id,
             job_id=job.job_id,
+            parent_review_run_id=cast(str | None, job.request.get("parent_review_run_id")),
+            applied_correction_proposal_ids=list(
+                job.request.get("applied_correction_proposal_ids", [])
+            ),
             case_revision=job.case_revision,
             review_as_of=review_as_of,
             trade_type=trade_type,
@@ -484,7 +674,7 @@ class WorkbenchService:
             result_digest=_result_digest(
                 provider_result_sha256=provider_result_sha256,
                 input_manifest_digest=input_manifest_digest,
-                agent_result=persisted_agent_result,
+                agent_result=result,
             ),
             execution_status=execution_status,
             assessment=assessment,
@@ -508,7 +698,13 @@ class WorkbenchService:
             created_at=utc_now(),
         )
 
-    def _run_review(self, principal: Principal, job: JobRecord) -> JobRecord:
+    def _run_review(
+        self,
+        principal: Principal,
+        job: JobRecord,
+        *,
+        applied_correction_proposal_ids: list[str] | None = None,
+    ) -> JobRecord:
         running = self.repository.update_job(
             job.model_copy(update={"status": JobStatus.running, "updated_at": utc_now()})
         )
@@ -537,7 +733,15 @@ class WorkbenchService:
             completed = running.model_copy(
                 update={"status": JobStatus.succeeded, "updated_at": utc_now(), "error_code": None}
             )
-            self.repository.complete_review(completed, run)
+            if applied_correction_proposal_ids:
+                self.repository.complete_review_and_apply_correction_proposals(
+                    job=completed,
+                    run=run,
+                    correction_proposal_ids=applied_correction_proposal_ids,
+                    applied_by=principal.subject,
+                )
+            else:
+                self.repository.complete_review(completed, run)
             return completed
         except Exception as exc:
             return self.repository.update_job(
@@ -568,6 +772,396 @@ class WorkbenchService:
         self.get_case(principal, case_id)
         return self.repository.list_runs(principal.org_id, case_id)
 
+    def _get_conversation(
+        self, principal: Principal, conversation_id: str
+    ) -> tuple[ConversationRecord, ReviewRunRecord]:
+        conversation = self.repository.get_conversation(principal.org_id, conversation_id)
+        if conversation is None:
+            raise NotFoundError("assistant conversation not found")
+        run = self.get_run(principal, conversation.review_run_id)
+        return conversation, run
+
+    def create_conversation(
+        self,
+        principal: Principal,
+        review_run_id: str,
+        request: ConversationCreate,
+    ) -> ConversationRecord:
+        self.get_run(principal, review_run_id)
+        now = utc_now()
+        return self.repository.create_conversation(
+            ConversationRecord(
+                conversation_id=_id("conv"),
+                review_run_id=review_run_id,
+                org_id=principal.org_id,
+                title=request.title,
+                created_by=principal.subject,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    def list_conversations(
+        self, principal: Principal, review_run_id: str
+    ) -> list[ConversationRecord]:
+        self.get_run(principal, review_run_id)
+        return self.repository.list_conversations(principal.org_id, review_run_id)
+
+    def list_conversation_messages(
+        self, principal: Principal, conversation_id: str
+    ) -> list[ConversationMessageRecord]:
+        self._get_conversation(principal, conversation_id)
+        return self.repository.list_messages(principal.org_id, conversation_id)
+
+    def get_conversation_run(self, principal: Principal, conversation_id: str) -> ReviewRunRecord:
+        """Resolve the immutable review that owns a conversation for API recording."""
+
+        _conversation, run = self._get_conversation(principal, conversation_id)
+        return run
+
+    def send_conversation_message(
+        self,
+        principal: Principal,
+        conversation_id: str,
+        request: ConversationMessageCreate,
+        idempotency_key: str,
+    ) -> ConversationMessageExchange:
+        conversation, run = self._get_conversation(principal, conversation_id)
+        request_digest = canonical_digest(
+            {"conversation_id": conversation_id, "content": request.content}
+        )
+        scoped_key = _scoped_conversation_idempotency_key(
+            principal, conversation_id, idempotency_key
+        )
+        existing = self.repository.get_message_exchange(
+            org_id=principal.org_id,
+            conversation_id=conversation_id,
+            idempotency_key=scoped_key,
+            idempotency_request_digest=request_digest,
+        )
+        if existing is not None:
+            return existing
+
+        lock_key, lock_entry = self._acquire_assistant_turn_lock(
+            org_id=principal.org_id,
+            conversation_id=conversation_id,
+            idempotency_key=scoped_key,
+        )
+        try:
+            # A concurrent first request may have completed while this request
+            # waited.  Recheck before constructing context or contacting Agent.
+            existing = self.repository.get_message_exchange(
+                org_id=principal.org_id,
+                conversation_id=conversation_id,
+                idempotency_key=scoped_key,
+                idempotency_request_digest=request_digest,
+            )
+            if existing is not None:
+                return existing
+
+            history = self.repository.list_messages(principal.org_id, conversation_id)[-8:]
+            answer_request = AgentAssistantAnswerRequest(
+                case_id=run.case_id,
+                review_run_id=run.review_run_id,
+                conversation_id=conversation_id,
+                review_result=_agent_result_snapshot(run),
+                question=request.content,
+                recent_turns=[
+                    AgentConversationTurn(role=item.role, content=item.content) for item in history
+                ],
+            )
+            answer_wire = answer_request.to_agent_wire()
+            try:
+                validate_agent_v3_payload("assistant_answer_request", answer_wire)
+                raw_answer = self.agent.answer(answer_request)
+                validate_agent_v3_payload("assistant_answer_response", raw_answer)
+                answer = AgentAssistantAnswerResponse.model_validate(raw_answer)
+            except (
+                AgentContractPayloadError,
+                AgentResponseRejectedError,
+                ValidationError,
+                ValueError,
+            ) as exc:
+                raise ConflictError(
+                    "Agent assistant response does not satisfy the bounded contract"
+                ) from exc
+            if (
+                answer.case_id != run.case_id
+                or answer.review_run_id != run.review_run_id
+                or answer.conversation_id != conversation_id
+            ):
+                raise ConflictError("Agent assistant response is not bound to the conversation")
+            citation_keys = [(item.kind.value, item.reference_id) for item in answer.citations]
+            if len(citation_keys) != len(set(citation_keys)):
+                raise ConflictError("Agent assistant response repeats a citation")
+            if (
+                answer.answer_scope.value in {"case_grounded", "evidence_grounded"}
+                and not citation_keys
+            ):
+                raise ConflictError("grounded Agent assistant response requires a citation")
+            references = _source_reference_sets(run)
+            if any(
+                citation.reference_id not in references[citation.kind.value]
+                for citation in answer.citations
+            ):
+                raise ConflictError("Agent assistant response contains an unknown citation")
+            if any(not item.strip() for item in answer.suggested_questions):
+                raise ConflictError("Agent assistant response contains an empty suggested question")
+            if answer.correction_draft is not None:
+                self._validate_correction_target(
+                    run,
+                    document_id=answer.correction_draft.document_id,
+                    field_name=answer.correction_draft.field_name,
+                    fact_id=answer.correction_draft.fact_id,
+                    item_id=answer.correction_draft.item_id,
+                    finding_id=None,
+                )
+            now = utc_now()
+            exchange, _created = self.repository.append_message_exchange(
+                user_message=ConversationMessageRecord(
+                    message_id=_id("msg"),
+                    conversation_id=conversation_id,
+                    role=ConversationMessageRole.user,
+                    content=request.content,
+                    created_by=principal.subject,
+                    created_at=now,
+                ),
+                assistant_message=ConversationMessageRecord(
+                    message_id=_id("msg"),
+                    conversation_id=conversation_id,
+                    role=ConversationMessageRole.assistant,
+                    content=answer.direct_answer,
+                    answer_scope=answer.answer_scope,
+                    citations=answer.citations,
+                    suggested_questions=answer.suggested_questions,
+                    correction_draft=answer.correction_draft,
+                    created_by="customs-ai-agent",
+                    created_at=now + timedelta(microseconds=1),
+                ),
+                idempotency_key=scoped_key,
+                idempotency_request_digest=request_digest,
+            )
+            return exchange
+        finally:
+            self._release_assistant_turn_lock(lock_key, lock_entry)
+
+    @staticmethod
+    def _validate_correction_target(
+        run: ReviewRunRecord,
+        *,
+        document_id: str,
+        field_name: str,
+        fact_id: str | None,
+        item_id: str | None,
+        finding_id: str | None,
+    ) -> None:
+        document_ids, facts, items, findings = _known_correction_targets(run)
+        if document_id not in document_ids:
+            raise NotFoundError("correction document is not part of this review input")
+        if item_id is not None and (document_id, item_id) not in items:
+            raise NotFoundError("correction item is not part of this review input")
+        if fact_id is not None:
+            target = facts.get(fact_id)
+            if target is None or target[0] != document_id:
+                raise NotFoundError("correction fact is not part of this review input")
+            if item_id is not None and target[1] != item_id:
+                raise ConflictError("correction fact and item do not match")
+            if target[2] != field_name:
+                raise ConflictError("correction field does not match the selected fact")
+        if finding_id is not None and finding_id not in findings:
+            raise NotFoundError("correction finding is not part of this review")
+
+    def create_correction_proposal(
+        self,
+        principal: Principal,
+        review_run_id: str,
+        request: CorrectionProposalCreate,
+    ) -> CorrectionProposalRecord:
+        self._require_role(principal, Role.reviewer)
+        run = self.get_run(principal, review_run_id)
+        self._validate_correction_target(
+            run,
+            document_id=request.document_id,
+            field_name=request.field_name,
+            fact_id=request.fact_id,
+            item_id=request.item_id,
+            finding_id=request.finding_id,
+        )
+        now = utc_now()
+        return self.repository.create_correction_proposal(
+            CorrectionProposalRecord(
+                correction_proposal_id=_id("correction"),
+                review_run_id=review_run_id,
+                case_id=run.case_id,
+                org_id=principal.org_id,
+                parent_result_digest=run.result_digest,
+                parent_input_manifest_sha256=run.agent_input_manifest_sha256,
+                document_id=request.document_id,
+                field_name=request.field_name,
+                new_value=request.new_value,
+                unit=request.unit,
+                fact_id=request.fact_id,
+                item_id=request.item_id,
+                finding_id=request.finding_id,
+                reason=request.reason,
+                created_by=principal.subject,
+                created_at=now,
+                history=[
+                    CorrectionProposalHistoryEntry(
+                        event="proposed",
+                        reason=request.reason,
+                        actor=principal.subject,
+                        occurred_at=now,
+                    )
+                ],
+            )
+        )
+
+    def list_correction_proposals(
+        self, principal: Principal, review_run_id: str
+    ) -> list[CorrectionProposalRecord]:
+        self.get_run(principal, review_run_id)
+        return self.repository.list_correction_proposals(principal.org_id, review_run_id)
+
+    def decide_correction_proposal(
+        self,
+        principal: Principal,
+        correction_proposal_id: str,
+        request: CorrectionProposalDecisionCreate,
+    ) -> CorrectionProposalRecord:
+        self._require_role(principal, Role.approver)
+        proposal = self.repository.get_correction_proposal(principal.org_id, correction_proposal_id)
+        if proposal is None:
+            raise NotFoundError("correction proposal not found")
+        self.get_run(principal, proposal.review_run_id)
+        if proposal.created_by == principal.subject:
+            raise ConflictError("a correction proposal cannot be approved by its creator")
+        now = utc_now()
+        return self.repository.decide_correction_proposal(
+            org_id=principal.org_id,
+            correction_proposal_id=correction_proposal_id,
+            decision=CorrectionProposalDecisionRecord(
+                status=request.status,
+                reason=request.reason,
+                decided_by=principal.subject,
+                decided_at=now,
+            ),
+        )
+
+    def create_revision(
+        self,
+        principal: Principal,
+        review_run_id: str,
+        request: RevisionCreate,
+        idempotency_key: str,
+    ) -> tuple[JobRecord, bool]:
+        self._require_role(principal, Role.approver)
+        parent = self.get_run(principal, review_run_id)
+        case = self.get_case(principal, parent.case_id)
+        supplied_digest = canonical_digest(
+            {"review_run_id": review_run_id, "proposal_ids": request.proposal_ids}
+        )
+        scoped_idempotency_key = _scoped_idempotency_key(principal, case.case_id, idempotency_key)
+        # Idempotency is deliberately checked before proposal state.  Once a
+        # child succeeds, its approved proposals are marked applied; a network
+        # retry with the original key must replay its JobResponse rather than
+        # being rejected as a second attempt.
+        existing = self.repository.get_review_job_by_idempotency(
+            principal.org_id, scoped_idempotency_key
+        )
+        if existing is not None:
+            if existing.idempotency_request_digest != supplied_digest:
+                raise ConflictError("idempotency key was reused with another request")
+            return existing, False
+        if case.status == CaseStatus.closed:
+            raise ConflictError("revisions cannot be started for a closed case")
+        proposals: list[CorrectionProposalRecord] = []
+        target_keys: set[tuple[str, str | None, str | None, str]] = set()
+        for proposal_id in request.proposal_ids:
+            proposal = self.repository.get_correction_proposal(principal.org_id, proposal_id)
+            if proposal is None:
+                raise NotFoundError("correction proposal not found")
+            if proposal.review_run_id != parent.review_run_id:
+                raise ConflictError("correction proposal belongs to another review run")
+            if proposal.status != CorrectionProposalStatus.approved:
+                raise ConflictError("only approved correction proposals can be applied")
+            if proposal.applied_review_run_id is not None:
+                raise ConflictError("approved correction proposal was already applied")
+            if (
+                proposal.parent_result_digest != parent.result_digest
+                or proposal.parent_input_manifest_sha256 != parent.agent_input_manifest_sha256
+            ):
+                raise ConflictError("correction proposal is no longer bound to its parent result")
+            self._validate_correction_target(
+                parent,
+                document_id=proposal.document_id,
+                field_name=proposal.field_name,
+                fact_id=proposal.fact_id,
+                item_id=proposal.item_id,
+                finding_id=proposal.finding_id,
+            )
+            target_key = (
+                proposal.document_id,
+                proposal.item_id,
+                proposal.fact_id,
+                proposal.field_name,
+            )
+            if target_key in target_keys:
+                raise ConflictError("a revision cannot apply two corrections to the same target")
+            target_keys.add(target_key)
+            proposals.append(proposal)
+        parent_job = self.repository.get_job(principal.org_id, parent.job_id)
+        if parent_job is None:
+            raise ConflictError("parent review input snapshot is unavailable")
+        correction_context = [
+            AgentHumanCorrection(
+                correction_proposal_id=proposal.correction_proposal_id,
+                document_id=proposal.document_id,
+                item_id=proposal.item_id,
+                fact_id=proposal.fact_id,
+                field_name=proposal.field_name,
+                new_value=proposal.new_value,
+                unit=proposal.unit,
+                reason=proposal.reason,
+            ).model_dump(mode="json")
+            for proposal in proposals
+        ]
+        snapshot = {
+            **parent_job.request,
+            "parent_review_run_id": parent.review_run_id,
+            "applied_correction_proposal_ids": list(request.proposal_ids),
+            "human_corrections": correction_context,
+        }
+        now = utc_now()
+        job = JobRecord(
+            job_id=_id("job"),
+            case_id=case.case_id,
+            org_id=principal.org_id,
+            idempotency_key=scoped_idempotency_key,
+            idempotency_request_digest=supplied_digest,
+            request_digest=canonical_digest(snapshot),
+            case_revision=case.revision,
+            request=snapshot,
+            status=JobStatus.queued,
+            review_run_id=_id("run"),
+            created_by=principal.subject,
+            created_at=now,
+            updated_at=now,
+        )
+        stored, created = self.repository.create_review_job(
+            job, expected_case_revision=case.revision
+        )
+        if not created:
+            return stored, False
+        return (
+            self._run_review(
+                principal,
+                stored,
+                applied_correction_proposal_ids=list(request.proposal_ids),
+            ),
+            True,
+        )
+
     def record_finding_decision(
         self,
         principal: Principal,
@@ -575,6 +1169,7 @@ class WorkbenchService:
         finding_id: str,
         request: FindingDecisionRequest,
     ) -> FindingDecisionRecord:
+        self._require_role(principal, Role.reviewer)
         run = self.get_run(principal, review_run_id)
         known_finding_ids = {
             str(item.get("finding_id"))

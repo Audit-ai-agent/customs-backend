@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 
 from customs_backend.domain import (
+    AgentAssistantAnswerRequest,
     AgentReviewRequest,
     MAX_TEXT_DOCUMENT_UTF8_BYTES,
     canonical_json_bytes,
@@ -217,6 +218,60 @@ class HttpAgentClient:
         )
         return result
 
+    def answer(self, request: AgentAssistantAnswerRequest) -> dict[str, Any]:
+        """Call the one bounded, synchronous assistant endpoint."""
+
+        wire = request.to_agent_wire()
+        encoded = canonical_json_bytes(wire)
+        if len(encoded) > 4 * 1024 * 1024:
+            raise ValueError("Agent assistant request exceeds the 4 MiB transport limit")
+        request_payload = {
+            "method": "POST",
+            "path": "/internal/agent/v2/assistant/answers",
+            "request_body": wire,
+        }
+        self._trace_review(request.review_run_id, "assistant_request", request_payload)
+        try:
+            response = self._client.post(
+                "/internal/agent/v2/assistant/answers",
+                content=encoded,
+                headers={"Content-Type": "application/json"},
+            )
+        except httpx.HTTPError as exc:
+            self._trace_review(
+                request.review_run_id,
+                "assistant_failure",
+                {**request_payload, "error_code": type(exc).__name__},
+            )
+            raise AgentResponseRejectedError("Agent assistant transport failed") from exc
+        try:
+            self._require_service_mode(response)
+            response.raise_for_status()
+            result = self._decode_object(
+                response, maximum_bytes=1_000_000, label="assistant answer"
+            )
+        except (AgentResponseRejectedError, httpx.HTTPStatusError) as exc:
+            self._trace_review(
+                request.review_run_id,
+                "assistant_failure",
+                {
+                    **request_payload,
+                    "response_status": response.status_code,
+                    "error_code": type(exc).__name__,
+                },
+            )
+            if isinstance(exc, httpx.HTTPStatusError):
+                raise AgentResponseRejectedError(
+                    f"Agent assistant answer returned HTTP {response.status_code}"
+                ) from exc
+            raise
+        self._trace_review(
+            request.review_run_id,
+            "assistant_response",
+            {**request_payload, "response_status": response.status_code, "response_body": result},
+        )
+        return result
+
     def metadata(self) -> dict[str, Any]:
         response = self._client.get("/internal/agent/v2/metadata")
         self._require_service_mode(response)
@@ -239,13 +294,31 @@ class CallableAgentClient:
         self,
         review: Callable[[AgentReviewRequest], dict[str, Any]],
         *,
+        answer: Callable[[AgentAssistantAnswerRequest], dict[str, Any]] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
         self._review = review
+        self._answer = answer
         self._metadata = metadata or {"status": "ready"}
 
     def review(self, request: AgentReviewRequest) -> dict[str, Any]:
         return self._review(request)
+
+    def answer(self, request: AgentAssistantAnswerRequest) -> dict[str, Any]:
+        if self._answer is not None:
+            return self._answer(request)
+        return {
+            "schema_version": "1.0",
+            "case_id": request.case_id,
+            "review_run_id": request.review_run_id,
+            "conversation_id": request.conversation_id,
+            "answer_scope": "clarification_needed",
+            "direct_answer": "Deterministic test assistant response.",
+            "citations": [],
+            "suggested_questions": [],
+            "correction_draft": None,
+            "engine": {"kind": "deterministic", "model_id": "backend-fixture"},
+        }
 
     def metadata(self) -> dict[str, Any]:
         return dict(self._metadata)

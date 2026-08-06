@@ -29,8 +29,12 @@ class Settings(BaseSettings):
     agent_service_token: SecretStr | None = Field(default=None, repr=False)
     agent_timeout_seconds: int = Field(default=180, ge=1, le=900)
 
-    dev_session_token: SecretStr | None = Field(default=None, repr=False)
-    dev_session_subject: str = "local-developer"
+    # Two explicit local identities keep the reviewer/approver boundary
+    # testable without introducing an external identity provider in dev-fixture.
+    dev_reviewer_session_token: SecretStr | None = Field(default=None, repr=False)
+    dev_approver_session_token: SecretStr | None = Field(default=None, repr=False)
+    dev_reviewer_subject: str = "local-reviewer"
+    dev_approver_subject: str = "local-approver"
     dev_session_org_id: str = "local-dev"
     dev_session_ttl_seconds: int = Field(default=28_800, ge=60, le=86_400)
 
@@ -88,8 +92,15 @@ class Settings(BaseSettings):
         if self.agent_service_token is None:
             raise ValueError("local Backend profiles require agent_service_token")
         if self.environment == "local-development":
-            if self.dev_session_token is None:
-                raise ValueError("local-development requires dev_session_token")
+            if self.dev_reviewer_session_token is None or self.dev_approver_session_token is None:
+                raise ValueError(
+                    "local-development requires reviewer and approver development session tokens"
+                )
+            if (
+                self.dev_reviewer_session_token.get_secret_value()
+                == self.dev_approver_session_token.get_secret_value()
+            ):
+                raise ValueError("reviewer and approver development session tokens must differ")
             unused = {
                 "database_url": self.database_url,
                 "minio_endpoint": self.minio_endpoint,

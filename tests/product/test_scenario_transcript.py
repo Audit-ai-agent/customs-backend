@@ -70,6 +70,8 @@ def test_text_and_nested_sensitive_values_are_redacted() -> None:
 def test_complete_functional_run_is_verified_without_echoing_bodies(tmp_path: Path) -> None:
     root = ScenarioTranscriptRoot.create(_root(tmp_path), secret_values=("live-secret-value",))
     controller = FunctionalTranscriptController(root=root)
+    # A terminal summary is a checkpoint rather than a write barrier: later
+    # functional-UAT conversation or correction traffic must not be dropped.
     controller.record_public(
         case_id="case-functional",
         method="POST",
@@ -137,7 +139,28 @@ def test_complete_functional_run_is_verified_without_echoing_bodies(tmp_path: Pa
         response_status=200,
         response_body={"review_run_id": "run-functional"},
     )
-    assert len((directory / "public-api.jsonl").read_text(encoding="utf-8").splitlines()) == 3
+    assert len((directory / "public-api.jsonl").read_text(encoding="utf-8").splitlines()) == 4
+    summary = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
+    assert isinstance(summary.get("last_recorded_at"), str)
+
+
+def test_revision_bind_records_its_actual_public_path(tmp_path: Path) -> None:
+    controller = FunctionalTranscriptController(root=ScenarioTranscriptRoot.create(_root(tmp_path)))
+    controller.bind_review(
+        case_id="case-functional",
+        review_run_id="run-revision",
+        job_id="job-revision",
+        review_request={"trade_type": "import"},
+        response_status=202,
+        response_body={"job": {"review_run_id": "run-revision"}},
+        job_status="succeeded",
+        public_path="/api/v1/review-runs/run-parent/revisions",
+    )
+
+    event = json.loads(
+        (_root(tmp_path) / "run-revision" / "public-api.jsonl").read_text(encoding="utf-8")
+    )
+    assert event["payload"]["path"] == "/api/v1/review-runs/run-parent/revisions"
 
 
 def test_verifier_rejects_unredacted_credential_shaped_stream_value(tmp_path: Path) -> None:

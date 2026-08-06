@@ -18,6 +18,8 @@ def _repository(tmp_path: Path) -> tuple[Path, bytes]:
         "docs/openapi-v1.json": openapi,
         "src/customs_backend/contracts/agent/v3/review-request.schema.json": b"{}\n",
         "src/customs_backend/contracts/agent/v3/review-result.schema.json": b"{}\n",
+        "src/customs_backend/contracts/agent/v3/assistant-answer-request.schema.json": b"{}\n",
+        "src/customs_backend/contracts/agent/v3/assistant-answer-response.schema.json": b"{}\n",
     }
     for relative, content in files.items():
         path = tmp_path / relative

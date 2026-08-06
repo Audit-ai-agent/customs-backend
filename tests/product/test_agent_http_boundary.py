@@ -8,8 +8,13 @@ import pytest
 
 from customs_backend.adapters import HttpAgentClient
 from customs_backend.agent_contract import validate_agent_v3_payload
-from customs_backend.domain import AgentDocumentInput, AgentReviewRequest
+from customs_backend.domain import (
+    AgentAssistantAnswerRequest,
+    AgentDocumentInput,
+    AgentReviewRequest,
+)
 from customs_backend.ports import AgentResponseRejectedError
+from tests.product.agent_v3_fixture import build_agent_v3_result
 
 
 def _request() -> AgentReviewRequest:
@@ -32,6 +37,34 @@ def test_packaged_agent_v3_request_schema_accepts_backend_projection() -> None:
     request = _request()
 
     validate_agent_v3_payload("review_request", request.to_agent_wire())
+
+
+def test_packaged_assistant_schemas_accept_the_bounded_backend_projection() -> None:
+    review = _request()
+    request = AgentAssistantAnswerRequest(
+        case_id=review.case_id,
+        review_run_id=review.review_run_id,
+        conversation_id="conversation-boundary",
+        review_result=build_agent_v3_result(review),
+        question="What should be reviewed?",
+        recent_turns=[],
+    )
+    validate_agent_v3_payload("assistant_answer_request", request.to_agent_wire())
+    validate_agent_v3_payload(
+        "assistant_answer_response",
+        {
+            "schema_version": "1.0",
+            "case_id": review.case_id,
+            "review_run_id": review.review_run_id,
+            "conversation_id": "conversation-boundary",
+            "answer_scope": "case_grounded",
+            "direct_answer": "Review the documented facts first.",
+            "citations": [],
+            "suggested_questions": [],
+            "correction_draft": None,
+            "engine": {"kind": "deterministic", "model_id": "fixture"},
+        },
+    )
 
 
 def test_review_uses_the_one_bearer_and_mode_bound_http_endpoint() -> None:
@@ -72,6 +105,54 @@ def test_review_uses_the_one_bearer_and_mode_bound_http_endpoint() -> None:
         "review_run_id",
         "trade_type",
     }
+
+
+def test_assistant_uses_the_same_bearer_and_mode_bound_http_endpoint() -> None:
+    review = _request()
+    assistant = AgentAssistantAnswerRequest(
+        case_id=review.case_id,
+        review_run_id=review.review_run_id,
+        conversation_id="conversation-boundary",
+        review_result=build_agent_v3_result(review),
+        question="What should be reviewed?",
+        recent_turns=[],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert request.method == "POST"
+        assert request.url.path == "/internal/agent/v2/assistant/answers"
+        assert request.headers["Authorization"] == "Bearer test-token"
+        assert request.headers["X-Customs-Service-Mode"] == "local-development"
+        assert payload["question"] == "What should be reviewed?"
+        return httpx.Response(
+            200,
+            json={
+                "schema_version": "1.0",
+                "case_id": review.case_id,
+                "review_run_id": review.review_run_id,
+                "conversation_id": "conversation-boundary",
+                "answer_scope": "case_grounded",
+                "direct_answer": "Review the documented facts first.",
+                "citations": [],
+                "suggested_questions": [],
+                "correction_draft": None,
+                "engine": {"kind": "deterministic", "model_id": "fixture"},
+            },
+            headers={"X-Customs-Service-Mode": "local-development"},
+            request=request,
+        )
+
+    client = HttpAgentClient(
+        base_url="http://127.0.0.1:8090",
+        service_token="test-token",
+        service_mode="local-development",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        assert client.answer(assistant)["answer_scope"] == "case_grounded"
+    finally:
+        client.close()
 
 
 def test_metadata_requires_the_same_mode_in_both_directions() -> None:

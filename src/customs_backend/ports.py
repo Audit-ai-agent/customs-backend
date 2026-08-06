@@ -6,6 +6,11 @@ from typing import Any, Protocol
 
 from customs_backend.domain import (
     CaseRecord,
+    ConversationMessageExchange,
+    ConversationMessageRecord,
+    ConversationRecord,
+    CorrectionProposalDecisionRecord,
+    CorrectionProposalRecord,
     DocumentRecord,
     FindingDecisionRecord,
     FindingDecisionStatus,
@@ -46,8 +51,19 @@ class WorkbenchRepository(Protocol):
     def create_review_job(
         self, job: JobRecord, *, expected_case_revision: int
     ) -> tuple[JobRecord, bool]: ...
+    def get_review_job_by_idempotency(
+        self, org_id: str, idempotency_key: str
+    ) -> JobRecord | None: ...
     def update_job(self, job: JobRecord) -> JobRecord: ...
     def complete_review(self, job: JobRecord, run: ReviewRunRecord) -> ReviewRunRecord: ...
+    def complete_review_and_apply_correction_proposals(
+        self,
+        *,
+        job: JobRecord,
+        run: ReviewRunRecord,
+        correction_proposal_ids: list[str],
+        applied_by: str,
+    ) -> ReviewRunRecord: ...
     def record_finding_decision(
         self,
         *,
@@ -58,6 +74,44 @@ class WorkbenchRepository(Protocol):
         reason: str,
         decided_by: str,
     ) -> FindingDecisionRecord: ...
+    def create_conversation(self, record: ConversationRecord) -> ConversationRecord: ...
+    def get_conversation(self, org_id: str, conversation_id: str) -> ConversationRecord | None: ...
+    def list_conversations(self, org_id: str, review_run_id: str) -> list[ConversationRecord]: ...
+    def list_messages(
+        self, org_id: str, conversation_id: str
+    ) -> list[ConversationMessageRecord]: ...
+    def get_message_exchange(
+        self,
+        *,
+        org_id: str,
+        conversation_id: str,
+        idempotency_key: str,
+        idempotency_request_digest: str,
+    ) -> ConversationMessageExchange | None: ...
+    def append_message_exchange(
+        self,
+        *,
+        user_message: ConversationMessageRecord,
+        assistant_message: ConversationMessageRecord,
+        idempotency_key: str,
+        idempotency_request_digest: str,
+    ) -> tuple[ConversationMessageExchange, bool]: ...
+    def create_correction_proposal(
+        self, record: CorrectionProposalRecord
+    ) -> CorrectionProposalRecord: ...
+    def get_correction_proposal(
+        self, org_id: str, correction_proposal_id: str
+    ) -> CorrectionProposalRecord | None: ...
+    def list_correction_proposals(
+        self, org_id: str, review_run_id: str
+    ) -> list[CorrectionProposalRecord]: ...
+    def decide_correction_proposal(
+        self,
+        *,
+        org_id: str,
+        correction_proposal_id: str,
+        decision: CorrectionProposalDecisionRecord,
+    ) -> CorrectionProposalRecord: ...
     def get_job(self, org_id: str, job_id: str) -> JobRecord | None: ...
     def get_run(self, org_id: str, review_run_id: str) -> ReviewRunRecord | None: ...
     def list_runs(self, org_id: str, case_id: str) -> list[ReviewRunRecord]: ...
@@ -71,6 +125,7 @@ class ObjectStore(Protocol):
 
 class AgentClient(Protocol):
     def review(self, request: Any) -> dict[str, Any]: ...
+    def answer(self, request: Any) -> dict[str, Any]: ...
     def metadata(self) -> dict[str, Any]: ...
 
 
