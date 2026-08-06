@@ -379,6 +379,26 @@ def _assert_internal_transcript(run: ScenarioTranscriptRun) -> None:
         raise ScenarioExecutionError("dev-fixture must record that Claude was not called")
 
 
+def _contains_run_reference(value: object, review_run_id: str) -> bool:
+    """Match an exact run ID in one buffered public API event.
+
+    The runner keeps the parent and child review records separate.  A path
+    alone is not trusted as a delimiter because it can contain arbitrary Case
+    text; the typed response/request bodies carry the generated review IDs.
+    """
+
+    if isinstance(value, Mapping):
+        return any(_contains_run_reference(item, review_run_id) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_run_reference(item, review_run_id) for item in value)
+    return isinstance(value, str) and value == review_run_id
+
+
+def _append_public_events(run: ScenarioTranscriptRun, events: Sequence[Mapping[str, Any]]) -> None:
+    for event in events:
+        run.append("public-api", "http_exchange", event)
+
+
 def _run_assistant_revision_journey(
     *,
     api: PublicApiScenarioClient,
@@ -466,6 +486,7 @@ def _run_assistant_revision_journey(
         "conversation_id": conversation_id,
         "correction_proposal_id": proposal_id,
         "child_review_run_id": child_run_id,
+        "child_job_id": child_job_id,
         "child_job_status": child_job_detail.get("status"),
         "child_assessment": child_run.get("assessment"),
         "child_human_review_required": child_run.get("review_disposition")
@@ -546,8 +567,21 @@ def _run_scenario(
             document_id=fixture_documents[0]["document_id"],
             scenario_name=scenario.name,
         )
-        for event in api.events:
-            transcript.append("public-api", "http_exchange", event)
+        child_review_run_id = assistant_journey["child_review_run_id"]
+        child_job_id = assistant_journey["child_job_id"]
+        correction_proposal_id = assistant_journey["correction_proposal_id"]
+        if not all(
+            isinstance(value, str)
+            for value in (child_review_run_id, child_job_id, correction_proposal_id)
+        ):
+            raise ScenarioExecutionError(f"{scenario.name}: child workflow identity is invalid")
+        child_events = [
+            event for event in api.events if _contains_run_reference(event, child_review_run_id)
+        ]
+        parent_events = [event for event in api.events if event not in child_events]
+        if not child_events:
+            raise ScenarioExecutionError(f"{scenario.name}: child public transcript is empty")
+        _append_public_events(transcript, parent_events)
         _assert_internal_transcript(transcript)
         summary = {
             "schema_version": "scenario-transcript/v1",
@@ -587,6 +621,53 @@ def _run_scenario(
             ],
         }
         transcript.write_json("summary.json", summary)
+
+        child_transcript = transcript_root.open_or_create_run(child_review_run_id)
+        child_transcript.write_json(
+            "scenario.json",
+            {
+                "schema_version": "scenario-transcript/v1",
+                "profile": "dev-fixture",
+                "scenario": f"{scenario.name}: approved-correction-child",
+                "review_run_id": child_review_run_id,
+                "parent_review_run_id": review_run_id,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "review_request": {
+                    "parent_review_run_id": review_run_id,
+                    "proposal_ids": [correction_proposal_id],
+                },
+                "claude": {
+                    "called": False,
+                    "reason": "dev-fixture uses the deterministic document analyzer",
+                },
+            },
+        )
+        _append_public_events(child_transcript, child_events)
+        _assert_internal_transcript(child_transcript)
+        child_transcript.write_json(
+            "summary.json",
+            {
+                "schema_version": "scenario-transcript/v1",
+                "profile": "dev-fixture",
+                "scenario": f"{scenario.name}: approved-correction-child",
+                "review_run_id": child_review_run_id,
+                "parent_review_run_id": review_run_id,
+                "status": "passed",
+                "actual": {
+                    "job_id": child_job_id,
+                    "job_status": assistant_journey["child_job_status"],
+                    "assessment": assistant_journey["child_assessment"],
+                    "human_review_required": assistant_journey["child_human_review_required"],
+                },
+                "streams": [
+                    "scenario.json",
+                    "public-api.jsonl",
+                    "backend-agent.jsonl",
+                    "agent-data.jsonl",
+                    "claude.jsonl",
+                ],
+            },
+        )
         return {"scenario": scenario.name, "review_run_id": review_run_id, "status": "passed"}
     finally:
         api.close()

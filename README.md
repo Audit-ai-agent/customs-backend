@@ -64,6 +64,10 @@ Backend의 표준 loopback 주소는 `http://127.0.0.1:18081`이다. Windows에�
 `Import-AgentProfile.ps1`로 아래 Agent 두 값과 Data Evidence token만 좁게 읽는다.
 Agent 프로세스에는 DB·MinIO·Keycloak·로컬 로그인 값이 전달되지 않는다.
 
+`dev-fixture`에서 심사 기준일을 생략하면 합성 Evidence의 고정 기준일인
+`2026-08-05`를 사용한다. 이는 팀 개발 결과를 재현 가능하게 하기 위한 fixture 규칙이며,
+실제 기능 UAT의 법령 기준일이나 운영 판단을 의미하지 않는다.
+
 - `CUSTOMS_BACKEND_AGENT_SERVICE_TOKEN`: Backend가 보내는 Bearer token
 - `CUSTOMS_AGENT_SERVICE_BEARER_TOKEN`: Agent가 검증하는 동일 token
 

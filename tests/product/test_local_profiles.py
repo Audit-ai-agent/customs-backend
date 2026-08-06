@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import date
 from pathlib import Path
 
 import httpx
@@ -16,6 +17,7 @@ from customs_backend.service import WorkbenchService
 from customs_backend.settings import Settings
 from customs_backend import local_profile
 from customs_backend.local_profile import _functional_uat
+from tests.product.agent_v3_fixture import build_agent_v3_result
 
 
 def _development_settings(**overrides: object) -> Settings:
@@ -111,6 +113,58 @@ def test_local_development_rejects_non_loopback_or_store_configuration() -> None
         _development_settings(database_url="postgresql://example.invalid/db")
     with pytest.raises(ValueError, match="in-memory state"):
         _development_settings(oidc_issuer="http://127.0.0.1:18088/realms/customs")
+
+
+def test_local_development_uses_the_fixture_date_when_review_date_is_omitted() -> None:
+    settings = _development_settings()
+    reviewer = Principal(
+        subject="local-reviewer", org_id="local-dev", roles=frozenset({Role.reviewer})
+    )
+    repository = InMemoryWorkbenchRepository()
+    objects = InMemoryObjectStore()
+    observed_dates: list[date] = []
+
+    def review_handler(request):
+        observed_dates.append(request.review_as_of)
+        return build_agent_v3_result(request)
+
+    agent = CallableAgentClient(review_handler)
+    service = WorkbenchService(repository=repository, object_store=objects, agent=agent)
+    app = create_app(
+        settings=settings,
+        container=Container(
+            settings=settings,
+            repository=repository,
+            object_store=objects,
+            agent=agent,
+            token_verifier=StaticTokenVerifier({"reviewer-token": reviewer}),
+            service=service,
+        ),
+    )
+    with TestClient(app, client=("127.0.0.1", 50_000)) as client:
+        headers = {"Authorization": "Bearer reviewer-token"}
+        case = client.post("/api/v1/cases", json={"title": "Fixture date"}, headers=headers)
+        assert case.status_code == 201
+        case_id = case.json()["case_id"]
+        document = client.post(
+            f"/api/v1/cases/{case_id}/documents",
+            json={
+                "document_type": "CI",
+                "filename": "fixture-date.txt",
+                "content_text": "COMMERCIAL INVOICE\\nInvoice No: FIXTURE-DATE",
+            },
+            headers=headers,
+        )
+        assert document.status_code == 201
+        review = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={"trade_type": "import"},
+            headers={**headers, "Idempotency-Key": "fixture-date-001"},
+        )
+        assert review.status_code == 202
+        assert review.json()["job"]["status"] == "succeeded"
+
+    assert observed_dates == [date(2026, 8, 5)]
 
 
 def test_functional_uat_has_a_fixed_backend_owned_review_date() -> None:

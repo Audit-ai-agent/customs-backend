@@ -67,6 +67,7 @@ IdempotencyKey = Annotated[
     Header(alias="Idempotency-Key", min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$"),
 ]
 MAX_PUBLIC_REQUEST_BODY_BYTES = 4 * 1024 * 1024
+_DEV_FIXTURE_REVIEW_AS_OF = date(2026, 8, 5)
 
 
 class ProblemDetailsV1(BaseModel):
@@ -790,7 +791,16 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         service: WorkbenchService = Depends(_service),
     ) -> JobResponse:
         public_request = body.model_dump(mode="json", exclude_none=True)
-        if actual_container.settings.environment == "functional-uat":
+        if (
+            actual_container.settings.environment == "local-development"
+            and body.review_as_of is None
+        ):
+            # The deterministic Evidence fixture has one fixed synthetic
+            # knowledge date.  Keep an omitted date reproducible instead of
+            # silently making a normal team-development run fail as wall time
+            # moves beyond that fixture date.
+            body = body.model_copy(update={"review_as_of": _DEV_FIXTURE_REVIEW_AS_OF})
+        elif actual_container.settings.environment == "functional-uat":
             required_as_of = actual_container.settings.functional_uat_as_of
             if body.review_as_of is not None and body.review_as_of != required_as_of:
                 raise HTTPException(
