@@ -21,8 +21,8 @@ from customs_backend.local_profile import _functional_uat
 def _development_settings(**overrides: object) -> Settings:
     values: dict[str, object] = {
         "environment": "local-development",
-        "public_base_url": "http://127.0.0.1:8080",
-        "agent_base_url": "http://127.0.0.1:8090",
+        "public_base_url": "http://127.0.0.1:18081",
+        "agent_base_url": "http://127.0.0.1:18090",
         "agent_service_token": "a" * 32,
         "dev_session_token": "d" * 32,
     }
@@ -93,8 +93,8 @@ def test_functional_uat_has_a_fixed_backend_owned_review_date() -> None:
     settings = Settings(
         _env_file=None,
         environment="functional-uat",
-        public_base_url="http://127.0.0.1:8080",
-        agent_base_url="http://127.0.0.1:8090",
+        public_base_url="http://127.0.0.1:18081",
+        agent_base_url="http://127.0.0.1:18090",
         agent_service_token="a" * 32,
         database_url="postgresql://customs:local@127.0.0.1/customs",
         minio_endpoint="127.0.0.1:19000",
@@ -114,8 +114,8 @@ def test_functional_uat_has_a_fixed_backend_owned_review_date() -> None:
 def test_functional_uat_rejects_nonlocal_store_or_identity_endpoints() -> None:
     values: dict[str, object] = {
         "environment": "functional-uat",
-        "public_base_url": "http://127.0.0.1:8080",
-        "agent_base_url": "http://127.0.0.1:8090",
+        "public_base_url": "http://127.0.0.1:18081",
+        "agent_base_url": "http://127.0.0.1:18090",
         "agent_service_token": "a" * 32,
         "database_url": "postgresql://customs:local@127.0.0.1/customs",
         "minio_endpoint": "127.0.0.1:19000",
@@ -129,7 +129,10 @@ def test_functional_uat_rejects_nonlocal_store_or_identity_endpoints() -> None:
         "oidc_token_endpoint": "http://127.0.0.1:18088/realms/customs/protocol/openid-connect/token",
     }
     with pytest.raises(ValueError, match="PostgreSQL on literal loopback"):
-        Settings(_env_file=None, **{**values, "database_url": "postgresql://customs:x@db.invalid/customs"})
+        Settings(
+            _env_file=None,
+            **{**values, "database_url": "postgresql://customs:x@db.invalid/customs"},
+        )
     with pytest.raises(ValueError, match="minio_endpoint must use literal loopback"):
         Settings(_env_file=None, **{**values, "minio_endpoint": "store.invalid:9000"})
     with pytest.raises(ValueError, match="literal HTTP loopback"):
@@ -234,10 +237,10 @@ def test_profile_loader_is_local_only_and_does_not_echo_values() -> None:
 
     assert "ValidateSet('dev-fixture', 'functional-uat')" in loader
     assert "ValidateSet('backend', 'agent')" in loader
-    assert "Set-Item -LiteralPath \"Env:$key\" -Value $value" in loader
+    assert 'Set-Item -LiteralPath "Env:$key" -Value $value' in loader
     assert "CUSTOMS_AGENT_SERVICE_BEARER_TOKEN" in loader
     assert "CUSTOMS_AGENT_SERVICE_MODE" in loader
     assert "CUSTOMS_FUNCTIONAL_KEYCLOAK_ADMIN_PASSWORD" in loader
     assert "$allowedKeys = if ($Scope -eq 'backend') { $backendKeys } else { $agentKeys }" in loader
-    assert "Write-Host \"Imported local $Profile $Scope profile values.\"" in loader
+    assert 'Write-Host "Imported local $Profile $Scope profile values."' in loader
     assert "Invoke-Expression" not in loader

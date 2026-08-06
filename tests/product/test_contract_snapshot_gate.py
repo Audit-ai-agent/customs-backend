@@ -9,9 +9,7 @@ from tools import verify_contract_snapshots as verifier
 
 
 def _git(root: Path, *arguments: str) -> None:
-    subprocess.run(
-        ["git", *arguments], cwd=root, check=True, capture_output=True, text=True
-    )
+    subprocess.run(["git", *arguments], cwd=root, check=True, capture_output=True, text=True)
 
 
 def _repository(tmp_path: Path) -> tuple[Path, bytes]:
@@ -57,6 +55,7 @@ def test_contract_snapshot_gate_fails_closed(tmp_path: Path, failure: str) -> No
             b'{"dirty":true}\n'
         )
     else:
+
         def renderer() -> bytes:
             return b'{"openapi":"different"}\n'
 

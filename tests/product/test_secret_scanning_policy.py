@@ -46,5 +46,8 @@ def test_ci_verifies_the_pinned_gitleaks_archive_before_scanning() -> None:
     assert "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb" in workflow
     assert "sha256sum --check --status" in workflow
     assert "git archive --format=tar HEAD" in workflow
-    assert './gitleaks dir "$scan_root" --config .gitleaks.toml --redact --no-banner --exit-code 1' in workflow
+    assert (
+        './gitleaks dir "$scan_root" --config .gitleaks.toml --redact --no-banner --exit-code 1'
+        in workflow
+    )
     assert "GITHUB_TOKEN" not in workflow

@@ -40,12 +40,8 @@ class Role(str, Enum):
 
 
 class Principal(BaseModel):
-    subject: str = Field(
-        min_length=1, max_length=256, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
-    )
-    org_id: str = Field(
-        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
-    )
+    subject: str = Field(min_length=1, max_length=256, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@/-]*$")
+    org_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
     roles: frozenset[Role]
 
 
@@ -117,6 +113,12 @@ class TextDocumentCreate(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
     content_text: str = Field(min_length=1, max_length=MAX_TEXT_DOCUMENT_CHARACTERS)
     media_type: Literal["text/plain"] = "text/plain"
+    replaces_document_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
 
     @field_validator("filename")
     @classmethod
@@ -146,6 +148,12 @@ class DocumentRecord(BaseModel):
     character_count: int = Field(ge=1, le=MAX_TEXT_DOCUMENT_CHARACTERS)
     created_by: str
     created_at: datetime
+    # A document is immutable.  A correction creates a new record and marks
+    # the earlier record as superseded, so historic review input snapshots
+    # remain reproducible.
+    replaces_document_id: str | None = None
+    superseded_by_document_id: str | None = None
+    superseded_at: datetime | None = None
 
 
 class ReviewEnqueueRequest(BaseModel):
@@ -184,6 +192,51 @@ class RequiredAction(BaseModel):
 
     action_code: str = Field(min_length=1, max_length=128)
     message: str = Field(min_length=1, max_length=4000)
+    finding_ids: list[str] = Field(default_factory=list, max_length=2000)
+
+
+class FindingDecisionStatus(str, Enum):
+    confirmed = "confirmed"
+    needs_information = "needs_information"
+    resolved = "resolved"
+
+
+class FindingDecisionRequest(BaseModel):
+    """A reviewer-owned decision which never changes the Agent result."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: FindingDecisionStatus
+    reason: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("reason")
+    @classmethod
+    def non_blank_reason(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("a reviewer decision reason is required")
+        return value
+
+
+class FindingDecisionHistoryEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: FindingDecisionStatus
+    reason: str = Field(min_length=1, max_length=4000)
+    decided_by: str = Field(min_length=1, max_length=256)
+    decided_at: datetime
+
+
+class FindingDecisionRecord(BaseModel):
+    """Current finding decision plus every prior reviewer decision."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    finding_id: str = Field(min_length=1, max_length=128)
+    status: FindingDecisionStatus
+    reason: str = Field(min_length=1, max_length=4000)
+    decided_by: str = Field(min_length=1, max_length=256)
+    decided_at: datetime
+    history: list[FindingDecisionHistoryEntry] = Field(min_length=1, max_length=100)
 
 
 class InputDocumentManifestEntry(BaseModel):
@@ -211,6 +264,13 @@ class ReviewRunRecord(BaseModel):
     result_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     execution_status: ExecutionStatus
     assessment: Assessment
+    # This is the Agent contract version, not a Backend API version.  Defaults
+    # keep historic local functional-UAT state readable after the V3.1 rollout.
+    agent_schema_version: str = Field(default="3.0", min_length=1, max_length=32)
+    agent_status: str = Field(default="needs_review", min_length=1, max_length=64)
+    agent_engine: dict[str, Any] | None = None
+    agent_jurisdiction: Literal["KR"] = "KR"
+    agent_requires_human_review: Literal[True] = True
     review_disposition: ReviewDisposition = ReviewDisposition.human_review_required
     assurance_level: AssuranceLevel = AssuranceLevel.diagnostic
     completion_eligibility: CompletionEligibility
@@ -218,6 +278,12 @@ class ReviewRunRecord(BaseModel):
     evidence: list[dict[str, Any]]
     findings: list[dict[str, Any]]
     required_actions: list[RequiredAction]
+    # V3.1 workflow detail is returned by the Agent and is immutable for a
+    # completed run.  It is intentionally separate from reviewer decisions.
+    workflow: dict[str, Any] = Field(default_factory=dict)
+    document_analyses: list[dict[str, Any]] = Field(default_factory=list)
+    comparisons: list[dict[str, Any]] = Field(default_factory=list)
+    reviewer_decisions: list[FindingDecisionRecord] = Field(default_factory=list)
     # Existing Browser key; it is display-only and never controls completion.
     release_identity: dict[str, Any] = Field(default_factory=dict)
     created_by: str
@@ -252,9 +318,7 @@ class AgentReviewRequest(BaseModel):
     review_run_id: str = Field(
         min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
     )
-    case_id: str = Field(
-        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
-    )
+    case_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
     documents: list[AgentDocumentInput] = Field(min_length=1, max_length=20)
     review_as_of: date
     trade_type: Literal["import", "export"]

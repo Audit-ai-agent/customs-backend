@@ -2,15 +2,133 @@
   "$id": "https://schemas.customs.local/agent/v3/review-result.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
-  "description": "Functional review result. It is always for human review and never a deployment decision.",
+  "description": "Bounded text-review result. It is always for human review and never an approval or deployment decision.",
   "$defs": {
+    "Source": {
+      "additionalProperties": false,
+      "properties": {
+        "document_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "quote": {"type": "string", "minLength": 1, "maxLength": 4000},
+        "occurrence": {"type": "integer", "minimum": 0, "maximum": 100000}
+      },
+      "required": ["document_id", "quote", "occurrence"],
+      "type": "object"
+    },
+    "Fact": {
+      "additionalProperties": false,
+      "properties": {
+        "fact_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "name": {"type": "string", "minLength": 1, "maxLength": 64},
+        "raw_value": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "normalized_value": {"type": ["string", "null"], "maxLength": 2000},
+        "unit": {"type": ["string", "null"], "maxLength": 64},
+        "source": {"$ref": "#/$defs/Source"}
+      },
+      "required": ["fact_id", "name", "raw_value", "normalized_value", "unit", "source"],
+      "type": "object"
+    },
+    "LineItem": {
+      "additionalProperties": false,
+      "properties": {
+        "item_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "source": {"$ref": "#/$defs/Source"},
+        "facts": {"type": "array", "maxItems": 32, "items": {"$ref": "#/$defs/Fact"}}
+      },
+      "required": ["item_id", "source", "facts"],
+      "type": "object"
+    },
+    "ExtractionWarning": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {"type": "string", "minLength": 1, "maxLength": 128},
+        "message": {"type": "string", "minLength": 1, "maxLength": 1000}
+      },
+      "required": ["code", "message"],
+      "type": "object"
+    },
+    "DocumentAnalysis": {
+      "additionalProperties": false,
+      "properties": {
+        "document_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "filename": {"type": "string", "minLength": 1, "maxLength": 255},
+        "declared_type": {"type": ["string", "null"], "maxLength": 64},
+        "document_type": {"type": "string", "enum": ["invoice", "packing_list", "bill_of_lading", "certificate_of_origin", "unknown"]},
+        "classification_source": {"anyOf": [{"$ref": "#/$defs/Source"}, {"type": "null"}]},
+        "extraction_status": {"type": "string", "enum": ["complete", "needs_review"]},
+        "facts": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/Fact"}},
+        "line_items": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/LineItem"}},
+        "warnings": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/ExtractionWarning"}}
+      },
+      "required": ["document_id", "filename", "declared_type", "document_type", "classification_source", "extraction_status", "facts", "line_items", "warnings"],
+      "type": "object"
+    },
+    "ComparisonOperand": {
+      "additionalProperties": false,
+      "properties": {
+        "document_id": {"type": ["string", "null"], "maxLength": 128},
+        "item_id": {"type": ["string", "null"], "maxLength": 256},
+        "fact_ids": {"type": "array", "maxItems": 8, "items": {"type": "string"}},
+        "display_value": {"type": ["string", "null"], "maxLength": 4000}
+      },
+      "required": ["document_id", "item_id", "fact_ids", "display_value"],
+      "type": "object"
+    },
+    "Comparison": {
+      "additionalProperties": false,
+      "properties": {
+        "comparison_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "rule_code": {"type": "string", "minLength": 1, "maxLength": 128},
+        "status": {"type": "string", "enum": ["pass", "skip", "mismatch", "needs_review"]},
+        "left": {"$ref": "#/$defs/ComparisonOperand"},
+        "right": {"$ref": "#/$defs/ComparisonOperand"},
+        "expected_value": {"type": ["string", "null"], "maxLength": 2000},
+        "observed_value": {"type": ["string", "null"], "maxLength": 2000},
+        "unit": {"type": ["string", "null"], "maxLength": 64},
+        "message": {"type": "string", "minLength": 1, "maxLength": 4000}
+      },
+      "required": ["comparison_id", "rule_code", "status", "left", "right", "expected_value", "observed_value", "unit", "message"],
+      "type": "object"
+    },
+    "Reextraction": {
+      "additionalProperties": false,
+      "properties": {
+        "document_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "attempt_count": {"type": "integer", "const": 1},
+        "requested_fields": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "string"}},
+        "status": {"type": "string", "enum": ["completed", "unavailable"]}
+      },
+      "required": ["document_id", "attempt_count", "requested_fields", "status"],
+      "type": "object"
+    },
+    "WorkflowStage": {
+      "additionalProperties": false,
+      "properties": {
+        "stage": {"type": "string", "enum": ["classify_documents", "extract_facts", "normalize_facts", "match_documents", "validate_documents", "reextract_documents", "retrieve_evidence", "generate_result"]},
+        "status": {"type": "string", "enum": ["completed", "skipped", "needs_review", "failed"]},
+        "attempt_count": {"type": "integer", "minimum": 0, "maximum": 40},
+        "summary": {"type": "string", "minLength": 1, "maxLength": 2000}
+      },
+      "required": ["stage", "status", "attempt_count", "summary"],
+      "type": "object"
+    },
+    "Workflow": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {"type": "string", "enum": ["completed", "partial", "failed"]},
+        "stages": {"type": "array", "minItems": 1, "maxItems": 8, "items": {"$ref": "#/$defs/WorkflowStage"}},
+        "reextractions": {"type": "array", "maxItems": 20, "items": {"$ref": "#/$defs/Reextraction"}}
+      },
+      "required": ["status", "stages", "reextractions"],
+      "type": "object"
+    },
     "Action": {
       "additionalProperties": false,
       "properties": {
         "action_code": {"type": "string", "minLength": 1, "maxLength": 128},
-        "message": {"type": "string", "minLength": 1, "maxLength": 4000}
+        "message": {"type": "string", "minLength": 1, "maxLength": 4000},
+        "finding_ids": {"type": "array", "maxItems": 256, "items": {"type": "string"}}
       },
-      "required": ["action_code", "message"],
+      "required": ["action_code", "message", "finding_ids"],
       "type": "object"
     },
     "Engine": {
@@ -35,20 +153,24 @@
         "text": {"type": "string", "minLength": 1, "maxLength": 20000},
         "title": {"type": "string", "minLength": 1, "maxLength": 2000}
       },
-      "required": ["evidence_id", "item_id", "title", "text", "source_uri", "source_type", "source_hash"],
+      "required": ["evidence_id", "item_id", "title", "text", "source_uri", "source_type", "source_hash", "law_id", "law_name"],
       "type": "object"
     },
     "Finding": {
       "additionalProperties": false,
       "properties": {
-        "code": {"type": "string", "minLength": 1, "maxLength": 128},
-        "evidence_ids": {"type": "array", "maxItems": 256, "items": {"type": "string", "minLength": 1, "maxLength": 128}},
-        "item_id": {"type": ["string", "null"], "maxLength": 128},
+        "finding_id": {"type": "string", "minLength": 1, "maxLength": 256},
         "kind": {"enum": ["validation_issue", "regulatory_finding"], "type": "string"},
+        "code": {"type": "string", "minLength": 1, "maxLength": 128},
+        "severity": {"enum": ["low", "medium", "high", "critical"], "type": "string"},
         "message": {"type": "string", "minLength": 1, "maxLength": 4000},
-        "severity": {"enum": ["low", "medium", "high", "critical"], "type": "string"}
+        "item_id": {"type": ["string", "null"], "maxLength": 128},
+        "evidence_ids": {"type": "array", "maxItems": 256, "items": {"type": "string", "minLength": 1, "maxLength": 128}},
+        "comparison_id": {"type": ["string", "null"], "maxLength": 256},
+        "document_ids": {"type": "array", "maxItems": 20, "items": {"type": "string"}},
+        "fact_ids": {"type": "array", "maxItems": 32, "items": {"type": "string"}}
       },
-      "required": ["kind", "code", "severity", "message", "item_id", "evidence_ids"],
+      "required": ["finding_id", "kind", "code", "severity", "message", "item_id", "evidence_ids", "comparison_id", "document_ids", "fact_ids"],
       "type": "object"
     },
     "Report": {
@@ -65,23 +187,26 @@
   "properties": {
     "assessment": {"enum": ["no_issue_detected", "issues_detected", "indeterminate"], "type": "string"},
     "case_id": {"type": "string", "minLength": 1, "maxLength": 128},
-    "engine": {"$ref": "#/$defs/Engine"},
+    "engine": {"anyOf": [{"$ref": "#/$defs/Engine"}, {"type": "null"}]},
     "evidence": {"type": "array", "maxItems": 10000, "items": {"$ref": "#/$defs/Evidence"}},
     "execution_status": {"enum": ["succeeded", "partial", "failed"], "type": "string"},
     "findings": {"type": "array", "maxItems": 2000, "items": {"$ref": "#/$defs/Finding"}},
     "input_manifest_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
     "jurisdiction": {"const": "KR", "type": "string"},
     "report": {"$ref": "#/$defs/Report"},
-    "required_actions": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"$ref": "#/$defs/Action"}},
+    "workflow": {"$ref": "#/$defs/Workflow"},
+    "document_analyses": {"type": "array", "minItems": 1, "maxItems": 20, "items": {"$ref": "#/$defs/DocumentAnalysis"}},
+    "comparisons": {"type": "array", "maxItems": 2000, "items": {"$ref": "#/$defs/Comparison"}},
+    "required_actions": {"type": "array", "minItems": 1, "maxItems": 2001, "items": {"$ref": "#/$defs/Action"}},
     "requires_human_review": {"const": true, "type": "boolean"},
     "result_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
     "review_as_of": {"type": "string", "format": "date"},
     "review_run_id": {"type": "string", "minLength": 1, "maxLength": 128},
-    "schema_version": {"const": "3.0", "type": "string"},
+    "schema_version": {"const": "3.1", "type": "string"},
     "status": {"enum": ["needs_review", "blocked"], "type": "string"},
     "trade_type": {"enum": ["import", "export"], "type": "string"}
   },
-  "required": ["case_id", "review_run_id", "review_as_of", "trade_type", "jurisdiction", "status", "requires_human_review", "execution_status", "assessment", "input_manifest_sha256", "report", "evidence", "findings", "required_actions", "result_sha256"],
-  "title": "Customs AI Agent functional review result",
+  "required": ["case_id", "review_run_id", "review_as_of", "trade_type", "jurisdiction", "status", "requires_human_review", "execution_status", "assessment", "input_manifest_sha256", "report", "workflow", "document_analyses", "comparisons", "evidence", "findings", "required_actions", "result_sha256", "schema_version"],
+  "title": "Customs AI Agent bounded functional review result",
   "type": "object"
 }

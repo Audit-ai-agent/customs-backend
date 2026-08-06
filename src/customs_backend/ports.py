@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-from customs_backend.domain import CaseRecord, DocumentRecord, JobRecord, ReviewRunRecord
+from customs_backend.domain import (
+    CaseRecord,
+    DocumentRecord,
+    FindingDecisionRecord,
+    FindingDecisionStatus,
+    JobRecord,
+    ReviewRunRecord,
+)
 
 
 class ConflictError(RuntimeError):
@@ -41,6 +48,16 @@ class WorkbenchRepository(Protocol):
     ) -> tuple[JobRecord, bool]: ...
     def update_job(self, job: JobRecord) -> JobRecord: ...
     def complete_review(self, job: JobRecord, run: ReviewRunRecord) -> ReviewRunRecord: ...
+    def record_finding_decision(
+        self,
+        *,
+        org_id: str,
+        review_run_id: str,
+        finding_id: str,
+        status: FindingDecisionStatus,
+        reason: str,
+        decided_by: str,
+    ) -> FindingDecisionRecord: ...
     def get_job(self, org_id: str, job_id: str) -> JobRecord | None: ...
     def get_run(self, org_id: str, review_run_id: str) -> ReviewRunRecord | None: ...
     def list_runs(self, org_id: str, case_id: str) -> list[ReviewRunRecord]: ...

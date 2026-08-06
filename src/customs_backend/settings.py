@@ -24,8 +24,8 @@ class Settings(BaseSettings):
     # A launched process can start only one of the two local modes.
     environment: Literal["local-development", "functional-uat", "test"] = "local-development"
     process_role: Literal["runtime"] = "runtime"
-    public_base_url: str = "http://127.0.0.1:8080"
-    agent_base_url: str = "http://127.0.0.1:8090"
+    public_base_url: str = "http://127.0.0.1:18081"
+    agent_base_url: str = "http://127.0.0.1:18090"
     agent_service_token: SecretStr | None = Field(default=None, repr=False)
     agent_timeout_seconds: int = Field(default=180, ge=1, le=900)
 
@@ -130,10 +130,10 @@ class Settings(BaseSettings):
             raise ValueError("functional-uat configuration is incomplete: " + ", ".join(missing))
         database_url = self.database_url.get_secret_value() if self.database_url else ""
         parsed_database = urlsplit(database_url)
-        if (
-            parsed_database.scheme != "postgresql"
-            or parsed_database.hostname not in {"127.0.0.1", "::1"}
-        ):
+        if parsed_database.scheme != "postgresql" or parsed_database.hostname not in {
+            "127.0.0.1",
+            "::1",
+        }:
             raise ValueError("functional-uat database_url must use PostgreSQL on literal loopback")
         for name in (
             "oidc_issuer",
@@ -145,7 +145,9 @@ class Settings(BaseSettings):
             assert isinstance(value, str)
             self._literal_loopback_url(value, name=name)
         if self.oidc_end_session_endpoint is not None:
-            self._literal_loopback_url(self.oidc_end_session_endpoint, name="oidc_end_session_endpoint")
+            self._literal_loopback_url(
+                self.oidc_end_session_endpoint, name="oidc_end_session_endpoint"
+            )
         minio = urlsplit("http://" + (self.minio_endpoint or ""))
         if (
             minio.hostname not in {"127.0.0.1", "::1"}
