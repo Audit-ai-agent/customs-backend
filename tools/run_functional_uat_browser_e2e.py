@@ -229,6 +229,12 @@ def _validate_workspace_main(workspace: Path) -> None:
             raise BrowserE2eError("functional_uat_browser_workspace_not_origin_main")
 
 
+def _corepack_command(platform: str | None = None) -> str:
+    """Return an executable name that subprocess can launch on the host OS."""
+
+    return "corepack.cmd" if (platform or os.name) == "nt" else "corepack"
+
+
 def _validate_frontend_command(frontend: Path) -> None:
     package_file = frontend / "package.json"
     try:
@@ -239,7 +245,7 @@ def _validate_frontend_command(frontend: Path) -> None:
     command = scripts.get("functional-uat:browser") if isinstance(scripts, Mapping) else None
     if not isinstance(command, str) or not command.strip():
         raise BrowserE2eError("functional_uat_browser_frontend_command_missing")
-    if shutil.which("corepack") is None:
+    if shutil.which(_corepack_command()) is None:
         raise BrowserE2eError("functional_uat_browser_corepack_unavailable")
 
 
@@ -386,7 +392,7 @@ def run(
     receipt_path = _receipt_path(safe_root)
     try:
         completed = runner(
-            ("corepack", "npm", "run", "functional-uat:browser"),
+        (_corepack_command(), "npm", "run", "functional-uat:browser"),
             cwd=workspace / "customs-frontend",
             env=_child_environment(
                 profile=profile,
