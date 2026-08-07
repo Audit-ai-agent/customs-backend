@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -23,7 +25,10 @@ def test_matrix_cases_are_marked_as_system_functional_uat_cases() -> None:
         }
         assert scenario.case_title.startswith("기능 UAT · ")
         assert all(document.filename.endswith(".txt") for document in scenario.documents)
-        assert all(any("가" <= character <= "힣" for character in document.filename) for document in scenario.documents)
+        assert all(
+            any("가" <= character <= "힣" for character in document.filename)
+            for document in scenario.documents
+        )
 
 
 def test_matrix_replacement_document_uses_a_korean_business_filename() -> None:
@@ -42,11 +47,7 @@ def _matching_result() -> dict[str, Any]:
                     "summary": "법령 근거를 한 번 조회했습니다.",
                 }
             ],
-            "planner": {
-                "actions": [
-                    {"summary": "문서 사실을 비교하고 법령 근거를 확인했습니다."}
-                ]
-            },
+            "planner": {"actions": [{"summary": "문서 사실을 비교하고 법령 근거를 확인했습니다."}]},
         },
         "document_analyses": [
             {
@@ -136,7 +137,9 @@ def _matching_result() -> dict[str, Any]:
 
 
 def test_matching_scenario_requires_hs_alias_grouped_requirement_and_korean_prose() -> None:
-    scenario = next(item for item in matrix._scenario_matrix() if item.name == "all-documents-match")
+    scenario = next(
+        item for item in matrix._scenario_matrix() if item.name == "all-documents-match"
+    )
     result = _matching_result()
 
     matrix._assert_scenario_semantics(result, scenario)
@@ -204,7 +207,9 @@ def test_user_prose_rejects_english_or_raw_filenames(mutate, error: str) -> None
 def test_matching_semantics_rejects_false_hs_data_partial_or_duplicate_requirement(
     mutate, error: str
 ) -> None:
-    scenario = next(item for item in matrix._scenario_matrix() if item.name == "all-documents-match")
+    scenario = next(
+        item for item in matrix._scenario_matrix() if item.name == "all-documents-match"
+    )
     result = deepcopy(_matching_result())
     mutate(result)
 
@@ -252,3 +257,198 @@ def test_assistant_user_text_rejects_raw_identifier() -> None:
             expected_scope="case_grounded",
             run=_matching_result(),
         )
+
+
+def _provider_trace(
+    *,
+    report_accepted: bool,
+    assistant_accepted: bool,
+    recent_turn_count: int = 8,
+) -> list[dict[str, Any]]:
+    provider = {"provider": "anthropic", "model": "claude-test"}
+    return [
+        {"event": "review_report_request_started", "payload": provider},
+        {"event": "review_report_response_received", "payload": provider},
+        *(
+            []
+            if report_accepted
+            else [
+                {
+                    "event": "review_report_fallback",
+                    "payload": {"reason_code": "provider_report_unavailable_or_ungrounded"},
+                }
+            ]
+        ),
+        {
+            "event": "review_report_generated",
+            "payload": {"source": "claude" if report_accepted else "deterministic"},
+        },
+        {
+            "event": "assistant_answer_request_started",
+            "payload": {
+                **provider,
+                "messages": [
+                    {
+                        "content": json.dumps(
+                            {"recent_turns": [{} for _ in range(recent_turn_count)]}
+                        )
+                    }
+                ],
+            },
+        },
+        {"event": "assistant_answer_response_received", "payload": provider},
+        *(
+            []
+            if assistant_accepted
+            else [
+                {
+                    "event": "assistant_answer_fallback",
+                    "payload": {"reason_code": "provider_answer_unavailable_or_ungrounded"},
+                }
+            ]
+        ),
+    ]
+
+
+def _write_provider_trace(tmp_path: Path, run_id: str, events: list[dict[str, Any]]) -> None:
+    directory = tmp_path / run_id
+    directory.mkdir()
+    (directory / "claude.jsonl").write_text(
+        "\n".join(json.dumps(event, ensure_ascii=False) for event in events) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_real_provider_trace_accepts_grounded_results_with_safe_fallbacks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_provider_trace(
+        tmp_path,
+        "run-accepted",
+        _provider_trace(report_accepted=True, assistant_accepted=True),
+    )
+    _write_provider_trace(
+        tmp_path,
+        "run-safe-fallback",
+        _provider_trace(report_accepted=False, assistant_accepted=False, recent_turn_count=1),
+    )
+    monkeypatch.setattr(matrix, "workspace_transcript_root", lambda: tmp_path)
+
+    receipt = matrix._assert_real_provider_trace(["run-accepted", "run-safe-fallback"])
+
+    assert receipt == {
+        "provider": "anthropic",
+        "claude_event_count": 12,
+        "max_recent_turns": 8,
+        "provider_report_accepted_count": 1,
+        "provider_report_fallback_count": 1,
+        "provider_assistant_accepted_count": 1,
+        "provider_assistant_fallback_count": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("report_accepted", "assistant_accepted", "error"),
+    [
+        (False, True, "claude_provider_report_unaccepted"),
+        (True, False, "claude_provider_assistant_unaccepted"),
+    ],
+)
+def test_real_provider_trace_requires_an_accepted_report_and_assistant_answer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    report_accepted: bool,
+    assistant_accepted: bool,
+    error: str,
+) -> None:
+    _write_provider_trace(
+        tmp_path,
+        "run-only-fallback",
+        _provider_trace(report_accepted=report_accepted, assistant_accepted=assistant_accepted),
+    )
+    monkeypatch.setattr(matrix, "workspace_transcript_root", lambda: tmp_path)
+
+    with pytest.raises(matrix.MatrixError, match=error):
+        matrix._assert_real_provider_trace(["run-only-fallback"])
+
+
+def test_real_provider_trace_rejects_unsafe_fallback_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = _provider_trace(report_accepted=False, assistant_accepted=True)
+    fallback = next(event for event in events if event["event"] == "review_report_fallback")
+    fallback["payload"] = {
+        "reason_code": "provider_report_unavailable_or_ungrounded",
+        "unexpected": "not-safe",
+    }
+    _write_provider_trace(tmp_path, "run-unsafe-fallback", events)
+    monkeypatch.setattr(matrix, "workspace_transcript_root", lambda: tmp_path)
+
+    with pytest.raises(matrix.MatrixError, match="claude_fallback_metadata_invalid"):
+        matrix._assert_real_provider_trace(["run-unsafe-fallback"])
+
+
+def test_real_provider_trace_rejects_fallback_from_a_different_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_provider_trace(
+        tmp_path,
+        "run-with-provider-answer",
+        _provider_trace(report_accepted=True, assistant_accepted=True),
+    )
+    unmatched_events = [
+        event
+        for event in _provider_trace(report_accepted=True, assistant_accepted=True)
+        if not event["event"].startswith("assistant_answer_")
+    ]
+    unmatched_events.append(
+        {
+            "event": "assistant_answer_fallback",
+            "payload": {"reason_code": "provider_answer_unavailable_or_ungrounded"},
+        }
+    )
+    _write_provider_trace(tmp_path, "run-with-unmatched-fallback", unmatched_events)
+    monkeypatch.setattr(matrix, "workspace_transcript_root", lambda: tmp_path)
+
+    with pytest.raises(matrix.MatrixError, match="claude_provider_sequence_invalid"):
+        matrix._assert_real_provider_trace(
+            ["run-with-provider-answer", "run-with-unmatched-fallback"]
+        )
+
+
+@pytest.mark.parametrize(
+    "event_name",
+    ["review_report_request_started", "assistant_answer_response_received"],
+)
+def test_real_provider_trace_requires_anthropic_provider_and_model_on_each_call_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, event_name: str
+) -> None:
+    events = _provider_trace(report_accepted=True, assistant_accepted=True)
+    target = next(event for event in events if event["event"] == event_name)
+    target["payload"] = {"provider": "anthropic", "model": ""}
+    _write_provider_trace(tmp_path, "run-provider-payload", events)
+    monkeypatch.setattr(matrix, "workspace_transcript_root", lambda: tmp_path)
+
+    with pytest.raises(matrix.MatrixError, match="claude_provider_payload_invalid"):
+        matrix._assert_real_provider_trace(["run-provider-payload"])
+
+
+def test_real_provider_trace_keeps_provider_request_and_json_failures_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = _provider_trace(report_accepted=True, assistant_accepted=True)
+    events.append(
+        {
+            "event": "assistant_answer_response_invalid",
+            "payload": {
+                "provider": "anthropic",
+                "model": "claude-test",
+                "error_code": "provider_output_invalid",
+            },
+        }
+    )
+    _write_provider_trace(tmp_path, "run-provider-failure", events)
+    monkeypatch.setattr(matrix, "workspace_transcript_root", lambda: tmp_path)
+
+    with pytest.raises(matrix.MatrixError, match="claude_provider_request_or_json_failed"):
+        matrix._assert_real_provider_trace(["run-provider-failure"])
