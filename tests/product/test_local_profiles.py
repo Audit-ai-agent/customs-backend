@@ -12,6 +12,7 @@ from customs_backend.adapters import CallableAgentClient, HttpAgentClient, InMem
 from customs_backend.api import Container, build_container, create_app
 from customs_backend.auth import StaticTokenVerifier
 from customs_backend.domain import Principal, Role
+from customs_backend.functional_uat_branding import FUNCTIONAL_UAT_REALM_BRANDING
 from customs_backend.repository import InMemoryWorkbenchRepository
 from customs_backend.service import WorkbenchService
 from customs_backend.settings import Settings
@@ -267,9 +268,20 @@ def test_functional_profile_uses_oidc_code_flow_and_two_local_roles(tmp_path) ->
     assert [user["firstName"] for user in realm["users"]] == ["Functional", "Functional"]
     assert [user["lastName"] for user in realm["users"]] == ["Reviewer", "Approver"]
     assert all(user["emailVerified"] is True for user in realm["users"])
+    assert {key: realm[key] for key in FUNCTIONAL_UAT_REALM_BRANDING} == (
+        FUNCTIONAL_UAT_REALM_BRANDING
+    )
     client = realm["clients"][0]
+    assert client["publicClient"] is True
     assert client["standardFlowEnabled"] is True
     assert client["directAccessGrantsEnabled"] is False
+    assert client["redirectUris"] == ["http://127.0.0.1:5173/*"]
+    assert client["webOrigins"] == ["http://127.0.0.1:5173"]
+    assert [mapper["name"] for mapper in client["protocolMappers"]] == [
+        "backend-audience",
+        "roles",
+        "organization",
+    ]
 
 
 def test_profile_initializer_writes_ignored_local_values_without_echoing_them(

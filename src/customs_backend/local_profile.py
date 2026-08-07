@@ -8,6 +8,8 @@ import os
 import secrets
 from pathlib import Path
 
+from customs_backend.functional_uat_branding import FUNCTIONAL_UAT_REALM_BRANDING
+
 
 def _repository_root() -> Path:
     """Find the Backend checkout without relying on an editable-install path."""
@@ -193,6 +195,7 @@ def _functional_uat(*, realm_path: Path) -> tuple[list[tuple[str, str]], dict[st
             },
         ],
     }
+    realm.update(FUNCTIONAL_UAT_REALM_BRANDING)
     return values, realm
 
 
