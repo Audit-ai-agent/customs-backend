@@ -16,6 +16,7 @@ import argparse
 import base64
 import hashlib
 import json
+import re
 import secrets
 import time
 import uuid
@@ -41,6 +42,13 @@ class MatrixError(RuntimeError):
 
 
 _REPLACEMENT_DOCUMENT_FILENAME = "상업송장_보완본.txt"
+_HANGUL = re.compile(r"[가-힣]")
+_RAW_FILENAME = re.compile(r"\S+\.txt\b", re.IGNORECASE)
+_INTERNAL_USER_TEXT = re.compile(
+    r"\b(?:comparison|finding|inspect)[_-][A-Za-z0-9_-]+\b|\bhs_code_not_found\b",
+    re.IGNORECASE,
+)
+_DATA_EVIDENCE_LABEL = re.compile(r"\b(?:data\s+)?evidence\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +65,9 @@ class Scenario:
     documents: tuple[Document, ...]
     expected_comparisons: tuple[tuple[str, str], ...]
     expected_execution: str | None = None
+    expected_retrieval_status: str | None = None
+    expected_regulatory_finding_count: int | None = None
+    requires_certificate_hs: bool = False
 
 
 class _LoginFormParser(HTMLParser):
@@ -444,6 +455,9 @@ def _scenario_matrix() -> tuple[Scenario, ...]:
                 ("bill_packing_container", "pass"),
                 ("bill_packing_gross_weight", "pass"),
             ),
+            expected_retrieval_status="completed",
+            expected_regulatory_finding_count=1,
+            requires_certificate_hs=True,
         ),
         Scenario(
             "all-comparison-mismatches",
@@ -514,6 +528,211 @@ def _require_mapping(value: object, *, code: str) -> Mapping[str, Any]:
     return value
 
 
+def _mapping_list(value: object, *, code: str) -> list[Mapping[str, Any]]:
+    if not isinstance(value, list) or any(not isinstance(item, Mapping) for item in value):
+        raise MatrixError(code)
+    return list(value)
+
+
+def _fact_name_values(analysis: Mapping[str, Any]) -> list[str]:
+    values: list[object] = []
+    facts = analysis.get("facts")
+    if isinstance(facts, list):
+        values.extend(facts)
+    line_items = analysis.get("line_items")
+    if isinstance(line_items, list):
+        for item in line_items:
+            if isinstance(item, Mapping) and isinstance(item.get("facts"), list):
+                values.extend(item["facts"])
+    return [str(fact.get("name")) for fact in values if isinstance(fact, Mapping)]
+
+
+def _documents_with_hs(run: Mapping[str, Any]) -> set[str]:
+    documents: set[str] = set()
+    for analysis in _mapping_list(run.get("document_analyses"), code="document_analyses_invalid"):
+        document_id = analysis.get("document_id")
+        if not isinstance(document_id, str):
+            raise MatrixError("document_analysis_identity_invalid")
+        if any(name in {"hs_code", "hs_codes"} for name in _fact_name_values(analysis)):
+            documents.add(document_id)
+    return documents
+
+
+def _workflow_stage(run: Mapping[str, Any], name: str) -> Mapping[str, Any]:
+    workflow = _require_mapping(run.get("workflow"), code="workflow_invalid")
+    stages = _mapping_list(workflow.get("stages"), code="workflow_stages_invalid")
+    for stage in stages:
+        if stage.get("stage") == name:
+            return stage
+    raise MatrixError(f"workflow_stage_{name}_missing")
+
+
+def _run_internal_markers(run: Mapping[str, Any]) -> set[str]:
+    markers: set[str] = set()
+    for collection_name, keys in (
+        ("document_analyses", ("document_id",)),
+        ("comparisons", ("comparison_id", "rule_code")),
+        ("findings", ("finding_id", "code")),
+        ("required_actions", ("action_code",)),
+        ("evidence", ("evidence_id", "item_id")),
+    ):
+        values = run.get(collection_name)
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if not isinstance(value, Mapping):
+                continue
+            for key in keys:
+                marker = value.get(key)
+                if isinstance(marker, str) and len(marker) >= 5:
+                    markers.add(marker.casefold())
+    return markers
+
+
+def _assert_user_text(
+    value: object,
+    *,
+    code: str,
+    filenames: set[str],
+    internal_markers: set[str],
+) -> None:
+    if not isinstance(value, str) or not value.strip() or _HANGUL.search(value) is None:
+        raise MatrixError(f"{code}_not_korean")
+    normalized = value.casefold()
+    if _RAW_FILENAME.search(value) is not None or any(filename.casefold() in normalized for filename in filenames):
+        raise MatrixError(f"{code}_raw_filename")
+    if _INTERNAL_USER_TEXT.search(value) is not None or _DATA_EVIDENCE_LABEL.search(value) is not None:
+        raise MatrixError(f"{code}_internal_label")
+    if any(marker in normalized for marker in internal_markers):
+        raise MatrixError(f"{code}_internal_identifier")
+
+
+def _assert_run_user_prose(run: Mapping[str, Any]) -> None:
+    analyses = _mapping_list(run.get("document_analyses"), code="document_analyses_invalid")
+    filenames = {
+        filename
+        for analysis in analyses
+        if isinstance((filename := analysis.get("filename")), str) and filename
+    }
+    internal_markers = _run_internal_markers(run)
+    report = _require_mapping(run.get("report"), code="report_invalid")
+    values: list[object] = [report.get("summary"), report.get("disclaimer")]
+    for section in _mapping_list(report.get("sections"), code="report_sections_invalid"):
+        values.append(section.get("title"))
+        for claim in _mapping_list(section.get("claims"), code="report_claims_invalid"):
+            values.append(claim.get("text"))
+    workflow = _require_mapping(run.get("workflow"), code="workflow_invalid")
+    for stage in _mapping_list(workflow.get("stages"), code="workflow_stages_invalid"):
+        values.append(stage.get("summary"))
+    planner = _require_mapping(workflow.get("planner"), code="planner_invalid")
+    for action in _mapping_list(planner.get("actions"), code="planner_actions_invalid"):
+        values.append(action.get("summary"))
+    for collection_name in ("comparisons", "findings", "required_actions"):
+        for item in _mapping_list(run.get(collection_name), code=f"{collection_name}_invalid"):
+            values.append(item.get("message"))
+    for index, value in enumerate(values, start=1):
+        _assert_user_text(
+            value,
+            code=f"user_prose_{index}",
+            filenames=filenames,
+            internal_markers=internal_markers,
+        )
+
+
+def _assert_scenario_semantics(run: Mapping[str, Any], scenario: Scenario) -> None:
+    if scenario.expected_retrieval_status is not None:
+        retrieval = _workflow_stage(run, "retrieve_evidence")
+        if retrieval.get("status") != scenario.expected_retrieval_status:
+            raise MatrixError(f"{scenario.name}_retrieval_status")
+        workflow = _require_mapping(run.get("workflow"), code="workflow_invalid")
+        if (
+            scenario.expected_retrieval_status == "completed"
+            and (workflow.get("status") == "partial" or run.get("execution_status") == "partial")
+        ):
+            raise MatrixError(f"{scenario.name}_false_data_partial")
+
+    findings = _mapping_list(run.get("findings"), code="findings_invalid")
+    if scenario.requires_certificate_hs:
+        analyses = _mapping_list(run.get("document_analyses"), code="document_analyses_invalid")
+        certificate_analyses = [
+            analysis
+            for analysis in analyses
+            if analysis.get("document_type") == "certificate_of_origin"
+        ]
+        if not certificate_analyses or not any(
+            {"hs_code", "hs_codes"}.intersection(_fact_name_values(analysis))
+            for analysis in certificate_analyses
+        ):
+            raise MatrixError(f"{scenario.name}_certificate_hs_missing")
+        if any(
+            "hs" in str(finding.get("code", "")).casefold()
+            and (
+                "missing" in str(finding.get("code", "")).casefold()
+                or "not_found" in str(finding.get("code", "")).casefold()
+            )
+            for finding in findings
+        ):
+            raise MatrixError(f"{scenario.name}_false_hs_missing_finding")
+
+    if scenario.expected_regulatory_finding_count is not None:
+        regulatory = [finding for finding in findings if finding.get("kind") == "regulatory_finding"]
+        if len(regulatory) != scenario.expected_regulatory_finding_count:
+            raise MatrixError(f"{scenario.name}_regulatory_requirement_count")
+        regulatory_ids: set[str] = set()
+        referenced_evidence: set[str] = set()
+        for finding in regulatory:
+            finding_id = finding.get("finding_id")
+            evidence_ids = finding.get("evidence_ids")
+            if (
+                not isinstance(finding_id, str)
+                or not isinstance(evidence_ids, list)
+                or not evidence_ids
+                or any(not isinstance(value, str) for value in evidence_ids)
+                or len(evidence_ids) != len(set(evidence_ids))
+                or referenced_evidence.intersection(evidence_ids)
+            ):
+                raise MatrixError(f"{scenario.name}_regulatory_requirement_invalid")
+            regulatory_ids.add(finding_id)
+            referenced_evidence.update(evidence_ids)
+        actions = _mapping_list(run.get("required_actions"), code="required_actions_invalid")
+        linked_actions = [
+            action
+            for action in actions
+            if isinstance(action.get("finding_ids"), list)
+            and regulatory_ids.intersection(
+                value for value in action["finding_ids"] if isinstance(value, str)
+            )
+        ]
+        if len(linked_actions) != len(regulatory):
+            raise MatrixError(f"{scenario.name}_regulatory_action_count")
+        action_finding_ids = [
+            action.get("finding_ids")
+            for action in linked_actions
+            if isinstance(action.get("finding_ids"), list)
+        ]
+        if (
+            len(action_finding_ids) != len(linked_actions)
+            or any(
+                len(finding_ids) != 1
+                or not isinstance(finding_ids[0], str)
+                or finding_ids[0] not in regulatory_ids
+                for finding_ids in action_finding_ids
+            )
+            or {finding_ids[0] for finding_ids in action_finding_ids} != regulatory_ids
+        ):
+            raise MatrixError(f"{scenario.name}_regulatory_action_grouping")
+        hs_documents = _documents_with_hs(run)
+        if not hs_documents.issubset(
+            {
+                document_id
+                for finding in regulatory
+                for document_id in finding.get("document_ids", [])
+                if isinstance(document_id, str)
+            }
+        ):
+            raise MatrixError(f"{scenario.name}_regulatory_document_grouping")
+
+
 def _assert_agent_result(run: Mapping[str, Any], scenario: Scenario) -> None:
     if run.get("review_disposition") != "human_review_required":
         raise MatrixError(f"{scenario.name}_human_review_boundary")
@@ -557,6 +776,8 @@ def _assert_agent_result(run: Mapping[str, Any], scenario: Scenario) -> None:
             for item in comparisons
         ):
             raise MatrixError(f"{scenario.name}_{rule_code}_{expected_status}")
+    _assert_scenario_semantics(run, scenario)
+    _assert_run_user_prose(run)
 
 
 def _case_create_body(scenario: Scenario) -> dict[str, Any]:
@@ -606,8 +827,63 @@ def _create_case_and_review(
     return case_id, documents, run_id, run
 
 
+def _assert_assistant_message(
+    assistant: Mapping[str, Any],
+    *,
+    expected_scope: str,
+    run: Mapping[str, Any],
+    required_terms: Sequence[str] = (),
+) -> None:
+    if assistant.get("role") != "assistant" or assistant.get("answer_scope") != expected_scope:
+        raise MatrixError(f"assistant_scope_{expected_scope}")
+    analyses = _mapping_list(run.get("document_analyses"), code="document_analyses_invalid")
+    filenames = {
+        filename
+        for analysis in analyses
+        if isinstance((filename := analysis.get("filename")), str) and filename
+    }
+    internal_markers = _run_internal_markers(run)
+    _assert_user_text(
+        assistant.get("content"),
+        code=f"assistant_{expected_scope}",
+        filenames=filenames,
+        internal_markers=internal_markers,
+    )
+    suggested_questions = assistant.get("suggested_questions", [])
+    if not isinstance(suggested_questions, list) or any(
+        not isinstance(question, str) for question in suggested_questions
+    ):
+        raise MatrixError("assistant_suggested_questions_invalid")
+    for index, question in enumerate(suggested_questions, start=1):
+        _assert_user_text(
+            question,
+            code=f"assistant_suggestion_{index}",
+            filenames=filenames,
+            internal_markers=internal_markers,
+        )
+    citations = assistant.get("citations", [])
+    if not isinstance(citations, list) or any(not isinstance(item, Mapping) for item in citations):
+        raise MatrixError("assistant_citations_invalid")
+    citation_kinds = {str(item.get("kind")) for item in citations}
+    if expected_scope == "case_grounded" and not citation_kinds.intersection({"fact", "comparison"}):
+        raise MatrixError("assistant_case_citation_missing")
+    if expected_scope == "evidence_grounded" and "evidence" not in citation_kinds:
+        raise MatrixError("assistant_evidence_citation_missing")
+    if expected_scope not in {"case_grounded", "evidence_grounded"} and citations:
+        raise MatrixError("assistant_non_grounded_citation")
+    if required_terms and not any(term in str(assistant.get("content")) for term in required_terms):
+        raise MatrixError("assistant_answer_topic_missing")
+
+
 def _conversation(
-    api: PublicApi, *, run_id: str, title: str, question: str, expected_scope: str
+    api: PublicApi,
+    *,
+    run_id: str,
+    run: Mapping[str, Any],
+    title: str,
+    question: str,
+    expected_scope: str,
+    required_terms: Sequence[str] = (),
 ) -> str:
     created = api.require(
         "POST",
@@ -627,12 +903,18 @@ def _conversation(
     assistant = _require_mapping(
         exchange.get("assistant_message"), code="assistant_message_invalid"
     )
-    if assistant.get("role") != "assistant" or assistant.get("answer_scope") != expected_scope:
-        raise MatrixError(f"assistant_scope_{expected_scope}")
+    _assert_assistant_message(
+        assistant,
+        expected_scope=expected_scope,
+        run=run,
+        required_terms=required_terms,
+    )
     return conversation_id
 
 
-def _assert_recent_context_limit(api: PublicApi, *, run_id: str) -> None:
+def _assert_recent_context_limit(
+    api: PublicApi, *, run_id: str, run: Mapping[str, Any]
+) -> None:
     created = api.require(
         "POST",
         f"/review-runs/{run_id}/assistant/conversations",
@@ -652,8 +934,11 @@ def _assert_recent_context_limit(api: PublicApi, *, run_id: str) -> None:
         assistant = _require_mapping(
             exchange.get("assistant_message"), code="context_message_invalid"
         )
-        if assistant.get("answer_scope") != "case_grounded":
-            raise MatrixError("context_scope_invalid")
+        _assert_assistant_message(
+            assistant,
+            expected_scope="case_grounded",
+            run=run,
+        )
     listed = api.require("GET", f"/assistant/conversations/{conversation_id}/messages")
     items = listed.get("items")
     if not isinstance(items, list) or len(items) != 10:
@@ -886,6 +1171,8 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
             case_id, documents, run_id, review_run = _create_case_and_review(reviewer, scenario)
             runs[scenario.name] = (case_id, documents, run_id, review_run)
             executed.append({"scenario": scenario.name, "review_run_id": run_id})
+        if len(executed) != 6:
+            raise MatrixError("functional_uat_scenario_count_invalid")
 
         mismatch_case, mismatch_documents, mismatch_run_id, mismatch_run = runs[
             "all-comparison-mismatches"
@@ -893,6 +1180,7 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
         _conversation(
             reviewer,
             run_id=mismatch_run_id,
+            run=mismatch_run,
             title="Case-grounded answer",
             question="현재 사건의 수량 비교 결과를 설명해 주세요.",
             expected_scope="case_grounded",
@@ -900,6 +1188,7 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
         _conversation(
             reviewer,
             run_id=mismatch_run_id,
+            run=mismatch_run,
             title="Evidence-grounded answer",
             question="현재 사건의 법령 근거를 보여 주세요.",
             expected_scope="evidence_grounded",
@@ -907,6 +1196,7 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
         _conversation(
             reviewer,
             run_id=mismatch_run_id,
+            run=mismatch_run,
             title="General customs guidance",
             question="원산지 증명서 확인 절차는 무엇인가요?",
             expected_scope="general_customs_guidance",
@@ -914,6 +1204,7 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
         _conversation(
             reviewer,
             run_id=mismatch_run_id,
+            run=mismatch_run,
             title="Clarification boundary",
             question="?",
             expected_scope="clarification_needed",
@@ -921,19 +1212,49 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
         _conversation(
             reviewer,
             run_id=mismatch_run_id,
+            run=mismatch_run,
             title="Out-of-scope boundary",
             question="웹 검색으로 경쟁사 정보를 찾아 주세요.",
             expected_scope="out_of_scope",
         )
         no_evidence_run_id = runs["no-evidence"][2]
+        no_evidence_run = runs["no-evidence"][3]
         _conversation(
             reviewer,
             run_id=no_evidence_run_id,
+            run=no_evidence_run,
             title="Insufficient-evidence boundary",
             question="현재 사건의 법령 근거를 보여 주세요.",
             expected_scope="insufficient_evidence",
         )
-        _assert_recent_context_limit(reviewer, run_id=mismatch_run_id)
+        matching_run_id = runs["all-documents-match"][2]
+        matching_run = runs["all-documents-match"][3]
+        _conversation(
+            reviewer,
+            run_id=matching_run_id,
+            run=matching_run,
+            title="원산지증명서 HS 코드 확인",
+            question="원산지증명서 원문에 HS 코드가 기재되어 있는지 현재 심사 결과로 확인해 주세요.",
+            expected_scope="case_grounded",
+        )
+        _conversation(
+            reviewer,
+            run_id=matching_run_id,
+            run=matching_run,
+            title="수입신고확인증 제출 여부",
+            question="수입식품등 수입신고확인증이 제출되었거나 제출 예정인지 현재 심사 결과로 확인할 수 있습니까?",
+            expected_scope="insufficient_evidence",
+            required_terms=("제출", "예정", "확인"),
+        )
+        _conversation(
+            reviewer,
+            run_id=matching_run_id,
+            run=matching_run,
+            title="문서 간 HS 코드 대응 확인",
+            question="원산지증명서, 포장명세서, 상업송장의 HS 코드가 같은 품목을 의미하는지 확인해 주세요.",
+            expected_scope="case_grounded",
+        )
+        _assert_recent_context_limit(reviewer, run_id=mismatch_run_id, run=mismatch_run)
         child_run_id, replacement_run_id = _assert_human_correction_flow(
             reviewer,
             approver,
@@ -944,6 +1265,8 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
         )
 
         all_run_ids = [entry[2] for entry in runs.values()] + [child_run_id, replacement_run_id]
+        if len(all_run_ids) != 8 or len(all_run_ids) != len(set(all_run_ids)):
+            raise MatrixError("functional_uat_review_run_count_invalid")
         transcripts = [_verify_transcript(run_id) for run_id in all_run_ids]
         trace = _assert_real_provider_trace(all_run_ids)
         return {

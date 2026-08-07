@@ -195,7 +195,7 @@ def test_run_invokes_frontend_without_forwarding_output_or_unrelated_secret(
     assert result == {
         "status": "passed",
         "profile": "functional-uat",
-        "checks_verified": 16,
+        "checks_verified": 20,
         "transcripts_verified": 3,
     }
     assert observed["arguments"] == (
@@ -211,3 +211,12 @@ def test_run_invokes_frontend_without_forwarding_output_or_unrelated_secret(
     environment = kwargs["env"]
     assert environment["CUSTOMS_FUNCTIONAL_UAT_BROWSER_E2E"] == "1"
     assert "ANTHROPIC_API_KEY" not in environment
+
+
+def test_browser_receipt_requires_current_workbench_correctness_checks() -> None:
+    assert {
+        "korean_user_prose",
+        "raw_filename_hidden",
+        "regulatory_requirement_deduplicated",
+        "data_retrieval_semantics",
+    } <= browser_e2e._REQUIRED_CHECKS
