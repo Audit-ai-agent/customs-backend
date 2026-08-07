@@ -49,6 +49,34 @@ _INTERNAL_USER_TEXT = re.compile(
     re.IGNORECASE,
 )
 _DATA_EVIDENCE_LABEL = re.compile(r"\b(?:data\s+)?evidence\b", re.IGNORECASE)
+_PROVIDER_REQUEST_RESPONSE_EVENTS = {
+    "request_started": "response_received",
+    "review_report_request_started": "review_report_response_received",
+    "assistant_answer_request_started": "assistant_answer_response_received",
+}
+_PROVIDER_RESPONSE_REQUEST_EVENTS = {
+    response_event: request_event
+    for request_event, response_event in _PROVIDER_REQUEST_RESPONSE_EVENTS.items()
+}
+_PROVIDER_FAILURE_EVENTS = frozenset(
+    {
+        "request_failed",
+        "response_invalid",
+        *(
+            f"{purpose}_{failure}"
+            for purpose in ("review_report", "assistant_answer")
+            for failure in ("request_failed", "response_invalid")
+        ),
+    }
+)
+_SAFE_FALLBACK_REASONS = {
+    "review_report_fallback": "provider_report_unavailable_or_ungrounded",
+    "assistant_answer_fallback": "provider_answer_unavailable_or_ungrounded",
+}
+_FALLBACK_REQUEST_EVENTS = {
+    "review_report_fallback": "review_report_request_started",
+    "assistant_answer_fallback": "assistant_answer_request_started",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -599,9 +627,14 @@ def _assert_user_text(
     if not isinstance(value, str) or not value.strip() or _HANGUL.search(value) is None:
         raise MatrixError(f"{code}_not_korean")
     normalized = value.casefold()
-    if _RAW_FILENAME.search(value) is not None or any(filename.casefold() in normalized for filename in filenames):
+    if _RAW_FILENAME.search(value) is not None or any(
+        filename.casefold() in normalized for filename in filenames
+    ):
         raise MatrixError(f"{code}_raw_filename")
-    if _INTERNAL_USER_TEXT.search(value) is not None or _DATA_EVIDENCE_LABEL.search(value) is not None:
+    if (
+        _INTERNAL_USER_TEXT.search(value) is not None
+        or _DATA_EVIDENCE_LABEL.search(value) is not None
+    ):
         raise MatrixError(f"{code}_internal_label")
     if any(marker in normalized for marker in internal_markers):
         raise MatrixError(f"{code}_internal_identifier")
@@ -645,9 +678,8 @@ def _assert_scenario_semantics(run: Mapping[str, Any], scenario: Scenario) -> No
         if retrieval.get("status") != scenario.expected_retrieval_status:
             raise MatrixError(f"{scenario.name}_retrieval_status")
         workflow = _require_mapping(run.get("workflow"), code="workflow_invalid")
-        if (
-            scenario.expected_retrieval_status == "completed"
-            and (workflow.get("status") == "partial" or run.get("execution_status") == "partial")
+        if scenario.expected_retrieval_status == "completed" and (
+            workflow.get("status") == "partial" or run.get("execution_status") == "partial"
         ):
             raise MatrixError(f"{scenario.name}_false_data_partial")
 
@@ -675,7 +707,9 @@ def _assert_scenario_semantics(run: Mapping[str, Any], scenario: Scenario) -> No
             raise MatrixError(f"{scenario.name}_false_hs_missing_finding")
 
     if scenario.expected_regulatory_finding_count is not None:
-        regulatory = [finding for finding in findings if finding.get("kind") == "regulatory_finding"]
+        regulatory = [
+            finding for finding in findings if finding.get("kind") == "regulatory_finding"
+        ]
         if len(regulatory) != scenario.expected_regulatory_finding_count:
             raise MatrixError(f"{scenario.name}_regulatory_requirement_count")
         regulatory_ids: set[str] = set()
@@ -865,7 +899,9 @@ def _assert_assistant_message(
     if not isinstance(citations, list) or any(not isinstance(item, Mapping) for item in citations):
         raise MatrixError("assistant_citations_invalid")
     citation_kinds = {str(item.get("kind")) for item in citations}
-    if expected_scope == "case_grounded" and not citation_kinds.intersection({"fact", "comparison"}):
+    if expected_scope == "case_grounded" and not citation_kinds.intersection(
+        {"fact", "comparison"}
+    ):
         raise MatrixError("assistant_case_citation_missing")
     if expected_scope == "evidence_grounded" and "evidence" not in citation_kinds:
         raise MatrixError("assistant_evidence_citation_missing")
@@ -912,9 +948,7 @@ def _conversation(
     return conversation_id
 
 
-def _assert_recent_context_limit(
-    api: PublicApi, *, run_id: str, run: Mapping[str, Any]
-) -> None:
+def _assert_recent_context_limit(api: PublicApi, *, run_id: str, run: Mapping[str, Any]) -> None:
     created = api.require(
         "POST",
         f"/review-runs/{run_id}/assistant/conversations",
@@ -1100,6 +1134,10 @@ def _assert_real_provider_trace(run_ids: Sequence[str]) -> dict[str, Any]:
     total_claude_events = 0
     max_recent_turns = 0
     observed_eight_turn_boundary = False
+    report_accepted_count = 0
+    report_fallback_count = 0
+    assistant_accepted_count = 0
+    assistant_fallback_count = 0
     for run_id in run_ids:
         path = root / run_id / "claude.jsonl"
         try:
@@ -1108,9 +1146,10 @@ def _assert_real_provider_trace(run_ids: Sequence[str]) -> dict[str, Any]:
             ]
         except (OSError, json.JSONDecodeError) as exc:
             raise MatrixError("claude_trace_invalid") from exc
-        names = {str(event.get("event")) for event in events if isinstance(event, Mapping)}
-        if {"review_report_fallback", "assistant_answer_fallback"}.intersection(names):
-            raise MatrixError("unexpected_claude_fallback")
+        if not all(
+            isinstance(event, Mapping) and isinstance(event.get("event"), str) for event in events
+        ):
+            raise MatrixError("claude_trace_invalid")
         providers = {
             str(event.get("payload", {}).get("provider"))
             for event in events
@@ -1120,14 +1159,75 @@ def _assert_real_provider_trace(run_ids: Sequence[str]) -> dict[str, Any]:
         }
         if providers != {"anthropic"}:
             raise MatrixError("claude_provider_trace_invalid")
+        request_states = {
+            request_event: "idle" for request_event in _PROVIDER_REQUEST_RESPONSE_EVENTS
+        }
         for event in events:
-            if (
-                not isinstance(event, Mapping)
-                or event.get("event") != "assistant_answer_request_started"
-                or not isinstance(event.get("payload"), Mapping)
-            ):
+            event_name = event["event"]
+            payload = event.get("payload")
+            if event_name in _PROVIDER_FAILURE_EVENTS:
+                raise MatrixError("claude_provider_request_or_json_failed")
+            if event_name in _PROVIDER_REQUEST_RESPONSE_EVENTS:
+                state = request_states[event_name]
+                if state == "responded" and event_name == "assistant_answer_request_started":
+                    assistant_accepted_count += 1
+                elif state != "idle":
+                    raise MatrixError("claude_provider_sequence_invalid")
+                if (
+                    not isinstance(payload, Mapping)
+                    or payload.get("provider") != "anthropic"
+                    or not isinstance(payload.get("model"), str)
+                    or not payload["model"].strip()
+                ):
+                    raise MatrixError("claude_provider_payload_invalid")
+                request_states[event_name] = "requested"
+            elif event_name in _PROVIDER_RESPONSE_REQUEST_EVENTS:
+                request_event = _PROVIDER_RESPONSE_REQUEST_EVENTS[event_name]
+                if request_states[request_event] != "requested":
+                    raise MatrixError("claude_provider_sequence_invalid")
+                if (
+                    not isinstance(payload, Mapping)
+                    or payload.get("provider") != "anthropic"
+                    or not isinstance(payload.get("model"), str)
+                    or not payload["model"].strip()
+                ):
+                    raise MatrixError("claude_provider_payload_invalid")
+                request_states[request_event] = (
+                    "idle" if request_event == "request_started" else "responded"
+                )
+            if event_name in _SAFE_FALLBACK_REASONS:
+                if (
+                    not isinstance(payload, Mapping)
+                    or set(payload) != {"reason_code"}
+                    or payload.get("reason_code") != _SAFE_FALLBACK_REASONS[event_name]
+                ):
+                    raise MatrixError("claude_fallback_metadata_invalid")
+                request_event = _FALLBACK_REQUEST_EVENTS[event_name]
+                if request_states[request_event] != "responded":
+                    raise MatrixError("claude_provider_sequence_invalid")
+                if event_name == "review_report_fallback":
+                    report_fallback_count += 1
+                    request_states[request_event] = "fallback"
+                else:
+                    assistant_fallback_count += 1
+                    request_states[request_event] = "idle"
+            if event_name == "review_report_generated":
+                if not isinstance(payload, Mapping):
+                    raise MatrixError("claude_report_source_invalid")
+                source = payload.get("source")
+                if source not in {"claude", "deterministic"}:
+                    raise MatrixError("claude_report_source_invalid")
+                report_state = request_states["review_report_request_started"]
+                if source == "claude" and report_state == "responded":
+                    report_accepted_count += 1
+                elif source == "deterministic" and report_state in {"responded", "fallback"}:
+                    pass
+                else:
+                    raise MatrixError("claude_provider_sequence_invalid")
+                request_states["review_report_request_started"] = "idle"
+            if event_name != "assistant_answer_request_started" or not isinstance(payload, Mapping):
                 continue
-            messages = event["payload"].get("messages")
+            messages = payload.get("messages")
             if (
                 not isinstance(messages, list)
                 or len(messages) != 1
@@ -1144,13 +1244,27 @@ def _assert_real_provider_trace(run_ids: Sequence[str]) -> dict[str, Any]:
                 raise MatrixError("claude_assistant_context_invalid")
             max_recent_turns = max(max_recent_turns, len(recent_turns))
             observed_eight_turn_boundary = observed_eight_turn_boundary or len(recent_turns) == 8
+        for request_event, state in request_states.items():
+            if request_event == "assistant_answer_request_started" and state == "responded":
+                assistant_accepted_count += 1
+                continue
+            if state != "idle":
+                raise MatrixError("claude_provider_sequence_invalid")
         total_claude_events += len(events)
+    if report_accepted_count < 1:
+        raise MatrixError("claude_provider_report_unaccepted")
+    if assistant_accepted_count < 1:
+        raise MatrixError("claude_provider_assistant_unaccepted")
     if not observed_eight_turn_boundary:
         raise MatrixError("claude_assistant_context_boundary_unobserved")
     return {
         "provider": "anthropic",
         "claude_event_count": total_claude_events,
         "max_recent_turns": max_recent_turns,
+        "provider_report_accepted_count": report_accepted_count,
+        "provider_report_fallback_count": report_fallback_count,
+        "provider_assistant_accepted_count": assistant_accepted_count,
+        "provider_assistant_fallback_count": assistant_fallback_count,
     }
 
 
