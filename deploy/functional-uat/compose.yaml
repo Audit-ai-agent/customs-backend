@@ -50,6 +50,10 @@ services:
         source: ${CUSTOMS_FUNCTIONAL_REALM_FILE:?run customs-backend-profile-init first}
         target: /opt/keycloak/data/import/customs-realm.json
         read_only: true
+      - type: bind
+        source: ./keycloak-themes/customs-workbench
+        target: /opt/keycloak/themes/customs-workbench
+        read_only: true
     healthcheck:
       test:
         [

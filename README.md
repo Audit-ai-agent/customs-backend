@@ -144,6 +144,18 @@ docker compose --project-name customs-functional-uat --env-file $Profile `
 uv run --no-sync customs-backend-api
 ```
 
+Keycloak 로그인 화면은 기본 Keycloak 테마를 상속한 가벼운 `customs-workbench` 테마다. CSS와 한국어
+메시지만 bind mount하며, 이미지 build나 별도 인증 서비스를 추가하지 않는다. 기존 Functional-UAT realm은
+초기화하지 않고 compose 설정을 적용한 뒤 아래 명령으로 표시명·한국어 locale·login theme만 동기화한다.
+
+```powershell
+uv run --no-sync python tools/sync_functional_uat_keycloak_branding.py
+```
+
+이 명령은 로컬 bootstrap-admin 비밀번호를 메모리에서만 사용한다. realm·token·비밀번호를 출력하지 않고,
+사용자·role·OIDC client·인증 흐름을 생성·삭제·변경하지 않는다. `updated` 또는 `already_current`과 변경된
+필드명만 출력하므로, 기존 realm을 reset하거나 profile을 `--force`로 다시 만들 필요가 없다.
+
 로컬 Keycloak에는 `local-functional-reviewer`와 `local-functional-approver` 계정이 각각
 생성된다. 비밀번호는 화면에 출력하지 않고, 본인 PC에서만 아래 명시적 명령으로
 클립보드에 복사한다.

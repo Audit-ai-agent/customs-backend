@@ -1,0 +1,34 @@
+:root {
+  --customs-workbench-navy: #10304f;
+  --customs-workbench-teal: #007f86;
+}
+
+body {
+  background:
+    linear-gradient(135deg, rgb(16 48 79 / 94%), rgb(0 127 134 / 86%)),
+    var(--customs-workbench-navy);
+}
+
+.kc-login-container,
+.login-pf-page .card-pf,
+.pf-v5-c-login__main {
+  border-top: 4px solid var(--customs-workbench-teal);
+}
+
+.kc-header-wrapper,
+.login-pf-page .login-pf-header h1 {
+  color: var(--customs-workbench-navy);
+  font-weight: 700;
+}
+
+.pf-v5-c-button.pf-m-primary,
+.btn-primary {
+  background-color: var(--customs-workbench-teal);
+  border-color: var(--customs-workbench-teal);
+}
+
+.pf-v5-c-button.pf-m-primary:hover,
+.btn-primary:hover {
+  background-color: #006970;
+  border-color: #006970;
+}
