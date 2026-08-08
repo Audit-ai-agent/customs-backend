@@ -557,7 +557,9 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
                 or {
                     "knowledge_provider": "anthropic",
                     "knowledge_claude_event_count": 2,
+                    "knowledge_provider_attempt_count": 1,
                     "knowledge_provider_accepted_count": 1,
+                    "knowledge_provider_safe_fallback_count": 0,
                 }
             )
         ),
@@ -579,7 +581,9 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
         "knowledge_rejected_exchanges": 0,
         "knowledge_provider": "anthropic",
         "knowledge_claude_event_count": 4,
+        "knowledge_provider_attempt_count": 2,
         "knowledge_provider_accepted_count": 2,
+        "knowledge_provider_safe_fallback_count": 0,
     }
     assert "knowledge-conversation-1" not in repr(receipt)
     assert "수출 요건을 공식 자료 범위에서 알려 주세요." not in repr(receipt)
@@ -841,7 +845,7 @@ def _knowledge_no_coverage_trace() -> list[dict[str, Any]]:
     ]
 
 
-def test_real_knowledge_provider_trace_requires_accepted_anthropic_answer_in_same_turn(
+def test_real_knowledge_provider_trace_records_an_accepted_anthropic_answer_in_same_turn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     turn = _write_knowledge_provider_trace(tmp_path, _knowledge_provider_trace())
@@ -851,7 +855,9 @@ def test_real_knowledge_provider_trace_requires_accepted_anthropic_answer_in_sam
     assert receipt == {
         "knowledge_provider": "anthropic",
         "knowledge_claude_event_count": 2,
+        "knowledge_provider_attempt_count": 1,
         "knowledge_provider_accepted_count": 1,
+        "knowledge_provider_safe_fallback_count": 0,
     }
     assert "knowledge-conversation" not in repr(receipt)
     assert "안전한 응답" not in repr(receipt)
@@ -887,54 +893,159 @@ def test_knowledge_no_coverage_trace_rejects_any_provider_or_reason_deviation(
 
 
 @pytest.mark.parametrize(
-    ("event", "error"),
+    "events",
     [
-        (
+        _knowledge_provider_trace()
+        + [
+            {
+                "event": "knowledge_answer_fallback",
+                "payload": {"reason_code": "provider_answer_unavailable_or_ungrounded"},
+            }
+        ],
+        [
+            _knowledge_provider_trace()[0],
             {
                 "event": "knowledge_answer_request_failed",
-                "payload": {"provider": "anthropic", "model": "claude-test"},
+                "payload": {
+                    "provider": "anthropic",
+                    "model": "claude-test",
+                    "error_code": "provider_request_failed",
+                },
             },
-            "knowledge_claude_provider_request_or_json_failed",
-        ),
-        (
-            {
-                "event": "knowledge_answer_response_invalid",
-                "payload": {"provider": "anthropic", "model": "claude-test"},
-            },
-            "knowledge_claude_provider_request_or_json_failed",
-        ),
-        (
             {
                 "event": "knowledge_answer_fallback",
                 "payload": {"reason_code": "provider_answer_unavailable_or_ungrounded"},
             },
-            "knowledge_claude_provider_answer_unaccepted",
-        ),
-        (
+        ],
+        _knowledge_provider_trace()
+        + [
             {
-                "event": "knowledge_answer_not_called",
+                "event": "knowledge_answer_response_invalid",
                 "payload": {
-                    "provider": "claude",
-                    "called": False,
-                    "reason_code": "official_guidance_coverage_unavailable",
+                    "provider": "anthropic",
+                    "model": "claude-test",
+                    "error_code": "provider_output_invalid",
                 },
             },
+            {
+                "event": "knowledge_answer_fallback",
+                "payload": {"reason_code": "provider_answer_unavailable_or_ungrounded"},
+            },
+        ],
+    ],
+)
+def test_real_knowledge_provider_trace_classifies_documented_safe_fallbacks(
+    tmp_path: Path, events: list[dict[str, Any]]
+) -> None:
+    turn = _write_knowledge_provider_trace(tmp_path, events)
+
+    receipt = matrix._assert_real_knowledge_provider_trace(turn)
+
+    assert receipt == {
+        "knowledge_provider": "anthropic",
+        "knowledge_claude_event_count": len(events),
+        "knowledge_provider_attempt_count": 1,
+        "knowledge_provider_accepted_count": 0,
+        "knowledge_provider_safe_fallback_count": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("events", "error"),
+    [
+        (
+            [
+                _knowledge_provider_trace()[0],
+                {
+                    "event": "knowledge_answer_request_failed",
+                    "payload": {
+                        "provider": "anthropic",
+                        "model": "claude-test",
+                        "error_code": "provider_request_failed",
+                    },
+                },
+            ],
+            "knowledge_claude_provider_sequence_invalid",
+        ),
+        (
+            _knowledge_provider_trace()
+            + [
+                {
+                    "event": "knowledge_answer_response_invalid",
+                    "payload": {
+                        "provider": "anthropic",
+                        "model": "claude-test",
+                        "error_code": "provider_output_invalid",
+                    },
+                }
+            ],
+            "knowledge_claude_provider_sequence_invalid",
+        ),
+        (
+            _knowledge_provider_trace()
+            + [
+                {
+                    "event": "knowledge_answer_fallback",
+                    "payload": {"reason_code": "wrong_reason"},
+                }
+            ],
+            "knowledge_claude_fallback_metadata_invalid",
+        ),
+        (
+            _knowledge_provider_trace()
+            + [
+                {
+                    "event": "knowledge_answer_not_called",
+                    "payload": {
+                        "provider": "claude",
+                        "called": False,
+                        "reason_code": "official_guidance_coverage_unavailable",
+                    },
+                }
+            ],
             "knowledge_claude_provider_answer_unaccepted",
         ),
     ],
 )
-def test_real_knowledge_provider_trace_rejects_provider_failure_or_unaccepted_answer(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    event: dict[str, Any],
-    error: str,
+def test_real_knowledge_provider_trace_rejects_incomplete_or_invalid_terminal_sequences(
+    tmp_path: Path, events: list[dict[str, Any]], error: str
 ) -> None:
-    events = _knowledge_provider_trace()
-    events.append(event)
     turn = _write_knowledge_provider_trace(tmp_path, events)
 
     with pytest.raises(matrix.MatrixError, match=error):
         matrix._assert_real_knowledge_provider_trace(turn)
+
+
+def test_knowledge_provider_turns_do_not_count_safe_fallback_as_accepted_claude(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    turns = [
+        Path("turn-" + "c" * 32),
+        Path("turn-" + "a" * 32),
+        Path("turn-" + "b" * 32),
+    ]
+    monkeypatch.setattr(matrix, "_verify_agent_knowledge_transcript", lambda _turn: None)
+    monkeypatch.setattr(
+        matrix,
+        "_assert_knowledge_provider_not_called_for_no_coverage",
+        lambda _turn: 1,
+    )
+
+    def classify(turn: Path) -> dict[str, Any]:
+        if turn.name == "turn-" + "c" * 32:
+            raise matrix.MatrixError("knowledge_claude_provider_answer_unaccepted")
+        return {
+            "knowledge_provider": "anthropic",
+            "knowledge_claude_event_count": 3,
+            "knowledge_provider_attempt_count": 1,
+            "knowledge_provider_accepted_count": 0,
+            "knowledge_provider_safe_fallback_count": 1,
+        }
+
+    monkeypatch.setattr(matrix, "_assert_real_knowledge_provider_trace", classify)
+
+    with pytest.raises(matrix.MatrixError, match="knowledge_claude_provider_answer_unaccepted"):
+        matrix._assert_knowledge_provider_turns(turns)
 
 
 @pytest.mark.parametrize(
