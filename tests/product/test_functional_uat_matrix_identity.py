@@ -6,9 +6,49 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 
 from tools import run_functional_uat_matrix as matrix
+
+
+def test_public_api_accepts_rfc7807_json_for_an_expected_rejected_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = matrix.PublicApi(base_url="http://127.0.0.1:18081/api/v1", access_token="test-token")
+    response = httpx.Response(
+        422,
+        headers={"content-type": "application/problem+json; charset=utf-8"},
+        json={"code": "knowledge_input_not_allowed"},
+    )
+    monkeypatch.setattr(client._client, "request", lambda *_args, **_kwargs: response)
+
+    assert client.require(
+        "POST",
+        "/knowledge/conversations/example/messages",
+        body={"content": "안전한 요청"},
+        idempotency_key="knowledge-problem-json-001",
+        expected=422,
+    ) == {"code": "knowledge_input_not_allowed"}
+    client.close()
+
+
+def test_public_api_keeps_html_error_responses_non_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = matrix.PublicApi(base_url="http://127.0.0.1:18081/api/v1", access_token="test-token")
+    response = httpx.Response(422, headers={"content-type": "text/html"}, text="rejected")
+    monkeypatch.setattr(client._client, "request", lambda *_args, **_kwargs: response)
+
+    with pytest.raises(matrix.MatrixError, match="public_api_non_json_post"):
+        client.require(
+            "POST",
+            "/knowledge/conversations/example/messages",
+            body={"content": "안전한 요청"},
+            idempotency_key="knowledge-html-rejection-001",
+            expected=422,
+        )
+    client.close()
 
 
 def test_matrix_cases_are_marked_as_system_functional_uat_cases() -> None:

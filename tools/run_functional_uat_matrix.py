@@ -342,7 +342,8 @@ class PublicApi:
             response = self._client.request(method, path, json=body, headers=headers)
         except httpx.HTTPError as exc:
             raise MatrixError(f"public_api_transport_{method.casefold()}") from exc
-        if not response.headers.get("content-type", "").startswith("application/json"):
+        content_type = response.headers.get("content-type", "").split(";", 1)[0].casefold()
+        if content_type not in {"application/json", "application/problem+json"}:
             # Deliberately rejected local-role probes are allowed to have an
             # empty/non-JSON response.  Successful public API calls remain
             # JSON-only in ``require`` below.
