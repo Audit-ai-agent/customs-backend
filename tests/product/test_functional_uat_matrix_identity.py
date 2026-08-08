@@ -253,6 +253,17 @@ def test_assistant_scopes_require_grounded_answers_or_safe_insufficient_evidence
         run=result,
         required_terms=("제출", "예정", "확인"),
     )
+    matrix._assert_assistant_message(
+        {
+            "role": "assistant",
+            "answer_scope": "general_customs_guidance",
+            "content": "공식 안내 범위에서 원산지 증명서 확인 절차를 안내합니다.",
+            "citations": [_official_guidance_citation()],
+            "suggested_questions": [],
+        },
+        expected_scope="general_customs_guidance",
+        run=result,
+    )
 
 
 def test_assistant_user_text_rejects_raw_identifier() -> None:
