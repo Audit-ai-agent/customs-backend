@@ -1406,6 +1406,38 @@ def _assert_real_knowledge_provider_trace(turn_directory: Path) -> dict[str, Any
     }
 
 
+def _assert_knowledge_provider_not_called_for_no_coverage(turn_directory: Path) -> int:
+    """Require the safe non-call receipt for one no-coverage knowledge turn.
+
+    This is deliberately distinct from a provider failure: when the active
+    official snapshot has no source for a classified topic, Agent must not
+    ask Claude to fill the gap.  Only safe event names and fixed metadata are
+    inspected; no question, prompt, response, turn path, or identity leaves
+    this helper.
+    """
+
+    path = turn_directory / "claude.jsonl"
+    try:
+        events = [
+            json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line
+        ]
+    except (OSError, json.JSONDecodeError) as exc:
+        raise MatrixError("knowledge_no_coverage_claude_trace_invalid") from exc
+    if len(events) != 1 or not isinstance(events[0], Mapping):
+        raise MatrixError("knowledge_no_coverage_claude_trace_invalid")
+    event = events[0]
+    if event.get("event") != "knowledge_answer_not_called":
+        raise MatrixError("knowledge_no_coverage_claude_call_invalid")
+    payload = event.get("payload")
+    if payload != {
+        "provider": "claude",
+        "called": False,
+        "reason_code": "official_guidance_coverage_unavailable",
+    }:
+        raise MatrixError("knowledge_no_coverage_claude_call_invalid")
+    return 1
+
+
 def _assert_standalone_knowledge_assistant(
     assistant: Mapping[str, Any], *, expected_as_of: str, code: str
 ) -> tuple[str, str, int]:
@@ -1452,6 +1484,42 @@ def _assert_standalone_knowledge_assistant(
     return snapshot_id, coverage, len(citations)
 
 
+def _assert_standalone_knowledge_no_coverage(
+    assistant: Mapping[str, Any], *, expected_as_of: str, code: str
+) -> str:
+    """Validate the explicit no-coverage boundary without model inference."""
+
+    if (
+        assistant.get("role") != "assistant"
+        or assistant.get("answer_scope") != "insufficient_evidence"
+    ):
+        raise MatrixError(f"{code}_scope_invalid")
+    if any(
+        key in assistant
+        for key in ("case_id", "review_run_id", "document_id", "filename", "content_text")
+    ):
+        raise MatrixError(f"{code}_case_boundary_invalid")
+    _assert_user_text(
+        assistant.get("content"),
+        code=f"{code}_content",
+        filenames=set(),
+        internal_markers=set(),
+    )
+    if _mapping_list(assistant.get("citations"), code=f"{code}_citations_invalid"):
+        raise MatrixError(f"{code}_citation_present")
+    if _mapping_list(assistant.get("answer_sections"), code=f"{code}_sections_invalid"):
+        raise MatrixError(f"{code}_sections_invalid")
+    snapshot_id = assistant.get("knowledge_snapshot_id")
+    if (
+        assistant.get("knowledge_coverage") != "no_coverage"
+        or not isinstance(snapshot_id, str)
+        or not snapshot_id
+        or assistant.get("knowledge_as_of") != expected_as_of
+    ):
+        raise MatrixError(f"{code}_provenance_invalid")
+    return snapshot_id
+
+
 def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
     """Verify an official guidance answer and a same-conversation follow-up."""
 
@@ -1472,7 +1540,7 @@ def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
     exchange = api.require(
         "POST",
         f"/knowledge/conversations/{conversation_id}/messages",
-        body={"content": "수출 신고 전에 필요한 기본 서류와 절차를 알려 주세요."},
+        body={"content": "수출 요건을 공식 자료 범위에서 알려 주세요."},
         idempotency_key=f"functional-matrix-knowledge-{uuid.uuid4().hex}",
     )
     assistant = _require_mapping(
@@ -1486,7 +1554,7 @@ def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
     follow_up_exchange = api.require(
         "POST",
         f"/knowledge/conversations/{conversation_id}/messages",
-        body={"content": "수출 운송 서류도 공식 자료 범위에서 알려 주세요."},
+        body={"content": "FTA 특혜 적용 절차도 공식 자료 범위에서 알려 주세요."},
         idempotency_key=f"functional-matrix-knowledge-follow-up-{uuid.uuid4().hex}",
     )
     follow_up = _require_mapping(
@@ -1501,6 +1569,22 @@ def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
     )
     if follow_up_snapshot != snapshot_id or follow_up_coverage != coverage:
         raise MatrixError("knowledge_follow_up_snapshot_pin_invalid")
+    no_coverage_exchange = api.require(
+        "POST",
+        f"/knowledge/conversations/{conversation_id}/messages",
+        body={"content": "수출 운송 서류도 공식 자료 범위에서 알려 주세요."},
+        idempotency_key=f"functional-matrix-knowledge-no-coverage-{uuid.uuid4().hex}",
+    )
+    no_coverage = _require_mapping(
+        no_coverage_exchange.get("assistant_message"), code="knowledge_no_coverage_message_invalid"
+    )
+    no_coverage_snapshot = _assert_standalone_knowledge_no_coverage(
+        no_coverage,
+        expected_as_of=expected_as_of,
+        code="knowledge_no_coverage",
+    )
+    if no_coverage_snapshot != snapshot_id:
+        raise MatrixError("knowledge_no_coverage_snapshot_pin_invalid")
     # The standalone assistant is Case-independent.  Verify the public
     # ingress boundary with synthetic structural markers only; ``PublicApi``
     # intentionally does not retain or print request bodies.
@@ -1515,7 +1599,14 @@ def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
         raise MatrixError("knowledge_input_boundary_invalid")
     messages = api.require("GET", f"/knowledge/conversations/{conversation_id}/messages")
     message_items = _mapping_list(messages.get("items"), code="knowledge_message_history_invalid")
-    if [item.get("role") for item in message_items] != ["user", "assistant", "user", "assistant"]:
+    if [item.get("role") for item in message_items] != [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]:
         raise MatrixError("knowledge_message_history_invalid")
     if any(
         item.get("knowledge_snapshot_id") != snapshot_id
@@ -1528,11 +1619,15 @@ def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
     matching = [item for item in listed_items if item.get("conversation_id") == conversation_id]
     if len(matching) != 1 or matching[0].get("snapshot_id") != snapshot_id:
         raise MatrixError("knowledge_snapshot_pin_invalid")
-    turn_directories = _knowledge_turn_directories(conversation_id, expected_count=2)
+    turn_directories = _knowledge_turn_directories(conversation_id, expected_count=3)
     provider_traces: list[dict[str, Any]] = []
-    for turn_directory in turn_directories:
+    for turn_directory in turn_directories[:2]:
         _verify_agent_knowledge_transcript(turn_directory)
         provider_traces.append(_assert_real_knowledge_provider_trace(turn_directory))
+    _verify_agent_knowledge_transcript(turn_directories[2])
+    no_coverage_not_called_count = _assert_knowledge_provider_not_called_for_no_coverage(
+        turn_directories[2]
+    )
     if {trace["knowledge_provider"] for trace in provider_traces} != {"anthropic"}:
         raise MatrixError("knowledge_claude_provider_payload_invalid")
     return {
@@ -1542,6 +1637,8 @@ def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
         "agent_knowledge_transcript_verified": True,
         "knowledge_turns_verified": len(turn_directories),
         "knowledge_recent_history_verified": 1,
+        "knowledge_no_coverage_verified": 1,
+        "knowledge_no_coverage_not_called_count": no_coverage_not_called_count,
         "knowledge_rejected_inputs_verified": 1,
         "knowledge_rejected_agent_dispatches": 0,
         "knowledge_rejected_exchanges": 0,

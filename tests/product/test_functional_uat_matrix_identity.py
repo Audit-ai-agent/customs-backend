@@ -397,7 +397,9 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
     calls: list[tuple[str, str, dict[str, Any] | None]] = []
     verified: list[Path] = []
     provider_traces: list[Path] = []
+    no_coverage_traces: list[Path] = []
     guidance = _official_guidance_citation()
+    knowledge_turn_count = 0
 
     class FakeApi:
         def require(
@@ -423,6 +425,21 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
                 assert _kwargs.get("expected") == 422
                 return {"code": "knowledge_input_not_allowed"}
             if method == "POST" and path.endswith("/messages"):
+                nonlocal knowledge_turn_count
+                knowledge_turn_count += 1
+                if knowledge_turn_count == 3:
+                    return {
+                        "assistant_message": {
+                            "role": "assistant",
+                            "answer_scope": "insufficient_evidence",
+                            "content": "현재 공식 지식 스냅샷에서 확인할 수 없습니다.",
+                            "citations": [],
+                            "answer_sections": [],
+                            "knowledge_coverage": "no_coverage",
+                            "knowledge_snapshot_id": "kr-trade-snapshot-20260805",
+                            "knowledge_as_of": "2026-08-05",
+                        }
+                    }
                 return {
                     "assistant_message": {
                         "role": "assistant",
@@ -438,6 +455,11 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
             if method == "GET" and path.endswith("/messages"):
                 return {
                     "items": [
+                        {"role": "user"},
+                        {
+                            "role": "assistant",
+                            "knowledge_snapshot_id": "kr-trade-snapshot-20260805",
+                        },
                         {"role": "user"},
                         {
                             "role": "assistant",
@@ -468,10 +490,16 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
             [
                 Path("turn-" + "a" * 32),
                 Path("turn-" + "b" * 32),
+                Path("turn-" + "c" * 32),
             ]
-            if expected_count == 2
+            if expected_count == 3
             else (_ for _ in ()).throw(AssertionError("unexpected turn count"))
         ),
+    )
+    monkeypatch.setattr(
+        matrix,
+        "_assert_knowledge_provider_not_called_for_no_coverage",
+        lambda turn_directory: no_coverage_traces.append(turn_directory) or 1,
     )
     monkeypatch.setattr(
         matrix,
@@ -498,8 +526,10 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
         "official_guidance_citations_verified": 2,
         "snapshot_pinned": True,
         "agent_knowledge_transcript_verified": True,
-        "knowledge_turns_verified": 2,
+        "knowledge_turns_verified": 3,
         "knowledge_recent_history_verified": 1,
+        "knowledge_no_coverage_verified": 1,
+        "knowledge_no_coverage_not_called_count": 1,
         "knowledge_rejected_inputs_verified": 1,
         "knowledge_rejected_agent_dispatches": 0,
         "knowledge_rejected_exchanges": 0,
@@ -508,14 +538,31 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
         "knowledge_provider_accepted_count": 2,
     }
     assert "knowledge-conversation-1" not in repr(receipt)
-    assert "수출 신고 전에 필요한 기본 서류와 절차를 알려 주세요." not in repr(receipt)
-    assert verified == [Path("turn-" + "a" * 32), Path("turn-" + "b" * 32)]
+    assert "수출 요건을 공식 자료 범위에서 알려 주세요." not in repr(receipt)
+    assert verified == [
+        Path("turn-" + "a" * 32),
+        Path("turn-" + "b" * 32),
+        Path("turn-" + "c" * 32),
+    ]
     assert provider_traces == [Path("turn-" + "a" * 32), Path("turn-" + "b" * 32)]
+    assert no_coverage_traces == [Path("turn-" + "c" * 32)]
     assert calls[0] == (
         "POST",
         "/knowledge/conversations",
         {"title": "수출 신고 기본 안내", "trade_type": "export", "as_of": "2026-08-05"},
     )
+    assert [
+        body["content"]
+        for method, path, body in calls
+        if method == "POST"
+        and path.endswith("/messages")
+        and body
+        and "filename:" not in body["content"]
+    ] == [
+        "수출 요건을 공식 자료 범위에서 알려 주세요.",
+        "FTA 특혜 적용 절차도 공식 자료 범위에서 알려 주세요.",
+        "수출 운송 서류도 공식 자료 범위에서 알려 주세요.",
+    ]
 
 
 def test_agent_knowledge_transcript_verifier_runs_with_safe_result_only(
@@ -736,6 +783,19 @@ def _knowledge_provider_trace(*, model: str = "claude-test") -> list[dict[str, A
     ]
 
 
+def _knowledge_no_coverage_trace() -> list[dict[str, Any]]:
+    return [
+        {
+            "event": "knowledge_answer_not_called",
+            "payload": {
+                "provider": "claude",
+                "called": False,
+                "reason_code": "official_guidance_coverage_unavailable",
+            },
+        }
+    ]
+
+
 def test_real_knowledge_provider_trace_requires_accepted_anthropic_answer_in_same_turn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -750,6 +810,35 @@ def test_real_knowledge_provider_trace_requires_accepted_anthropic_answer_in_sam
     }
     assert "knowledge-conversation" not in repr(receipt)
     assert "안전한 응답" not in repr(receipt)
+
+
+def test_knowledge_no_coverage_trace_requires_explicit_safe_non_call(tmp_path: Path) -> None:
+    turn = _write_knowledge_provider_trace(tmp_path, _knowledge_no_coverage_trace())
+
+    assert matrix._assert_knowledge_provider_not_called_for_no_coverage(turn) == 1
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"event": "knowledge_answer_fallback", "payload": {}},
+        {
+            "event": "knowledge_answer_not_called",
+            "payload": {
+                "provider": "claude",
+                "called": False,
+                "reason_code": "another_reason",
+            },
+        },
+    ],
+)
+def test_knowledge_no_coverage_trace_rejects_any_provider_or_reason_deviation(
+    tmp_path: Path, event: dict[str, Any]
+) -> None:
+    turn = _write_knowledge_provider_trace(tmp_path, [event])
+
+    with pytest.raises(matrix.MatrixError, match="knowledge_no_coverage_claude"):
+        matrix._assert_knowledge_provider_not_called_for_no_coverage(turn)
 
 
 @pytest.mark.parametrize(
