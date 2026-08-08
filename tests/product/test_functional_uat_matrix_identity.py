@@ -528,9 +528,9 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
         "_knowledge_turn_directories",
         lambda _conversation_id, *, expected_count: (
             [
+                Path("turn-" + "c" * 32),
                 Path("turn-" + "a" * 32),
                 Path("turn-" + "b" * 32),
-                Path("turn-" + "c" * 32),
             ]
             if expected_count == 3
             else (_ for _ in ()).throw(AssertionError("unexpected turn count"))
@@ -550,12 +550,16 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
         matrix,
         "_assert_real_knowledge_provider_trace",
         lambda turn_directory: (
-            provider_traces.append(turn_directory)
-            or {
-                "knowledge_provider": "anthropic",
-                "knowledge_claude_event_count": 2,
-                "knowledge_provider_accepted_count": 1,
-            }
+            (_ for _ in ()).throw(matrix.MatrixError("knowledge_claude_provider_answer_unaccepted"))
+            if turn_directory.name == "turn-" + "c" * 32
+            else (
+                provider_traces.append(turn_directory)
+                or {
+                    "knowledge_provider": "anthropic",
+                    "knowledge_claude_event_count": 2,
+                    "knowledge_provider_accepted_count": 1,
+                }
+            )
         ),
     )
 
@@ -580,9 +584,9 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
     assert "knowledge-conversation-1" not in repr(receipt)
     assert "수출 요건을 공식 자료 범위에서 알려 주세요." not in repr(receipt)
     assert verified == [
+        Path("turn-" + "c" * 32),
         Path("turn-" + "a" * 32),
         Path("turn-" + "b" * 32),
-        Path("turn-" + "c" * 32),
     ]
     assert provider_traces == [Path("turn-" + "a" * 32), Path("turn-" + "b" * 32)]
     assert no_coverage_traces == [Path("turn-" + "c" * 32)]

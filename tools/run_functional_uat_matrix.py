@@ -1623,14 +1623,25 @@ def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
         raise MatrixError("knowledge_snapshot_pin_invalid")
     turn_directories = _knowledge_turn_directories(conversation_id, expected_count=3)
     provider_traces: list[dict[str, Any]] = []
-    for turn_directory in turn_directories[:2]:
+    no_coverage_not_called_count = 0
+    for turn_directory in turn_directories:
         _verify_agent_knowledge_transcript(turn_directory)
-        provider_traces.append(_assert_real_knowledge_provider_trace(turn_directory))
-    _verify_agent_knowledge_transcript(turn_directories[2])
-    no_coverage_not_called_count = _assert_knowledge_provider_not_called_for_no_coverage(
-        turn_directories[2]
-    )
-    if {trace["knowledge_provider"] for trace in provider_traces} != {"anthropic"}:
+        try:
+            provider_traces.append(_assert_real_knowledge_provider_trace(turn_directory))
+        except MatrixError as exc:
+            # Turn IDs are random UUIDs, so directory-name ordering must not
+            # decide which official-source turn is covered.  The only
+            # permitted unaccepted trace is the exact no-coverage non-call.
+            if str(exc) != "knowledge_claude_provider_answer_unaccepted":
+                raise
+            no_coverage_not_called_count += _assert_knowledge_provider_not_called_for_no_coverage(
+                turn_directory
+            )
+    if (
+        len(provider_traces) != 2
+        or no_coverage_not_called_count != 1
+        or {trace["knowledge_provider"] for trace in provider_traces} != {"anthropic"}
+    ):
         raise MatrixError("knowledge_claude_provider_payload_invalid")
     return {
         "status": "passed",
