@@ -1070,7 +1070,21 @@ def _assert_assistant_message(
         raise MatrixError("assistant_case_citation_missing")
     if expected_scope == "evidence_grounded" and "evidence" not in citation_kinds:
         raise MatrixError("assistant_evidence_citation_missing")
-    if expected_scope not in {"case_grounded", "evidence_grounded"} and citations:
+    if expected_scope == "general_customs_guidance":
+        _assert_official_guidance_citations(
+            citations,
+            expected_as_of=str(run.get("review_as_of")),
+            code="assistant_general_guidance",
+        )
+    if (
+        expected_scope
+        not in {
+            "case_grounded",
+            "evidence_grounded",
+            "general_customs_guidance",
+        }
+        and citations
+    ):
         raise MatrixError("assistant_non_grounded_citation")
     if required_terms and not any(term in str(assistant.get("content")) for term in required_terms):
         raise MatrixError("assistant_answer_topic_missing")
