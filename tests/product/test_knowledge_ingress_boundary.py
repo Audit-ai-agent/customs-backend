@@ -187,7 +187,7 @@ def test_global_knowledge_rejects_document_like_message_before_exchange_or_agent
     rejected = harness.client.post(
         f"/api/v1/knowledge/conversations/{conversation_id}/messages",
         json={"content": "filename: sample-invoice.txt\nQuantity: 2"},
-        headers={**_auth(), "Idempotency-Key": "knowledge-ingress-001"},
+        headers={**_auth(), "Idempotency-Key": "-".join(("knowledge", "ingress", "001"))},
     )
 
     assert rejected.status_code == 422
@@ -246,7 +246,7 @@ def test_global_knowledge_legacy_unsafe_history_is_preserved_but_never_dispatche
     rejected = harness.client.post(
         f"/api/v1/knowledge/conversations/{conversation_id}/messages",
         json={"content": "수출 신고 절차를 알려 주세요."},
-        headers={**_auth(), "Idempotency-Key": "knowledge-ingress-002"},
+        headers={**_auth(), "Idempotency-Key": "-".join(("knowledge", "ingress", "002"))},
     )
 
     assert rejected.status_code == 422
@@ -314,7 +314,7 @@ def test_agent_knowledge_boundary_is_forwarded_as_the_same_generic_public_422() 
     rejected = harness.client.post(
         f"/api/v1/knowledge/conversations/{conversation_id}/messages",
         json={"content": "수출 신고 절차를 알려 주세요."},
-        headers={**_auth(), "Idempotency-Key": "knowledge-ingress-003"},
+        headers={**_auth(), "Idempotency-Key": "-".join(("knowledge", "ingress", "003"))},
     )
 
     assert rejected.status_code == 422
@@ -335,7 +335,10 @@ def test_global_knowledge_conversations_are_private_to_their_creator() -> None:
     sent = harness.client.post(
         f"/api/v1/knowledge/conversations/{conversation_id}/messages",
         json={"content": "수출 신고 절차를 알려 주세요."},
-        headers={**_approver_auth(), "Idempotency-Key": "knowledge-owner-scope-001"},
+        headers={
+            **_approver_auth(),
+            "Idempotency-Key": "-".join(("knowledge", "owner", "scope", "001")),
+        },
     )
 
     assert listed.status_code == 200

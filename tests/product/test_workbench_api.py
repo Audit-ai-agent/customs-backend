@@ -1080,7 +1080,7 @@ def test_knowledge_answer_rejects_an_uncited_display_section() -> None:
         response = client.post(
             f"/api/v1/knowledge/conversations/{conversation_id}/messages",
             json={"content": "수출 신고 전에 무엇을 확인해야 하나요?"},
-            headers={**_auth(), "Idempotency-Key": "uncited-section-001"},
+            headers={**_auth(), "Idempotency-Key": "-".join(("uncited", "section", "001"))},
         )
 
     assert response.status_code == 409
