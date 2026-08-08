@@ -32,7 +32,34 @@ def canonical_digest(value: Any) -> str:
 
 MAX_TEXT_DOCUMENT_CHARACTERS = 200_000
 MAX_TEXT_DOCUMENT_UTF8_BYTES = MAX_TEXT_DOCUMENT_CHARACTERS * 4
-DocumentType = Literal["CI", "PL", "BL", "CO", "UNKNOWN"]
+# Keep the compact legacy codes while adding the text documents needed for a
+# normal export workbench.  They are only labels for text input; this does not
+# imply PDF/image/OCR support.
+DocumentType = Literal[
+    "CI",
+    "PL",
+    "BL",
+    "CO",
+    "AWB",
+    "EXPORT_DECLARATION",
+    "SUPPORTING_EVIDENCE",
+    "UNKNOWN",
+]
+CaseTradeType = Literal["import", "export"]
+KnowledgeTradeType = Literal["import", "export", "both"]
+GuidanceCoverage = Literal["covered", "no_coverage", "partial", "unavailable"]
+# ``development_fixture`` is deliberately separate from the official snapshot
+# registry.  Functional-UAT can render every official registry category, but
+# must never present the deterministic development fixture as an official
+# source.
+GuidanceSourceKind = Literal[
+    "official_law",
+    "official_law_catalog",
+    "official_agency_guidance",
+    "official_requirement_reference",
+    "official_public_guidance",
+    "development_fixture",
+]
 
 
 class Role(str, Enum):
@@ -161,7 +188,7 @@ class ReviewEnqueueRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     review_as_of: date | None = None
-    trade_type: Literal["import", "export"] = "import"
+    trade_type: CaseTradeType = "import"
 
 
 class JobRecord(BaseModel):
@@ -266,6 +293,51 @@ class ConversationRecord(BaseModel):
     updated_at: datetime
 
 
+class KnowledgeConversationCreate(BaseModel):
+    """Create a standalone official-trade knowledge conversation.
+
+    It is intentionally not attached to a Case or a Review Run.  A case
+    conversation remains the only API that can receive immutable review facts
+    or create a correction draft.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = Field(default=None, max_length=200)
+    trade_type: KnowledgeTradeType = "both"
+    as_of: date | None = None
+
+    @field_validator("title")
+    @classmethod
+    def normalise_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
+class KnowledgeConversationRecord(BaseModel):
+    """Persisted global guidance thread with no Case/Review Run ownership."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    conversation_id: str
+    org_id: str
+    title: str | None = None
+    trade_type: KnowledgeTradeType
+    # The public create request may omit this value.  The API resolves it to
+    # the active profile's fixed knowledge date before this record is stored
+    # or a request reaches Agent/Data.
+    as_of: date
+    # The first Agent answer that resolves a snapshot pins this thread to that
+    # immutable snapshot.  A later answer may not silently switch sources
+    # while keeping the same as-of date.
+    snapshot_id: str | None = Field(default=None, min_length=1, max_length=512)
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+
 class ConversationMessageRole(str, Enum):
     user = "user"
     assistant = "assistant"
@@ -284,13 +356,82 @@ class CitationKind(str, Enum):
     fact = "fact"
     comparison = "comparison"
     evidence = "evidence"
+    guidance_evidence = "guidance_evidence"
 
 
 class MessageCitation(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     kind: CitationKind
-    reference_id: str = Field(min_length=1, max_length=256)
+    # ``reference_id`` is the retained V3 case-conversation field.  A
+    # guidance citation deliberately uses ``source_id`` instead because it
+    # refers to an official snapshot source rather than a Case-internal ID.
+    reference_id: str | None = Field(default=None, min_length=1, max_length=256)
+    source_id: str | None = Field(default=None, min_length=1, max_length=256)
+    source_kind: GuidanceSourceKind | None = None
+    source_title: str | None = Field(default=None, min_length=1, max_length=1_000)
+    source_uri: str | None = Field(default=None, min_length=1, max_length=2_000)
+    as_of: date | None = None
+    snapshot_id: str | None = Field(default=None, min_length=1, max_length=512)
+    coverage: GuidanceCoverage | None = None
+
+    @model_validator(mode="after")
+    def validate_reference_shape(self) -> "MessageCitation":
+        if self.kind == CitationKind.guidance_evidence:
+            if not all(
+                (
+                    self.source_id,
+                    self.source_kind,
+                    self.source_title,
+                    self.source_uri,
+                    self.as_of,
+                    self.snapshot_id,
+                    self.coverage,
+                )
+            ):
+                raise ValueError("guidance evidence requires official snapshot source metadata")
+            if self.reference_id is not None and self.reference_id != self.source_id:
+                raise ValueError("guidance evidence reference_id must match source_id when present")
+            return self
+        if self.reference_id is None:
+            raise ValueError("case citation requires reference_id")
+        if any(
+            value is not None
+            for value in (
+                self.source_id,
+                self.source_kind,
+                self.source_title,
+                self.source_uri,
+                self.as_of,
+                self.snapshot_id,
+                self.coverage,
+            )
+        ):
+            raise ValueError("case citation cannot contain guidance source metadata")
+        return self
+
+
+class AnswerSectionKind(str, Enum):
+    case_analysis = "case_analysis"
+    general_guidance = "general_guidance"
+
+
+class AnswerSection(BaseModel):
+    """A user-facing answer part, kept alongside the legacy one-string answer."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: AnswerSectionKind
+    title: str = Field(min_length=1, max_length=200)
+    content: str = Field(min_length=1, max_length=4_000)
+    citations: list[MessageCitation] = Field(default_factory=list, max_length=100)
+
+    @field_validator("title", "content")
+    @classmethod
+    def non_blank_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("answer section text is required")
+        return value.strip()
 
 
 class CorrectionDraft(BaseModel):
@@ -329,10 +470,30 @@ class ConversationMessageRecord(BaseModel):
     content: str = Field(min_length=1, max_length=4000)
     answer_scope: AnswerScope | None = None
     citations: list[MessageCitation] = Field(default_factory=list, max_length=100)
+    # Optional and additive: existing persisted V3 messages without sections
+    # remain valid and retain their legacy direct ``content`` field.
+    answer_sections: list[AnswerSection] = Field(default_factory=list, max_length=2)
     suggested_questions: list[str] = Field(default_factory=list, max_length=3)
     correction_draft: CorrectionDraft | None = None
+    # Standalone knowledge conversations retain the Agent/Data resolution for
+    # every answer, including no-coverage and clarification answers that have
+    # no citation to carry it.  These fields stay absent for Case messages.
+    knowledge_coverage: GuidanceCoverage | None = None
+    knowledge_snapshot_id: str | None = Field(default=None, min_length=1, max_length=512)
+    knowledge_as_of: date | None = None
     created_by: str
     created_at: datetime
+
+    @model_validator(mode="after")
+    def validate_knowledge_provenance(self) -> "ConversationMessageRecord":
+        supplied = (
+            self.knowledge_coverage is not None
+            or self.knowledge_snapshot_id is not None
+            or self.knowledge_as_of is not None
+        )
+        if supplied and (self.knowledge_coverage is None or self.knowledge_as_of is None):
+            raise ValueError("knowledge message provenance requires coverage and as_of")
+        return self
 
 
 class ConversationMessageExchange(BaseModel):
@@ -376,8 +537,46 @@ class AgentAssistantAnswerResponse(BaseModel):
     answer_scope: AnswerScope
     direct_answer: str = Field(min_length=1, max_length=4000)
     citations: list[MessageCitation] = Field(default_factory=list, max_length=100)
+    answer_sections: list[AnswerSection] = Field(default_factory=list, max_length=2)
     suggested_questions: list[str] = Field(default_factory=list, max_length=3)
     correction_draft: CorrectionDraft | None = None
+    engine: dict[str, Any]
+
+
+class AgentKnowledgeAnswerRequest(BaseModel):
+    """One bounded official-snapshot guidance request to the Agent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"] = "1.0"
+    conversation_id: str = Field(min_length=1, max_length=128)
+    question: str = Field(min_length=1, max_length=4_000)
+    trade_type: KnowledgeTradeType
+    recent_turns: list[AgentConversationTurn] = Field(default_factory=list, max_length=8)
+    as_of: date
+
+    def to_agent_wire(self) -> dict[str, Any]:
+        return self.model_dump(mode="json")
+
+
+class AgentKnowledgeAnswerResponse(BaseModel):
+    """A general trade answer backed only by official snapshot citations."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"]
+    conversation_id: str = Field(min_length=1, max_length=128)
+    answer_scope: AnswerScope
+    direct_answer: str = Field(min_length=1, max_length=4_000)
+    citations: list[MessageCitation] = Field(default_factory=list, max_length=100)
+    answer_sections: list[AnswerSection] = Field(default_factory=list, max_length=2)
+    suggested_questions: list[str] = Field(default_factory=list, max_length=3)
+    # Data resolves these at query time.  They remain explicit even when no
+    # source was returned, so a global conversation cannot silently drift to
+    # another snapshot between turns.
+    coverage: GuidanceCoverage
+    snapshot_id: str | None = Field(default=None, min_length=1, max_length=512)
+    as_of: date
     engine: dict[str, Any]
 
 

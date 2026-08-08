@@ -11,11 +11,12 @@ import httpx
 
 from customs_backend.domain import (
     AgentAssistantAnswerRequest,
+    AgentKnowledgeAnswerRequest,
     AgentReviewRequest,
     MAX_TEXT_DOCUMENT_UTF8_BYTES,
     canonical_json_bytes,
 )
-from customs_backend.ports import AgentResponseRejectedError
+from customs_backend.ports import AgentResponseRejectedError, KnowledgeInputRejectedError
 
 
 class InMemoryObjectStore:
@@ -272,6 +273,44 @@ class HttpAgentClient:
         )
         return result
 
+    def answer_knowledge(self, request: AgentKnowledgeAnswerRequest) -> dict[str, Any]:
+        """Call the bounded standalone official-trade guidance endpoint.
+
+        Unlike a case assistant turn there is no Review Run to attach to a
+        Functional-UAT transcript.  The method therefore deliberately does
+        not reuse the review trace callback or retain request/response bodies.
+        """
+
+        wire = request.to_agent_wire()
+        encoded = canonical_json_bytes(wire)
+        if len(encoded) > 1_000_000:
+            raise ValueError("Agent knowledge request exceeds the 1 MiB transport limit")
+        try:
+            response = self._client.post(
+                "/internal/agent/v2/knowledge/answers",
+                content=encoded,
+                headers={"Content-Type": "application/json"},
+            )
+        except httpx.HTTPError as exc:
+            raise AgentResponseRejectedError("Agent knowledge transport failed") from exc
+        try:
+            self._require_service_mode(response)
+            # Agent's independent ingress guard deliberately returns a
+            # generic 422.  Preserve that safe outcome for the public
+            # knowledge boundary without reading or exposing its body.
+            if response.status_code == 422:
+                raise KnowledgeInputRejectedError()
+            response.raise_for_status()
+            return self._decode_object(response, maximum_bytes=1_000_000, label="knowledge answer")
+        except KnowledgeInputRejectedError:
+            raise
+        except (AgentResponseRejectedError, httpx.HTTPStatusError) as exc:
+            if isinstance(exc, httpx.HTTPStatusError):
+                raise AgentResponseRejectedError(
+                    f"Agent knowledge answer returned HTTP {response.status_code}"
+                ) from exc
+            raise
+
     def metadata(self) -> dict[str, Any]:
         response = self._client.get("/internal/agent/v2/metadata")
         self._require_service_mode(response)
@@ -295,10 +334,12 @@ class CallableAgentClient:
         review: Callable[[AgentReviewRequest], dict[str, Any]],
         *,
         answer: Callable[[AgentAssistantAnswerRequest], dict[str, Any]] | None = None,
+        knowledge_answer: Callable[[AgentKnowledgeAnswerRequest], dict[str, Any]] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
         self._review = review
         self._answer = answer
+        self._knowledge_answer = knowledge_answer
         self._metadata = metadata or {"status": "ready"}
 
     def review(self, request: AgentReviewRequest) -> dict[str, Any]:
@@ -317,6 +358,23 @@ class CallableAgentClient:
             "citations": [],
             "suggested_questions": [],
             "correction_draft": None,
+            "engine": {"kind": "deterministic", "model_id": "backend-fixture"},
+        }
+
+    def answer_knowledge(self, request: AgentKnowledgeAnswerRequest) -> dict[str, Any]:
+        if self._knowledge_answer is not None:
+            return self._knowledge_answer(request)
+        return {
+            "schema_version": "1.0",
+            "conversation_id": request.conversation_id,
+            "answer_scope": "clarification_needed",
+            "direct_answer": "질문의 통관 단계 또는 품목을 조금 더 구체적으로 알려 주세요.",
+            "citations": [],
+            "answer_sections": [],
+            "suggested_questions": [],
+            "coverage": "unavailable",
+            "snapshot_id": None,
+            "as_of": request.as_of.isoformat(),
             "engine": {"kind": "deterministic", "model_id": "backend-fixture"},
         }
 

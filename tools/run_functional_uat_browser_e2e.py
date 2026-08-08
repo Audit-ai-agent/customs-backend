@@ -78,6 +78,11 @@ _REQUIRED_CHECKS = frozenset(
         "data_retrieval_semantics",
         "citation_navigation",
         "assistant_conversation",
+        "assistant_mixed_sections",
+        "knowledge_conversation",
+        "knowledge_recent_history",
+        "knowledge_official_provenance",
+        "knowledge_default_boundary",
         "finding_decision",
         "correction_proposed",
         "approver_login",
@@ -85,6 +90,9 @@ _REQUIRED_CHECKS = frozenset(
         "child_review_completed",
         "document_replaced",
         "replacement_review_completed",
+        "export_document_registered",
+        "export_partial_coverage",
+        "export_human_review_required",
         "backend_only_network",
     }
 )
@@ -286,9 +294,7 @@ def _child_environment(
     """Pass only OS necessities plus the seven declared Browser inputs to Node."""
 
     allowed_names = {name.casefold() for name in _CHILD_ENVIRONMENT_KEYS}
-    allowed = {
-        key: value for key, value in os.environ.items() if key.casefold() in allowed_names
-    }
+    allowed = {key: value for key, value in os.environ.items() if key.casefold() in allowed_names}
     allowed.update(
         {
             "CUSTOMS_FUNCTIONAL_UAT_BROWSER_E2E": "1",
@@ -353,7 +359,9 @@ def _load_receipt(path: Path) -> BrowserReceipt:
         or set(checks) != _REQUIRED_CHECKS
         or not isinstance(review_run_ids, list)
         or len(review_run_ids) < 3
-        or not all(isinstance(value, str) and _SAFE_RUN_ID.fullmatch(value) for value in review_run_ids)
+        or not all(
+            isinstance(value, str) and _SAFE_RUN_ID.fullmatch(value) for value in review_run_ids
+        )
         or len(review_run_ids) != len(set(review_run_ids))
     ):
         raise BrowserE2eError("functional_uat_browser_receipt_invalid")
@@ -396,7 +404,7 @@ def run(
     receipt_path = _receipt_path(safe_root)
     try:
         completed = runner(
-        (_corepack_command(), "npm", "run", "functional-uat:browser"),
+            (_corepack_command(), "npm", "run", "functional-uat:browser"),
             cwd=workspace / "customs-frontend",
             env=_child_environment(
                 profile=profile,
@@ -406,7 +414,7 @@ def run(
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=600,
+            timeout=900,
         )
     except subprocess.TimeoutExpired as exc:
         raise BrowserE2eError("functional_uat_browser_command_timed_out") from exc

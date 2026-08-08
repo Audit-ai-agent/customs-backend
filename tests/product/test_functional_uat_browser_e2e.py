@@ -53,6 +53,7 @@ def test_corepack_command_is_executable_on_windows_and_posix() -> None:
     "mutate",
     [
         lambda payload: payload.update({"raw_body": "not allowed"}),
+        lambda payload: payload.update({"knowledge_conversation_id": "knowledge_conv_not_allowed"}),
         lambda payload: payload.update({"status": "failed"}),
         lambda payload: payload.update({"review_run_ids": [RUN_IDS[0], RUN_IDS[1]]}),
         lambda payload: payload.update({"review_run_ids": ["not-a-run", RUN_IDS[1], RUN_IDS[2]]}),
@@ -92,12 +93,8 @@ def test_child_environment_is_narrow_and_keeps_only_declared_credentials(
     assert child["CUSTOMS_FUNCTIONAL_UAT_BROWSER_APPROVER_USERNAME"] == (
         "local-functional-approver"
     )
-    assert child["CUSTOMS_FUNCTIONAL_UAT_BROWSER_REVIEWER_PASSWORD"] == (
-        "reviewer-local-value"
-    )
-    assert child["CUSTOMS_FUNCTIONAL_UAT_BROWSER_APPROVER_PASSWORD"] == (
-        "approver-local-value"
-    )
+    assert child["CUSTOMS_FUNCTIONAL_UAT_BROWSER_REVIEWER_PASSWORD"] == ("reviewer-local-value")
+    assert child["CUSTOMS_FUNCTIONAL_UAT_BROWSER_APPROVER_PASSWORD"] == ("approver-local-value")
     assert "ANTHROPIC_API_KEY" not in child
     assert not any(
         key.startswith("CUSTOMS_") and not key.startswith("CUSTOMS_FUNCTIONAL_UAT_BROWSER_")
@@ -195,7 +192,7 @@ def test_run_invokes_frontend_without_forwarding_output_or_unrelated_secret(
     assert result == {
         "status": "passed",
         "profile": "functional-uat",
-        "checks_verified": 20,
+        "checks_verified": len(browser_e2e._REQUIRED_CHECKS),
         "transcripts_verified": 3,
     }
     assert observed["arguments"] == (
@@ -207,7 +204,7 @@ def test_run_invokes_frontend_without_forwarding_output_or_unrelated_secret(
     kwargs = observed["kwargs"]
     assert kwargs["stdout"] is subprocess.DEVNULL
     assert kwargs["stderr"] is subprocess.DEVNULL
-    assert kwargs["timeout"] == 600
+    assert kwargs["timeout"] == 900
     environment = kwargs["env"]
     assert environment["CUSTOMS_FUNCTIONAL_UAT_BROWSER_E2E"] == "1"
     assert "ANTHROPIC_API_KEY" not in environment
@@ -219,4 +216,12 @@ def test_browser_receipt_requires_current_workbench_correctness_checks() -> None
         "raw_filename_hidden",
         "regulatory_requirement_deduplicated",
         "data_retrieval_semantics",
+        "assistant_mixed_sections",
+        "knowledge_conversation",
+        "knowledge_recent_history",
+        "knowledge_official_provenance",
+        "knowledge_default_boundary",
+        "export_document_registered",
+        "export_partial_coverage",
+        "export_human_review_required",
     } <= browser_e2e._REQUIRED_CHECKS

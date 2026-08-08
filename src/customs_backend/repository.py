@@ -20,6 +20,7 @@ from customs_backend.domain import (
     FindingDecisionRecord,
     FindingDecisionStatus,
     JobRecord,
+    KnowledgeConversationRecord,
     ReviewRunRecord,
     utc_now,
 )
@@ -39,6 +40,12 @@ class InMemoryWorkbenchRepository:
         self._conversations: dict[str, ConversationRecord] = {}
         self._messages: dict[str, ConversationMessageRecord] = {}
         self._chat_idempotency: dict[tuple[str, str, str], tuple[str, str, str]] = {}
+        # Standalone knowledge conversations deliberately do not share the
+        # Case/Review Run maps.  That prevents a global guidance thread from
+        # ever being resolved as a case-grounded conversation by accident.
+        self._knowledge_conversations: dict[str, KnowledgeConversationRecord] = {}
+        self._knowledge_messages: dict[str, ConversationMessageRecord] = {}
+        self._knowledge_chat_idempotency: dict[tuple[str, str, str], tuple[str, str, str]] = {}
         self._correction_proposals: dict[str, CorrectionProposalRecord] = {}
 
     def health(self) -> bool:
@@ -420,6 +427,161 @@ class InMemoryWorkbenchRepository:
                 conversation.model_copy(update={"updated_at": assistant_message.created_at})
             )
             return self._exchange(user_message.message_id, assistant_message.message_id), True
+
+    def create_knowledge_conversation(
+        self, record: KnowledgeConversationRecord
+    ) -> KnowledgeConversationRecord:
+        with self._lock:
+            if record.conversation_id in self._knowledge_conversations:
+                raise ConflictError("knowledge conversation_id already exists")
+            self._knowledge_conversations[record.conversation_id] = self._copy(record)
+            return self._copy(record)
+
+    def get_knowledge_conversation(
+        self, org_id: str, owner_subject: str, conversation_id: str
+    ) -> KnowledgeConversationRecord | None:
+        with self._lock:
+            record = self._knowledge_conversations.get(conversation_id)
+            return (
+                self._copy(record)
+                if (
+                    record is not None
+                    and record.org_id == org_id
+                    and record.created_by == owner_subject
+                )
+                else None
+            )
+
+    def list_knowledge_conversations(
+        self, org_id: str, owner_subject: str
+    ) -> list[KnowledgeConversationRecord]:
+        with self._lock:
+            records = [
+                value
+                for value in self._knowledge_conversations.values()
+                if value.org_id == org_id and value.created_by == owner_subject
+            ]
+            return self._copy(
+                sorted(
+                    records,
+                    key=lambda value: (value.updated_at, value.conversation_id),
+                    reverse=True,
+                )
+            )
+
+    def list_knowledge_messages(
+        self, org_id: str, owner_subject: str, conversation_id: str
+    ) -> list[ConversationMessageRecord]:
+        with self._lock:
+            conversation = self._knowledge_conversations.get(conversation_id)
+            if (
+                conversation is None
+                or conversation.org_id != org_id
+                or conversation.created_by != owner_subject
+            ):
+                return []
+            records = [
+                value
+                for value in self._knowledge_messages.values()
+                if value.conversation_id == conversation_id
+            ]
+            return self._copy(
+                sorted(records, key=lambda value: (value.created_at, value.message_id))
+            )
+
+    def _knowledge_exchange(
+        self, user_message_id: str, assistant_message_id: str
+    ) -> ConversationMessageExchange:
+        try:
+            return ConversationMessageExchange(
+                user_message=self._copy(self._knowledge_messages[user_message_id]),
+                assistant_message=self._copy(self._knowledge_messages[assistant_message_id]),
+            )
+        except KeyError as exc:
+            raise ConflictError("knowledge conversation exchange is incomplete") from exc
+
+    def get_knowledge_message_exchange(
+        self,
+        *,
+        org_id: str,
+        owner_subject: str,
+        conversation_id: str,
+        idempotency_key: str,
+        idempotency_request_digest: str,
+    ) -> ConversationMessageExchange | None:
+        with self._lock:
+            conversation = self._knowledge_conversations.get(conversation_id)
+            if (
+                conversation is None
+                or conversation.org_id != org_id
+                or conversation.created_by != owner_subject
+            ):
+                return None
+            stored = self._knowledge_chat_idempotency.get(
+                (org_id, conversation_id, idempotency_key)
+            )
+            if stored is None:
+                return None
+            request_digest, user_message_id, assistant_message_id = stored
+            if request_digest != idempotency_request_digest:
+                raise ConflictError("idempotency key was reused with another knowledge message")
+            return self._knowledge_exchange(user_message_id, assistant_message_id)
+
+    def append_knowledge_message_exchange(
+        self,
+        *,
+        user_message: ConversationMessageRecord,
+        assistant_message: ConversationMessageRecord,
+        knowledge_snapshot_id: str | None,
+        idempotency_key: str,
+        idempotency_request_digest: str,
+    ) -> tuple[ConversationMessageExchange, bool]:
+        with self._lock:
+            conversation = self._knowledge_conversations.get(user_message.conversation_id)
+            if (
+                conversation is None
+                or conversation.conversation_id != assistant_message.conversation_id
+            ):
+                raise ConflictError("knowledge conversation does not exist")
+            if user_message.created_by != conversation.created_by:
+                raise ConflictError("knowledge message must be created by the conversation owner")
+            if (
+                user_message.message_id in self._knowledge_messages
+                or assistant_message.message_id in self._knowledge_messages
+            ):
+                raise ConflictError("knowledge message_id already exists")
+            key = (conversation.org_id, conversation.conversation_id, idempotency_key)
+            existing = self._knowledge_chat_idempotency.get(key)
+            if existing is not None:
+                existing_digest, user_id, assistant_id = existing
+                if existing_digest != idempotency_request_digest:
+                    raise ConflictError("idempotency key was reused with another knowledge message")
+                return self._knowledge_exchange(user_id, assistant_id), False
+            if user_message.role.value != "user" or assistant_message.role.value != "assistant":
+                raise ConflictError("knowledge conversation exchange roles are invalid")
+            if (
+                conversation.snapshot_id is not None
+                and knowledge_snapshot_id != conversation.snapshot_id
+            ):
+                raise ConflictError("knowledge conversation cannot switch its resolved snapshot")
+            self._knowledge_messages[user_message.message_id] = self._copy(user_message)
+            self._knowledge_messages[assistant_message.message_id] = self._copy(assistant_message)
+            self._knowledge_chat_idempotency[key] = (
+                idempotency_request_digest,
+                user_message.message_id,
+                assistant_message.message_id,
+            )
+            self._knowledge_conversations[conversation.conversation_id] = self._copy(
+                conversation.model_copy(
+                    update={
+                        "snapshot_id": conversation.snapshot_id or knowledge_snapshot_id,
+                        "updated_at": assistant_message.created_at,
+                    }
+                )
+            )
+            return self._knowledge_exchange(
+                user_message.message_id, assistant_message.message_id
+            ), True
 
     def create_correction_proposal(
         self, record: CorrectionProposalRecord

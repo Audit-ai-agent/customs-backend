@@ -18,6 +18,7 @@ import hashlib
 import json
 import re
 import secrets
+import subprocess
 import time
 import uuid
 from collections.abc import Mapping, Sequence
@@ -77,6 +78,40 @@ _FALLBACK_REQUEST_EVENTS = {
     "review_report_fallback": "review_report_request_started",
     "assistant_answer_fallback": "assistant_answer_request_started",
 }
+_KNOWLEDGE_PROVIDER_REQUEST_EVENT = "knowledge_answer_request_started"
+_KNOWLEDGE_PROVIDER_RESPONSE_EVENT = "knowledge_answer_response_received"
+_KNOWLEDGE_PROVIDER_FAILURE_EVENTS = frozenset(
+    {
+        "knowledge_answer_request_failed",
+        "knowledge_answer_response_invalid",
+    }
+)
+_KNOWLEDGE_PROVIDER_UNACCEPTED_EVENTS = frozenset(
+    {
+        "knowledge_answer_not_called",
+        "knowledge_answer_fallback",
+    }
+)
+_SAFE_LOCAL_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_SAFE_KNOWLEDGE_TURN_ID = re.compile(r"^turn-[a-f0-9]{32}$")
+_OFFICIAL_GUIDANCE_SOURCE_KINDS = frozenset(
+    {
+        "official_law",
+        "official_law_catalog",
+        "official_agency_guidance",
+        "official_requirement_reference",
+        "official_public_guidance",
+    }
+)
+_OFFICIAL_GUIDANCE_HOSTS = frozenset(
+    {
+        "law.go.kr",
+        "www.law.go.kr",
+        "customs.go.kr",
+        "www.customs.go.kr",
+        "dream.kotra.or.kr",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +131,10 @@ class Scenario:
     expected_retrieval_status: str | None = None
     expected_regulatory_finding_count: int | None = None
     requires_certificate_hs: bool = False
+    trade_type: str = "import"
+    required_document_types: tuple[str, ...] = ()
+    required_comparison_codes: tuple[str, ...] = ()
+    required_fact_names: tuple[str, ...] = ()
 
 
 class _LoginFormParser(HTMLParser):
@@ -469,6 +508,70 @@ def _scenario_matrix() -> tuple[Scenario, ...]:
             "Unit Price: USD 10 | Amount: USD 10",
         ),
     )
+    export_documents = _documents(
+        Document(
+            "CI",
+            "상업송장_수출정합확인.txt",
+            "\n".join(
+                (
+                    "COMMERCIAL INVOICE",
+                    "Invoice No: INV-EXPORT-001",
+                    "Total Amount: USD 20",
+                    "Country of Origin: KR",
+                    "Description: Widget | HS Code: 0303540000 | Quantity: 2 PCS | Unit: PCS | "
+                    "Unit Price: USD 10 | Amount: USD 20",
+                )
+            ),
+        ),
+        Document(
+            "PL",
+            "포장명세서_수출정합확인.txt",
+            "\n".join(
+                (
+                    "PACKING LIST",
+                    "Packing No: PL-EXPORT-001",
+                    "AWB No: AWB-EXPORT-001",
+                    "Total Gross Weight: 100 KG",
+                    "Description: Widget | HS Code: 0303540000 | Quantity: 2 PCS | Unit: PCS",
+                )
+            ),
+        ),
+        Document(
+            "CO",
+            "원산지증명서_수출정합확인.txt",
+            "CERTIFICATE OF ORIGIN\nCertificate No: COO-EXPORT-001\nOrigin Country: KR\n"
+            "HS Code: 0303540000",
+        ),
+        Document(
+            "AWB",
+            "항공화물운송장_수출정합확인.txt",
+            "AIR WAYBILL\nAWB No: AWB-EXPORT-001\nGross Weight: 100 KG",
+        ),
+        Document(
+            "EXPORT_DECLARATION",
+            "수출신고서_수출정합확인.txt",
+            "\n".join(
+                (
+                    "EXPORT DECLARATION",
+                    "Export Declaration No: ED-EXPORT-001",
+                    "Filing Date: 2026-08-05",
+                    "Submission Status: Accepted",
+                    "Invoice No: INV-EXPORT-001",
+                    "Total Amount: USD 20",
+                    "Origin Country: KR",
+                    "Destination Country: US",
+                    "Description: Widget | HS Code: 0303540000 | Quantity: 2 PCS | Unit: PCS | "
+                    "Amount: USD 20",
+                )
+            ),
+        ),
+        Document(
+            "SUPPORTING_EVIDENCE",
+            "제출증빙_수출정합확인.txt",
+            "SUPPORTING EVIDENCE\nReceipt No: RECEIPT-EXPORT-001\nSubmission Date: 2026-08-05\n"
+            "Submission Status: Accepted",
+        ),
+    )
     return (
         Scenario(
             "all-documents-match",
@@ -523,6 +626,44 @@ def _scenario_matrix() -> tuple[Scenario, ...]:
         # transport/data partial failure.  The follow-up assistant question
         # below verifies the user-facing ``insufficient_evidence`` boundary.
         Scenario("no-evidence", "기능 UAT · 법령 근거 부재 검토", no_evidence, ()),
+        Scenario(
+            "export-documents-and-submission-evidence",
+            "기능 UAT · 수출 서류 및 제출 증빙 확인",
+            export_documents,
+            (),
+            # The local KR official-knowledge snapshot cannot claim complete
+            # destination-country coverage for US.  This is an expected safe
+            # limitation: retain the extracted/export comparisons, surface a
+            # partial run, and keep the mandatory human-review boundary.
+            expected_execution="partial",
+            expected_retrieval_status="needs_review",
+            trade_type="export",
+            required_document_types=(
+                "invoice",
+                "packing_list",
+                "certificate_of_origin",
+                "air_waybill",
+                "export_declaration",
+                "supporting_evidence",
+            ),
+            required_comparison_codes=(
+                "awb_packing_awb_no",
+                "awb_packing_gross_weight",
+                "export_declaration_destination_country",
+                "invoice_export_declaration_invoice_no",
+                "invoice_export_declaration_total_amount",
+                "invoice_export_declaration_origin",
+                "invoice_export_declaration_hs_code",
+                "invoice_export_declaration_quantity_unit",
+                "invoice_export_declaration_amount",
+            ),
+            required_fact_names=(
+                "export_declaration_no",
+                "destination_country",
+                "submission_receipt_no",
+                "submission_status",
+            ),
+        ),
     )
 
 
@@ -673,6 +814,30 @@ def _assert_run_user_prose(run: Mapping[str, Any]) -> None:
 
 
 def _assert_scenario_semantics(run: Mapping[str, Any], scenario: Scenario) -> None:
+    if scenario.trade_type == "export":
+        if run.get("trade_type") != "export":
+            raise MatrixError(f"{scenario.name}_trade_type")
+        analyses = _mapping_list(run.get("document_analyses"), code="document_analyses_invalid")
+        document_types = {
+            value
+            for analysis in analyses
+            if isinstance((value := analysis.get("document_type")), str)
+        }
+        if not set(scenario.required_document_types).issubset(document_types):
+            raise MatrixError(f"{scenario.name}_document_types")
+        comparison_codes = {
+            value
+            for comparison in _mapping_list(run.get("comparisons"), code="comparisons_invalid")
+            if isinstance((value := comparison.get("rule_code")), str)
+        }
+        if not set(scenario.required_comparison_codes).issubset(comparison_codes):
+            raise MatrixError(f"{scenario.name}_comparison_codes")
+        fact_names = {
+            fact_name for analysis in analyses for fact_name in _fact_name_values(analysis)
+        }
+        if not set(scenario.required_fact_names).issubset(fact_names):
+            raise MatrixError(f"{scenario.name}_required_facts")
+
     if scenario.expected_retrieval_status is not None:
         retrieval = _workflow_stage(run, "retrieve_evidence")
         if retrieval.get("status") != scenario.expected_retrieval_status:
@@ -852,7 +1017,7 @@ def _create_case_and_review(
     review = api.require(
         "POST",
         f"/cases/{case_id}/reviews",
-        body={"trade_type": "import", "review_as_of": "2026-08-05"},
+        body={"trade_type": scenario.trade_type, "review_as_of": "2026-08-05"},
         idempotency_key=f"functional-matrix-{uuid.uuid4().hex}",
     )
     job_id, run_id = _job_id(review)
@@ -911,6 +1076,117 @@ def _assert_assistant_message(
         raise MatrixError("assistant_answer_topic_missing")
 
 
+def _assert_official_guidance_citations(
+    citations: object,
+    *,
+    expected_as_of: str,
+    code: str,
+) -> tuple[str, str]:
+    """Validate official provenance without returning source bodies or IDs."""
+
+    values = _mapping_list(citations, code=f"{code}_citations_invalid")
+    if not values:
+        raise MatrixError(f"{code}_citation_missing")
+    snapshots: set[str] = set()
+    coverages: set[str] = set()
+    for citation in values:
+        if citation.get("kind") != "guidance_evidence":
+            raise MatrixError(f"{code}_citation_kind")
+        if citation.get("source_kind") not in _OFFICIAL_GUIDANCE_SOURCE_KINDS:
+            raise MatrixError(f"{code}_source_kind")
+        if not _is_safe_official_guidance_uri(citation.get("source_uri")):
+            raise MatrixError(f"{code}_source_uri")
+        if citation.get("as_of") != expected_as_of:
+            raise MatrixError(f"{code}_as_of")
+        snapshot_id = citation.get("snapshot_id")
+        coverage = citation.get("coverage")
+        if (
+            not isinstance(snapshot_id, str)
+            or not snapshot_id
+            or coverage not in {"covered", "partial"}
+        ):
+            raise MatrixError(f"{code}_provenance")
+        snapshots.add(snapshot_id)
+        coverages.add(coverage)
+    if len(snapshots) != 1 or len(coverages) != 1:
+        raise MatrixError(f"{code}_provenance_mismatch")
+    return next(iter(snapshots)), next(iter(coverages))
+
+
+def _is_safe_official_guidance_uri(value: object) -> bool:
+    """Accept only the same navigable official URI boundary used by the product.
+
+    Functional-UAT validates the public result independently of Backend/Agent
+    admission.  Checking ``netloc`` as well as ``parsed.port`` deliberately
+    rejects a blank explicit port such as ``https://law.go.kr:/...``; Python
+    otherwise represents that malformed authority with ``port is None``.
+    """
+
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname is not None
+        and parsed.hostname.lower() in _OFFICIAL_GUIDANCE_HOSTS
+        and parsed.username is None
+        and parsed.password is None
+        and port is None
+        and ":" not in parsed.netloc
+    )
+
+
+def _assert_mixed_assistant_sections(
+    assistant: Mapping[str, Any], *, run: Mapping[str, Any]
+) -> None:
+    """Require a Case answer and official general guidance to remain separate."""
+
+    _assert_assistant_message(
+        assistant,
+        expected_scope="case_grounded",
+        run=run,
+    )
+    sections = _mapping_list(assistant.get("answer_sections"), code="mixed_sections_invalid")
+    if [section.get("kind") for section in sections] != ["case_analysis", "general_guidance"]:
+        raise MatrixError("mixed_sections_missing")
+    analyses = _mapping_list(run.get("document_analyses"), code="document_analyses_invalid")
+    filenames = {
+        filename
+        for analysis in analyses
+        if isinstance((filename := analysis.get("filename")), str) and filename
+    }
+    internal_markers = _run_internal_markers(run)
+    for index, section in enumerate(sections, start=1):
+        _assert_user_text(
+            section.get("title"),
+            code=f"mixed_section_title_{index}",
+            filenames=filenames,
+            internal_markers=internal_markers,
+        )
+        _assert_user_text(
+            section.get("content"),
+            code=f"mixed_section_content_{index}",
+            filenames=filenames,
+            internal_markers=internal_markers,
+        )
+    case_citations = _mapping_list(
+        sections[0].get("citations"), code="mixed_case_citations_invalid"
+    )
+    if not any(
+        citation.get("kind") in {"fact", "comparison", "evidence"} for citation in case_citations
+    ):
+        raise MatrixError("mixed_case_citation_missing")
+    _assert_official_guidance_citations(
+        sections[1].get("citations"),
+        expected_as_of=str(run.get("review_as_of")),
+        code="mixed_guidance",
+    )
+
+
 def _conversation(
     api: PublicApi,
     *,
@@ -946,6 +1222,323 @@ def _conversation(
         required_terms=required_terms,
     )
     return conversation_id
+
+
+def _mixed_conversation(api: PublicApi, *, run_id: str, run: Mapping[str, Any]) -> None:
+    """Exercise one Case question that also requests bounded general guidance."""
+
+    created = api.require(
+        "POST",
+        f"/review-runs/{run_id}/assistant/conversations",
+        body={"title": "현재 사건과 일반 안내"},
+        expected=201,
+    )
+    conversation_id = created.get("conversation_id")
+    if not isinstance(conversation_id, str):
+        raise MatrixError("mixed_conversation_identity_invalid")
+    exchange = api.require(
+        "POST",
+        f"/assistant/conversations/{conversation_id}/messages",
+        body={"content": "현재 사건의 문서 비교 결과와 일반 수입 통관 절차를 함께 설명해 주세요."},
+        idempotency_key=f"functional-matrix-mixed-{uuid.uuid4().hex}",
+    )
+    assistant = _require_mapping(exchange.get("assistant_message"), code="mixed_assistant_invalid")
+    _assert_mixed_assistant_sections(assistant, run=run)
+
+
+def _knowledge_turn_directories(conversation_id: str, *, expected_count: int) -> list[Path]:
+    """Find an exact number of safe standalone turns without exposing them.
+
+    A normal follow-up in the same knowledge conversation must generate its
+    own Agent-owned turn.  Counting precisely makes the recent-history path a
+    Functional-UAT requirement instead of a one-message smoke test.
+    """
+
+    if expected_count < 1 or _SAFE_LOCAL_IDENTIFIER.fullmatch(conversation_id) is None:
+        raise MatrixError("knowledge_transcript_conversation_invalid")
+    root = workspace_transcript_root() / "knowledge"
+    conversation_directory = root / conversation_id
+    try:
+        resolved_root = root.resolve(strict=True)
+        resolved_conversation = conversation_directory.resolve(strict=True)
+    except OSError as exc:
+        raise MatrixError("knowledge_transcript_missing") from exc
+    if resolved_conversation.parent != resolved_root:
+        raise MatrixError("knowledge_transcript_layout_invalid")
+    try:
+        turns = sorted(
+            (
+                item
+                for item in resolved_conversation.iterdir()
+                if item.is_dir() and _SAFE_KNOWLEDGE_TURN_ID.fullmatch(item.name) is not None
+            ),
+            key=lambda item: item.name,
+        )
+    except OSError as exc:
+        raise MatrixError("knowledge_transcript_missing") from exc
+    if len(turns) != expected_count:
+        raise MatrixError("knowledge_transcript_turn_count_invalid")
+    return turns
+
+
+def _verify_agent_knowledge_transcript(turn_directory: Path) -> None:
+    """Run the Agent-owned verifier and retain its safe status only."""
+
+    agent_root = _workspace_root() / "customs-ai-agent"
+    if not agent_root.is_dir():
+        raise MatrixError("agent_knowledge_verifier_unavailable")
+    command = [
+        "uv",
+        "run",
+        "--locked",
+        "--no-sync",
+        "--group",
+        "dev",
+        "python",
+        "-m",
+        "customs_ai_agent.knowledge_transcript_verifier",
+        "--service-mode",
+        "functional-uat",
+        "--turn-directory",
+        str(turn_directory),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=agent_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise MatrixError("agent_knowledge_verifier_unavailable") from exc
+    if completed.returncode != 0:
+        raise MatrixError("agent_knowledge_transcript_verification_failed")
+    try:
+        receipt = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise MatrixError("agent_knowledge_transcript_verification_failed") from exc
+    if receipt != {"status": "passed"}:
+        raise MatrixError("agent_knowledge_transcript_verification_failed")
+
+
+def _assert_real_knowledge_provider_trace(turn_directory: Path) -> dict[str, Any]:
+    """Require one accepted real-Claude answer in a verified knowledge turn.
+
+    The Agent-owned verifier establishes the filesystem, redaction, and record
+    boundary.  This additional Functional-UAT assertion deliberately examines
+    only event names and safe provider/model metadata; it never returns the
+    question, prompt, answer, turn path, or conversation identity.
+    """
+
+    path = turn_directory / "claude.jsonl"
+    try:
+        events = [
+            json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line
+        ]
+    except (OSError, json.JSONDecodeError) as exc:
+        raise MatrixError("knowledge_claude_trace_invalid") from exc
+    if not events or not all(
+        isinstance(event, Mapping) and isinstance(event.get("event"), str) for event in events
+    ):
+        raise MatrixError("knowledge_claude_trace_invalid")
+
+    requested_model: str | None = None
+    accepted_count = 0
+    for event in events:
+        event_name = event["event"]
+        payload = event.get("payload")
+        if event_name in _KNOWLEDGE_PROVIDER_FAILURE_EVENTS:
+            raise MatrixError("knowledge_claude_provider_request_or_json_failed")
+        if event_name in _KNOWLEDGE_PROVIDER_UNACCEPTED_EVENTS:
+            raise MatrixError("knowledge_claude_provider_answer_unaccepted")
+        if event_name == _KNOWLEDGE_PROVIDER_REQUEST_EVENT:
+            if requested_model is not None:
+                raise MatrixError("knowledge_claude_provider_sequence_invalid")
+            if (
+                not isinstance(payload, Mapping)
+                or payload.get("provider") != "anthropic"
+                or payload.get("purpose") != "knowledge_answer"
+                or not isinstance(payload.get("model"), str)
+                or not payload["model"].strip()
+            ):
+                raise MatrixError("knowledge_claude_provider_payload_invalid")
+            requested_model = payload["model"]
+            continue
+        if event_name == _KNOWLEDGE_PROVIDER_RESPONSE_EVENT:
+            if requested_model is None:
+                raise MatrixError("knowledge_claude_provider_sequence_invalid")
+            if (
+                not isinstance(payload, Mapping)
+                or payload.get("provider") != "anthropic"
+                or payload.get("model") != requested_model
+                or not isinstance(payload.get("output_text"), str)
+                or not payload["output_text"].strip()
+            ):
+                raise MatrixError("knowledge_claude_provider_payload_invalid")
+            requested_model = None
+            accepted_count += 1
+            continue
+        raise MatrixError("knowledge_claude_trace_invalid")
+    if requested_model is not None:
+        raise MatrixError("knowledge_claude_provider_sequence_invalid")
+    if accepted_count < 1:
+        raise MatrixError("knowledge_claude_provider_answer_unaccepted")
+    return {
+        "knowledge_provider": "anthropic",
+        "knowledge_claude_event_count": len(events),
+        "knowledge_provider_accepted_count": accepted_count,
+    }
+
+
+def _assert_standalone_knowledge_assistant(
+    assistant: Mapping[str, Any], *, expected_as_of: str, code: str
+) -> tuple[str, str, int]:
+    """Validate one Case-free official-guidance answer without returning it."""
+
+    if (
+        assistant.get("role") != "assistant"
+        or assistant.get("answer_scope") != "general_customs_guidance"
+    ):
+        raise MatrixError(f"{code}_scope_invalid")
+    if any(
+        key in assistant
+        for key in ("case_id", "review_run_id", "document_id", "filename", "content_text")
+    ):
+        raise MatrixError(f"{code}_case_boundary_invalid")
+    _assert_user_text(
+        assistant.get("content"),
+        code=f"{code}_content",
+        filenames=set(),
+        internal_markers=set(),
+    )
+    snapshot_id, coverage = _assert_official_guidance_citations(
+        assistant.get("citations"),
+        expected_as_of=expected_as_of,
+        code=code,
+    )
+    if (
+        assistant.get("knowledge_coverage") != coverage
+        or assistant.get("knowledge_snapshot_id") != snapshot_id
+        or assistant.get("knowledge_as_of") != expected_as_of
+    ):
+        raise MatrixError(f"{code}_provenance_invalid")
+    sections = _mapping_list(assistant.get("answer_sections"), code=f"{code}_sections_invalid")
+    if [section.get("kind") for section in sections] != ["general_guidance"]:
+        raise MatrixError(f"{code}_sections_invalid")
+    section_snapshot, section_coverage = _assert_official_guidance_citations(
+        sections[0].get("citations"),
+        expected_as_of=expected_as_of,
+        code=f"{code}_section",
+    )
+    if section_snapshot != snapshot_id or section_coverage != coverage:
+        raise MatrixError(f"{code}_section_provenance_invalid")
+    citations = _mapping_list(assistant.get("citations"), code=f"{code}_citations_invalid")
+    return snapshot_id, coverage, len(citations)
+
+
+def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
+    """Verify an official guidance answer and a same-conversation follow-up."""
+
+    created = api.require(
+        "POST",
+        "/knowledge/conversations",
+        body={
+            "title": "수출 신고 기본 안내",
+            "trade_type": "export",
+            "as_of": "2026-08-05",
+        },
+        expected=201,
+    )
+    conversation_id = created.get("conversation_id")
+    expected_as_of = created.get("as_of")
+    if not isinstance(conversation_id, str) or expected_as_of != "2026-08-05":
+        raise MatrixError("knowledge_conversation_identity_invalid")
+    exchange = api.require(
+        "POST",
+        f"/knowledge/conversations/{conversation_id}/messages",
+        body={"content": "수출 신고 전에 필요한 기본 서류와 절차를 알려 주세요."},
+        idempotency_key=f"functional-matrix-knowledge-{uuid.uuid4().hex}",
+    )
+    assistant = _require_mapping(
+        exchange.get("assistant_message"), code="knowledge_assistant_message_invalid"
+    )
+    snapshot_id, coverage, citation_count = _assert_standalone_knowledge_assistant(
+        assistant,
+        expected_as_of=expected_as_of,
+        code="knowledge_assistant",
+    )
+    follow_up_exchange = api.require(
+        "POST",
+        f"/knowledge/conversations/{conversation_id}/messages",
+        body={"content": "수출 운송 서류도 공식 자료 범위에서 알려 주세요."},
+        idempotency_key=f"functional-matrix-knowledge-follow-up-{uuid.uuid4().hex}",
+    )
+    follow_up = _require_mapping(
+        follow_up_exchange.get("assistant_message"), code="knowledge_follow_up_message_invalid"
+    )
+    follow_up_snapshot, follow_up_coverage, follow_up_citation_count = (
+        _assert_standalone_knowledge_assistant(
+            follow_up,
+            expected_as_of=expected_as_of,
+            code="knowledge_follow_up",
+        )
+    )
+    if follow_up_snapshot != snapshot_id or follow_up_coverage != coverage:
+        raise MatrixError("knowledge_follow_up_snapshot_pin_invalid")
+    # The standalone assistant is Case-independent.  Verify the public
+    # ingress boundary with synthetic structural markers only; ``PublicApi``
+    # intentionally does not retain or print request bodies.
+    rejected = api.require(
+        "POST",
+        f"/knowledge/conversations/{conversation_id}/messages",
+        body={"content": "filename: sample-invoice.txt\nQuantity: 2"},
+        idempotency_key=f"functional-matrix-knowledge-rejected-{uuid.uuid4().hex}",
+        expected=422,
+    )
+    if rejected.get("code") != "knowledge_input_not_allowed":
+        raise MatrixError("knowledge_input_boundary_invalid")
+    messages = api.require("GET", f"/knowledge/conversations/{conversation_id}/messages")
+    message_items = _mapping_list(messages.get("items"), code="knowledge_message_history_invalid")
+    if [item.get("role") for item in message_items] != ["user", "assistant", "user", "assistant"]:
+        raise MatrixError("knowledge_message_history_invalid")
+    if any(
+        item.get("knowledge_snapshot_id") != snapshot_id
+        for item in message_items
+        if item.get("role") == "assistant"
+    ):
+        raise MatrixError("knowledge_message_snapshot_invalid")
+    listed = api.require("GET", "/knowledge/conversations")
+    listed_items = _mapping_list(listed.get("items"), code="knowledge_conversation_list_invalid")
+    matching = [item for item in listed_items if item.get("conversation_id") == conversation_id]
+    if len(matching) != 1 or matching[0].get("snapshot_id") != snapshot_id:
+        raise MatrixError("knowledge_snapshot_pin_invalid")
+    turn_directories = _knowledge_turn_directories(conversation_id, expected_count=2)
+    provider_traces: list[dict[str, Any]] = []
+    for turn_directory in turn_directories:
+        _verify_agent_knowledge_transcript(turn_directory)
+        provider_traces.append(_assert_real_knowledge_provider_trace(turn_directory))
+    if {trace["knowledge_provider"] for trace in provider_traces} != {"anthropic"}:
+        raise MatrixError("knowledge_claude_provider_payload_invalid")
+    return {
+        "status": "passed",
+        "official_guidance_citations_verified": citation_count + follow_up_citation_count,
+        "snapshot_pinned": True,
+        "agent_knowledge_transcript_verified": True,
+        "knowledge_turns_verified": len(turn_directories),
+        "knowledge_recent_history_verified": 1,
+        "knowledge_rejected_inputs_verified": 1,
+        "knowledge_rejected_agent_dispatches": 0,
+        "knowledge_rejected_exchanges": 0,
+        "knowledge_provider": "anthropic",
+        "knowledge_claude_event_count": sum(
+            trace["knowledge_claude_event_count"] for trace in provider_traces
+        ),
+        "knowledge_provider_accepted_count": sum(
+            trace["knowledge_provider_accepted_count"] for trace in provider_traces
+        ),
+    }
 
 
 def _assert_recent_context_limit(api: PublicApi, *, run_id: str, run: Mapping[str, Any]) -> None:
@@ -1285,7 +1878,7 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
             case_id, documents, run_id, review_run = _create_case_and_review(reviewer, scenario)
             runs[scenario.name] = (case_id, documents, run_id, review_run)
             executed.append({"scenario": scenario.name, "review_run_id": run_id})
-        if len(executed) != 6:
+        if len(executed) != 7:
             raise MatrixError("functional_uat_scenario_count_invalid")
 
         mismatch_case, mismatch_documents, mismatch_run_id, mismatch_run = runs[
@@ -1368,6 +1961,8 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
             question="원산지증명서, 포장명세서, 상업송장의 HS 코드가 같은 품목을 의미하는지 확인해 주세요.",
             expected_scope="case_grounded",
         )
+        _mixed_conversation(reviewer, run_id=matching_run_id, run=matching_run)
+        knowledge_guidance = _standalone_knowledge_conversation(reviewer)
         _assert_recent_context_limit(reviewer, run_id=mismatch_run_id, run=mismatch_run)
         child_run_id, replacement_run_id = _assert_human_correction_flow(
             reviewer,
@@ -1379,7 +1974,7 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
         )
 
         all_run_ids = [entry[2] for entry in runs.values()] + [child_run_id, replacement_run_id]
-        if len(all_run_ids) != 8 or len(all_run_ids) != len(set(all_run_ids)):
+        if len(all_run_ids) != 9 or len(all_run_ids) != len(set(all_run_ids)):
             raise MatrixError("functional_uat_review_run_count_invalid")
         transcripts = [_verify_transcript(run_id) for run_id in all_run_ids]
         trace = _assert_real_provider_trace(all_run_ids)
@@ -1392,6 +1987,7 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
             "child_run_id": child_run_id,
             "replacement_run_id": replacement_run_id,
             "transcripts_verified": len(transcripts),
+            "knowledge_guidance": knowledge_guidance,
             **trace,
         }
     finally:

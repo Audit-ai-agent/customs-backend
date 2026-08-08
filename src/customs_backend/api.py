@@ -36,6 +36,8 @@ from customs_backend.domain import (
     FindingDecisionRecord,
     FindingDecisionRequest,
     JobStatus,
+    KnowledgeConversationCreate,
+    KnowledgeConversationRecord,
     Principal,
     RevisionCreate,
     ReviewEnqueueRequest,
@@ -47,6 +49,7 @@ from customs_backend.ports import (
     AgentClient,
     AuthorizationError,
     ConflictError,
+    KnowledgeInputRejectedError,
     NotFoundError,
     ObjectStore,
     TokenVerifier,
@@ -164,6 +167,38 @@ class ConversationListResponse(BaseModel):
 
 
 class ConversationMessageListResponse(BaseModel):
+    items: list[ConversationMessageRecord]
+
+
+class KnowledgeConversationView(BaseModel):
+    conversation_id: str
+    title: str | None = None
+    trade_type: Literal["import", "export", "both"]
+    as_of: date
+    snapshot_id: str | None = None
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_record(cls, record: KnowledgeConversationRecord) -> "KnowledgeConversationView":
+        return cls(
+            conversation_id=record.conversation_id,
+            title=record.title,
+            trade_type=record.trade_type,
+            as_of=record.as_of,
+            snapshot_id=record.snapshot_id,
+            created_by=record.created_by,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+        )
+
+
+class KnowledgeConversationListResponse(BaseModel):
+    items: list[KnowledgeConversationView]
+
+
+class KnowledgeConversationMessageListResponse(BaseModel):
     items: list[ConversationMessageRecord]
 
 
@@ -557,6 +592,11 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
     @app.exception_handler(AuthorizationError)
     async def authorization_handler(request: Request, _exc: AuthorizationError):
         return _error_response(403, "permission_denied", instance=request.url.path)
+
+    @app.exception_handler(KnowledgeInputRejectedError)
+    async def knowledge_input_handler(request: Request, _exc: KnowledgeInputRejectedError):
+        # This stable response deliberately contains no rejected value.
+        return _error_response(422, "knowledge_input_not_allowed", instance=request.url.path)
 
     @app.exception_handler(ValueError)
     async def value_handler(request: Request, _exc: ValueError):
@@ -992,7 +1032,11 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
     ) -> ConversationMessageExchange:
         run = service.get_conversation_run(principal, conversation_id)
         result = service.send_conversation_message(
-            principal, conversation_id, body, idempotency_key
+            principal,
+            conversation_id,
+            body,
+            idempotency_key,
+            functional_uat=actual_container.settings.environment == "functional-uat",
         )
         record_public_exchange(
             case_id=run.case_id,
@@ -1029,6 +1073,94 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             review_run_id=run.review_run_id,
         )
         return result
+
+    # Standalone official-trade guidance stays separate from Case/Review Run
+    # conversations.  In particular it cannot be recorded under a scenario
+    # transcript's review-run directory or accidentally receive case facts.
+    @app.post(
+        "/api/v1/knowledge/conversations",
+        response_model=KnowledgeConversationView,
+        response_model_exclude_none=True,
+        status_code=201,
+    )
+    def create_knowledge_conversation_endpoint(
+        body: KnowledgeConversationCreate,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> KnowledgeConversationView:
+        # The public field is optional for a simple general-question start,
+        # but Agent/Data must never receive an ambiguous knowledge date.
+        # Functional-UAT uses the same fixed date as a review; the lightweight
+        # fixture has its own stable reference date.
+        if actual_container.settings.environment == "functional-uat":
+            resolved_as_of = actual_container.settings.functional_uat_as_of
+            if body.as_of is not None and body.as_of != resolved_as_of:
+                raise HTTPException(
+                    status_code=422,
+                    detail="functional UAT uses its configured knowledge date",
+                )
+        elif body.as_of is not None:
+            resolved_as_of = body.as_of
+        elif actual_container.settings.environment == "local-development":
+            resolved_as_of = _DEV_FIXTURE_REVIEW_AS_OF
+        else:
+            # Unit-test containers use the same documented functional-UAT
+            # baseline instead of deriving a wall-clock date.
+            resolved_as_of = actual_container.settings.functional_uat_as_of
+        body = body.model_copy(update={"as_of": resolved_as_of})
+        return KnowledgeConversationView.from_record(
+            service.create_knowledge_conversation(principal, body)
+        )
+
+    @app.get(
+        "/api/v1/knowledge/conversations",
+        response_model=KnowledgeConversationListResponse,
+        response_model_exclude_none=True,
+    )
+    def list_knowledge_conversations_endpoint(
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> KnowledgeConversationListResponse:
+        return KnowledgeConversationListResponse(
+            items=[
+                KnowledgeConversationView.from_record(record)
+                for record in service.list_knowledge_conversations(principal)
+            ]
+        )
+
+    @app.post(
+        "/api/v1/knowledge/conversations/{conversation_id}/messages",
+        response_model=ConversationMessageExchange,
+        response_model_exclude_none=True,
+    )
+    def send_knowledge_conversation_message_endpoint(
+        conversation_id: str,
+        body: ConversationMessageCreate,
+        idempotency_key: IdempotencyKey,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> ConversationMessageExchange:
+        return service.send_knowledge_conversation_message(
+            principal,
+            conversation_id,
+            body,
+            idempotency_key,
+            functional_uat=actual_container.settings.environment == "functional-uat",
+        )
+
+    @app.get(
+        "/api/v1/knowledge/conversations/{conversation_id}/messages",
+        response_model=KnowledgeConversationMessageListResponse,
+        response_model_exclude_none=True,
+    )
+    def list_knowledge_conversation_messages_endpoint(
+        conversation_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> KnowledgeConversationMessageListResponse:
+        return KnowledgeConversationMessageListResponse(
+            items=service.list_knowledge_conversation_messages(principal, conversation_id)
+        )
 
     @app.post(
         "/api/v1/review-runs/{review_run_id}/correction-proposals",

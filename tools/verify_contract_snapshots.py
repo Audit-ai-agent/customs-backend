@@ -29,6 +29,8 @@ AGENT_SCHEMA_PATHS = (
     AGENT_SCHEMA_DIRECTORY / "review-result.schema.json",
     AGENT_SCHEMA_DIRECTORY / "assistant-answer-request.schema.json",
     AGENT_SCHEMA_DIRECTORY / "assistant-answer-response.schema.json",
+    AGENT_SCHEMA_DIRECTORY / "knowledge-answer-request.schema.json",
+    AGENT_SCHEMA_DIRECTORY / "knowledge-answer-response.schema.json",
 )
 TRACKED_FILES = (
     OPENAPI_PATH,

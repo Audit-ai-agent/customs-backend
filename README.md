@@ -112,8 +112,11 @@ uv run --locked --no-sync --group dev python tools/run_dev_fixture_scenarios.py 
   --base-url http://127.0.0.1:5173/api/v1
 ```
 
-이 실행기는 Frontend Vite proxy를 통해 여섯 현재 지원 시나리오를 실행하고, 각
-`_local/state/scenario-runs/<review-run-id>/`에 아래를 남긴다.
+이 실행기는 Frontend Vite proxy를 통해 일곱 현재 지원 심사 시나리오와 독립된 통관 지식
+대화의 동일 대화방 2 turn을 실행합니다. 심사 시나리오에는 기존 수입 비교·예외 흐름과 함께 수출 문서
+(AWB, 수출신고서, 보완·제출 증빙) 등록, 수출 심사, 문서상 제출 상태, 사건+일반 안내 분리
+응답이 포함됩니다. 각 심사 결과는
+`_local/state/scenario-runs/<review-run-id>/`에 아래를 남깁니다.
 
 - `scenario.json`: 합성 문서 원문·실제 review 요청
 - `public-api.jsonl`: Frontend proxy → Backend API의 request/response body
@@ -121,6 +124,10 @@ uv run --locked --no-sync --group dev python tools/run_dev_fixture_scenarios.py 
 - `agent-data.jsonl`: Agent → Data 실제 HTTP body (Agent만 기록)
 - `claude.jsonl`: dev-fixture의 Claude 미호출 표시
 - `summary.json`: 기대값·실제 판정·안전 assertion
+
+독립 통관 지식 대화는 Case·Review Run·문서 원문과 분리된 Agent 전용 로컬 transcript
+namespace에만 기록됩니다. 실행기의 최종 요약에는 대화 ID나 요청·응답 본문을 넣지 않고,
+검증된 지식 대화 수와 개발 fixture 근거 수만 남깁니다.
 
 세션/서비스 token, Authorization·Cookie 헤더, API key, 비밀번호, DSN 및
 credential-shaped 값은 모두 `[REDACTED]` 처리한다. 이 transcript는 Git, `_artifacts`,
