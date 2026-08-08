@@ -379,10 +379,14 @@ class PublicApi:
         except httpx.HTTPError as exc:
             raise MatrixError(f"public_api_transport_{method.casefold()}") from exc
         # A long real-Claude run can cross the local Keycloak access-token
-        # lifetime.  Authentication is evaluated before a public handler, so
-        # retrying exactly once after a fresh PKCE login cannot repeat a write;
-        # the original idempotency key is preserved as a second boundary.
-        if response.status_code == 401 and self._renew_access_token is not None:
+        # lifetime.  Proactive renewal protects writes.  For a residual clock
+        # race, retry only a read exactly once after a fresh PKCE login; a POST
+        # stays fail-closed rather than risking a repeated state change.
+        if (
+            response.status_code == 401
+            and method.casefold() in {"get", "head"}
+            and self._renew_access_token is not None
+        ):
             refreshed_token = self._resolve_access_token(self._renew_access_token)
             headers["Authorization"] = f"Bearer {refreshed_token}"
             try:

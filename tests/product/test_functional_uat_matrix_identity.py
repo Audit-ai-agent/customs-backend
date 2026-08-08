@@ -58,7 +58,7 @@ def test_public_api_resolves_a_token_supplier_for_each_request(
     client.close()
 
 
-def test_public_api_reauthenticates_once_after_an_expired_token_401(
+def test_public_api_reauthenticates_once_for_a_read_after_an_expired_token_401(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     renewal_count = 0
@@ -87,13 +87,13 @@ def test_public_api_reauthenticates_once_after_an_expired_token_401(
     client._renew_access_token = renew
     monkeypatch.setattr(client._client, "request", request)
 
-    assert client.require("POST", "/cases", body={"title": "기능 UAT"}) == {}
+    assert client.require("GET", "/cases") == {}
     assert renewal_count == 1
     assert authorization_headers == ["Bearer expired-token", "Bearer renewed-token"]
     client.close()
 
 
-def test_public_api_does_not_reauthenticate_for_non_401_or_repeat_a_401(
+def test_public_api_keeps_writes_and_a_repeated_read_401_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     renewals = 0
@@ -113,11 +113,14 @@ def test_public_api_does_not_reauthenticate_for_non_401_or_repeat_a_401(
             httpx.Response(403, headers={"content-type": "application/problem+json"}, json={}),
             httpx.Response(401, headers={"content-type": "application/problem+json"}, json={}),
             httpx.Response(401, headers={"content-type": "application/problem+json"}, json={}),
+            httpx.Response(401, headers={"content-type": "application/problem+json"}, json={}),
         ]
     )
     monkeypatch.setattr(client._client, "request", lambda *_args, **_kwargs: next(responses))
 
     assert client.require("GET", "/cases", expected=403) == {}
+    assert renewals == 0
+    assert client.require("POST", "/cases", body={"title": "기능 UAT"}, expected=401) == {}
     assert renewals == 0
     with pytest.raises(matrix.MatrixError, match="public_api_status_get_401"):
         client.require("GET", "/cases")
