@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -10,6 +11,118 @@ import httpx
 import pytest
 
 from tools import run_functional_uat_matrix as matrix
+
+
+def _unsigned_token_with_expiry(expiry: int) -> str:
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"exp": expiry}, separators=(",", ":")).encode("utf-8")
+    ).rstrip(b"=")
+    return f"header.{payload.decode('ascii')}.signature"
+
+
+def test_functional_uat_oidc_reuses_a_valid_in_memory_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    oidc = matrix.FunctionalUatOidc({}, redirect_uri="http://127.0.0.1:5173/")
+    oidc._access_tokens["reviewer"] = ("cached-token", 500.0)
+    monkeypatch.setattr(matrix.time, "time", lambda: 100.0)
+
+    assert oidc.access_token("reviewer") == "cached-token"
+
+
+def test_access_token_expiry_parses_only_a_valid_numeric_expiry() -> None:
+    assert matrix._access_token_expiry(_unsigned_token_with_expiry(500)) == 500.0
+
+    with pytest.raises(matrix.MatrixError, match="functional_uat_token_response_invalid"):
+        matrix._access_token_expiry("not-a-jwt")
+
+
+def test_public_api_resolves_a_token_supplier_for_each_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supplied = iter(["a" * 32, "b" * 32])
+    client = matrix.PublicApi(
+        base_url="http://127.0.0.1:18081/api/v1", access_token=lambda: next(supplied)
+    )
+    authorization_headers: list[str] = []
+
+    def request(*_args: Any, **kwargs: Any) -> httpx.Response:
+        authorization_headers.append(kwargs["headers"]["Authorization"])
+        return httpx.Response(200, headers={"content-type": "application/json"}, json={})
+
+    monkeypatch.setattr(client._client, "request", request)
+
+    assert client.require("GET", "/health") == {}
+    assert client.require("GET", "/health") == {}
+    assert authorization_headers == [f"Bearer {'a' * 32}", f"Bearer {'b' * 32}"]
+    client.close()
+
+
+def test_public_api_reauthenticates_once_after_an_expired_token_401(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    renewal_count = 0
+    authorization_headers: list[str] = []
+    client = matrix.PublicApi(
+        base_url="http://127.0.0.1:18081/api/v1",
+        access_token="expired-token",
+        renew_access_token=lambda: "renewed-token",
+    )
+    responses = iter(
+        [
+            httpx.Response(401, headers={"content-type": "application/problem+json"}, json={}),
+            httpx.Response(200, headers={"content-type": "application/json"}, json={}),
+        ]
+    )
+
+    def request(*_args: Any, **kwargs: Any) -> httpx.Response:
+        authorization_headers.append(kwargs["headers"]["Authorization"])
+        return next(responses)
+
+    def renew() -> str:
+        nonlocal renewal_count
+        renewal_count += 1
+        return "renewed-token"
+
+    client._renew_access_token = renew
+    monkeypatch.setattr(client._client, "request", request)
+
+    assert client.require("POST", "/cases", body={"title": "기능 UAT"}) == {}
+    assert renewal_count == 1
+    assert authorization_headers == ["Bearer expired-token", "Bearer renewed-token"]
+    client.close()
+
+
+def test_public_api_does_not_reauthenticate_for_non_401_or_repeat_a_401(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    renewals = 0
+
+    def renew() -> str:
+        nonlocal renewals
+        renewals += 1
+        return "renewed-token"
+
+    client = matrix.PublicApi(
+        base_url="http://127.0.0.1:18081/api/v1",
+        access_token="initial-token",
+        renew_access_token=renew,
+    )
+    responses = iter(
+        [
+            httpx.Response(403, headers={"content-type": "application/problem+json"}, json={}),
+            httpx.Response(401, headers={"content-type": "application/problem+json"}, json={}),
+            httpx.Response(401, headers={"content-type": "application/problem+json"}, json={}),
+        ]
+    )
+    monkeypatch.setattr(client._client, "request", lambda *_args, **_kwargs: next(responses))
+
+    assert client.require("GET", "/cases", expected=403) == {}
+    assert renewals == 0
+    with pytest.raises(matrix.MatrixError, match="public_api_status_get_401"):
+        client.require("GET", "/cases")
+    assert renewals == 1
+    client.close()
 
 
 def test_public_api_accepts_rfc7807_json_for_an_expected_rejected_probe(

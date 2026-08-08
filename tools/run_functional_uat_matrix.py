@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import hashlib
 import json
 import re
@@ -21,7 +22,7 @@ import secrets
 import subprocess
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from html import unescape
 from html.parser import HTMLParser
@@ -224,16 +225,40 @@ def _code_challenge(verifier: str) -> str:
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
 
+def _access_token_expiry(token: str) -> float:
+    """Read only the expiry needed to refresh an in-memory local token.
+
+    The Backend still validates the signature and claims.  This runner uses
+    the unsigned JWT payload only to avoid sending a known-expired token in a
+    long Functional-UAT session, and never logs or persists the token.
+    """
+
+    try:
+        _header, payload_segment, _signature = token.split(".")
+        payload_segment += "=" * (-len(payload_segment) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_segment))
+        expiry = payload.get("exp") if isinstance(payload, Mapping) else None
+    except (binascii.Error, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MatrixError("functional_uat_token_response_invalid") from exc
+    if isinstance(expiry, bool) or not isinstance(expiry, int) or expiry <= 0:
+        raise MatrixError("functional_uat_token_response_invalid")
+    return float(expiry)
+
+
 class FunctionalUatOidc:
     """Perform the local realm's standard Authorization Code + PKCE login."""
 
     def __init__(self, profile: Mapping[str, str], *, redirect_uri: str) -> None:
         self._profile = profile
         self._redirect_uri = redirect_uri
+        self._access_tokens: dict[str, tuple[str, float]] = {}
 
-    def access_token(self, actor: str) -> str:
+    def access_token(self, actor: str, *, force_refresh: bool = False) -> str:
         if actor not in {"reviewer", "approver"}:
             raise MatrixError("functional_uat_actor_invalid")
+        cached = self._access_tokens.get(actor)
+        if not force_refresh and cached is not None and time.time() < cached[1] - 30.0:
+            return cached[0]
         username = self._profile[f"CUSTOMS_FUNCTIONAL_{actor.upper()}_USERNAME"]
         password = self._profile[f"CUSTOMS_FUNCTIONAL_{actor.upper()}_PASSWORD"]
         verifier = secrets.token_urlsafe(48)
@@ -311,15 +336,26 @@ class FunctionalUatOidc:
             token = payload.get("access_token") if isinstance(payload, Mapping) else None
             if exchange.status_code != 200 or not isinstance(token, str) or len(token) < 32:
                 raise MatrixError("functional_uat_token_exchange_failed")
+            expiry = _access_token_expiry(token)
+            if expiry <= time.time() + 30.0:
+                raise MatrixError("functional_uat_token_response_invalid")
+            self._access_tokens[actor] = (token, expiry)
             return token
 
 
 class PublicApi:
     """A public Backend API client that never records or prints bodies locally."""
 
-    def __init__(self, *, base_url: str, access_token: str) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        access_token: str | Callable[[], str],
+        renew_access_token: Callable[[], str] | None = None,
+    ) -> None:
         self._client = httpx.Client(base_url=base_url, timeout=httpx.Timeout(90.0, connect=5.0))
         self._access_token = access_token
+        self._renew_access_token = renew_access_token
 
     def close(self) -> None:
         self._client.close()
@@ -332,7 +368,8 @@ class PublicApi:
         body: Mapping[str, Any] | None = None,
         idempotency_key: str | None = None,
     ) -> tuple[int, dict[str, Any] | None]:
-        headers = {"Accept": "application/json", "Authorization": f"Bearer {self._access_token}"}
+        access_token = self._resolve_access_token(self._access_token)
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {access_token}"}
         if body is not None:
             headers["Content-Type"] = "application/json"
         if idempotency_key is not None:
@@ -341,6 +378,17 @@ class PublicApi:
             response = self._client.request(method, path, json=body, headers=headers)
         except httpx.HTTPError as exc:
             raise MatrixError(f"public_api_transport_{method.casefold()}") from exc
+        # A long real-Claude run can cross the local Keycloak access-token
+        # lifetime.  Authentication is evaluated before a public handler, so
+        # retrying exactly once after a fresh PKCE login cannot repeat a write;
+        # the original idempotency key is preserved as a second boundary.
+        if response.status_code == 401 and self._renew_access_token is not None:
+            refreshed_token = self._resolve_access_token(self._renew_access_token)
+            headers["Authorization"] = f"Bearer {refreshed_token}"
+            try:
+                response = self._client.request(method, path, json=body, headers=headers)
+            except httpx.HTTPError as exc:
+                raise MatrixError(f"public_api_transport_{method.casefold()}") from exc
         content_type = response.headers.get("content-type", "").split(";", 1)[0].casefold()
         if content_type not in {"application/json", "application/problem+json"}:
             # Deliberately rejected local-role probes are allowed to have an
@@ -354,6 +402,13 @@ class PublicApi:
         if not isinstance(payload, dict):
             raise MatrixError(f"public_api_non_object_{method.casefold()}")
         return response.status_code, payload
+
+    @staticmethod
+    def _resolve_access_token(token_or_supplier: str | Callable[[], str]) -> str:
+        access_token = token_or_supplier() if callable(token_or_supplier) else token_or_supplier
+        if not isinstance(access_token, str) or not access_token.strip():
+            raise MatrixError("functional_uat_token_response_invalid")
+        return access_token
 
     def require(
         self,
@@ -2057,8 +2112,16 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
         raise MatrixError("functional_uat_not_ready")
     profile = _load_profile(profile_path)
     oidc = FunctionalUatOidc(profile, redirect_uri=redirect_uri)
-    reviewer = PublicApi(base_url=base_url, access_token=oidc.access_token("reviewer"))
-    approver = PublicApi(base_url=base_url, access_token=oidc.access_token("approver"))
+    reviewer = PublicApi(
+        base_url=base_url,
+        access_token=lambda: oidc.access_token("reviewer"),
+        renew_access_token=lambda: oidc.access_token("reviewer", force_refresh=True),
+    )
+    approver = PublicApi(
+        base_url=base_url,
+        access_token=lambda: oidc.access_token("approver"),
+        renew_access_token=lambda: oidc.access_token("approver", force_refresh=True),
+    )
     try:
         executed: list[dict[str, Any]] = []
         runs: dict[str, tuple[str, list[dict[str, str]], str, dict[str, Any]]] = {}
