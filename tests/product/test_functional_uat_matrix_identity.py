@@ -629,6 +629,7 @@ def test_agent_knowledge_transcript_verifier_runs_with_safe_result_only(
         str(turn),
     ]
     assert invoked[0]["cwd"] == tmp_path / "customs-ai-agent"
+    assert invoked[0]["encoding"] == "utf-8"
 
 
 def test_matrix_run_includes_export_mixed_and_safe_standalone_knowledge_receipt(
