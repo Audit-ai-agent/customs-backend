@@ -86,11 +86,10 @@ _KNOWLEDGE_PROVIDER_FAILURE_EVENTS = frozenset(
         "knowledge_answer_response_invalid",
     }
 )
-_KNOWLEDGE_PROVIDER_UNACCEPTED_EVENTS = frozenset(
-    {
-        "knowledge_answer_not_called",
-        "knowledge_answer_fallback",
-    }
+_KNOWLEDGE_SAFE_FALLBACK_REASON = "provider_answer_unavailable_or_ungrounded"
+_KNOWLEDGE_REQUEST_FAILURE_ERROR_CODES = frozenset({"provider_request_failed"})
+_KNOWLEDGE_RESPONSE_INVALID_ERROR_CODES = frozenset(
+    {"provider_response_invalid", "provider_output_invalid"}
 )
 _SAFE_LOCAL_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SAFE_KNOWLEDGE_TURN_ID = re.compile(r"^turn-[a-f0-9]{32}$")
@@ -1340,12 +1339,15 @@ def _verify_agent_knowledge_transcript(turn_directory: Path) -> None:
 
 
 def _assert_real_knowledge_provider_trace(turn_directory: Path) -> dict[str, Any]:
-    """Require one accepted real-Claude answer in a verified knowledge turn.
+    """Classify one real-Claude attempt in a verified knowledge turn.
 
     The Agent-owned verifier establishes the filesystem, redaction, and record
     boundary.  This additional Functional-UAT assertion deliberately examines
     only event names and safe provider/model metadata; it never returns the
-    question, prompt, answer, turn path, or conversation identity.
+    question, prompt, answer, turn path, or conversation identity.  A
+    provider attempt may end in an accepted code-owned presentation or in the
+    documented deterministic fallback.  Both preserve the official Data
+    citation boundary; only the former counts as a provider-accepted answer.
     """
 
     path = turn_directory / "claude.jsonl"
@@ -1361,16 +1363,14 @@ def _assert_real_knowledge_provider_trace(turn_directory: Path) -> dict[str, Any
         raise MatrixError("knowledge_claude_trace_invalid")
 
     requested_model: str | None = None
-    accepted_count = 0
+    state = "idle"
     for event in events:
         event_name = event["event"]
         payload = event.get("payload")
-        if event_name in _KNOWLEDGE_PROVIDER_FAILURE_EVENTS:
-            raise MatrixError("knowledge_claude_provider_request_or_json_failed")
-        if event_name in _KNOWLEDGE_PROVIDER_UNACCEPTED_EVENTS:
+        if event_name == "knowledge_answer_not_called":
             raise MatrixError("knowledge_claude_provider_answer_unaccepted")
         if event_name == _KNOWLEDGE_PROVIDER_REQUEST_EVENT:
-            if requested_model is not None:
+            if state != "idle" or requested_model is not None:
                 raise MatrixError("knowledge_claude_provider_sequence_invalid")
             if (
                 not isinstance(payload, Mapping)
@@ -1381,9 +1381,10 @@ def _assert_real_knowledge_provider_trace(turn_directory: Path) -> dict[str, Any
             ):
                 raise MatrixError("knowledge_claude_provider_payload_invalid")
             requested_model = payload["model"]
+            state = "requested"
             continue
         if event_name == _KNOWLEDGE_PROVIDER_RESPONSE_EVENT:
-            if requested_model is None:
+            if state != "requested" or requested_model is None:
                 raise MatrixError("knowledge_claude_provider_sequence_invalid")
             if (
                 not isinstance(payload, Mapping)
@@ -1393,18 +1394,55 @@ def _assert_real_knowledge_provider_trace(turn_directory: Path) -> dict[str, Any
                 or not payload["output_text"].strip()
             ):
                 raise MatrixError("knowledge_claude_provider_payload_invalid")
-            requested_model = None
-            accepted_count += 1
+            state = "responded"
+            continue
+        if event_name in _KNOWLEDGE_PROVIDER_FAILURE_EVENTS:
+            allowed_states = (
+                {"requested"}
+                if event_name == "knowledge_answer_request_failed"
+                else {"requested", "responded"}
+            )
+            if state not in allowed_states or requested_model is None:
+                raise MatrixError("knowledge_claude_provider_sequence_invalid")
+            allowed_error_codes = (
+                _KNOWLEDGE_REQUEST_FAILURE_ERROR_CODES
+                if event_name == "knowledge_answer_request_failed"
+                else _KNOWLEDGE_RESPONSE_INVALID_ERROR_CODES
+            )
+            if (
+                not isinstance(payload, Mapping)
+                or set(payload) != {"provider", "model", "error_code"}
+                or payload.get("provider") != "anthropic"
+                or payload.get("model") != requested_model
+                or payload.get("error_code") not in allowed_error_codes
+            ):
+                raise MatrixError("knowledge_claude_provider_payload_invalid")
+            state = (
+                "request_failed" if event_name.endswith("request_failed") else "response_invalid"
+            )
+            continue
+        if event_name == "knowledge_answer_fallback":
+            if state not in {"responded", "request_failed", "response_invalid"}:
+                raise MatrixError("knowledge_claude_provider_sequence_invalid")
+            if payload != {"reason_code": _KNOWLEDGE_SAFE_FALLBACK_REASON}:
+                raise MatrixError("knowledge_claude_fallback_metadata_invalid")
+            state = "fallback"
             continue
         raise MatrixError("knowledge_claude_trace_invalid")
-    if requested_model is not None:
+    if state == "responded":
+        accepted_count = 1
+        fallback_count = 0
+    elif state == "fallback":
+        accepted_count = 0
+        fallback_count = 1
+    else:
         raise MatrixError("knowledge_claude_provider_sequence_invalid")
-    if accepted_count < 1:
-        raise MatrixError("knowledge_claude_provider_answer_unaccepted")
     return {
         "knowledge_provider": "anthropic",
         "knowledge_claude_event_count": len(events),
+        "knowledge_provider_attempt_count": 1,
         "knowledge_provider_accepted_count": accepted_count,
+        "knowledge_provider_safe_fallback_count": fallback_count,
     }
 
 
@@ -1438,6 +1476,60 @@ def _assert_knowledge_provider_not_called_for_no_coverage(turn_directory: Path) 
     }:
         raise MatrixError("knowledge_no_coverage_claude_call_invalid")
     return 1
+
+
+def _assert_knowledge_provider_turns(turn_directories: Sequence[Path]) -> dict[str, Any]:
+    """Validate two covered Claude attempts and one exact no-coverage turn.
+
+    Knowledge turn IDs are UUID-derived and have no temporal meaning.  Classify
+    every verified turn by its own safe event sequence instead of relying on
+    directory ordering.  A covered turn can safely fall back after a real
+    Anthropic attempt; the exact no-coverage non-call is the only permitted
+    turn without one.
+    """
+
+    provider_traces: list[dict[str, Any]] = []
+    no_coverage_not_called_count = 0
+    for turn_directory in turn_directories:
+        _verify_agent_knowledge_transcript(turn_directory)
+        try:
+            provider_traces.append(_assert_real_knowledge_provider_trace(turn_directory))
+        except MatrixError as exc:
+            if str(exc) != "knowledge_claude_provider_answer_unaccepted":
+                raise
+            no_coverage_not_called_count += _assert_knowledge_provider_not_called_for_no_coverage(
+                turn_directory
+            )
+    accepted_count = sum(trace["knowledge_provider_accepted_count"] for trace in provider_traces)
+    safe_fallback_count = sum(
+        trace["knowledge_provider_safe_fallback_count"] for trace in provider_traces
+    )
+    if (
+        len(provider_traces) != 2
+        or no_coverage_not_called_count != 1
+        or {trace["knowledge_provider"] for trace in provider_traces} != {"anthropic"}
+        or sum(trace["knowledge_provider_attempt_count"] for trace in provider_traces) != 2
+    ):
+        raise MatrixError("knowledge_claude_provider_payload_invalid")
+    # The happy-path Functional-UAT specifically proves that both covered
+    # guidance turns were accepted by the real Claude path.  A safe fallback
+    # is a correct degraded product outcome (and is covered by controlled
+    # failure tests), but it must not make this actual-provider acceptance
+    # gate appear green.
+    if accepted_count != 2 or safe_fallback_count != 0:
+        raise MatrixError("knowledge_claude_provider_answer_unaccepted")
+    return {
+        "knowledge_no_coverage_not_called_count": no_coverage_not_called_count,
+        "knowledge_provider": "anthropic",
+        "knowledge_claude_event_count": sum(
+            trace["knowledge_claude_event_count"] for trace in provider_traces
+        ),
+        "knowledge_provider_attempt_count": sum(
+            trace["knowledge_provider_attempt_count"] for trace in provider_traces
+        ),
+        "knowledge_provider_accepted_count": accepted_count,
+        "knowledge_provider_safe_fallback_count": safe_fallback_count,
+    }
 
 
 def _assert_standalone_knowledge_assistant(
@@ -1622,16 +1714,7 @@ def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
     if len(matching) != 1 or matching[0].get("snapshot_id") != snapshot_id:
         raise MatrixError("knowledge_snapshot_pin_invalid")
     turn_directories = _knowledge_turn_directories(conversation_id, expected_count=3)
-    provider_traces: list[dict[str, Any]] = []
-    for turn_directory in turn_directories[:2]:
-        _verify_agent_knowledge_transcript(turn_directory)
-        provider_traces.append(_assert_real_knowledge_provider_trace(turn_directory))
-    _verify_agent_knowledge_transcript(turn_directories[2])
-    no_coverage_not_called_count = _assert_knowledge_provider_not_called_for_no_coverage(
-        turn_directories[2]
-    )
-    if {trace["knowledge_provider"] for trace in provider_traces} != {"anthropic"}:
-        raise MatrixError("knowledge_claude_provider_payload_invalid")
+    provider_receipt = _assert_knowledge_provider_turns(turn_directories)
     return {
         "status": "passed",
         "official_guidance_citations_verified": citation_count + follow_up_citation_count,
@@ -1640,18 +1723,10 @@ def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
         "knowledge_turns_verified": len(turn_directories),
         "knowledge_recent_history_verified": 1,
         "knowledge_no_coverage_verified": 1,
-        "knowledge_no_coverage_not_called_count": no_coverage_not_called_count,
         "knowledge_rejected_inputs_verified": 1,
         "knowledge_rejected_agent_dispatches": 0,
         "knowledge_rejected_exchanges": 0,
-        "knowledge_provider": "anthropic",
-        "knowledge_claude_event_count": sum(
-            trace["knowledge_claude_event_count"] for trace in provider_traces
-        ),
-        "knowledge_provider_accepted_count": sum(
-            trace["knowledge_provider_accepted_count"] for trace in provider_traces
-        ),
-    }
+    } | provider_receipt
 
 
 def _assert_recent_context_limit(api: PublicApi, *, run_id: str, run: Mapping[str, Any]) -> None:
