@@ -4,13 +4,45 @@
   "additionalProperties": false,
   "description": "One grounded assistant answer. It never mutates Case state, approves a correction, or makes a final customs decision.",
   "$defs": {
-    "Citation": {
+    "CaseCitation": {
       "additionalProperties": false,
       "properties": {
         "kind": {"type": "string", "enum": ["fact", "comparison", "evidence"]},
         "reference_id": {"type": "string", "minLength": 1, "maxLength": 256}
       },
       "required": ["kind", "reference_id"],
+      "type": "object"
+    },
+    "GuidanceCitation": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"const": "guidance_evidence", "type": "string"},
+        "source_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "source_kind": {"type": "string", "enum": ["official_law", "official_law_catalog", "official_agency_guidance", "official_requirement_reference", "official_public_guidance", "development_fixture"]},
+        "source_title": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "source_uri": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "as_of": {"type": "string", "format": "date"},
+        "snapshot_id": {"type": "string", "minLength": 1, "maxLength": 512},
+        "coverage": {"type": "string", "enum": ["covered", "no_coverage", "partial", "unavailable"]}
+      },
+      "required": ["kind", "source_id", "source_kind", "source_title", "source_uri", "as_of", "snapshot_id", "coverage"],
+      "type": "object"
+    },
+    "Citation": {
+      "oneOf": [
+        {"$ref": "#/$defs/CaseCitation"},
+        {"$ref": "#/$defs/GuidanceCitation"}
+      ]
+    },
+    "AnswerSection": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"type": "string", "enum": ["case_analysis", "general_guidance"]},
+        "title": {"type": "string", "minLength": 1, "maxLength": 200},
+        "content": {"type": "string", "minLength": 1, "maxLength": 4000},
+        "citations": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/Citation"}}
+      },
+      "required": ["kind", "title", "content", "citations"],
       "type": "object"
     },
     "CorrectionDraft": {
@@ -44,7 +76,8 @@
     "conversation_id": {"type": "string", "minLength": 1, "maxLength": 128},
     "answer_scope": {"type": "string", "enum": ["case_grounded", "evidence_grounded", "general_customs_guidance", "clarification_needed", "insufficient_evidence", "out_of_scope"]},
     "direct_answer": {"type": "string", "minLength": 1, "maxLength": 4000},
-    "citations": {"type": "array", "maxItems": 32, "items": {"$ref": "#/$defs/Citation"}},
+    "citations": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/Citation"}},
+    "answer_sections": {"type": "array", "maxItems": 2, "items": {"$ref": "#/$defs/AnswerSection"}},
     "suggested_questions": {"type": "array", "maxItems": 3, "items": {"type": "string", "minLength": 1, "maxLength": 4000}},
     "correction_draft": {"anyOf": [{"$ref": "#/$defs/CorrectionDraft"}, {"type": "null"}]},
     "engine": {"$ref": "#/$defs/Engine"}

@@ -15,6 +15,7 @@ from customs_backend.domain import (
     FindingDecisionRecord,
     FindingDecisionStatus,
     JobRecord,
+    KnowledgeConversationRecord,
     ReviewRunRecord,
 )
 
@@ -29,6 +30,17 @@ class NotFoundError(RuntimeError):
 
 class AuthorizationError(RuntimeError):
     pass
+
+
+class KnowledgeInputRejectedError(ValueError):
+    """A global knowledge request attempted to carry Case-like material.
+
+    The fixed exception text is intentionally non-diagnostic: API handlers
+    must not echo a document field, identifier, filename, or raw prompt.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("knowledge input is not allowed")
 
 
 class AgentResponseRejectedError(RuntimeError):
@@ -96,6 +108,36 @@ class WorkbenchRepository(Protocol):
         idempotency_key: str,
         idempotency_request_digest: str,
     ) -> tuple[ConversationMessageExchange, bool]: ...
+    def create_knowledge_conversation(
+        self, record: KnowledgeConversationRecord
+    ) -> KnowledgeConversationRecord: ...
+    def get_knowledge_conversation(
+        self, org_id: str, owner_subject: str, conversation_id: str
+    ) -> KnowledgeConversationRecord | None: ...
+    def list_knowledge_conversations(
+        self, org_id: str, owner_subject: str
+    ) -> list[KnowledgeConversationRecord]: ...
+    def list_knowledge_messages(
+        self, org_id: str, owner_subject: str, conversation_id: str
+    ) -> list[ConversationMessageRecord]: ...
+    def get_knowledge_message_exchange(
+        self,
+        *,
+        org_id: str,
+        owner_subject: str,
+        conversation_id: str,
+        idempotency_key: str,
+        idempotency_request_digest: str,
+    ) -> ConversationMessageExchange | None: ...
+    def append_knowledge_message_exchange(
+        self,
+        *,
+        user_message: ConversationMessageRecord,
+        assistant_message: ConversationMessageRecord,
+        knowledge_snapshot_id: str | None,
+        idempotency_key: str,
+        idempotency_request_digest: str,
+    ) -> tuple[ConversationMessageExchange, bool]: ...
     def create_correction_proposal(
         self, record: CorrectionProposalRecord
     ) -> CorrectionProposalRecord: ...
@@ -126,6 +168,7 @@ class ObjectStore(Protocol):
 class AgentClient(Protocol):
     def review(self, request: Any) -> dict[str, Any]: ...
     def answer(self, request: Any) -> dict[str, Any]: ...
+    def answer_knowledge(self, request: Any) -> dict[str, Any]: ...
     def metadata(self) -> dict[str, Any]: ...
 
 

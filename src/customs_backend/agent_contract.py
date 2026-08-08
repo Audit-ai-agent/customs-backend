@@ -26,6 +26,8 @@ AgentContractKind = Literal[
     "review_result",
     "assistant_answer_request",
     "assistant_answer_response",
+    "knowledge_answer_request",
+    "knowledge_answer_response",
 ]
 _SCHEMA_PATHS: dict[AgentContractKind, tuple[str, ...]] = {
     "review_request": ("contracts", "agent", "v3", "review-request.schema.json"),
@@ -41,6 +43,18 @@ _SCHEMA_PATHS: dict[AgentContractKind, tuple[str, ...]] = {
         "agent",
         "v3",
         "assistant-answer-response.schema.json",
+    ),
+    "knowledge_answer_request": (
+        "contracts",
+        "agent",
+        "v3",
+        "knowledge-answer-request.schema.json",
+    ),
+    "knowledge_answer_response": (
+        "contracts",
+        "agent",
+        "v3",
+        "knowledge-answer-response.schema.json",
     ),
 }
 
@@ -72,7 +86,7 @@ def _strict_json_object(raw: bytes, *, label: str) -> dict[str, Any]:
     return value
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=8)
 def load_agent_contract_schema(kind: AgentContractKind) -> dict[str, Any]:
     try:
         raw = resources.files("customs_backend").joinpath(*_SCHEMA_PATHS[kind]).read_bytes()
@@ -91,9 +105,11 @@ def validate_agent_contract_bundle() -> None:
     load_agent_contract_schema("review_result")
     load_agent_contract_schema("assistant_answer_request")
     load_agent_contract_schema("assistant_answer_response")
+    load_agent_contract_schema("knowledge_answer_request")
+    load_agent_contract_schema("knowledge_answer_response")
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=8)
 def _agent_contract_validator(kind: AgentContractKind) -> Draft202012Validator:
     """Build a local-only registry for the assistant request's relative ref."""
 

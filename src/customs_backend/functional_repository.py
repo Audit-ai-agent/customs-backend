@@ -16,6 +16,7 @@ from customs_backend.domain import (
     FindingDecisionRecord,
     FindingDecisionStatus,
     JobRecord,
+    KnowledgeConversationRecord,
     ReviewRunRecord,
 )
 from customs_backend.repository import InMemoryWorkbenchRepository
@@ -109,6 +110,23 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
                 for item in list(state.get("chat_idempotency", []))
                 if isinstance(item, list) and len(item) == 6
             }
+            self._knowledge_conversations = {
+                key: KnowledgeConversationRecord.model_validate(value)
+                for key, value in dict(state.get("knowledge_conversations", {})).items()
+            }
+            self._knowledge_messages = {
+                key: ConversationMessageRecord.model_validate(value)
+                for key, value in dict(state.get("knowledge_messages", {})).items()
+            }
+            self._knowledge_chat_idempotency = {
+                (str(item[0]), str(item[1]), str(item[2])): (
+                    str(item[3]),
+                    str(item[4]),
+                    str(item[5]),
+                )
+                for item in list(state.get("knowledge_chat_idempotency", []))
+                if isinstance(item, list) and len(item) == 6
+            }
             self._correction_proposals = {
                 key: CorrectionProposalRecord.model_validate(value)
                 for key, value in dict(state.get("correction_proposals", {})).items()
@@ -138,6 +156,22 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
                     user_message_id,
                     assistant_message_id,
                 ) in self._chat_idempotency.items()
+            ],
+            "knowledge_conversations": {
+                key: value.model_dump(mode="json")
+                for key, value in self._knowledge_conversations.items()
+            },
+            "knowledge_messages": {
+                key: value.model_dump(mode="json")
+                for key, value in self._knowledge_messages.items()
+            },
+            "knowledge_chat_idempotency": [
+                [org, conversation_id, key, request_digest, user_message_id, assistant_message_id]
+                for (org, conversation_id, key), (
+                    request_digest,
+                    user_message_id,
+                    assistant_message_id,
+                ) in self._knowledge_chat_idempotency.items()
             ],
             "correction_proposals": {
                 key: value.model_dump(mode="json")
@@ -251,6 +285,33 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
         value = super().append_message_exchange(
             user_message=user_message,
             assistant_message=assistant_message,
+            idempotency_key=idempotency_key,
+            idempotency_request_digest=idempotency_request_digest,
+        )
+        if value[1]:
+            self._persist()
+        return value
+
+    def create_knowledge_conversation(
+        self, record: KnowledgeConversationRecord
+    ) -> KnowledgeConversationRecord:
+        value = super().create_knowledge_conversation(record)
+        self._persist()
+        return value
+
+    def append_knowledge_message_exchange(
+        self,
+        *,
+        user_message: ConversationMessageRecord,
+        assistant_message: ConversationMessageRecord,
+        knowledge_snapshot_id: str | None,
+        idempotency_key: str,
+        idempotency_request_digest: str,
+    ) -> tuple[ConversationMessageExchange, bool]:
+        value = super().append_knowledge_message_exchange(
+            user_message=user_message,
+            assistant_message=assistant_message,
+            knowledge_snapshot_id=knowledge_snapshot_id,
             idempotency_key=idempotency_key,
             idempotency_request_digest=idempotency_request_digest,
         )

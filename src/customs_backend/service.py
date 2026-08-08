@@ -8,11 +8,22 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Literal, cast
+from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
 from customs_backend.agent_contract import AgentContractPayloadError, validate_agent_v3_payload
+from customs_backend.knowledge_ingress import (
+    canonical_knowledge_title,
+    require_safe_knowledge_history,
+    require_safe_knowledge_message,
+)
 from customs_backend.domain import (
+    AnswerSection,
+    AnswerSectionKind,
+    AnswerScope,
+    AgentKnowledgeAnswerRequest,
+    AgentKnowledgeAnswerResponse,
     AgentDocumentInput,
     AgentAssistantAnswerRequest,
     AgentAssistantAnswerResponse,
@@ -24,6 +35,7 @@ from customs_backend.domain import (
     CaseCreate,
     CaseRecord,
     CaseStatus,
+    CitationKind,
     CompletionEligibility,
     ConversationCreate,
     ConversationMessageCreate,
@@ -42,10 +54,13 @@ from customs_backend.domain import (
     FindingDecisionRecord,
     FindingDecisionRequest,
     InputDocumentManifestEntry,
+    KnowledgeConversationCreate,
+    KnowledgeConversationRecord,
     JobRecord,
     JobStatus,
     MAX_TEXT_DOCUMENT_CHARACTERS,
     MAX_TEXT_DOCUMENT_UTF8_BYTES,
+    MessageCitation,
     Principal,
     RequiredAction,
     RevisionCreate,
@@ -63,6 +78,7 @@ from customs_backend.ports import (
     AgentResponseRejectedError,
     AuthorizationError,
     ConflictError,
+    KnowledgeInputRejectedError,
     NotFoundError,
     ObjectStore,
     WorkbenchRepository,
@@ -70,16 +86,32 @@ from customs_backend.ports import (
 
 
 _DECLARED_TYPE_MAP: dict[
-    str, Literal["invoice", "packing_list", "bill_of_lading", "certificate_of_origin", "unknown"]
+    str,
+    Literal[
+        "invoice",
+        "packing_list",
+        "bill_of_lading",
+        "certificate_of_origin",
+        "air_waybill",
+        "export_declaration",
+        "supporting_evidence",
+        "unknown",
+    ],
 ] = {
     "CI": "invoice",
     "PL": "packing_list",
     "BL": "bill_of_lading",
     "CO": "certificate_of_origin",
+    "AWB": "air_waybill",
+    "EXPORT_DECLARATION": "export_declaration",
+    "SUPPORTING_EVIDENCE": "supporting_evidence",
     "UNKNOWN": "unknown",
 }
 _MAX_DOCUMENTS = 20
 _MAX_AGENT_REQUEST_BYTES = 2 * 1024 * 1024
+_OFFICIAL_GUIDANCE_HOSTS = frozenset(
+    {"law.go.kr", "www.law.go.kr", "customs.go.kr", "www.customs.go.kr", "dream.kotra.or.kr"}
+)
 
 
 def _id(prefix: str) -> str:
@@ -102,6 +134,123 @@ def _scoped_conversation_idempotency_key(
             "key": supplied_key,
         }
     )
+
+
+def _scoped_knowledge_conversation_idempotency_key(
+    principal: Principal, conversation_id: str, supplied_key: str
+) -> str:
+    """Keep standalone guidance retries separate from Case-assistant retries."""
+
+    return "knowledge_chat_" + canonical_digest(
+        {
+            "subject": principal.subject,
+            "conversation_id": conversation_id,
+            "key": supplied_key,
+        }
+    )
+
+
+def _citation_key(citation: MessageCitation) -> tuple[str, str]:
+    """Use one stable identity for legacy Case and snapshot-source citations."""
+
+    if citation.kind == CitationKind.guidance_evidence:
+        if citation.source_id is None:  # guarded by the domain model
+            raise ConflictError("guidance citation has no source identity")
+        return citation.kind.value, citation.source_id
+    if citation.reference_id is None:  # guarded by the domain model
+        raise ConflictError("case citation has no reference identity")
+    return citation.kind.value, citation.reference_id
+
+
+def _canonical_citation(citation: MessageCitation) -> bytes:
+    """Return the complete stored citation representation for section binding."""
+
+    return canonical_json_bytes(citation.model_dump(mode="json"))
+
+
+def _validate_answer_sections(
+    sections: list[AnswerSection], *, citations: list[MessageCitation], global_only: bool
+) -> None:
+    """Keep additive display sections tied to the canonical citation list.
+
+    The legacy ``direct_answer`` remains the compatibility projection.  A
+    section may repeat a top-level citation for display, but cannot smuggle a
+    second unvalidated source into storage or the Browser.
+    """
+
+    if len({section.kind for section in sections}) != len(sections):
+        raise ConflictError("assistant response repeats an answer section kind")
+    known = {_canonical_citation(item) for item in citations}
+    for section in sections:
+        if global_only and section.kind != AnswerSectionKind.general_guidance:
+            raise ConflictError("knowledge answer cannot contain a case analysis section")
+        if not section.citations:
+            raise ConflictError("answer section requires at least one canonical citation")
+        section_keys = [_citation_key(item) for item in section.citations]
+        if len(section_keys) != len(set(section_keys)):
+            raise ConflictError("answer section repeats a citation")
+        if any(_canonical_citation(item) not in known for item in section.citations):
+            raise ConflictError("answer section citation differs from its canonical citation")
+        if section.kind == AnswerSectionKind.case_analysis and any(
+            item.kind == CitationKind.guidance_evidence for item in section.citations
+        ):
+            raise ConflictError("case analysis section cannot use a guidance citation")
+        if section.kind == AnswerSectionKind.general_guidance and any(
+            item.kind != CitationKind.guidance_evidence for item in section.citations
+        ):
+            raise ConflictError("general guidance section requires official guidance citations")
+
+
+def _validate_guidance_citations(
+    citations: list[MessageCitation],
+    *,
+    expected_as_of: date,
+    functional_uat: bool,
+) -> None:
+    """Apply the profile-specific boundary to every displayed guidance source."""
+
+    for citation in citations:
+        if citation.kind != CitationKind.guidance_evidence:
+            continue
+        # Only official snapshot citations can become Browser links.  Keep the
+        # local deterministic fixture out of this policy: it is never allowed
+        # in Functional-UAT and the Browser separately refuses its URL.
+        if citation.source_kind != "development_fixture" and not _is_safe_official_guidance_uri(
+            citation.source_uri
+        ):
+            raise ConflictError("guidance citation has an unsafe official source URI")
+        if citation.as_of != expected_as_of:
+            raise ConflictError("Agent assistant guidance citation is not bound to the review date")
+        # The versioned knowledge registry distinguishes an enacted law from
+        # its official catalog, agency guidance, requirement reference, and
+        # public guidance.  They are all legitimate *official* Functional-UAT
+        # sources.  Only the deterministic fixture is local-development-only.
+        if functional_uat and citation.source_kind == "development_fixture":
+            raise ConflictError("functional UAT guidance requires an official snapshot source")
+        if functional_uat and citation.coverage not in {"covered", "partial"}:
+            raise ConflictError("functional UAT guidance requires covered official knowledge")
+
+
+def _is_safe_official_guidance_uri(value: str | None) -> bool:
+    """Accept only the versioned registry's public HTTPS source hosts."""
+
+    if not value:
+        return False
+    try:
+        parsed = urlsplit(value)
+        return (
+            parsed.scheme == "https"
+            and parsed.hostname in _OFFICIAL_GUIDANCE_HOSTS
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.port is None
+            # ``urlsplit`` normalises an empty explicit port (``host:/``) to
+            # ``None``.  Inspect the raw authority as well so every explicit
+            # port spelling remains outside the immutable official-URI policy.
+            and ":" not in parsed.netloc.rsplit("@", 1)[-1]
+        )
+    except ValueError:
+        return False
 
 
 def _review_documents(documents: list[DocumentRecord]) -> list[DocumentRecord]:
@@ -133,7 +282,19 @@ def _public_manifest(documents: list[DocumentRecord]) -> list[InputDocumentManif
     return [
         InputDocumentManifestEntry(
             document_id=item.document_id,
-            document_type=cast(Literal["CI", "PL", "BL", "CO", "UNKNOWN"], item.document_type),
+            document_type=cast(
+                Literal[
+                    "CI",
+                    "PL",
+                    "BL",
+                    "CO",
+                    "AWB",
+                    "EXPORT_DECLARATION",
+                    "SUPPORTING_EVIDENCE",
+                    "UNKNOWN",
+                ],
+                item.document_type,
+            ),
             content_sha256=item.content_sha256,
         )
         for item in _review_documents(documents)
@@ -825,6 +986,8 @@ class WorkbenchService:
         conversation_id: str,
         request: ConversationMessageCreate,
         idempotency_key: str,
+        *,
+        functional_uat: bool = False,
     ) -> ConversationMessageExchange:
         conversation, run = self._get_conversation(principal, conversation_id)
         request_digest = canonical_digest(
@@ -891,20 +1054,34 @@ class WorkbenchService:
                 or answer.conversation_id != conversation_id
             ):
                 raise ConflictError("Agent assistant response is not bound to the conversation")
-            citation_keys = [(item.kind.value, item.reference_id) for item in answer.citations]
+            citation_keys = [_citation_key(item) for item in answer.citations]
             if len(citation_keys) != len(set(citation_keys)):
                 raise ConflictError("Agent assistant response repeats a citation")
-            if (
-                answer.answer_scope.value in {"case_grounded", "evidence_grounded"}
-                and not citation_keys
+            if answer.answer_scope.value in {"case_grounded", "evidence_grounded"} and not any(
+                item.kind != CitationKind.guidance_evidence for item in answer.citations
             ):
                 raise ConflictError("grounded Agent assistant response requires a citation")
+            if answer.answer_scope == AnswerScope.general_customs_guidance and not any(
+                item.kind == CitationKind.guidance_evidence for item in answer.citations
+            ):
+                raise ConflictError(
+                    "general Agent assistant response requires an official citation"
+                )
             references = _source_reference_sets(run)
             if any(
-                citation.reference_id not in references[citation.kind.value]
+                citation.kind != CitationKind.guidance_evidence
+                and citation.reference_id not in references[citation.kind.value]
                 for citation in answer.citations
             ):
                 raise ConflictError("Agent assistant response contains an unknown citation")
+            _validate_guidance_citations(
+                answer.citations,
+                expected_as_of=run.review_as_of,
+                functional_uat=functional_uat,
+            )
+            _validate_answer_sections(
+                answer.answer_sections, citations=answer.citations, global_only=False
+            )
             if any(not item.strip() for item in answer.suggested_questions):
                 raise ConflictError("Agent assistant response contains an empty suggested question")
             if answer.correction_draft is not None:
@@ -933,11 +1110,263 @@ class WorkbenchService:
                     content=answer.direct_answer,
                     answer_scope=answer.answer_scope,
                     citations=answer.citations,
+                    answer_sections=answer.answer_sections,
                     suggested_questions=answer.suggested_questions,
                     correction_draft=answer.correction_draft,
                     created_by="customs-ai-agent",
                     created_at=now + timedelta(microseconds=1),
                 ),
+                idempotency_key=scoped_key,
+                idempotency_request_digest=request_digest,
+            )
+            return exchange
+        finally:
+            self._release_assistant_turn_lock(lock_key, lock_entry)
+
+    @staticmethod
+    def _require_knowledge_access(principal: Principal) -> None:
+        if not principal.roles.intersection({Role.reviewer, Role.approver}):
+            raise NotFoundError("knowledge conversation not found")
+
+    def _get_knowledge_conversation(
+        self, principal: Principal, conversation_id: str
+    ) -> KnowledgeConversationRecord:
+        self._require_knowledge_access(principal)
+        record = self.repository.get_knowledge_conversation(
+            principal.org_id, principal.subject, conversation_id
+        )
+        if record is None:
+            raise NotFoundError("knowledge conversation not found")
+        return record
+
+    def create_knowledge_conversation(
+        self,
+        principal: Principal,
+        request: KnowledgeConversationCreate,
+    ) -> KnowledgeConversationRecord:
+        self._require_knowledge_access(principal)
+        # A standalone knowledge thread must never become a second
+        # persistence route for case material.  Its durable title is code
+        # owned rather than caller prose, so a first pasted question cannot
+        # survive in conversation-list text through this field.
+        title = canonical_knowledge_title(request.title, request.trade_type)
+        if request.as_of is None:
+            # A caller outside the public API must not bypass its fixed-date
+            # resolution and issue an ambiguous Agent/Data request.
+            raise ConflictError("knowledge conversation requires a resolved as_of date")
+        now = utc_now()
+        return self.repository.create_knowledge_conversation(
+            KnowledgeConversationRecord(
+                conversation_id=_id("knowledge_conv"),
+                org_id=principal.org_id,
+                title=title,
+                trade_type=request.trade_type,
+                as_of=request.as_of,
+                created_by=principal.subject,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    def list_knowledge_conversations(
+        self, principal: Principal
+    ) -> list[KnowledgeConversationRecord]:
+        self._require_knowledge_access(principal)
+        return self.repository.list_knowledge_conversations(principal.org_id, principal.subject)
+
+    def list_knowledge_conversation_messages(
+        self, principal: Principal, conversation_id: str
+    ) -> list[ConversationMessageRecord]:
+        self._get_knowledge_conversation(principal, conversation_id)
+        return self.repository.list_knowledge_messages(
+            principal.org_id, principal.subject, conversation_id
+        )
+
+    def send_knowledge_conversation_message(
+        self,
+        principal: Principal,
+        conversation_id: str,
+        request: ConversationMessageCreate,
+        idempotency_key: str,
+        *,
+        functional_uat: bool = False,
+    ) -> ConversationMessageExchange:
+        conversation = self._get_knowledge_conversation(principal, conversation_id)
+        # Validate before digesting, replaying, persisting, or dispatching.
+        # In particular, a rejected first turn cannot create a user/assistant
+        # exchange; a Browser-created generic title is the only permitted
+        # persisted shell for that failed attempt.
+        require_safe_knowledge_message(request.content)
+        existing_history = self.repository.list_knowledge_messages(
+            principal.org_id, principal.subject, conversation_id
+        )
+        require_safe_knowledge_history(
+            title=conversation.title,
+            turns=((item.role.value, item.content) for item in existing_history),
+        )
+        request_digest = canonical_digest(
+            {
+                "conversation_id": conversation_id,
+                "content": request.content,
+                "trade_type": conversation.trade_type,
+                "as_of": conversation.as_of.isoformat(),
+            }
+        )
+        scoped_key = _scoped_knowledge_conversation_idempotency_key(
+            principal, conversation_id, idempotency_key
+        )
+        existing = self.repository.get_knowledge_message_exchange(
+            org_id=principal.org_id,
+            owner_subject=principal.subject,
+            conversation_id=conversation_id,
+            idempotency_key=scoped_key,
+            idempotency_request_digest=request_digest,
+        )
+        if existing is not None:
+            return existing
+
+        lock_key, lock_entry = self._acquire_assistant_turn_lock(
+            org_id=principal.org_id,
+            conversation_id=conversation_id,
+            idempotency_key=scoped_key,
+        )
+        try:
+            existing = self.repository.get_knowledge_message_exchange(
+                org_id=principal.org_id,
+                owner_subject=principal.subject,
+                conversation_id=conversation_id,
+                idempotency_key=scoped_key,
+                idempotency_request_digest=request_digest,
+            )
+            if existing is not None:
+                return existing
+            # Re-read under the per-turn lock.  An old unsafe record is not
+            # altered, but it must never become recent context for Agent.
+            history = self.repository.list_knowledge_messages(
+                principal.org_id, principal.subject, conversation_id
+            )
+            require_safe_knowledge_history(
+                title=conversation.title,
+                turns=((item.role.value, item.content) for item in history),
+            )
+            recent_history = history[-8:]
+            answer_request = AgentKnowledgeAnswerRequest(
+                conversation_id=conversation_id,
+                question=request.content,
+                trade_type=conversation.trade_type,
+                as_of=conversation.as_of,
+                recent_turns=[
+                    AgentConversationTurn(role=item.role, content=item.content)
+                    for item in recent_history
+                ],
+            )
+            answer_wire = answer_request.to_agent_wire()
+            try:
+                validate_agent_v3_payload("knowledge_answer_request", answer_wire)
+                raw_answer = self.agent.answer_knowledge(answer_request)
+                validate_agent_v3_payload("knowledge_answer_response", raw_answer)
+                answer = AgentKnowledgeAnswerResponse.model_validate(raw_answer)
+            except KnowledgeInputRejectedError:
+                # The Agent maintains the same independent boundary.  Its
+                # fixed 422 signal is safe to expose through the public API,
+                # while any provider text remains suppressed.
+                raise
+            except (
+                AgentContractPayloadError,
+                AgentResponseRejectedError,
+                ValidationError,
+                ValueError,
+            ) as exc:
+                raise ConflictError(
+                    "Agent knowledge answer does not satisfy the bounded contract"
+                ) from exc
+            if answer.conversation_id != conversation_id:
+                raise ConflictError("Agent knowledge answer is not bound to the conversation")
+            if answer.as_of != conversation.as_of:
+                raise ConflictError("Agent knowledge answer is not bound to the requested date")
+            if answer.answer_scope.value not in {
+                "general_customs_guidance",
+                "clarification_needed",
+                "insufficient_evidence",
+                "out_of_scope",
+            }:
+                raise ConflictError("knowledge answer has an invalid scope")
+            citation_keys = [_citation_key(item) for item in answer.citations]
+            if len(citation_keys) != len(set(citation_keys)):
+                raise ConflictError("Agent knowledge answer repeats a citation")
+            if any(item.kind != CitationKind.guidance_evidence for item in answer.citations):
+                raise ConflictError("knowledge answer contains a non-guidance citation")
+            if any(
+                item.as_of != answer.as_of
+                or item.snapshot_id != answer.snapshot_id
+                or item.coverage != answer.coverage
+                for item in answer.citations
+            ):
+                raise ConflictError(
+                    "knowledge answer citation does not match its resolved snapshot"
+                )
+            _validate_guidance_citations(
+                answer.citations,
+                expected_as_of=conversation.as_of,
+                functional_uat=functional_uat,
+            )
+            if answer.answer_scope.value == "general_customs_guidance" and not citation_keys:
+                raise ConflictError("grounded knowledge answer requires an official citation")
+            if answer.answer_scope.value == "general_customs_guidance" and answer.coverage not in {
+                "covered",
+                "partial",
+            }:
+                raise ConflictError("grounded knowledge answer has no covered snapshot")
+            if (
+                conversation.snapshot_id is not None
+                and answer.snapshot_id != conversation.snapshot_id
+            ):
+                raise ConflictError("knowledge conversation cannot switch its resolved snapshot")
+            _validate_answer_sections(
+                answer.answer_sections, citations=answer.citations, global_only=True
+            )
+            if answer.answer_scope.value != "general_customs_guidance" and answer.answer_sections:
+                raise ConflictError(
+                    "non-guidance knowledge answer cannot contain a guidance section"
+                )
+            sections = answer.answer_sections
+            if answer.answer_scope.value == "general_customs_guidance" and not sections:
+                sections = [
+                    AnswerSection(
+                        kind=AnswerSectionKind.general_guidance,
+                        title="공식 통관 안내",
+                        content=answer.direct_answer,
+                        citations=answer.citations,
+                    )
+                ]
+            if any(not item.strip() for item in answer.suggested_questions):
+                raise ConflictError("Agent knowledge answer contains an empty suggested question")
+            now = utc_now()
+            exchange, _created = self.repository.append_knowledge_message_exchange(
+                user_message=ConversationMessageRecord(
+                    message_id=_id("knowledge_msg"),
+                    conversation_id=conversation_id,
+                    role=ConversationMessageRole.user,
+                    content=request.content,
+                    created_by=principal.subject,
+                    created_at=now,
+                ),
+                assistant_message=ConversationMessageRecord(
+                    message_id=_id("knowledge_msg"),
+                    conversation_id=conversation_id,
+                    role=ConversationMessageRole.assistant,
+                    content=answer.direct_answer,
+                    answer_scope=answer.answer_scope,
+                    citations=answer.citations,
+                    answer_sections=sections,
+                    suggested_questions=answer.suggested_questions,
+                    knowledge_coverage=answer.coverage,
+                    knowledge_snapshot_id=answer.snapshot_id,
+                    knowledge_as_of=answer.as_of,
+                    created_by="customs-ai-agent",
+                    created_at=now + timedelta(microseconds=1),
+                ),
+                knowledge_snapshot_id=answer.snapshot_id,
                 idempotency_key=scoped_key,
                 idempotency_request_digest=request_digest,
             )

@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from tests.product.agent_v3_fixture import build_agent_v3_result
@@ -31,9 +32,14 @@ from customs_backend.settings import Settings
 
 
 def _client(
-    *, include_finding: bool = False, review_handler=None, answer_handler=None
+    *,
+    include_finding: bool = False,
+    review_handler=None,
+    answer_handler=None,
+    knowledge_answer_handler=None,
+    settings: Settings | None = None,
 ) -> TestClient:
-    settings = Settings(_env_file=None, environment="test")
+    settings = settings or Settings(_env_file=None, environment="test")
     principal = Principal(
         subject="reviewer-1",
         org_id="local-dev",
@@ -50,6 +56,7 @@ def _client(
         review_handler
         or (lambda request: build_agent_v3_result(request, include_finding=include_finding)),
         answer=answer_handler,
+        knowledge_answer=knowledge_answer_handler,
     )
     service = WorkbenchService(
         repository=repository,
@@ -110,6 +117,16 @@ def _functional_settings() -> Settings:
         oidc_client_id="customs-workbench-spa",
         oidc_authorization_endpoint="http://127.0.0.1:18088/realms/customs/protocol/openid-connect/auth",
         oidc_token_endpoint="http://127.0.0.1:18088/realms/customs/protocol/openid-connect/token",
+    )
+
+
+def _local_development_settings() -> Settings:
+    return Settings(
+        _env_file=None,
+        environment="local-development",
+        agent_service_token="a" * 32,
+        dev_reviewer_session_token="reviewer-session-token",
+        dev_approver_session_token="approver-session-token",
     )
 
 
@@ -662,6 +679,731 @@ def test_grounded_assistant_conversation_is_persisted_and_idempotent() -> None:
             == 200
         )
         assert document_id
+
+
+def test_case_assistant_persists_additive_case_and_guidance_sections() -> None:
+    def answer_handler(request):
+        guidance = {
+            "kind": "guidance_evidence",
+            "source_id": "guide-export-001",
+            "source_kind": "official_law",
+            "source_title": "수출 통관 안내",
+            "source_uri": "https://www.customs.go.kr/guide/export",
+            "as_of": "2026-08-05",
+            "snapshot_id": "kr-trade-2026-08-05",
+            "coverage": "covered",
+        }
+        return {
+            "schema_version": "1.0",
+            "case_id": request.case_id,
+            "review_run_id": request.review_run_id,
+            "conversation_id": request.conversation_id,
+            "answer_scope": "case_grounded",
+            "direct_answer": "현재 사건의 수량 차이와 관련 수출 절차를 함께 확인해야 합니다.",
+            "citations": [
+                {"kind": "comparison", "reference_id": "cmp_fixture_quantity"},
+                guidance,
+            ],
+            "answer_sections": [
+                {
+                    "kind": "case_analysis",
+                    "title": "현재 심사 결과",
+                    "content": "상업송장과 포장명세서의 수량 차이를 먼저 확인해야 합니다.",
+                    "citations": [{"kind": "comparison", "reference_id": "cmp_fixture_quantity"}],
+                },
+                {
+                    "kind": "general_guidance",
+                    "title": "일반 수출 안내",
+                    "content": "수출 신고 전에는 문서 간 수량과 품목 정보를 함께 확인합니다.",
+                    "citations": [guidance],
+                },
+            ],
+            "suggested_questions": [],
+            "correction_draft": None,
+            "engine": {"kind": "deterministic", "model_id": "section-fixture"},
+        }
+
+    with _client(include_finding=True, answer_handler=answer_handler) as client:
+        case_id = client.post("/api/v1/cases", json={"title": "혼합 안내"}, headers=_auth()).json()[
+            "case_id"
+        ]
+        client.post(
+            f"/api/v1/cases/{case_id}/documents",
+            json={"document_type": "CI", "filename": "invoice.txt", "content_text": "INV-001"},
+            headers=_auth(),
+        )
+        run_id = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={"trade_type": "export", "review_as_of": "2026-08-05"},
+            headers={**_auth(), "Idempotency-Key": "section-review-001"},
+        ).json()["job"]["review_run_id"]
+        conversation_id = client.post(
+            f"/api/v1/review-runs/{run_id}/assistant/conversations",
+            json={},
+            headers=_auth(),
+        ).json()["conversation_id"]
+        response = client.post(
+            f"/api/v1/assistant/conversations/{conversation_id}/messages",
+            json={"content": "현재 사건과 일반 수출 절차를 함께 알려 주세요."},
+            headers={**_auth(), "Idempotency-Key": "section-answer-001"},
+        )
+
+    assert response.status_code == 200, response.text
+    assistant = response.json()["assistant_message"]
+    assert assistant["content"] == "현재 사건의 수량 차이와 관련 수출 절차를 함께 확인해야 합니다."
+    assert [section["kind"] for section in assistant["answer_sections"]] == [
+        "case_analysis",
+        "general_guidance",
+    ]
+    assert assistant["answer_sections"][1]["citations"][0]["source_id"] == "guide-export-001"
+    assert assistant["answer_sections"][1]["citations"][0]["coverage"] == "covered"
+
+
+def test_case_assistant_rejects_guidance_from_another_review_date() -> None:
+    def answer_handler(request):
+        return {
+            "schema_version": "1.0",
+            "case_id": request.case_id,
+            "review_run_id": request.review_run_id,
+            "conversation_id": request.conversation_id,
+            "answer_scope": "case_grounded",
+            "direct_answer": "현재 사건의 수량 차이를 먼저 확인해야 합니다.",
+            "citations": [
+                {"kind": "comparison", "reference_id": "cmp_fixture_quantity"},
+                {
+                    "kind": "guidance_evidence",
+                    "source_id": "guide-wrong-date",
+                    "source_kind": "official_law",
+                    "source_title": "수출 통관 안내",
+                    "source_uri": "https://www.customs.go.kr/guide/export",
+                    "as_of": "2026-08-06",
+                    "snapshot_id": "kr-trade-2026-08-06",
+                    "coverage": "covered",
+                },
+            ],
+            "suggested_questions": [],
+            "correction_draft": None,
+            "engine": {"kind": "deterministic", "model_id": "date-fixture"},
+        }
+
+    with _client(include_finding=True, answer_handler=answer_handler) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "기준일 일치"}, headers=_auth()
+        ).json()["case_id"]
+        client.post(
+            f"/api/v1/cases/{case_id}/documents",
+            json={"document_type": "CI", "filename": "invoice.txt", "content_text": "INV-001"},
+            headers=_auth(),
+        )
+        run_id = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={"review_as_of": "2026-08-05"},
+            headers={**_auth(), "Idempotency-Key": "guidance-date-review-001"},
+        ).json()["job"]["review_run_id"]
+        conversation_id = client.post(
+            f"/api/v1/review-runs/{run_id}/assistant/conversations",
+            json={},
+            headers=_auth(),
+        ).json()["conversation_id"]
+        response = client.post(
+            f"/api/v1/assistant/conversations/{conversation_id}/messages",
+            json={"content": "현재 사건의 수량을 설명해 주세요."},
+            headers={**_auth(), "Idempotency-Key": "guidance-date-answer-001"},
+        )
+
+    assert response.status_code == 409
+
+
+def test_official_knowledge_conversation_is_separate_and_snapshot_grounded() -> None:
+    observed: dict[str, object] = {}
+
+    def knowledge_handler(request):
+        observed.update(request.to_agent_wire())
+        guidance = {
+            "kind": "guidance_evidence",
+            "source_id": "official-export-guide-2026",
+            "source_kind": "official_law",
+            "source_title": "관세청 수출 통관 안내",
+            "source_uri": "https://www.customs.go.kr/guide/export",
+            "as_of": "2026-08-05",
+            "snapshot_id": "kr-trade-2026-08-05",
+            "coverage": "covered",
+        }
+        return {
+            "schema_version": "1.0",
+            "conversation_id": request.conversation_id,
+            "answer_scope": "general_customs_guidance",
+            "direct_answer": "수출 신고 전에는 품목, 수량, 거래 조건과 필요한 증빙을 함께 확인해야 합니다.",
+            "citations": [guidance],
+            "answer_sections": [
+                {
+                    "kind": "general_guidance",
+                    "title": "공식 수출 통관 안내",
+                    "content": "수출 신고 전에는 품목, 수량, 거래 조건과 필요한 증빙을 함께 확인해야 합니다.",
+                    "citations": [guidance],
+                }
+            ],
+            "suggested_questions": ["수출 품목의 HS 코드를 함께 확인할까요?"],
+            "coverage": "covered",
+            "snapshot_id": "kr-trade-2026-08-05",
+            "as_of": "2026-08-05",
+            "engine": {"kind": "deterministic", "model_id": "knowledge-fixture"},
+        }
+
+    with _client(knowledge_answer_handler=knowledge_handler) as client:
+        created = client.post(
+            "/api/v1/knowledge/conversations",
+            json={"title": "수출 기본 절차", "trade_type": "export", "as_of": "2026-08-05"},
+            headers=_auth(),
+        )
+        assert created.status_code == 201, created.text
+        conversation = created.json()
+        assert set(conversation) == {
+            "conversation_id",
+            "title",
+            "trade_type",
+            "as_of",
+            "created_by",
+            "created_at",
+            "updated_at",
+        }
+        assert conversation["trade_type"] == "export"
+        assert "review_run_id" not in conversation
+        conversation_id = conversation["conversation_id"]
+
+        answer = client.post(
+            f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+            json={"content": "수출 신고 전에 무엇을 확인해야 하나요?"},
+            headers={**_auth(), "Idempotency-Key": "knowledge-answer-001"},
+        )
+        assert answer.status_code == 200, answer.text
+        exchange = answer.json()
+        assistant = exchange["assistant_message"]
+        assert assistant["answer_scope"] == "general_customs_guidance"
+        assert assistant["citations"][0]["kind"] == "guidance_evidence"
+        assert assistant["citations"][0]["source_id"] == "official-export-guide-2026"
+        assert assistant["citations"][0]["source_kind"] == "official_law"
+        assert assistant["answer_sections"][0]["kind"] == "general_guidance"
+        assert assistant["knowledge_coverage"] == "covered"
+        assert assistant["knowledge_snapshot_id"] == "kr-trade-2026-08-05"
+        assert assistant["knowledge_as_of"] == "2026-08-05"
+
+        replay = client.post(
+            f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+            json={"content": "수출 신고 전에 무엇을 확인해야 하나요?"},
+            headers={**_auth(), "Idempotency-Key": "knowledge-answer-001"},
+        )
+        assert replay.status_code == 200
+        assert replay.json() == exchange
+        conflict = client.post(
+            f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+            json={"content": "다른 질문입니다."},
+            headers={**_auth(), "Idempotency-Key": "knowledge-answer-001"},
+        )
+        assert conflict.status_code == 409
+        messages = client.get(
+            f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+            headers=_auth(),
+        )
+        assert messages.status_code == 200
+        assert [item["role"] for item in messages.json()["items"]] == ["user", "assistant"]
+        listed = client.get("/api/v1/knowledge/conversations", headers=_auth())
+        assert listed.status_code == 200
+        assert [item["conversation_id"] for item in listed.json()["items"]] == [conversation_id]
+        assert listed.json()["items"][0]["snapshot_id"] == "kr-trade-2026-08-05"
+
+    assert observed["trade_type"] == "export"
+    assert observed["as_of"] == "2026-08-05"
+    assert "case_id" not in observed
+    assert "review_run_id" not in observed
+
+
+def test_knowledge_conversation_resolves_an_omitted_public_as_of_before_agent() -> None:
+    observed: dict[str, object] = {}
+
+    def knowledge_handler(request):
+        observed.update(request.to_agent_wire())
+        return {
+            "schema_version": "1.0",
+            "conversation_id": request.conversation_id,
+            "answer_scope": "clarification_needed",
+            "direct_answer": "품목과 수출입 방향을 알려 주세요.",
+            "citations": [],
+            "suggested_questions": [],
+            "coverage": "unavailable",
+            "snapshot_id": None,
+            "as_of": request.as_of.isoformat(),
+            "engine": {"kind": "deterministic", "model_id": "knowledge-fixture"},
+        }
+
+    with _client(knowledge_answer_handler=knowledge_handler) as client:
+        created = client.post(
+            "/api/v1/knowledge/conversations",
+            json={"title": "기본 안내"},
+            headers=_auth(),
+        )
+        assert created.status_code == 201, created.text
+        conversation = created.json()
+        assert conversation["as_of"] == "2026-08-05"
+        answer = client.post(
+            f"/api/v1/knowledge/conversations/{conversation['conversation_id']}/messages",
+            json={"content": "통관 절차를 알려 주세요."},
+            headers={**_auth(), "Idempotency-Key": "knowledge-default-date-001"},
+        )
+
+    assert answer.status_code == 200, answer.text
+    assert observed["as_of"] == "2026-08-05"
+    assert answer.json()["assistant_message"]["answer_sections"] == []
+    assert answer.json()["assistant_message"]["knowledge_coverage"] == "unavailable"
+    assert answer.json()["assistant_message"]["knowledge_as_of"] == "2026-08-05"
+    assert "knowledge_snapshot_id" not in answer.json()["assistant_message"]
+
+
+def test_knowledge_answer_rejects_a_different_resolved_snapshot_date() -> None:
+    def knowledge_handler(request):
+        return {
+            "schema_version": "1.0",
+            "conversation_id": request.conversation_id,
+            "answer_scope": "clarification_needed",
+            "direct_answer": "품목을 알려 주세요.",
+            "citations": [],
+            "suggested_questions": [],
+            "coverage": "unavailable",
+            "snapshot_id": None,
+            "as_of": "2026-08-06",
+            "engine": {"kind": "deterministic", "model_id": "knowledge-fixture"},
+        }
+
+    with _client(knowledge_answer_handler=knowledge_handler) as client:
+        conversation_id = client.post(
+            "/api/v1/knowledge/conversations",
+            json={"as_of": "2026-08-05"},
+            headers=_auth(),
+        ).json()["conversation_id"]
+        response = client.post(
+            f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+            json={"content": "통관 절차를 알려 주세요."},
+            headers={**_auth(), "Idempotency-Key": "knowledge-date-mismatch-001"},
+        )
+
+    assert response.status_code == 409
+
+
+def test_knowledge_answer_rejects_section_citation_metadata_that_differs_from_canonical() -> None:
+    def knowledge_handler(request):
+        canonical = {
+            "kind": "guidance_evidence",
+            "source_id": "official-guide-001",
+            "source_kind": "official_law",
+            "source_title": "관세청 수출 통관 안내",
+            "source_uri": "https://www.customs.go.kr/guide/export",
+            "as_of": request.as_of.isoformat(),
+            "snapshot_id": "kr-trade-2026-08-05",
+            "coverage": "covered",
+        }
+        changed = {
+            **canonical,
+            "source_uri": "https://untrusted.example/altered",
+            "snapshot_id": "untrusted-snapshot",
+        }
+        return {
+            "schema_version": "1.0",
+            "conversation_id": request.conversation_id,
+            "answer_scope": "general_customs_guidance",
+            "direct_answer": "공식 안내를 확인해야 합니다.",
+            "citations": [canonical],
+            "answer_sections": [
+                {
+                    "kind": "general_guidance",
+                    "title": "공식 안내",
+                    "content": "공식 안내를 확인해야 합니다.",
+                    "citations": [changed],
+                }
+            ],
+            "suggested_questions": [],
+            "coverage": "covered",
+            "snapshot_id": "kr-trade-2026-08-05",
+            "as_of": request.as_of.isoformat(),
+            "engine": {"kind": "deterministic", "model_id": "knowledge-fixture"},
+        }
+
+    with _client(knowledge_answer_handler=knowledge_handler) as client:
+        conversation_id = client.post(
+            "/api/v1/knowledge/conversations", json={}, headers=_auth()
+        ).json()["conversation_id"]
+        response = client.post(
+            f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+            json={"content": "수출 신고 전에 무엇을 확인해야 하나요?"},
+            headers={**_auth(), "Idempotency-Key": "canonical-citation-001"},
+        )
+
+    assert response.status_code == 409
+
+
+def test_knowledge_answer_rejects_an_uncited_display_section() -> None:
+    def knowledge_handler(request):
+        guidance = {
+            "kind": "guidance_evidence",
+            "source_id": "official-guide-001",
+            "source_kind": "official_law",
+            "source_title": "관세청 수출 통관 안내",
+            "source_uri": "https://www.customs.go.kr/guide/export",
+            "as_of": request.as_of.isoformat(),
+            "snapshot_id": "kr-trade-2026-08-05",
+            "coverage": "covered",
+        }
+        return {
+            "schema_version": "1.0",
+            "conversation_id": request.conversation_id,
+            "answer_scope": "general_customs_guidance",
+            "direct_answer": "공식 안내를 확인해야 합니다.",
+            "citations": [guidance],
+            "answer_sections": [
+                {
+                    "kind": "general_guidance",
+                    "title": "공식 안내",
+                    "content": "공식 안내를 확인해야 합니다.",
+                    "citations": [],
+                }
+            ],
+            "suggested_questions": [],
+            "coverage": "covered",
+            "snapshot_id": "kr-trade-2026-08-05",
+            "as_of": request.as_of.isoformat(),
+            "engine": {"kind": "deterministic", "model_id": "knowledge-fixture"},
+        }
+
+    with _client(knowledge_answer_handler=knowledge_handler) as client:
+        conversation_id = client.post(
+            "/api/v1/knowledge/conversations", json={}, headers=_auth()
+        ).json()["conversation_id"]
+        response = client.post(
+            f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+            json={"content": "수출 신고 전에 무엇을 확인해야 하나요?"},
+            headers={**_auth(), "Idempotency-Key": "-".join(("uncited", "section", "001"))},
+        )
+
+    assert response.status_code == 409
+
+
+def test_knowledge_conversation_rejects_snapshot_drift_and_preserves_answer_provenance() -> None:
+    answer_count = 0
+
+    def knowledge_handler(request):
+        nonlocal answer_count
+        answer_count += 1
+        snapshot_id = "kr-trade-2026-08-05-a" if answer_count == 1 else "kr-trade-2026-08-05-b"
+        guidance = {
+            "kind": "guidance_evidence",
+            "source_id": "official-guide-001",
+            "source_kind": "official_law",
+            "source_title": "관세청 수출 통관 안내",
+            "source_uri": "https://www.customs.go.kr/guide/export",
+            "as_of": request.as_of.isoformat(),
+            "snapshot_id": snapshot_id,
+            "coverage": "partial",
+        }
+        return {
+            "schema_version": "1.0",
+            "conversation_id": request.conversation_id,
+            "answer_scope": "general_customs_guidance",
+            "direct_answer": "공식 안내를 확인해야 합니다.",
+            "citations": [guidance],
+            "answer_sections": [],
+            "suggested_questions": [],
+            "coverage": "partial",
+            "snapshot_id": snapshot_id,
+            "as_of": request.as_of.isoformat(),
+            "engine": {"kind": "deterministic", "model_id": "knowledge-fixture"},
+        }
+
+    with _client(knowledge_answer_handler=knowledge_handler) as client:
+        conversation_id = client.post(
+            "/api/v1/knowledge/conversations", json={}, headers=_auth()
+        ).json()["conversation_id"]
+        first = client.post(
+            f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+            json={"content": "첫 질문"},
+            headers={**_auth(), "Idempotency-Key": "snapshot-drift-001"},
+        )
+        second = client.post(
+            f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+            json={"content": "둘째 질문"},
+            headers={**_auth(), "Idempotency-Key": "snapshot-drift-002"},
+        )
+        history = client.get(
+            f"/api/v1/knowledge/conversations/{conversation_id}/messages", headers=_auth()
+        ).json()["items"]
+        conversation = client.get("/api/v1/knowledge/conversations", headers=_auth()).json()[
+            "items"
+        ][0]
+
+    assert first.status_code == 200, first.text
+    assert first.json()["assistant_message"]["knowledge_coverage"] == "partial"
+    assert first.json()["assistant_message"]["knowledge_snapshot_id"] == "kr-trade-2026-08-05-a"
+    assert first.json()["assistant_message"]["knowledge_as_of"] == "2026-08-05"
+    assert second.status_code == 409
+    assert [item["role"] for item in history] == ["user", "assistant"]
+    assert history[-1]["knowledge_snapshot_id"] == "kr-trade-2026-08-05-a"
+    assert conversation["snapshot_id"] == "kr-trade-2026-08-05-a"
+
+
+@pytest.mark.parametrize(
+    "source_kind",
+    (
+        "official_law",
+        "official_law_catalog",
+        "official_agency_guidance",
+        "official_requirement_reference",
+        "official_public_guidance",
+    ),
+)
+def test_functional_uat_accepts_every_official_guidance_registry_source_kind(
+    source_kind: str,
+) -> None:
+    """Official registry categories remain distinct but all work in Functional-UAT."""
+
+    def knowledge_handler(request):
+        guidance = {
+            "kind": "guidance_evidence",
+            "source_id": f"guide-{source_kind}",
+            "source_kind": source_kind,
+            "source_title": "공식 통관 안내",
+            "source_uri": "https://www.customs.go.kr/guide",
+            "as_of": request.as_of.isoformat(),
+            "snapshot_id": "kr-trade-2026-08-05",
+            "coverage": "covered",
+        }
+        return {
+            "schema_version": "1.0",
+            "conversation_id": request.conversation_id,
+            "answer_scope": "general_customs_guidance",
+            "direct_answer": "공식 자료 기준으로 확인할 수 있습니다.",
+            "citations": [guidance],
+            "answer_sections": [
+                {
+                    "kind": "general_guidance",
+                    "title": "공식 통관 안내",
+                    "content": "공식 자료 기준으로 확인할 수 있습니다.",
+                    "citations": [guidance],
+                }
+            ],
+            "suggested_questions": [],
+            "coverage": "covered",
+            "snapshot_id": "kr-trade-2026-08-05",
+            "as_of": request.as_of.isoformat(),
+            "engine": {"kind": "deterministic", "model_id": "knowledge-fixture"},
+        }
+
+    with _client(
+        knowledge_answer_handler=knowledge_handler, settings=_functional_settings()
+    ) as client:
+        conversation_id = client.post(
+            "/api/v1/knowledge/conversations", json={}, headers=_auth()
+        ).json()["conversation_id"]
+        response = client.post(
+            f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+            json={"content": "공식 통관 안내를 알려 주세요."},
+            headers={
+                "Authorization": "Bearer test-token",
+                "Idempotency-Key": f"official-{source_kind}",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    citation = response.json()["assistant_message"]["citations"][0]
+    assert citation["source_kind"] == source_kind
+    assert citation["snapshot_id"] == "kr-trade-2026-08-05"
+
+
+def test_local_development_allows_its_deterministic_guidance_fixture() -> None:
+    """The fixture remains useful for local development but cannot cross into UAT."""
+
+    def knowledge_handler(request):
+        guidance = {
+            "kind": "guidance_evidence",
+            "source_id": "development-fixture-guide",
+            "source_kind": "development_fixture",
+            "source_title": "개발용 통관 안내",
+            "source_uri": "https://fixture.invalid/guide",
+            "as_of": request.as_of.isoformat(),
+            "snapshot_id": "dev-fixture-2026-08-05",
+            "coverage": "covered",
+        }
+        return {
+            "schema_version": "1.0",
+            "conversation_id": request.conversation_id,
+            "answer_scope": "general_customs_guidance",
+            "direct_answer": "개발용 공식 지식 fixture에서 확인했습니다.",
+            "citations": [guidance],
+            "answer_sections": [],
+            "suggested_questions": [],
+            "coverage": "covered",
+            "snapshot_id": "dev-fixture-2026-08-05",
+            "as_of": request.as_of.isoformat(),
+            "engine": {"kind": "deterministic", "model_id": "knowledge-fixture"},
+        }
+
+    with _client(
+        knowledge_answer_handler=knowledge_handler, settings=_local_development_settings()
+    ) as client:
+        conversation_id = client.post(
+            "/api/v1/knowledge/conversations", json={}, headers=_auth()
+        ).json()["conversation_id"]
+        response = client.post(
+            f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+            json={"content": "개발용 통관 안내를 알려 주세요."},
+            headers={**_auth(), "Idempotency-Key": "development-fixture-source-001"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert (
+        response.json()["assistant_message"]["citations"][0]["source_kind"] == "development_fixture"
+    )
+
+
+def test_functional_uat_rejects_nonofficial_or_uncovered_global_guidance() -> None:
+    def knowledge_handler(request):
+        fixture_source = request.question.startswith("fixture")
+        guidance = {
+            "kind": "guidance_evidence",
+            "source_id": "trade-guide-001",
+            "source_kind": "development_fixture" if fixture_source else "official_law",
+            "source_title": "통관 안내",
+            "source_uri": "https://example.invalid/guide",
+            "as_of": request.as_of.isoformat(),
+            "snapshot_id": "fixture-snapshot",
+            "coverage": "covered" if fixture_source else "no_coverage",
+        }
+        return {
+            "schema_version": "1.0",
+            "conversation_id": request.conversation_id,
+            "answer_scope": "general_customs_guidance",
+            "direct_answer": "통관 안내입니다.",
+            "citations": [guidance],
+            "answer_sections": [],
+            "suggested_questions": [],
+            "coverage": guidance["coverage"],
+            "snapshot_id": "fixture-snapshot",
+            "as_of": request.as_of.isoformat(),
+            "engine": {"kind": "deterministic", "model_id": "knowledge-fixture"},
+        }
+
+    with _client(
+        knowledge_answer_handler=knowledge_handler, settings=_functional_settings()
+    ) as client:
+        conversation_id = client.post(
+            "/api/v1/knowledge/conversations", json={}, headers=_auth()
+        ).json()["conversation_id"]
+        fixture = client.post(
+            f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+            json={"content": "fixture source"},
+            headers={**_auth(), "Idempotency-Key": "functional-source-001"},
+        )
+        uncovered = client.post(
+            f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+            json={"content": "uncovered source"},
+            headers={**_auth(), "Idempotency-Key": "functional-source-002"},
+        )
+
+    assert fixture.status_code == 409
+    assert uncovered.status_code == 409
+
+
+def test_functional_uat_rejects_nonofficial_guidance_in_case_assistant() -> None:
+    def answer_handler(request):
+        guidance = {
+            "kind": "guidance_evidence",
+            "source_id": "fixture-guide-001",
+            "source_kind": "development_fixture",
+            "source_title": "개발용 안내",
+            "source_uri": "https://fixture.invalid/guide",
+            "as_of": "2026-08-05",
+            "snapshot_id": "fixture-snapshot",
+            "coverage": "covered",
+        }
+        return {
+            "schema_version": "1.0",
+            "case_id": request.case_id,
+            "review_run_id": request.review_run_id,
+            "conversation_id": request.conversation_id,
+            "answer_scope": "general_customs_guidance",
+            "direct_answer": "일반 안내입니다.",
+            "citations": [guidance],
+            "answer_sections": [],
+            "suggested_questions": [],
+            "correction_draft": None,
+            "engine": {"kind": "deterministic", "model_id": "case-fixture"},
+        }
+
+    with _client(answer_handler=answer_handler, settings=_functional_settings()) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "기능 UAT 사건"}, headers=_auth()
+        ).json()["case_id"]
+        document = client.post(
+            f"/api/v1/cases/{case_id}/documents",
+            json={"document_type": "CI", "filename": "invoice.txt", "content_text": "INV-001"},
+            headers=_auth(),
+        )
+        assert document.status_code == 201
+        review_run_id = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={"review_as_of": "2026-08-05"},
+            headers={**_auth(), "Idempotency-Key": "functional-case-review-001"},
+        ).json()["job"]["review_run_id"]
+        conversation_id = client.post(
+            f"/api/v1/review-runs/{review_run_id}/assistant/conversations",
+            json={},
+            headers=_auth(),
+        ).json()["conversation_id"]
+        response = client.post(
+            f"/api/v1/assistant/conversations/{conversation_id}/messages",
+            json={"content": "일반 수출 절차를 알려 주세요."},
+            headers={**_auth(), "Idempotency-Key": "functional-case-answer-001"},
+        )
+
+    assert response.status_code == 409
+
+
+def test_new_text_document_types_and_export_review_remain_within_existing_case_boundary() -> None:
+    with _client() as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "수출 문서 기반"}, headers=_auth()
+        ).json()["case_id"]
+        for document_type, filename in (
+            ("AWB", "air-waybill.txt"),
+            ("EXPORT_DECLARATION", "export-declaration.txt"),
+            ("SUPPORTING_EVIDENCE", "supporting-evidence.txt"),
+        ):
+            document = client.post(
+                f"/api/v1/cases/{case_id}/documents",
+                json={
+                    "document_type": document_type,
+                    "filename": filename,
+                    "content_text": f"Synthetic {document_type} text.",
+                },
+                headers=_auth(),
+            )
+            assert document.status_code == 201, document.text
+            assert document.json()["record"]["document_type"] == document_type
+        review = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={"trade_type": "export"},
+            headers={**_auth(), "Idempotency-Key": "export-document-types-001"},
+        )
+        assert review.status_code == 202, review.text
+        assert review.json()["job"]["status"] == "succeeded"
+        review_run_id = review.json()["job"]["review_run_id"]
+        run = client.get(f"/api/v1/review-runs/{review_run_id}", headers=_auth())
+
+    assert run.status_code == 200, run.text
+    assert {
+        (item["declared_type"], item["document_type"]) for item in run.json()["document_analyses"]
+    } == {
+        ("air_waybill", "air_waybill"),
+        ("export_declaration", "export_declaration"),
+        ("supporting_evidence", "supporting_evidence"),
+    }
 
 
 def test_approved_correction_creates_an_immutable_child_review() -> None:

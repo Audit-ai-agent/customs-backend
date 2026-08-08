@@ -64,7 +64,7 @@
         "document_id": {"type": "string", "minLength": 1, "maxLength": 128},
         "filename": {"type": "string", "minLength": 1, "maxLength": 255},
         "declared_type": {"type": ["string", "null"], "maxLength": 64},
-        "document_type": {"type": "string", "enum": ["invoice", "packing_list", "bill_of_lading", "certificate_of_origin", "unknown"]},
+        "document_type": {"type": "string", "enum": ["invoice", "packing_list", "bill_of_lading", "certificate_of_origin", "air_waybill", "export_declaration", "supporting_evidence", "unknown"]},
         "classification_source": {"anyOf": [{"$ref": "#/$defs/Source"}, {"type": "null"}]},
         "extraction_status": {"type": "string", "enum": ["complete", "needs_review"]},
         "facts": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/Fact"}},

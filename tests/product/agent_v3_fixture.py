@@ -21,6 +21,9 @@ def build_agent_v3_result(
                 "packing_list",
                 "bill_of_lading",
                 "certificate_of_origin",
+                "air_waybill",
+                "export_declaration",
+                "supporting_evidence",
                 "unknown",
             }
             else "unknown"

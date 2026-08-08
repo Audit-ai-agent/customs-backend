@@ -49,7 +49,9 @@ def test_sync_updates_only_branding_and_preserves_existing_realm_values() -> Non
             return httpx.Response(204, request=request)
         return httpx.Response(404, request=request)
 
-    with httpx.Client(base_url="http://127.0.0.1:18088", transport=httpx.MockTransport(handler)) as client:
+    with httpx.Client(
+        base_url="http://127.0.0.1:18088", transport=httpx.MockTransport(handler)
+    ) as client:
         result = branding._sync_with_client(client, admin_password="local-admin-test-value")
 
     assert result.status == "updated"
@@ -80,7 +82,9 @@ def test_sync_is_idempotent_when_branding_is_already_current() -> None:
             return httpx.Response(200, json=_realm(current=True), request=request)
         return httpx.Response(404, request=request)
 
-    with httpx.Client(base_url="http://127.0.0.1:18088", transport=httpx.MockTransport(handler)) as client:
+    with httpx.Client(
+        base_url="http://127.0.0.1:18088", transport=httpx.MockTransport(handler)
+    ) as client:
         result = branding._sync_with_client(client, admin_password="local-admin-test-value")
 
     assert result.status == "already_current"
@@ -138,7 +142,9 @@ def test_profile_reader_rejects_missing_or_duplicate_admin_password(tmp_path: Pa
         branding._read_admin_password(profile)
 
 
-def test_cli_prints_only_safe_status_and_field_names(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+def test_cli_prints_only_safe_status_and_field_names(
+    monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
     monkeypatch.setattr(
         branding,
         "sync",
