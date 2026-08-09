@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 from pathlib import Path
@@ -46,7 +47,7 @@ def _failure_receipt(*, first_failure: dict[str, object] | None = None) -> dict[
 def _prepare_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, Path]:
     profile_path = tmp_path / "backend.env"
     profile_path.write_text("ignored", encoding="utf-8")
-    receipt_root = tmp_path / "e2e-runs"
+    receipt_root = tmp_path / "_local" / "state" / "e2e-runs"
     monkeypatch.setattr(browser_e2e, "_workspace_root", lambda: tmp_path)
     monkeypatch.setattr(browser_e2e, "_validate_workspace_main", lambda _workspace: None)
     monkeypatch.setattr(browser_e2e, "_validate_frontend_command", lambda _frontend: None)
@@ -56,7 +57,6 @@ def _prepare_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path,
         lambda *, backend_api_url, frontend_url: None,
     )
     monkeypatch.setattr(browser_e2e, "_profile_path", lambda _value: profile_path)
-    monkeypatch.setattr(browser_e2e, "_receipt_root", lambda _value: receipt_root)
     monkeypatch.setattr(browser_e2e, "_load_profile", lambda _path: PROFILE)
     return profile_path, receipt_root
 
@@ -166,6 +166,52 @@ def test_child_environment_is_narrow_and_keeps_only_declared_credentials(
     )
 
 
+@pytest.mark.parametrize("link_parts", [("_local",), ("_local", "state")])
+def test_receipt_root_rejects_a_symlinked_workspace_ancestor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, link_parts: tuple[str, ...]
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = workspace.joinpath(*link_parts)
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this host")
+    monkeypatch.setattr(browser_e2e, "_workspace_root", lambda: workspace)
+
+    with pytest.raises(argparse.ArgumentTypeError, match="receipt root is unsafe"):
+        browser_e2e._receipt_root(str(workspace / "_local" / "state" / "e2e-runs"))
+
+
+def test_receipt_path_derives_the_workspace_root_instead_of_accepting_an_outside_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setattr(browser_e2e, "_workspace_root", lambda: workspace)
+
+    with pytest.raises(browser_e2e.BrowserE2eError, match="receipt_root_unsafe"):
+        browser_e2e._receipt_path(outside)
+
+
+def test_receipt_root_rejects_a_non_directory_local_e2e_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    unsafe_root = workspace / "_local" / "state" / "e2e-runs"
+    unsafe_root.parent.mkdir(parents=True)
+    unsafe_root.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setattr(browser_e2e, "_workspace_root", lambda: workspace)
+
+    with pytest.raises(argparse.ArgumentTypeError, match="receipt root is unsafe"):
+        browser_e2e._receipt_root(str(unsafe_root))
+
+
 def test_workspace_validation_requires_clean_main_product_siblings(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -262,6 +308,8 @@ def test_run_invokes_frontend_without_forwarding_output_or_unrelated_secret(
     assert receipt_path.is_absolute()
     assert failure_path == receipt_path.with_name("failure.json")
     assert failure_path.parent.name == receipt_path.parent.name
+    assert browser_e2e._SAFE_E2E_RUN_DIRECTORY.fullmatch(receipt_path.parent.name)
+    assert not receipt_path.exists()
     assert not failure_path.exists()
 
 

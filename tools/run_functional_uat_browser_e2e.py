@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import uuid
 from collections.abc import Mapping, Sequence
@@ -89,6 +90,7 @@ _FAILURE_RECEIPT_KEYS = frozenset(
 _FAILURE_LOCATION_KEYS = frozenset({"file", "line", "column"})
 _FAILURE_FILE_NAME = "failure.json"
 _FAILURE_SPEC_FILE = "functional-uat-browser.spec.ts"
+_RECEIPT_ROOT_PARTS = ("_local", "state", "e2e-runs")
 _REQUIRED_CHECKS = frozenset(
     {
         "reviewer_login",
@@ -129,6 +131,7 @@ _SAFE_RUN_ID = re.compile(r"^run_[0-9a-f]{32}$")
 _SAFE_E2E_RUN_DIRECTORY = re.compile(r"^[0-9a-f]{32}$")
 _MAX_RECEIPT_BYTES = 16 * 1024
 _MAX_FAILURE_RECEIPT_BYTES = 1024
+_MAX_RUN_DIRECTORY_CREATE_ATTEMPTS = 3
 _BACKEND_API_URL = "http://127.0.0.1:18081/api/v1"
 _FRONTEND_URL = "http://127.0.0.1:5173"
 _CHILD_ENVIRONMENT_KEYS = (
@@ -217,15 +220,75 @@ def _profile_path(value: str) -> Path:
     return candidate
 
 
-def _receipt_root(value: str) -> Path:
+def _is_link_or_reparse_point(details: os.stat_result) -> bool:
+    reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return stat.S_ISLNK(details.st_mode) or bool(
+        getattr(details, "st_file_attributes", 0) & reparse_point
+    )
+
+
+def _ensure_safe_directory(path: Path, *, create: bool) -> bool:
+    """Reject links/reparse points before and after a one-level directory creation."""
+
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        if not create:
+            return False
+        try:
+            path.mkdir()
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise BrowserE2eError("functional_uat_browser_receipt_root_unsafe") from exc
+        try:
+            details = path.lstat()
+        except OSError as exc:
+            raise BrowserE2eError("functional_uat_browser_receipt_root_unsafe") from exc
+    except OSError as exc:
+        raise BrowserE2eError("functional_uat_browser_receipt_root_unsafe") from exc
+    if _is_link_or_reparse_point(details):
+        raise BrowserE2eError("functional_uat_browser_receipt_root_unsafe")
+    try:
+        if not path.is_dir():
+            raise BrowserE2eError("functional_uat_browser_receipt_root_unsafe")
+    except OSError as exc:
+        raise BrowserE2eError("functional_uat_browser_receipt_root_unsafe") from exc
+    return True
+
+
+def _trusted_receipt_root(*, create: bool) -> Path:
+    """Derive the only permitted root without resolving user-supplied paths."""
+
     workspace = _workspace_root()
-    expected = (workspace / "_local" / "state" / "e2e-runs").resolve()
-    candidate = Path(value).resolve()
-    if candidate != expected:
+    if not workspace.is_absolute() or not _ensure_safe_directory(workspace, create=False):
+        raise BrowserE2eError("functional_uat_browser_receipt_root_unsafe")
+    current = workspace
+    for component in _RECEIPT_ROOT_PARTS:
+        current = current / component
+        _ensure_safe_directory(current, create=create)
+    return current
+
+
+def _absolute_path_without_resolving_links(value: str | Path) -> Path:
+    return Path(os.path.abspath(os.fspath(value)))
+
+
+def _same_lexical_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(os.path.normpath(os.fspath(left))) == os.path.normcase(
+        os.path.normpath(os.fspath(right))
+    )
+
+
+def _receipt_root(value: str) -> Path:
+    try:
+        expected = _trusted_receipt_root(create=False)
+    except BrowserE2eError as exc:
+        raise argparse.ArgumentTypeError("receipt root is unsafe") from exc
+    candidate = _absolute_path_without_resolving_links(value)
+    if not _same_lexical_path(candidate, expected):
         raise argparse.ArgumentTypeError("receipt root must remain under local e2e-runs")
-    if candidate.exists() and (not candidate.is_dir() or candidate.is_symlink()):
-        raise argparse.ArgumentTypeError("receipt root is unsafe")
-    return candidate
+    return expected
 
 
 def _load_profile(path: Path) -> dict[str, str]:
@@ -358,36 +421,74 @@ def _child_environment(
 
 
 def _receipt_path(receipt_root: Path) -> Path:
-    try:
-        receipt_root.mkdir(parents=True, exist_ok=True)
-        if receipt_root.is_symlink():
-            raise BrowserE2eError("functional_uat_browser_receipt_root_unsafe")
-        run_directory = receipt_root / uuid.uuid4().hex
-        run_directory.mkdir()
-        if run_directory.is_symlink():
-            raise BrowserE2eError("functional_uat_browser_receipt_root_unsafe")
-    except OSError as exc:
-        raise BrowserE2eError("functional_uat_browser_receipt_root_unsafe") from exc
-    if not run_directory.is_dir():
+    trusted_root = _trusted_receipt_root(create=True)
+    if not _same_lexical_path(receipt_root, trusted_root):
         raise BrowserE2eError("functional_uat_browser_receipt_root_unsafe")
-    return run_directory / "receipt.json"
+    for _ in range(_MAX_RUN_DIRECTORY_CREATE_ATTEMPTS):
+        run_directory = trusted_root / uuid.uuid4().hex
+        try:
+            run_directory.mkdir()
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise BrowserE2eError("functional_uat_browser_receipt_root_unsafe") from exc
+        if (
+            run_directory.parent != trusted_root
+            or not _SAFE_E2E_RUN_DIRECTORY.fullmatch(run_directory.name)
+            or not _ensure_safe_directory(trusted_root, create=False)
+            or not _ensure_safe_directory(run_directory, create=False)
+        ):
+            raise BrowserE2eError("functional_uat_browser_receipt_root_unsafe")
+        return run_directory / "receipt.json"
+    raise BrowserE2eError("functional_uat_browser_receipt_root_unsafe")
 
 
-def _failure_receipt_path(*, receipt_path: Path, receipt_root: Path) -> Path:
-    """Reserve an absent sidecar path in the same task-local Browser run directory."""
-
+def _validated_run_directory(*, receipt_path: Path, receipt_root: Path) -> Path:
+    trusted_root = _trusted_receipt_root(create=False)
     run_directory = receipt_path.parent
-    failure_path = run_directory / _FAILURE_FILE_NAME
     if (
         not receipt_path.is_absolute()
         or receipt_path.name != "receipt.json"
         or not receipt_root.is_absolute()
-        or run_directory.parent != receipt_root
+        or not _same_lexical_path(receipt_root, trusted_root)
+        or run_directory.parent != trusted_root
         or not _SAFE_E2E_RUN_DIRECTORY.fullmatch(run_directory.name)
-        or not run_directory.is_dir()
-        or run_directory.is_symlink()
-        or failure_path.exists()
-        or failure_path.is_symlink()
+        or not _ensure_safe_directory(trusted_root, create=False)
+        or not _ensure_safe_directory(run_directory, create=False)
+    ):
+        raise BrowserE2eError("functional_uat_browser_receipt_root_unsafe")
+    return run_directory
+
+
+def _entry_details_or_none(path: Path, *, error_code: str) -> os.stat_result | None:
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise BrowserE2eError(error_code) from exc
+
+
+def _failure_receipt_path(*, receipt_path: Path, receipt_root: Path, require_absent: bool) -> Path:
+    """Reserve an absent sidecar path in the same task-local Browser run directory."""
+
+    try:
+        run_directory = _validated_run_directory(
+            receipt_path=receipt_path, receipt_root=receipt_root
+        )
+    except BrowserE2eError:
+        raise BrowserE2eError("functional_uat_browser_failure_receipt_path_unsafe") from None
+    failure_path = run_directory / _FAILURE_FILE_NAME
+    receipt_details = _entry_details_or_none(
+        receipt_path, error_code="functional_uat_browser_failure_receipt_path_unsafe"
+    )
+    failure_details = _entry_details_or_none(
+        failure_path, error_code="functional_uat_browser_failure_receipt_path_unsafe"
+    )
+    if (
+        (receipt_details is not None and _is_link_or_reparse_point(receipt_details))
+        or (failure_details is not None and _is_link_or_reparse_point(failure_details))
+        or (require_absent and (receipt_details is not None or failure_details is not None))
     ):
         raise BrowserE2eError("functional_uat_browser_failure_receipt_path_unsafe")
     return failure_path
@@ -395,7 +496,11 @@ def _failure_receipt_path(*, receipt_path: Path, receipt_root: Path) -> Path:
 
 def _load_receipt(path: Path) -> BrowserReceipt:
     try:
-        if not path.is_file() or path.is_symlink() or path.stat().st_size > _MAX_RECEIPT_BYTES:
+        if (
+            _is_link_or_reparse_point(path.lstat())
+            or not path.is_file()
+            or path.stat().st_size > _MAX_RECEIPT_BYTES
+        ):
             raise BrowserE2eError("functional_uat_browser_receipt_invalid")
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -436,13 +541,13 @@ def _load_failure_receipt(path: Path) -> BrowserFailureReceipt:
     """Load a Frontend failure receipt without reading or surfacing process output."""
 
     try:
-        if path.is_symlink():
+        if _is_link_or_reparse_point(path.lstat()):
             raise BrowserE2eError("functional_uat_browser_failure_receipt_invalid")
-        if not path.exists():
-            raise BrowserE2eError("functional_uat_browser_failure_receipt_missing")
         if not path.is_file() or path.stat().st_size > _MAX_FAILURE_RECEIPT_BYTES:
             raise BrowserE2eError("functional_uat_browser_failure_receipt_invalid")
         payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise BrowserE2eError("functional_uat_browser_failure_receipt_missing") from exc
     except BrowserE2eError:
         raise
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -508,9 +613,14 @@ def run(
     _validate_frontend_command(workspace / "customs-frontend")
     _validate_readiness(backend_api_url=backend_api_url, frontend_url=frontend_url)
     profile = _load_profile(_profile_path(str(profile_path)))
-    safe_root = _receipt_root(str(output_root))
+    try:
+        safe_root = _receipt_root(str(output_root))
+    except argparse.ArgumentTypeError as exc:
+        raise BrowserE2eError("functional_uat_browser_receipt_root_unsafe") from exc
     receipt_path = _receipt_path(safe_root)
-    failure_path = _failure_receipt_path(receipt_path=receipt_path, receipt_root=safe_root)
+    failure_path = _failure_receipt_path(
+        receipt_path=receipt_path, receipt_root=safe_root, require_absent=True
+    )
     try:
         completed = runner(
             (_corepack_command(), "npm", "run", "functional-uat:browser"),
@@ -531,10 +641,14 @@ def run(
     except OSError as exc:
         raise BrowserE2eError("functional_uat_browser_command_unavailable") from exc
     if completed.returncode != 0:
+        _failure_receipt_path(
+            receipt_path=receipt_path, receipt_root=safe_root, require_absent=False
+        )
         failure = _load_failure_receipt(failure_path)
         raise BrowserE2eError(
             "functional_uat_browser_command_failed", first_failure=failure.first_failure
         )
+    _validated_run_directory(receipt_path=receipt_path, receipt_root=safe_root)
     receipt = _load_receipt(receipt_path)
     transcripts_verified = _verify_transcripts(receipt)
     return {
