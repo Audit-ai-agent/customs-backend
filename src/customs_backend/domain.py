@@ -48,6 +48,10 @@ DocumentType = Literal[
 CaseTradeType = Literal["import", "export"]
 KnowledgeTradeType = Literal["import", "export", "both"]
 GuidanceCoverage = Literal["covered", "no_coverage", "partial", "unavailable"]
+GuidanceRegistryVersion = Literal["1.0", "2.0"]
+GuidanceRequestedDirection = Literal["import", "export", "both"]
+GuidanceApplicableDirection = Literal["import", "export"]
+CaseInputNotice = Literal["unregistered_document_text"]
 # ``development_fixture`` is deliberately separate from the official snapshot
 # registry.  Functional-UAT can render every official registry category, but
 # must never present the deterministic development fixture as an official
@@ -374,6 +378,17 @@ class MessageCitation(BaseModel):
     as_of: date | None = None
     snapshot_id: str | None = Field(default=None, min_length=1, max_length=512)
     coverage: GuidanceCoverage | None = None
+    # The registry source is required for new V2 provenance verification but
+    # was not part of the original Browser contract.  Keep it in the typed
+    # Agent-boundary model and persisted object, while excluding it from all
+    # public API serialisation and generated OpenAPI schemas.
+    registry_source_id: str | None = Field(
+        default=None,
+        min_length=3,
+        max_length=64,
+        pattern=r"^[a-z][a-z0-9_]{2,63}$",
+        exclude=True,
+    )
 
     @model_validator(mode="after")
     def validate_reference_shape(self) -> "MessageCitation":
@@ -405,15 +420,52 @@ class MessageCitation(BaseModel):
                 self.as_of,
                 self.snapshot_id,
                 self.coverage,
+                self.registry_source_id,
             )
         ):
             raise ValueError("case citation cannot contain guidance source metadata")
         return self
 
 
+class GuidanceResolution(BaseModel):
+    """Safe, public snapshot-resolution metadata for one guidance attempt.
+
+    This contains only a fixed topic/scope projection, date, direction, and
+    coverage state.  Registry hash and source-internal identifiers never
+    appear here; Backend uses its packaged registry projection internally.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    topic: str = Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_]{0,127}$")
+    scope: str = Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_]{0,127}$")
+    requested_direction: GuidanceRequestedDirection
+    applicable_directions: list[GuidanceApplicableDirection] = Field(
+        min_length=1, max_length=2
+    )
+    coverage: GuidanceCoverage
+    snapshot_id: str | None = Field(default=None, min_length=1, max_length=512)
+    as_of: date
+    registry_version: GuidanceRegistryVersion
+
+    @model_validator(mode="after")
+    def validate_applicable_directions(self) -> "GuidanceResolution":
+        if len(self.applicable_directions) != len(set(self.applicable_directions)):
+            raise ValueError("guidance applicable directions must be unique")
+        canonical_directions = [
+            direction for direction in ("import", "export") if direction in self.applicable_directions
+        ]
+        if self.applicable_directions != canonical_directions:
+            raise ValueError("guidance applicable directions must be canonical")
+        if self.coverage in {"covered", "partial"} and self.snapshot_id is None:
+            raise ValueError("covered guidance resolution requires a snapshot")
+        return self
+
+
 class AnswerSectionKind(str, Enum):
     case_analysis = "case_analysis"
     general_guidance = "general_guidance"
+    case_application = "case_application"
 
 
 class AnswerSection(BaseModel):
@@ -472,7 +524,7 @@ class ConversationMessageRecord(BaseModel):
     citations: list[MessageCitation] = Field(default_factory=list, max_length=100)
     # Optional and additive: existing persisted V3 messages without sections
     # remain valid and retain their legacy direct ``content`` field.
-    answer_sections: list[AnswerSection] = Field(default_factory=list, max_length=2)
+    answer_sections: list[AnswerSection] = Field(default_factory=list, max_length=3)
     suggested_questions: list[str] = Field(default_factory=list, max_length=3)
     correction_draft: CorrectionDraft | None = None
     # Standalone knowledge conversations retain the Agent/Data resolution for
@@ -481,6 +533,10 @@ class ConversationMessageRecord(BaseModel):
     knowledge_coverage: GuidanceCoverage | None = None
     knowledge_snapshot_id: str | None = Field(default=None, min_length=1, max_length=512)
     knowledge_as_of: date | None = None
+    # Case and standalone knowledge messages use this same safe projection.
+    # It stays optional so existing persisted V3 messages remain readable.
+    guidance_resolution: GuidanceResolution | None = None
+    case_input_notice: CaseInputNotice | None = None
     created_by: str
     created_at: datetime
 
@@ -493,6 +549,20 @@ class ConversationMessageRecord(BaseModel):
         )
         if supplied and (self.knowledge_coverage is None or self.knowledge_as_of is None):
             raise ValueError("knowledge message provenance requires coverage and as_of")
+        if self.guidance_resolution is not None and self.role != ConversationMessageRole.assistant:
+            raise ValueError("guidance resolution belongs only to assistant messages")
+        if self.case_input_notice is not None:
+            if self.role != ConversationMessageRole.assistant:
+                raise ValueError("case input notice belongs only to assistant messages")
+            if self.answer_scope != AnswerScope.insufficient_evidence:
+                raise ValueError("case input notice requires an insufficient-evidence response")
+            if (
+                self.citations
+                or self.answer_sections
+                or self.correction_draft is not None
+                or self.guidance_resolution is not None
+            ):
+                raise ValueError("case input notice cannot create review evidence")
         return self
 
 
@@ -537,9 +607,21 @@ class AgentAssistantAnswerResponse(BaseModel):
     answer_scope: AnswerScope
     direct_answer: str = Field(min_length=1, max_length=4000)
     citations: list[MessageCitation] = Field(default_factory=list, max_length=100)
-    answer_sections: list[AnswerSection] = Field(default_factory=list, max_length=2)
+    answer_sections: list[AnswerSection] = Field(default_factory=list, max_length=3)
     suggested_questions: list[str] = Field(default_factory=list, max_length=3)
     correction_draft: CorrectionDraft | None = None
+    guidance_resolution: GuidanceResolution | None = None
+    case_input_notice: CaseInputNotice | None = None
+    # Agent→Backend provenance only.  The Backend compares this against its
+    # exact packaged Data manifest before persistence, then excludes it from
+    # every Browser-facing DTO/OpenAPI projection.
+    guidance_registry_sha256: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[a-f0-9]{64}$",
+        exclude=True,
+    )
     engine: dict[str, Any]
 
 
@@ -577,6 +659,16 @@ class AgentKnowledgeAnswerResponse(BaseModel):
     coverage: GuidanceCoverage
     snapshot_id: str | None = Field(default=None, min_length=1, max_length=512)
     as_of: date
+    guidance_resolution: GuidanceResolution | None = None
+    # Internal Agent→Backend registry digest; never copied into a stored
+    # conversation message or public response.
+    guidance_registry_sha256: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[a-f0-9]{64}$",
+        exclude=True,
+    )
     engine: dict[str, Any]
 
 

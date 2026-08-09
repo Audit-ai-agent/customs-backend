@@ -437,7 +437,7 @@ def test_global_knowledge_rejects_an_unsafe_citation_uri_before_persistence(
     )
 
 
-def test_case_assistant_is_not_subject_to_global_knowledge_input_guard() -> None:
+def test_case_assistant_retains_document_paste_without_agent_or_global_knowledge_dispatch() -> None:
     harness = _harness()
     case = harness.client.post("/api/v1/cases", json={"title": "사건 심사"}, headers=_auth())
     assert case.status_code == 201
@@ -471,5 +471,16 @@ def test_case_assistant_is_not_subject_to_global_knowledge_input_guard() -> None
     )
 
     assert response.status_code == 200, response.text
-    assert len(harness.case_calls) == 1
+    exchange = response.json()
+    assert exchange["assistant_message"]["case_input_notice"] == "unregistered_document_text"
+    assert exchange["assistant_message"]["answer_scope"] == "insufficient_evidence"
+    assert harness.case_calls == []
     assert harness.knowledge_calls == []
+    messages = harness.repository.list_messages(
+        "local-dev", conversation.json()["conversation_id"]
+    )
+    assert [message.role for message in messages] == [
+        ConversationMessageRole.user,
+        ConversationMessageRole.assistant,
+    ]
+    assert messages[0].content == "Invoice No: INV-001\nQuantity: 2"

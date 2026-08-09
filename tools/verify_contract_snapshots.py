@@ -2,7 +2,7 @@
 
 ``git diff`` alone does not report an untracked snapshot.  This verifier first
 requires every expected file to be present in Git's index, then requires the
-two contract path groups to be clean (including untracked files), validates
+contract snapshot path groups to be clean (including untracked files), validates
 the packaged Agent review and assistant schemas, and finally compares a
 freshly rendered OpenAPI document byte-for-byte with the tracked snapshot.
 """
@@ -14,6 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from customs_backend.agent_contract import validate_agent_contract_bundle
+from customs_backend.guidance_registry import verify_guidance_registry_projection_bundle
 
 if __package__:
     from tools.export_product_openapi import render_product_openapi
@@ -24,6 +25,7 @@ else:
 ROOT = Path(__file__).resolve().parents[1]
 OPENAPI_PATH = Path("docs/openapi-v1.json")
 AGENT_SCHEMA_DIRECTORY = Path("src/customs_backend/contracts/agent/v3")
+EVIDENCE_MANIFEST_DIRECTORY = Path("src/customs_backend/contracts/evidence/v3")
 AGENT_SCHEMA_PATHS = (
     AGENT_SCHEMA_DIRECTORY / "review-request.schema.json",
     AGENT_SCHEMA_DIRECTORY / "review-result.schema.json",
@@ -32,13 +34,19 @@ AGENT_SCHEMA_PATHS = (
     AGENT_SCHEMA_DIRECTORY / "knowledge-answer-request.schema.json",
     AGENT_SCHEMA_DIRECTORY / "knowledge-answer-response.schema.json",
 )
+EVIDENCE_MANIFEST_PATHS = (
+    EVIDENCE_MANIFEST_DIRECTORY / "guidance_registry_v1.manifest.json",
+    EVIDENCE_MANIFEST_DIRECTORY / "guidance_registry_v2.manifest.json",
+)
 TRACKED_FILES = (
     OPENAPI_PATH,
     *AGENT_SCHEMA_PATHS,
+    *EVIDENCE_MANIFEST_PATHS,
 )
 CONTRACT_PATH_GROUPS = (
     OPENAPI_PATH,
     AGENT_SCHEMA_DIRECTORY,
+    EVIDENCE_MANIFEST_DIRECTORY,
 )
 
 
@@ -114,8 +122,10 @@ def verify_contract_snapshots(
             "contract snapshot paths are not clean:\n" + status.stdout.rstrip()
         )
 
-    # Validate the packaged request/result schemas after the Git checks.
+    # Validate the packaged Agent schema and exact public registry projections
+    # after the Git checks.  Neither projection contains raw source material.
     contract_validator()
+    verify_guidance_registry_projection_bundle()
 
     stored_openapi = (resolved_root / OPENAPI_PATH).read_bytes()
     rendered_openapi = openapi_renderer()

@@ -13,6 +13,16 @@ from urllib.parse import urlsplit
 from pydantic import ValidationError
 
 from customs_backend.agent_contract import AgentContractPayloadError, validate_agent_v3_payload
+from customs_backend.case_input_boundary import (
+    CASE_DOCUMENT_INPUT_RESPONSE,
+    case_input_notice,
+    safe_case_turn_content,
+)
+from customs_backend.guidance_registry import (
+    GuidanceRegistryProjectionError,
+    validate_guidance_citation,
+    validate_guidance_resolution,
+)
 from customs_backend.knowledge_ingress import (
     canonical_knowledge_title,
     require_safe_knowledge_history,
@@ -53,6 +63,7 @@ from customs_backend.domain import (
     ExecutionStatus,
     FindingDecisionRecord,
     FindingDecisionRequest,
+    GuidanceResolution,
     InputDocumentManifestEntry,
     KnowledgeConversationCreate,
     KnowledgeConversationRecord,
@@ -110,7 +121,13 @@ _DECLARED_TYPE_MAP: dict[
 _MAX_DOCUMENTS = 20
 _MAX_AGENT_REQUEST_BYTES = 2 * 1024 * 1024
 _OFFICIAL_GUIDANCE_HOSTS = frozenset(
-    {"law.go.kr", "www.law.go.kr", "customs.go.kr", "www.customs.go.kr", "dream.kotra.or.kr"}
+    {
+        "law.go.kr",
+        "www.law.go.kr",
+        "customs.go.kr",
+        "www.customs.go.kr",
+        "dream.kotra.or.kr",
+    }
 )
 
 
@@ -165,7 +182,12 @@ def _citation_key(citation: MessageCitation) -> tuple[str, str]:
 def _canonical_citation(citation: MessageCitation) -> bytes:
     """Return the complete stored citation representation for section binding."""
 
-    return canonical_json_bytes(citation.model_dump(mode="json"))
+    # ``registry_source_id`` is intentionally excluded from public response
+    # serialisation, but it is part of the internal Agent boundary.  Include
+    # it here so a display section cannot omit or change provenance metadata.
+    value = citation.model_dump(mode="json")
+    value["registry_source_id"] = citation.registry_source_id
+    return canonical_json_bytes(value)
 
 
 def _validate_answer_sections(
@@ -180,10 +202,25 @@ def _validate_answer_sections(
 
     if len({section.kind for section in sections}) != len(sections):
         raise ConflictError("assistant response repeats an answer section kind")
+    expected_order = {
+        AnswerSectionKind.case_analysis: 0,
+        AnswerSectionKind.general_guidance: 1,
+        AnswerSectionKind.case_application: 2,
+    }
+    if [expected_order[section.kind] for section in sections] != sorted(
+        expected_order[section.kind] for section in sections
+    ):
+        raise ConflictError("assistant response answer sections are out of order")
+    section_kinds = {section.kind for section in sections}
+    if AnswerSectionKind.case_application in section_kinds and not {
+        AnswerSectionKind.case_analysis,
+        AnswerSectionKind.general_guidance,
+    }.issubset(section_kinds):
+        raise ConflictError("case application requires case and guidance sections")
     known = {_canonical_citation(item) for item in citations}
     for section in sections:
         if global_only and section.kind != AnswerSectionKind.general_guidance:
-            raise ConflictError("knowledge answer cannot contain a case analysis section")
+            raise ConflictError("knowledge answer cannot contain a case-specific section")
         if not section.citations:
             raise ConflictError("answer section requires at least one canonical citation")
         section_keys = [_citation_key(item) for item in section.citations]
@@ -199,6 +236,15 @@ def _validate_answer_sections(
             item.kind != CitationKind.guidance_evidence for item in section.citations
         ):
             raise ConflictError("general guidance section requires official guidance citations")
+        if section.kind == AnswerSectionKind.case_application:
+            has_case = any(item.kind != CitationKind.guidance_evidence for item in section.citations)
+            has_guidance = any(
+                item.kind == CitationKind.guidance_evidence for item in section.citations
+            )
+            if not has_case or not has_guidance:
+                raise ConflictError(
+                    "case application section requires case and official guidance citations"
+                )
 
 
 def _validate_guidance_citations(
@@ -206,17 +252,86 @@ def _validate_guidance_citations(
     *,
     expected_as_of: date,
     functional_uat: bool,
+    guidance_resolution: GuidanceResolution | None = None,
+    guidance_registry_sha256: str | None = None,
 ) -> None:
     """Apply the profile-specific boundary to every displayed guidance source."""
 
-    for citation in citations:
-        if citation.kind != CitationKind.guidance_evidence:
-            continue
+    guidance_citations = [
+        citation for citation in citations if citation.kind == CitationKind.guidance_evidence
+    ]
+    registry = None
+    if guidance_resolution is not None:
+        resolution = guidance_resolution
+        try:
+            if resolution.as_of != expected_as_of:
+                raise GuidanceRegistryProjectionError("guidance resolution date is invalid")
+            registry = validate_guidance_resolution(
+                registry_version=resolution.registry_version,
+                topic=resolution.topic,
+                scope=resolution.scope,
+                requested_direction=resolution.requested_direction,
+                applicable_directions=resolution.applicable_directions,
+                coverage=resolution.coverage,
+            )
+            if guidance_registry_sha256 != registry.registry_sha256:
+                raise GuidanceRegistryProjectionError("guidance registry digest is invalid")
+            if any(
+                citation.as_of != resolution.as_of
+                or citation.snapshot_id != resolution.snapshot_id
+                or citation.coverage != resolution.coverage
+                for citation in guidance_citations
+            ):
+                raise GuidanceRegistryProjectionError("guidance citation snapshot is inconsistent")
+            if registry.version == "2.0" and any(
+                citation.registry_source_id is None for citation in guidance_citations
+            ):
+                raise GuidanceRegistryProjectionError("V2 guidance citation has no registry source")
+            for citation in guidance_citations:
+                if citation.registry_source_id is None:
+                    # Legacy V1/r3 records did not expose a registry source
+                    # identity.  They remain valid but cannot be upgraded or
+                    # made to claim V2 provenance retroactively.
+                    continue
+                validate_guidance_citation(
+                    registry=registry,
+                    registry_source_id=citation.registry_source_id,
+                    source_kind=str(citation.source_kind),
+                    source_title=str(citation.source_title),
+                    source_uri=str(citation.source_uri),
+                    topic=resolution.topic,
+                    scope=resolution.scope,
+                    requested_direction=resolution.requested_direction,
+                    applicable_directions=resolution.applicable_directions,
+                )
+        except (AttributeError, GuidanceRegistryProjectionError) as exc:
+            raise ConflictError("guidance provenance is outside the registry projection") from exc
+    elif guidance_registry_sha256 is not None or any(
+        citation.registry_source_id is not None for citation in guidance_citations
+    ):
+        raise ConflictError("guidance citation has registry provenance without a resolution")
+    elif any(
+        citation.source_kind != "development_fixture" for citation in guidance_citations
+    ):
+        # New Agent responses must bind every official citation to a concrete
+        # V1 or V2 registry version and digest.  This does not reinterpret
+        # historic persisted messages (which are read as-is), and it leaves
+        # the explicitly local deterministic fixture usable without a real
+        # Data snapshot.
+        raise ConflictError("official guidance citation requires registry provenance")
+
+    for citation in guidance_citations:
         # Only official snapshot citations can become Browser links.  Keep the
         # local deterministic fixture out of this policy: it is never allowed
         # in Functional-UAT and the Browser separately refuses its URL.
-        if citation.source_kind != "development_fixture" and not _is_safe_official_guidance_uri(
-            citation.source_uri
+        # ``www2.customs.go.kr`` and any future V2-only hostname are accepted
+        # solely after the exact source/page projection above succeeds.  The
+        # generic legacy host boundary intentionally does not widen to them.
+        v2_exact = registry is not None and registry.version == "2.0"
+        if (
+            citation.source_kind != "development_fixture"
+            and not v2_exact
+            and not _is_safe_official_guidance_uri(citation.source_uri)
         ):
             raise ConflictError("guidance citation has an unsafe official source URI")
         if citation.as_of != expected_as_of:
@@ -229,6 +344,8 @@ def _validate_guidance_citations(
             raise ConflictError("functional UAT guidance requires an official snapshot source")
         if functional_uat and citation.coverage not in {"covered", "partial"}:
             raise ConflictError("functional UAT guidance requires covered official knowledge")
+        if citation.coverage not in {"covered", "partial"}:
+            raise ConflictError("guidance citation cannot claim unavailable coverage")
 
 
 def _is_safe_official_guidance_uri(value: str | None) -> bool:
@@ -1022,6 +1139,41 @@ class WorkbenchService:
             if existing is not None:
                 return existing
 
+            input_notice = case_input_notice(request.content)
+            if input_notice is not None:
+                # Preserve the authorised Case conversation record, but do
+                # not create a new fact, finding, correction, Agent request,
+                # or Functional-UAT transcript containing the pasted source
+                # text.  A document can influence review only after the
+                # normal document registration/review workflow.
+                now = utc_now()
+                exchange, _created = self.repository.append_message_exchange(
+                    user_message=ConversationMessageRecord(
+                        message_id=_id("msg"),
+                        conversation_id=conversation_id,
+                        role=ConversationMessageRole.user,
+                        content=request.content,
+                        created_by=principal.subject,
+                        created_at=now,
+                    ),
+                    assistant_message=ConversationMessageRecord(
+                        message_id=_id("msg"),
+                        conversation_id=conversation_id,
+                        role=ConversationMessageRole.assistant,
+                        content=CASE_DOCUMENT_INPUT_RESPONSE,
+                        answer_scope=AnswerScope.insufficient_evidence,
+                        suggested_questions=[
+                            "문서를 등록 또는 교체한 뒤 새 심사를 시작하려면 어떻게 하나요?"
+                        ],
+                        case_input_notice=input_notice,
+                        created_by="customs-backend",
+                        created_at=now + timedelta(microseconds=1),
+                    ),
+                    idempotency_key=scoped_key,
+                    idempotency_request_digest=request_digest,
+                )
+                return exchange
+
             history = self.repository.list_messages(principal.org_id, conversation_id)[-8:]
             answer_request = AgentAssistantAnswerRequest(
                 case_id=run.case_id,
@@ -1030,7 +1182,11 @@ class WorkbenchService:
                 review_result=_agent_result_snapshot(run),
                 question=request.content,
                 recent_turns=[
-                    AgentConversationTurn(role=item.role, content=item.content) for item in history
+                    AgentConversationTurn(
+                        role=item.role,
+                        content=safe_case_turn_content(role=item.role.value, content=item.content),
+                    )
+                    for item in history
                 ],
             )
             answer_wire = answer_request.to_agent_wire()
@@ -1078,10 +1234,20 @@ class WorkbenchService:
                 answer.citations,
                 expected_as_of=run.review_as_of,
                 functional_uat=functional_uat,
+                guidance_resolution=answer.guidance_resolution,
+                guidance_registry_sha256=answer.guidance_registry_sha256,
             )
             _validate_answer_sections(
                 answer.answer_sections, citations=answer.citations, global_only=False
             )
+            if answer.case_input_notice is not None and (
+                answer.citations
+                or answer.answer_sections
+                or answer.correction_draft is not None
+                or answer.guidance_resolution is not None
+                or answer.guidance_registry_sha256 is not None
+            ):
+                raise ConflictError("case input notice response cannot create review evidence")
             if any(not item.strip() for item in answer.suggested_questions):
                 raise ConflictError("Agent assistant response contains an empty suggested question")
             if answer.correction_draft is not None:
@@ -1113,6 +1279,8 @@ class WorkbenchService:
                     answer_sections=answer.answer_sections,
                     suggested_questions=answer.suggested_questions,
                     correction_draft=answer.correction_draft,
+                    guidance_resolution=answer.guidance_resolution,
+                    case_input_notice=answer.case_input_notice,
                     created_by="customs-ai-agent",
                     created_at=now + timedelta(microseconds=1),
                 ),
@@ -1305,10 +1473,18 @@ class WorkbenchService:
                 raise ConflictError(
                     "knowledge answer citation does not match its resolved snapshot"
                 )
+            if answer.guidance_resolution is not None and (
+                answer.guidance_resolution.as_of != answer.as_of
+                or answer.guidance_resolution.snapshot_id != answer.snapshot_id
+                or answer.guidance_resolution.coverage != answer.coverage
+            ):
+                raise ConflictError("knowledge answer resolution does not match its snapshot")
             _validate_guidance_citations(
                 answer.citations,
                 expected_as_of=conversation.as_of,
                 functional_uat=functional_uat,
+                guidance_resolution=answer.guidance_resolution,
+                guidance_registry_sha256=answer.guidance_registry_sha256,
             )
             if answer.answer_scope.value == "general_customs_guidance" and not citation_keys:
                 raise ConflictError("grounded knowledge answer requires an official citation")
@@ -1317,8 +1493,15 @@ class WorkbenchService:
                 "partial",
             }:
                 raise ConflictError("grounded knowledge answer has no covered snapshot")
+            # A V2 no-coverage answer can be deliberately resolved before
+            # Data is called (for example, export-side customs value).  Its
+            # ``snapshot_id`` is therefore ``null``.  It cannot replace the
+            # immutable snapshot already pinned by an earlier covered answer,
+            # but it is not a snapshot switch either.  A *non-null* later
+            # snapshot still has to match exactly.
             if (
                 conversation.snapshot_id is not None
+                and answer.snapshot_id is not None
                 and answer.snapshot_id != conversation.snapshot_id
             ):
                 raise ConflictError("knowledge conversation cannot switch its resolved snapshot")
@@ -1363,6 +1546,7 @@ class WorkbenchService:
                     knowledge_coverage=answer.coverage,
                     knowledge_snapshot_id=answer.snapshot_id,
                     knowledge_as_of=answer.as_of,
+                    guidance_resolution=answer.guidance_resolution,
                     created_by="customs-ai-agent",
                     created_at=now + timedelta(microseconds=1),
                 ),

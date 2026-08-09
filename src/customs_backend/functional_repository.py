@@ -22,6 +22,37 @@ from customs_backend.domain import (
 from customs_backend.repository import InMemoryWorkbenchRepository
 
 
+def _message_persistence_dump(record: ConversationMessageRecord) -> dict[str, Any]:
+    """Serialize a message for local PostgreSQL without widening its public DTO.
+
+    ``registry_source_id`` is intentionally excluded from Pydantic's normal
+    model dump so it cannot appear in Browser API responses or OpenAPI. It is
+    nevertheless needed in Functional-UAT's local operational state to retain
+    a V2 citation's already-validated registry binding across a restart.
+    Restore only that fixed identifier here; never persist the Agent-only
+    registry digest or change public serialization.
+    """
+
+    value = record.model_dump(mode="json")
+
+    def dump_citations(citations: list[Any]) -> list[dict[str, Any]]:
+        dumped: list[dict[str, Any]] = []
+        for citation in citations:
+            entry = citation.model_dump(mode="json")
+            if citation.registry_source_id is not None:
+                entry["registry_source_id"] = citation.registry_source_id
+            dumped.append(entry)
+        return dumped
+
+    value["citations"] = dump_citations(record.citations)
+    sections = value.get("answer_sections")
+    if isinstance(sections, list):
+        for dumped_section, section in zip(sections, record.answer_sections, strict=True):
+            if isinstance(dumped_section, dict):
+                dumped_section["citations"] = dump_citations(section.citations)
+    return value
+
+
 class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
     """Persist the compact aggregate in one local PostgreSQL row."""
 
@@ -147,7 +178,7 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
                 key: value.model_dump(mode="json") for key, value in self._conversations.items()
             },
             "messages": {
-                key: value.model_dump(mode="json") for key, value in self._messages.items()
+                key: _message_persistence_dump(value) for key, value in self._messages.items()
             },
             "chat_idempotency": [
                 [org, conversation_id, key, request_digest, user_message_id, assistant_message_id]
@@ -162,7 +193,7 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
                 for key, value in self._knowledge_conversations.items()
             },
             "knowledge_messages": {
-                key: value.model_dump(mode="json")
+                key: _message_persistence_dump(value)
                 for key, value in self._knowledge_messages.items()
             },
             "knowledge_chat_idempotency": [

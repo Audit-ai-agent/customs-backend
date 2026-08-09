@@ -32,6 +32,7 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 
 import httpx
 
+from customs_backend.guidance_registry import guidance_registry_projection
 from customs_backend.scenario_transcript import (
     ScenarioTranscriptError,
     verify_run,
@@ -60,10 +61,21 @@ _PROVIDER_RESPONSE_REQUEST_EVENTS = {
     response_event: request_event
     for request_event, response_event in _PROVIDER_REQUEST_RESPONSE_EVENTS.items()
 }
+_DOCUMENT_PROVIDER_REQUEST_EVENT = "request_started"
+_DOCUMENT_PROVIDER_RESPONSE_EVENT = "response_received"
+_DOCUMENT_PROVIDER_FAILURE_EVENTS = frozenset({"request_failed", "response_invalid"})
+_DOCUMENT_ANALYSIS_INITIAL_PHASE = "initial_extraction"
+_DOCUMENT_ANALYSIS_FOCUSED_PHASE = "focused_reextraction"
+_DOCUMENT_ANALYSIS_PHASES = frozenset(
+    {_DOCUMENT_ANALYSIS_INITIAL_PHASE, _DOCUMENT_ANALYSIS_FOCUSED_PHASE}
+)
+_DOCUMENT_PROVIDER_FAILURE_ERROR_CODES = {
+    "request_failed": frozenset({"provider_request_failed"}),
+    "response_invalid": frozenset({"provider_response_invalid", "provider_output_invalid"}),
+}
 _PROVIDER_FAILURE_EVENTS = frozenset(
     {
-        "request_failed",
-        "response_invalid",
+        *_DOCUMENT_PROVIDER_FAILURE_EVENTS,
         *(
             f"{purpose}_{failure}"
             for purpose in ("review_report", "assistant_answer")
@@ -94,6 +106,15 @@ _KNOWLEDGE_RESPONSE_INVALID_ERROR_CODES = frozenset(
 )
 _SAFE_LOCAL_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SAFE_KNOWLEDGE_TURN_ID = re.compile(r"^turn-[a-f0-9]{32}$")
+_GUIDANCE_TOKEN = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
+_V2_GUIDANCE_PROFILE = "functional-uat-kr-trade-v2"
+_CASE_DOCUMENT_PASTE_CONTENT = "품명: 합성 검증 품목\n단가: USD 1"
+_CASE_DOCUMENT_PASTE_STREAMS = (
+    "public-api",
+    "backend-agent",
+    "agent-data",
+    "claude",
+)
 _OFFICIAL_GUIDANCE_SOURCE_KINDS = frozenset(
     {
         "official_law",
@@ -1091,6 +1112,8 @@ def _assert_assistant_message(
     expected_scope: str,
     run: Mapping[str, Any],
     required_terms: Sequence[str] = (),
+    require_guidance_resolution: bool = False,
+    required_registry_version: str | None = None,
 ) -> None:
     if assistant.get("role") != "assistant" or assistant.get("answer_scope") != expected_scope:
         raise MatrixError(f"assistant_scope_{expected_scope}")
@@ -1130,10 +1153,18 @@ def _assert_assistant_message(
     if expected_scope == "evidence_grounded" and "evidence" not in citation_kinds:
         raise MatrixError("assistant_evidence_citation_missing")
     if expected_scope == "general_customs_guidance":
+        resolution = _assert_guidance_resolution(
+            assistant.get("guidance_resolution"),
+            expected_as_of=str(run.get("review_as_of")),
+            code="assistant_general_guidance",
+            required=require_guidance_resolution,
+            required_registry_version=required_registry_version,
+        )
         _assert_official_guidance_citations(
             citations,
             expected_as_of=str(run.get("review_as_of")),
             code="assistant_general_guidance",
+            guidance_resolution=resolution,
         )
     if (
         expected_scope
@@ -1149,11 +1180,120 @@ def _assert_assistant_message(
         raise MatrixError("assistant_answer_topic_missing")
 
 
+def _assert_guidance_resolution(
+    value: object,
+    *,
+    expected_as_of: str,
+    code: str,
+    required: bool = False,
+    required_registry_version: str | None = None,
+) -> Mapping[str, Any] | None:
+    """Validate the public-safe topic/scope resolution without registry hash.
+
+    Existing V1 messages can omit this additive object.  When it is present,
+    V2 must match Backend's exact checked-in public registry projection.  The
+    Browser response must never carry registry hashes or registry source IDs.
+    """
+
+    if value is None:
+        if required:
+            raise MatrixError(f"{code}_resolution_missing")
+        return None
+    resolution = _require_mapping(value, code=f"{code}_resolution_invalid")
+    allowed = {
+        "topic",
+        "scope",
+        "requested_direction",
+        "applicable_directions",
+        "coverage",
+        "snapshot_id",
+        "as_of",
+        "registry_version",
+    }
+    if set(resolution).difference(allowed):
+        raise MatrixError(f"{code}_resolution_internal_field")
+    topic = resolution.get("topic")
+    scope = resolution.get("scope")
+    requested_direction = resolution.get("requested_direction")
+    applicable = resolution.get("applicable_directions")
+    coverage = resolution.get("coverage")
+    registry_version = resolution.get("registry_version")
+    snapshot_id = resolution.get("snapshot_id")
+    if (
+        not isinstance(topic, str)
+        or _GUIDANCE_TOKEN.fullmatch(topic) is None
+        or not isinstance(scope, str)
+        or _GUIDANCE_TOKEN.fullmatch(scope) is None
+        or requested_direction not in {"import", "export", "both"}
+        or not isinstance(applicable, list)
+        or not 1 <= len(applicable) <= 2
+        or any(direction not in {"import", "export"} for direction in applicable)
+        or len(applicable) != len(set(applicable))
+        or applicable != [direction for direction in ("import", "export") if direction in applicable]
+        or coverage not in {"covered", "no_coverage", "partial", "unavailable"}
+        or registry_version not in {"1.0", "2.0"}
+        or (
+            required_registry_version is not None
+            and registry_version != required_registry_version
+        )
+        or resolution.get("as_of") != expected_as_of
+        or snapshot_id is not None and (not isinstance(snapshot_id, str) or not snapshot_id)
+        or coverage in {"covered", "partial"} and snapshot_id is None
+    ):
+        raise MatrixError(f"{code}_resolution_invalid")
+    if registry_version == "2.0":
+        registry = guidance_registry_projection("2.0")
+        expected_scope = registry.scopes.get((topic, scope))
+        if expected_scope is None or applicable != list(expected_scope.directions):
+            raise MatrixError(f"{code}_resolution_registry")
+        if (
+            requested_direction != "both"
+            and requested_direction not in expected_scope.directions
+            and coverage in {"covered", "partial"}
+        ):
+            raise MatrixError(f"{code}_resolution_direction")
+    return resolution
+
+
+def _assert_v2_public_guidance_citation(
+    citation: Mapping[str, Any], *, resolution: Mapping[str, Any], code: str
+) -> None:
+    """Map a public V2 citation back to one exact safe registry page.
+
+    ``registry_source_id`` is intentionally absent from Browser/API output.
+    Matching the public source kind/title/URI and the selected topic/scope is
+    therefore the strongest independent check available in the UAT harness.
+    """
+
+    registry = guidance_registry_projection("2.0")
+    topic = str(resolution["topic"])
+    scope = str(resolution["scope"])
+    applicable = resolution["applicable_directions"]
+    requested_direction = str(resolution["requested_direction"])
+    required_directions = (
+        set(applicable)
+        if requested_direction == "both"
+        else {requested_direction}
+    )
+    candidates = [
+        source
+        for source in registry.sources.values()
+        if source.source_kind == citation.get("source_kind")
+        and source.title == citation.get("source_title")
+        and source.official_uri == citation.get("source_uri")
+        and (source_directions := source.scope_directions.get((topic, scope))) is not None
+        and required_directions.issubset(source_directions)
+    ]
+    if len(candidates) != 1:
+        raise MatrixError(f"{code}_registry_source")
+
+
 def _assert_official_guidance_citations(
     citations: object,
     *,
     expected_as_of: str,
     code: str,
+    guidance_resolution: Mapping[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Validate official provenance without returning source bodies or IDs."""
 
@@ -1167,7 +1307,11 @@ def _assert_official_guidance_citations(
             raise MatrixError(f"{code}_citation_kind")
         if citation.get("source_kind") not in _OFFICIAL_GUIDANCE_SOURCE_KINDS:
             raise MatrixError(f"{code}_source_kind")
-        if not _is_safe_official_guidance_uri(citation.get("source_uri")):
+        if guidance_resolution is not None and guidance_resolution["registry_version"] == "2.0":
+            _assert_v2_public_guidance_citation(
+                citation, resolution=guidance_resolution, code=code
+            )
+        elif not _is_safe_official_guidance_uri(citation.get("source_uri")):
             raise MatrixError(f"{code}_source_uri")
         if citation.get("as_of") != expected_as_of:
             raise MatrixError(f"{code}_as_of")
@@ -1179,6 +1323,11 @@ def _assert_official_guidance_citations(
             or coverage not in {"covered", "partial"}
         ):
             raise MatrixError(f"{code}_provenance")
+        if guidance_resolution is not None and (
+            snapshot_id != guidance_resolution.get("snapshot_id")
+            or coverage != guidance_resolution.get("coverage")
+        ):
+            raise MatrixError(f"{code}_resolution_provenance")
         snapshots.add(snapshot_id)
         coverages.add(coverage)
     if len(snapshots) != 1 or len(coverages) != 1:
@@ -1214,7 +1363,11 @@ def _is_safe_official_guidance_uri(value: object) -> bool:
 
 
 def _assert_mixed_assistant_sections(
-    assistant: Mapping[str, Any], *, run: Mapping[str, Any]
+    assistant: Mapping[str, Any],
+    *,
+    run: Mapping[str, Any],
+    require_guidance_resolution: bool = False,
+    required_registry_version: str | None = None,
 ) -> None:
     """Require a Case answer and official general guidance to remain separate."""
 
@@ -1226,6 +1379,13 @@ def _assert_mixed_assistant_sections(
     sections = _mapping_list(assistant.get("answer_sections"), code="mixed_sections_invalid")
     if [section.get("kind") for section in sections] != ["case_analysis", "general_guidance"]:
         raise MatrixError("mixed_sections_missing")
+    resolution = _assert_guidance_resolution(
+        assistant.get("guidance_resolution"),
+        expected_as_of=str(run.get("review_as_of")),
+        code="mixed_guidance",
+        required=require_guidance_resolution,
+        required_registry_version=required_registry_version,
+    )
     analyses = _mapping_list(run.get("document_analyses"), code="document_analyses_invalid")
     filenames = {
         filename
@@ -1257,7 +1417,100 @@ def _assert_mixed_assistant_sections(
         sections[1].get("citations"),
         expected_as_of=str(run.get("review_as_of")),
         code="mixed_guidance",
+        guidance_resolution=resolution,
     )
+
+
+def _assert_case_application_sections(
+    assistant: Mapping[str, Any], *, run: Mapping[str, Any]
+) -> None:
+    """Verify a three-part Case/general/application answer stays separated.
+
+    ``case_application`` is deliberately a next-check template, not a third
+    factual source.  It can exist only when it repeats at least one current
+    Case citation and one independently verified official-guidance citation.
+    """
+
+    _assert_assistant_message(
+        assistant,
+        expected_scope="case_grounded",
+        run=run,
+    )
+    sections = _mapping_list(assistant.get("answer_sections"), code="application_sections_invalid")
+    if [section.get("kind") for section in sections] != [
+        "case_analysis",
+        "general_guidance",
+        "case_application",
+    ]:
+        raise MatrixError("application_sections_missing")
+    resolution = _assert_guidance_resolution(
+        assistant.get("guidance_resolution"),
+        expected_as_of=str(run.get("review_as_of")),
+        code="application_guidance",
+        required=True,
+        required_registry_version="2.0",
+    )
+    assert resolution is not None  # narrowed after the required check above
+    analyses = _mapping_list(run.get("document_analyses"), code="document_analyses_invalid")
+    filenames = {
+        filename
+        for analysis in analyses
+        if isinstance((filename := analysis.get("filename")), str) and filename
+    }
+    internal_markers = _run_internal_markers(run)
+    for index, section in enumerate(sections, start=1):
+        _assert_user_text(
+            section.get("title"),
+            code=f"application_section_title_{index}",
+            filenames=filenames,
+            internal_markers=internal_markers,
+        )
+        _assert_user_text(
+            section.get("content"),
+            code=f"application_section_content_{index}",
+            filenames=filenames,
+            internal_markers=internal_markers,
+        )
+    case_citations = _mapping_list(
+        sections[0].get("citations"), code="application_case_citations_invalid"
+    )
+    if not any(
+        citation.get("kind") in {"fact", "comparison", "evidence"}
+        for citation in case_citations
+    ):
+        raise MatrixError("application_case_citation_missing")
+    guidance_snapshot, guidance_coverage = _assert_official_guidance_citations(
+        sections[1].get("citations"),
+        expected_as_of=str(run.get("review_as_of")),
+        code="application_guidance",
+        guidance_resolution=resolution,
+    )
+    application_citations = _mapping_list(
+        sections[2].get("citations"), code="application_citations_invalid"
+    )
+    application_case_citations = [
+        citation
+        for citation in application_citations
+        if citation.get("kind") in {"fact", "comparison", "evidence"}
+    ]
+    application_guidance_citations = [
+        citation
+        for citation in application_citations
+        if citation.get("kind") == "guidance_evidence"
+    ]
+    if not application_case_citations or not application_guidance_citations:
+        raise MatrixError("application_citation_boundary_missing")
+    application_snapshot, application_coverage = _assert_official_guidance_citations(
+        application_guidance_citations,
+        expected_as_of=str(run.get("review_as_of")),
+        code="application_guidance_citations",
+        guidance_resolution=resolution,
+    )
+    if (
+        application_snapshot != guidance_snapshot
+        or application_coverage != guidance_coverage
+    ):
+        raise MatrixError("application_guidance_provenance_mismatch")
 
 
 def _conversation(
@@ -1269,6 +1522,8 @@ def _conversation(
     question: str,
     expected_scope: str,
     required_terms: Sequence[str] = (),
+    require_guidance_resolution: bool = False,
+    required_registry_version: str | None = None,
 ) -> str:
     created = api.require(
         "POST",
@@ -1293,12 +1548,14 @@ def _conversation(
         expected_scope=expected_scope,
         run=run,
         required_terms=required_terms,
+        require_guidance_resolution=require_guidance_resolution,
+        required_registry_version=required_registry_version,
     )
     return conversation_id
 
 
 def _mixed_conversation(api: PublicApi, *, run_id: str, run: Mapping[str, Any]) -> None:
-    """Exercise one Case question that also requests bounded general guidance."""
+    """Exercise Case facts, official guidance, and an explicit next-check template."""
 
     created = api.require(
         "POST",
@@ -1312,11 +1569,163 @@ def _mixed_conversation(api: PublicApi, *, run_id: str, run: Mapping[str, Any]) 
     exchange = api.require(
         "POST",
         f"/assistant/conversations/{conversation_id}/messages",
-        body={"content": "현재 사건의 문서 비교 결과와 일반 수입 통관 절차를 함께 설명해 주세요."},
+        body={
+            "content": (
+                "현재 사건의 문서 비교 결과에 일반 수입 통관 절차를 적용하면 "
+                "다음에 무엇을 확인해야 하나요?"
+            )
+        },
         idempotency_key=f"functional-matrix-mixed-{uuid.uuid4().hex}",
     )
     assistant = _require_mapping(exchange.get("assistant_message"), code="mixed_assistant_invalid")
-    _assert_mixed_assistant_sections(assistant, run=run)
+    _assert_case_application_sections(assistant, run=run)
+
+
+def _case_paste_transcript_metadata(review_run_id: str) -> dict[str, tuple[int, int]]:
+    """Read only local stream metadata for one already-created Functional-UAT run.
+
+    The document-shaped input itself must never be read from a transcript by
+    this checker.  File size and modification time are sufficient to prove
+    that the Case paste did not append a public exchange, Backend-to-Agent
+    request, Agent-to-Data request, or Claude turn.
+    """
+
+    if _SAFE_LOCAL_IDENTIFIER.fullmatch(review_run_id) is None:
+        raise MatrixError("case_document_paste_transcript_identity_invalid")
+    root = workspace_transcript_root()
+    try:
+        resolved_root = root.resolve(strict=True)
+        directory = (root / review_run_id).resolve(strict=True)
+    except OSError as exc:
+        raise MatrixError("case_document_paste_transcript_unavailable") from exc
+    if directory.parent != resolved_root:
+        raise MatrixError("case_document_paste_transcript_layout_invalid")
+
+    metadata: dict[str, tuple[int, int]] = {}
+    for stream in _CASE_DOCUMENT_PASTE_STREAMS:
+        path = directory / f"{stream}.jsonl"
+        try:
+            if path.is_symlink() or not path.is_file():
+                raise MatrixError("case_document_paste_transcript_unavailable")
+            details = path.stat()
+        except OSError as exc:
+            raise MatrixError("case_document_paste_transcript_unavailable") from exc
+        metadata[stream] = (details.st_size, details.st_mtime_ns)
+    return metadata
+
+
+def _case_paste_review_aggregate(run: Mapping[str, Any]) -> tuple[int, int]:
+    """Return fact/finding counts without examining Case fact values."""
+
+    fact_count = 0
+    analyses = _mapping_list(
+        run.get("document_analyses"), code="case_document_paste_document_analyses_invalid"
+    )
+    for analysis in analyses:
+        facts = analysis.get("facts")
+        line_items = analysis.get("line_items")
+        if (
+            not isinstance(facts, list)
+            or not isinstance(line_items, list)
+            or any(not isinstance(item, Mapping) for item in line_items)
+        ):
+            raise MatrixError("case_document_paste_facts_invalid")
+        fact_count += len(facts)
+        for item in line_items:
+            item_facts = item.get("facts")
+            if not isinstance(item_facts, list):
+                raise MatrixError("case_document_paste_facts_invalid")
+            fact_count += len(item_facts)
+    findings = _mapping_list(run.get("findings"), code="case_document_paste_findings_invalid")
+    return fact_count, len(findings)
+
+
+def _case_paste_correction_count(value: Mapping[str, Any]) -> int:
+    """Count correction records only; proposal values must not enter the receipt."""
+
+    return len(
+        _mapping_list(
+            value.get("items"), code="case_document_paste_corrections_invalid"
+        )
+    )
+
+
+def _assert_case_document_paste_zero_dispatch(
+    api: PublicApi, *, run_id: str, run: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Exercise the Case paste boundary without retaining or inspecting its body.
+
+    The synthetic two-field record is deliberately submitted through the real
+    public Case-chat API.  Its fixed notice and zero stream deltas prove that
+    it was retained only in the authorised Case conversation, not forwarded
+    into Agent, Data, Claude, or any Functional-UAT transcript stream.
+    """
+
+    created = api.require(
+        "POST",
+        f"/review-runs/{run_id}/assistant/conversations",
+        body={"title": "문서형 붙여넣기 경계"},
+        expected=201,
+    )
+    conversation_id = created.get("conversation_id")
+    if (
+        not isinstance(conversation_id, str)
+        or _SAFE_LOCAL_IDENTIFIER.fullmatch(conversation_id) is None
+    ):
+        raise MatrixError("case_document_paste_conversation_identity_invalid")
+
+    before_facts, before_findings = _case_paste_review_aggregate(run)
+    before_corrections = _case_paste_correction_count(
+        api.require("GET", f"/review-runs/{run_id}/correction-proposals")
+    )
+    before_streams = _case_paste_transcript_metadata(run_id)
+
+    exchange = api.require(
+        "POST",
+        f"/assistant/conversations/{conversation_id}/messages",
+        body={"content": _CASE_DOCUMENT_PASTE_CONTENT},
+        idempotency_key=f"functional-matrix-document-paste-{uuid.uuid4().hex}",
+    )
+    # Do not inspect ``user_message`` or assistant prose: only fixed public
+    # state fields are used here, so the synthetic input never reaches the
+    # matrix output or a MatrixError.
+    assistant = _require_mapping(
+        exchange.get("assistant_message"), code="case_document_paste_assistant_invalid"
+    )
+    if (
+        assistant.get("role") != "assistant"
+        or assistant.get("answer_scope") != "insufficient_evidence"
+        or assistant.get("case_input_notice") != "unregistered_document_text"
+        or assistant.get("citations") != []
+        or assistant.get("answer_sections") != []
+        or assistant.get("correction_draft") is not None
+        or assistant.get("guidance_resolution") is not None
+    ):
+        raise MatrixError("case_document_paste_notice_invalid")
+    if _case_paste_transcript_metadata(run_id) != before_streams:
+        raise MatrixError("case_document_paste_transcript_dispatch")
+
+    after_run = api.require("GET", f"/review-runs/{run_id}")
+    after_facts, after_findings = _case_paste_review_aggregate(after_run)
+    after_corrections = _case_paste_correction_count(
+        api.require("GET", f"/review-runs/{run_id}/correction-proposals")
+    )
+    if (after_facts, after_findings) != (before_facts, before_findings):
+        raise MatrixError("case_document_paste_review_state_changed")
+    if after_corrections != before_corrections:
+        raise MatrixError("case_document_paste_correction_state_changed")
+
+    return {
+        "status": "passed",
+        "case_document_paste_notice_verified": True,
+        "case_document_paste_agent_http_exchanges": 0,
+        "case_document_paste_public_transcript_exchanges": 0,
+        "case_document_paste_agent_data_dispatches": 0,
+        "case_document_paste_claude_dispatches": 0,
+        "case_document_paste_fact_changes": 0,
+        "case_document_paste_finding_changes": 0,
+        "case_document_paste_correction_changes": 0,
+    }
 
 
 def _knowledge_turn_directories(conversation_id: str, *, expected_count: int) -> list[Path]:
@@ -1537,18 +1946,26 @@ def _assert_knowledge_provider_not_called_for_no_coverage(turn_directory: Path) 
     return 1
 
 
-def _assert_knowledge_provider_turns(turn_directories: Sequence[Path]) -> dict[str, Any]:
-    """Validate two covered Claude attempts and one exact no-coverage turn.
+def _assert_knowledge_provider_turns(
+    turn_directories: Sequence[Path],
+    *,
+    expected_covered_turns: int,
+    expected_data_no_coverage_non_call_turns: int,
+) -> dict[str, Any]:
+    """Validate covered provider turns separately from Data no-coverage turns.
 
     Knowledge turn IDs are UUID-derived and have no temporal meaning.  Classify
     every verified turn by its own safe event sequence instead of relying on
     directory ordering.  A covered turn can safely fall back after a real
-    Anthropic attempt; the exact no-coverage non-call is the only permitted
-    turn without one.
+    Anthropic attempt; a Data ``no_coverage`` lookup records one exact
+    non-call turn.  A direction-inapplicable policy is different: it must not
+    allocate a turn at all, so callers require zero such turns.
     """
 
+    if expected_covered_turns < 1 or expected_data_no_coverage_non_call_turns < 0:
+        raise MatrixError("knowledge_claude_provider_expectation_invalid")
     provider_traces: list[dict[str, Any]] = []
-    no_coverage_not_called_count = 0
+    data_no_coverage_non_call_count = 0
     for turn_directory in turn_directories:
         _verify_agent_knowledge_transcript(turn_directory)
         try:
@@ -1556,7 +1973,7 @@ def _assert_knowledge_provider_turns(turn_directories: Sequence[Path]) -> dict[s
         except MatrixError as exc:
             if str(exc) != "knowledge_claude_provider_answer_unaccepted":
                 raise
-            no_coverage_not_called_count += _assert_knowledge_provider_not_called_for_no_coverage(
+            data_no_coverage_non_call_count += _assert_knowledge_provider_not_called_for_no_coverage(
                 turn_directory
             )
     accepted_count = sum(trace["knowledge_provider_accepted_count"] for trace in provider_traces)
@@ -1564,10 +1981,11 @@ def _assert_knowledge_provider_turns(turn_directories: Sequence[Path]) -> dict[s
         trace["knowledge_provider_safe_fallback_count"] for trace in provider_traces
     )
     if (
-        len(provider_traces) != 2
-        or no_coverage_not_called_count != 1
+        len(provider_traces) != expected_covered_turns
+        or data_no_coverage_non_call_count != expected_data_no_coverage_non_call_turns
         or {trace["knowledge_provider"] for trace in provider_traces} != {"anthropic"}
-        or sum(trace["knowledge_provider_attempt_count"] for trace in provider_traces) != 2
+        or sum(trace["knowledge_provider_attempt_count"] for trace in provider_traces)
+        != expected_covered_turns
     ):
         raise MatrixError("knowledge_claude_provider_payload_invalid")
     # The happy-path Functional-UAT specifically proves that both covered
@@ -1575,10 +1993,10 @@ def _assert_knowledge_provider_turns(turn_directories: Sequence[Path]) -> dict[s
     # is a correct degraded product outcome (and is covered by controlled
     # failure tests), but it must not make this actual-provider acceptance
     # gate appear green.
-    if accepted_count != 2 or safe_fallback_count != 0:
+    if accepted_count != expected_covered_turns or safe_fallback_count != 0:
         raise MatrixError("knowledge_claude_provider_answer_unaccepted")
     return {
-        "knowledge_no_coverage_not_called_count": no_coverage_not_called_count,
+        "knowledge_data_no_coverage_non_call_turn_count": data_no_coverage_non_call_count,
         "knowledge_provider": "anthropic",
         "knowledge_claude_event_count": sum(
             trace["knowledge_claude_event_count"] for trace in provider_traces
@@ -1612,10 +2030,19 @@ def _assert_standalone_knowledge_assistant(
         filenames=set(),
         internal_markers=set(),
     )
+    resolution = _assert_guidance_resolution(
+        assistant.get("guidance_resolution"),
+        expected_as_of=expected_as_of,
+        code=code,
+        required=True,
+        required_registry_version="2.0",
+    )
+    assert resolution is not None  # narrowed after the required check above
     snapshot_id, coverage = _assert_official_guidance_citations(
         assistant.get("citations"),
         expected_as_of=expected_as_of,
         code=code,
+        guidance_resolution=resolution,
     )
     if (
         assistant.get("knowledge_coverage") != coverage
@@ -1630,6 +2057,7 @@ def _assert_standalone_knowledge_assistant(
         sections[0].get("citations"),
         expected_as_of=expected_as_of,
         code=f"{code}_section",
+        guidance_resolution=resolution,
     )
     if section_snapshot != snapshot_id or section_coverage != coverage:
         raise MatrixError(f"{code}_section_provenance_invalid")
@@ -1639,7 +2067,7 @@ def _assert_standalone_knowledge_assistant(
 
 def _assert_standalone_knowledge_no_coverage(
     assistant: Mapping[str, Any], *, expected_as_of: str, code: str
-) -> str:
+) -> Mapping[str, Any]:
     """Validate the explicit no-coverage boundary without model inference."""
 
     if (
@@ -1658,19 +2086,27 @@ def _assert_standalone_knowledge_no_coverage(
         filenames=set(),
         internal_markers=set(),
     )
+    resolution = _assert_guidance_resolution(
+        assistant.get("guidance_resolution"),
+        expected_as_of=expected_as_of,
+        code=code,
+        required=True,
+        required_registry_version="2.0",
+    )
+    assert resolution is not None  # narrowed after the required check above
+    if resolution.get("coverage") != "no_coverage" or resolution.get("snapshot_id") is not None:
+        raise MatrixError(f"{code}_resolution_provenance_invalid")
     if _mapping_list(assistant.get("citations"), code=f"{code}_citations_invalid"):
         raise MatrixError(f"{code}_citation_present")
     if _mapping_list(assistant.get("answer_sections"), code=f"{code}_sections_invalid"):
         raise MatrixError(f"{code}_sections_invalid")
-    snapshot_id = assistant.get("knowledge_snapshot_id")
     if (
         assistant.get("knowledge_coverage") != "no_coverage"
-        or not isinstance(snapshot_id, str)
-        or not snapshot_id
+        or assistant.get("knowledge_snapshot_id") is not None
         or assistant.get("knowledge_as_of") != expected_as_of
     ):
         raise MatrixError(f"{code}_provenance_invalid")
-    return snapshot_id
+    return resolution
 
 
 def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
@@ -1725,19 +2161,24 @@ def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
     no_coverage_exchange = api.require(
         "POST",
         f"/knowledge/conversations/{conversation_id}/messages",
-        body={"content": "수출 운송 서류도 공식 자료 범위에서 알려 주세요."},
+        body={"content": "수출 과세가격의 기본을 공식 자료 범위에서 알려 주세요."},
         idempotency_key=f"functional-matrix-knowledge-no-coverage-{uuid.uuid4().hex}",
     )
     no_coverage = _require_mapping(
         no_coverage_exchange.get("assistant_message"), code="knowledge_no_coverage_message_invalid"
     )
-    no_coverage_snapshot = _assert_standalone_knowledge_no_coverage(
+    direction_skip_resolution = _assert_standalone_knowledge_no_coverage(
         no_coverage,
         expected_as_of=expected_as_of,
         code="knowledge_no_coverage",
     )
-    if no_coverage_snapshot != snapshot_id:
-        raise MatrixError("knowledge_no_coverage_snapshot_pin_invalid")
+    if (
+        direction_skip_resolution.get("topic") != "customs_duty"
+        or direction_skip_resolution.get("scope") != "customs_value_basics"
+        or direction_skip_resolution.get("requested_direction") != "export"
+        or direction_skip_resolution.get("applicable_directions") != ["import"]
+    ):
+        raise MatrixError("knowledge_direction_inapplicable_resolution_invalid")
     # The standalone assistant is Case-independent.  Verify the public
     # ingress boundary with synthetic structural markers only; ``PublicApi``
     # intentionally does not retain or print request bodies.
@@ -1761,19 +2202,29 @@ def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
         "assistant",
     ]:
         raise MatrixError("knowledge_message_history_invalid")
-    if any(
-        item.get("knowledge_snapshot_id") != snapshot_id
-        for item in message_items
-        if item.get("role") == "assistant"
-    ):
+    assistants = [item for item in message_items if item.get("role") == "assistant"]
+    if [item.get("knowledge_snapshot_id") for item in assistants] != [
+        snapshot_id,
+        snapshot_id,
+        None,
+    ]:
         raise MatrixError("knowledge_message_snapshot_invalid")
     listed = api.require("GET", "/knowledge/conversations")
     listed_items = _mapping_list(listed.get("items"), code="knowledge_conversation_list_invalid")
     matching = [item for item in listed_items if item.get("conversation_id") == conversation_id]
     if len(matching) != 1 or matching[0].get("snapshot_id") != snapshot_id:
         raise MatrixError("knowledge_snapshot_pin_invalid")
-    turn_directories = _knowledge_turn_directories(conversation_id, expected_count=3)
-    provider_receipt = _assert_knowledge_provider_turns(turn_directories)
+    # The third public answer is a V2 direction-inapplicable policy skip:
+    # export customs-value guidance is outside an import-only scope.  It must
+    # return no-coverage without allocating an Agent-owned turn, querying
+    # Data, or invoking Claude.  Exactly two turn directories after all three
+    # public messages is the safe non-dispatch proof.
+    turn_directories = _knowledge_turn_directories(conversation_id, expected_count=2)
+    provider_receipt = _assert_knowledge_provider_turns(
+        turn_directories,
+        expected_covered_turns=2,
+        expected_data_no_coverage_non_call_turns=0,
+    )
     return {
         "status": "passed",
         "official_guidance_citations_verified": citation_count + follow_up_citation_count,
@@ -1782,6 +2233,10 @@ def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
         "knowledge_turns_verified": len(turn_directories),
         "knowledge_recent_history_verified": 1,
         "knowledge_no_coverage_verified": 1,
+        "knowledge_direction_inapplicable_skip_verified": True,
+        "knowledge_direction_inapplicable_transcript_turns": 0,
+        "knowledge_direction_inapplicable_data_dispatches": 0,
+        "knowledge_direction_inapplicable_claude_dispatches": 0,
         "knowledge_rejected_inputs_verified": 1,
         "knowledge_rejected_agent_dispatches": 0,
         "knowledge_rejected_exchanges": 0,
@@ -1969,6 +2424,117 @@ def _verify_transcript(run_id: str) -> dict[str, Any]:
     return verified
 
 
+def _assert_focused_reextraction_provider_failures(
+    root: Path,
+    run_id: str,
+    *,
+    document_attempt_count: int,
+    failed_attempt_numbers: Sequence[int],
+) -> int:
+    """Allow only the workflow's explicit partial re-extraction fallback.
+
+    A document-analyzer provider failure is ordinarily fatal.  The bounded
+    workflow deliberately catches one *focused* retry failure per document,
+    however, preserves the first extraction, and returns a human-review
+    partial result.  The caller has already required Agent's explicit
+    ``analysis_phase=focused_reextraction`` marker; this helper additionally
+    correlates it with public-safe workflow attempt counts, an unavailable
+    re-extraction, and the terminal partial result.  Nothing from the source
+    document, prompt, provider output, or Agent result is returned.
+    """
+
+    if not failed_attempt_numbers or document_attempt_count < 1:
+        raise MatrixError("claude_focused_reextraction_receipt_invalid")
+    directory = root / run_id
+    summary_path = directory / "summary.json"
+    backend_path = directory / "backend-agent.jsonl"
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        backend_events = [
+            json.loads(line) for line in backend_path.read_text(encoding="utf-8").splitlines() if line
+        ]
+    except (OSError, json.JSONDecodeError) as exc:
+        raise MatrixError("claude_focused_reextraction_receipt_invalid") from exc
+    if (
+        not isinstance(summary, Mapping)
+        or summary.get("status") != "completed"
+        or summary.get("execution_status") != "partial"
+        or not backend_events
+        or not all(isinstance(event, Mapping) for event in backend_events)
+    ):
+        raise MatrixError("claude_focused_reextraction_receipt_invalid")
+    review_responses = [event for event in backend_events if event.get("event") == "review_response"]
+    if len(review_responses) != 1 or not isinstance(review_responses[0].get("payload"), Mapping):
+        raise MatrixError("claude_focused_reextraction_receipt_invalid")
+    response_body = review_responses[0]["payload"].get("response_body")
+    if not isinstance(response_body, Mapping) or response_body.get("execution_status") != "partial":
+        raise MatrixError("claude_focused_reextraction_receipt_invalid")
+    workflow = response_body.get("workflow")
+    if not isinstance(workflow, Mapping) or workflow.get("status") != "partial":
+        raise MatrixError("claude_focused_reextraction_receipt_invalid")
+    reextractions = workflow.get("reextractions")
+    stages = workflow.get("stages")
+    if (
+        not isinstance(reextractions, list)
+        or not reextractions
+        or not isinstance(stages, list)
+        or any(not isinstance(item, Mapping) for item in reextractions)
+        or any(not isinstance(stage, Mapping) for stage in stages)
+    ):
+        raise MatrixError("claude_focused_reextraction_receipt_invalid")
+    unavailable_count = sum(item.get("status") == "unavailable" for item in reextractions)
+    if unavailable_count != len(failed_attempt_numbers):
+        raise MatrixError("claude_focused_reextraction_receipt_invalid")
+    required_stage_names = (
+        "classify_documents",
+        "extract_facts",
+        "reextract_documents",
+    )
+    if any(
+        sum(stage.get("stage") == stage_name for stage in stages) != 1
+        for stage_name in required_stage_names
+    ):
+        raise MatrixError("claude_focused_reextraction_receipt_invalid")
+    stage_by_name = {
+        stage.get("stage"): stage
+        for stage in stages
+        if isinstance(stage.get("stage"), str)
+    }
+    initial_stage = stage_by_name.get("classify_documents")
+    extraction_stage = stage_by_name.get("extract_facts")
+    reextraction_stage = stage_by_name.get("reextract_documents")
+    if (
+        not isinstance(initial_stage, Mapping)
+        or not isinstance(extraction_stage, Mapping)
+        or not isinstance(reextraction_stage, Mapping)
+    ):
+        raise MatrixError("claude_focused_reextraction_receipt_invalid")
+    initial_attempt_count = initial_stage.get("attempt_count")
+    extraction_attempt_count = extraction_stage.get("attempt_count")
+    if (
+        not isinstance(initial_attempt_count, int)
+        or initial_attempt_count < 1
+        or not isinstance(extraction_attempt_count, int)
+        or extraction_attempt_count != initial_attempt_count + len(reextractions)
+        or document_attempt_count != extraction_attempt_count
+        or reextraction_stage.get("status") != "needs_review"
+        or reextraction_stage.get("attempt_count") != len(reextractions)
+        or any(
+            not isinstance(item.get("attempt_count"), int)
+            or item["attempt_count"] not in {1, 2}
+            or item.get("status") not in {"completed", "unavailable"}
+            for item in reextractions
+        )
+        or any(
+            attempt_number <= initial_attempt_count
+            or attempt_number > extraction_attempt_count
+            for attempt_number in failed_attempt_numbers
+        )
+    ):
+        raise MatrixError("claude_focused_reextraction_receipt_invalid")
+    return unavailable_count
+
+
 def _assert_real_provider_trace(run_ids: Sequence[str]) -> dict[str, Any]:
     root = workspace_transcript_root()
     total_claude_events = 0
@@ -1978,6 +2544,7 @@ def _assert_real_provider_trace(run_ids: Sequence[str]) -> dict[str, Any]:
     report_fallback_count = 0
     assistant_accepted_count = 0
     assistant_fallback_count = 0
+    focused_reextraction_unavailable_count = 0
     for run_id in run_ids:
         path = root / run_id / "claude.jsonl"
         try:
@@ -2002,9 +2569,70 @@ def _assert_real_provider_trace(run_ids: Sequence[str]) -> dict[str, Any]:
         request_states = {
             request_event: "idle" for request_event in _PROVIDER_REQUEST_RESPONSE_EVENTS
         }
+        document_request_state = "idle"
+        document_attempt_phase: str | None = None
+        document_attempt_count = 0
+        document_failure_attempt_numbers: list[int] = []
         for event in events:
             event_name = event["event"]
             payload = event.get("payload")
+            if event_name == _DOCUMENT_PROVIDER_REQUEST_EVENT:
+                if document_request_state not in {"idle", "responded"}:
+                    raise MatrixError("claude_provider_sequence_invalid")
+                if (
+                    not isinstance(payload, Mapping)
+                    or payload.get("provider") != "anthropic"
+                    or not isinstance(payload.get("model"), str)
+                    or not payload["model"].strip()
+                    or payload.get("analysis_phase") not in _DOCUMENT_ANALYSIS_PHASES
+                ):
+                    raise MatrixError("claude_provider_payload_invalid")
+                document_attempt_count += 1
+                document_attempt_phase = payload["analysis_phase"]
+                document_request_state = "requested"
+                continue
+            if event_name == _DOCUMENT_PROVIDER_RESPONSE_EVENT:
+                if document_request_state != "requested":
+                    raise MatrixError("claude_provider_sequence_invalid")
+                if (
+                    not isinstance(payload, Mapping)
+                    or payload.get("provider") != "anthropic"
+                    or not isinstance(payload.get("model"), str)
+                    or not payload["model"].strip()
+                    or payload.get("analysis_phase") != document_attempt_phase
+                ):
+                    raise MatrixError("claude_provider_payload_invalid")
+                document_request_state = "responded"
+                continue
+            if event_name in _DOCUMENT_PROVIDER_FAILURE_EVENTS:
+                accepted_states = (
+                    {"requested", "responded"}
+                    if event_name == "response_invalid"
+                    else {"requested"}
+                )
+                if document_request_state not in accepted_states:
+                    raise MatrixError("claude_provider_sequence_invalid")
+                if (
+                    not isinstance(payload, Mapping)
+                    or set(payload) != {"provider", "model", "error_code", "analysis_phase"}
+                    or payload.get("provider") != "anthropic"
+                    or not isinstance(payload.get("model"), str)
+                    or not payload["model"].strip()
+                    or payload.get("error_code")
+                    not in _DOCUMENT_PROVIDER_FAILURE_ERROR_CODES[event_name]
+                    or payload.get("analysis_phase") != document_attempt_phase
+                ):
+                    raise MatrixError("claude_provider_payload_invalid")
+                if (
+                    event_name != "response_invalid"
+                    or payload.get("error_code") != "provider_output_invalid"
+                    or document_attempt_phase != _DOCUMENT_ANALYSIS_FOCUSED_PHASE
+                ):
+                    raise MatrixError("claude_provider_request_or_json_failed")
+                document_failure_attempt_numbers.append(document_attempt_count)
+                document_request_state = "idle"
+                document_attempt_phase = None
+                continue
             if event_name in _PROVIDER_FAILURE_EVENTS:
                 raise MatrixError("claude_provider_request_or_json_failed")
             if event_name in _PROVIDER_REQUEST_RESPONSE_EVENTS:
@@ -2084,12 +2712,23 @@ def _assert_real_provider_trace(run_ids: Sequence[str]) -> dict[str, Any]:
                 raise MatrixError("claude_assistant_context_invalid")
             max_recent_turns = max(max_recent_turns, len(recent_turns))
             observed_eight_turn_boundary = observed_eight_turn_boundary or len(recent_turns) == 8
+        if document_request_state not in {"idle", "responded"}:
+            raise MatrixError("claude_provider_sequence_invalid")
         for request_event, state in request_states.items():
             if request_event == "assistant_answer_request_started" and state == "responded":
                 assistant_accepted_count += 1
                 continue
             if state != "idle":
                 raise MatrixError("claude_provider_sequence_invalid")
+        if document_failure_attempt_numbers:
+            focused_reextraction_unavailable_count += (
+                _assert_focused_reextraction_provider_failures(
+                    root,
+                    run_id,
+                    document_attempt_count=document_attempt_count,
+                    failed_attempt_numbers=document_failure_attempt_numbers,
+                )
+            )
         total_claude_events += len(events)
     if report_accepted_count < 1:
         raise MatrixError("claude_provider_report_unaccepted")
@@ -2105,6 +2744,7 @@ def _assert_real_provider_trace(run_ids: Sequence[str]) -> dict[str, Any]:
         "provider_report_fallback_count": report_fallback_count,
         "provider_assistant_accepted_count": assistant_accepted_count,
         "provider_assistant_fallback_count": assistant_fallback_count,
+        "provider_focused_reextraction_unavailable_count": focused_reextraction_unavailable_count,
     }
 
 
@@ -2162,6 +2802,8 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
             title="General customs guidance",
             question="원산지 증명서 확인 절차는 무엇인가요?",
             expected_scope="general_customs_guidance",
+            require_guidance_resolution=True,
+            required_registry_version="2.0",
         )
         _conversation(
             reviewer,
@@ -2191,6 +2833,11 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
         )
         matching_run_id = runs["all-documents-match"][2]
         matching_run = runs["all-documents-match"][3]
+        case_document_paste = _assert_case_document_paste_zero_dispatch(
+            reviewer,
+            run_id=matching_run_id,
+            run=matching_run,
+        )
         _conversation(
             reviewer,
             run_id=matching_run_id,
@@ -2236,12 +2883,14 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
         return {
             "status": "passed",
             "profile": "functional-uat",
+            "guidance_profile": _V2_GUIDANCE_PROFILE,
             "scenario_count": len(executed),
             "review_run_count": len(all_run_ids),
             "scenarios": executed,
             "child_run_id": child_run_id,
             "replacement_run_id": replacement_run_id,
             "transcripts_verified": len(transcripts),
+            "case_document_paste": case_document_paste,
             "knowledge_guidance": knowledge_guidance,
             **trace,
         }

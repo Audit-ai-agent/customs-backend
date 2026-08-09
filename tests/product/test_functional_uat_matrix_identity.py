@@ -201,6 +201,163 @@ def test_matrix_replacement_document_uses_a_korean_business_filename() -> None:
     assert matrix._REPLACEMENT_DOCUMENT_FILENAME == "상업송장_보완본.txt"
 
 
+def _prepare_case_document_paste_streams(tmp_path: Path, run_id: str) -> None:
+    directory = tmp_path / run_id
+    directory.mkdir()
+    for stream in matrix._CASE_DOCUMENT_PASTE_STREAMS:
+        (directory / f"{stream}.jsonl").write_bytes(b"opaque-existing-event\n")
+
+
+def _case_document_paste_assistant() -> dict[str, Any]:
+    # Deliberately omit user/assistant prose: the matrix guard must validate
+    # fixed safe fields without looking at a pasted body or generated prose.
+    return {
+        "role": "assistant",
+        "answer_scope": "insufficient_evidence",
+        "case_input_notice": "unregistered_document_text",
+        "citations": [],
+        "answer_sections": [],
+    }
+
+
+def test_case_document_paste_matrix_keeps_safe_aggregate_zero_dispatch_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = "run-case-document-paste"
+    _prepare_case_document_paste_streams(tmp_path, run_id)
+    review = _matching_result()
+    sent_paste_count = 0
+
+    class FakeApi:
+        def require(
+            self,
+            method: str,
+            path: str,
+            *,
+            body: dict[str, Any] | None = None,
+            **_kwargs: Any,
+        ) -> dict[str, Any]:
+            nonlocal sent_paste_count
+            if method == "POST" and path.endswith("/assistant/conversations"):
+                return {"conversation_id": "conversation-case-document-paste"}
+            if method == "POST" and path.endswith("/messages"):
+                assert body == {"content": matrix._CASE_DOCUMENT_PASTE_CONTENT}
+                sent_paste_count += 1
+                return {"assistant_message": _case_document_paste_assistant()}
+            if method == "GET" and path == f"/review-runs/{run_id}":
+                return deepcopy(review)
+            if method == "GET" and path.endswith("/correction-proposals"):
+                return {"items": []}
+            raise AssertionError(f"unexpected request: {method} {path}")
+
+    monkeypatch.setattr(matrix, "workspace_transcript_root", lambda: tmp_path)
+
+    receipt = matrix._assert_case_document_paste_zero_dispatch(
+        FakeApi(), run_id=run_id, run=review
+    )
+
+    assert sent_paste_count == 1
+    assert receipt == {
+        "status": "passed",
+        "case_document_paste_notice_verified": True,
+        "case_document_paste_agent_http_exchanges": 0,
+        "case_document_paste_public_transcript_exchanges": 0,
+        "case_document_paste_agent_data_dispatches": 0,
+        "case_document_paste_claude_dispatches": 0,
+        "case_document_paste_fact_changes": 0,
+        "case_document_paste_finding_changes": 0,
+        "case_document_paste_correction_changes": 0,
+    }
+    assert matrix._CASE_DOCUMENT_PASTE_CONTENT not in repr(receipt)
+    assert "conversation-case-document-paste" not in repr(receipt)
+
+
+@pytest.mark.parametrize("changed_stream", matrix._CASE_DOCUMENT_PASTE_STREAMS)
+def test_case_document_paste_matrix_rejects_any_dispatch_stream_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_stream: str
+) -> None:
+    run_id = "run-case-document-paste-dispatch"
+    _prepare_case_document_paste_streams(tmp_path, run_id)
+    review = _matching_result()
+
+    class FakeApi:
+        def require(
+            self,
+            method: str,
+            path: str,
+            *,
+            body: dict[str, Any] | None = None,
+            **_kwargs: Any,
+        ) -> dict[str, Any]:
+            if method == "POST" and path.endswith("/assistant/conversations"):
+                return {"conversation_id": "conversation-case-document-paste"}
+            if method == "POST" and path.endswith("/messages"):
+                assert body == {"content": matrix._CASE_DOCUMENT_PASTE_CONTENT}
+                with (tmp_path / run_id / f"{changed_stream}.jsonl").open("ab") as handle:
+                    handle.write(b"unexpected-dispatch\n")
+                return {"assistant_message": _case_document_paste_assistant()}
+            if method == "GET" and path.endswith("/correction-proposals"):
+                return {"items": []}
+            raise AssertionError(f"unexpected request: {method} {path}")
+
+    monkeypatch.setattr(matrix, "workspace_transcript_root", lambda: tmp_path)
+
+    with pytest.raises(matrix.MatrixError, match="case_document_paste_transcript_dispatch"):
+        matrix._assert_case_document_paste_zero_dispatch(FakeApi(), run_id=run_id, run=review)
+
+
+@pytest.mark.parametrize(
+    ("changed_state", "error"),
+    [
+        ("facts", "case_document_paste_review_state_changed"),
+        ("findings", "case_document_paste_review_state_changed"),
+        ("corrections", "case_document_paste_correction_state_changed"),
+    ],
+)
+def test_case_document_paste_matrix_rejects_fact_finding_or_correction_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_state: str,
+    error: str,
+) -> None:
+    run_id = "run-case-document-paste-state"
+    _prepare_case_document_paste_streams(tmp_path, run_id)
+    review = _matching_result()
+    pasted = False
+
+    class FakeApi:
+        def require(
+            self,
+            method: str,
+            path: str,
+            *,
+            body: dict[str, Any] | None = None,
+            **_kwargs: Any,
+        ) -> dict[str, Any]:
+            nonlocal pasted
+            if method == "POST" and path.endswith("/assistant/conversations"):
+                return {"conversation_id": "conversation-case-document-paste"}
+            if method == "POST" and path.endswith("/messages"):
+                assert body == {"content": matrix._CASE_DOCUMENT_PASTE_CONTENT}
+                pasted = True
+                return {"assistant_message": _case_document_paste_assistant()}
+            if method == "GET" and path == f"/review-runs/{run_id}":
+                value = deepcopy(review)
+                if pasted and changed_state == "facts":
+                    value["document_analyses"][0]["facts"].append({})
+                if pasted and changed_state == "findings":
+                    value["findings"].append({})
+                return value
+            if method == "GET" and path.endswith("/correction-proposals"):
+                return {"items": [{}] if pasted and changed_state == "corrections" else []}
+            raise AssertionError(f"unexpected request: {method} {path}")
+
+    monkeypatch.setattr(matrix, "workspace_transcript_root", lambda: tmp_path)
+
+    with pytest.raises(matrix.MatrixError, match=error):
+        matrix._assert_case_document_paste_zero_dispatch(FakeApi(), run_id=run_id, run=review)
+
+
 def _matching_result() -> dict[str, Any]:
     return {
         "review_as_of": "2026-08-05",
@@ -450,6 +607,45 @@ def _official_guidance_citation() -> dict[str, str]:
     }
 
 
+def _v2_guidance_resolution(
+    *,
+    topic: str,
+    scope: str,
+    requested_direction: str = "export",
+    applicable_directions: list[str] | None = None,
+    coverage: str = "covered",
+    snapshot_id: str | None = "kr-trade-v2-snapshot-20260805",
+) -> dict[str, Any]:
+    return {
+        "topic": topic,
+        "scope": scope,
+        "requested_direction": requested_direction,
+        "applicable_directions": applicable_directions or [requested_direction],
+        "coverage": coverage,
+        "snapshot_id": snapshot_id,
+        "as_of": "2026-08-05",
+        "registry_version": "2.0",
+    }
+
+
+def _v2_guidance_citation(
+    *,
+    source_id: str,
+    source_title: str,
+    source_uri: str,
+) -> dict[str, str]:
+    return {
+        "kind": "guidance_evidence",
+        "source_id": source_id,
+        "source_kind": "official_agency_guidance",
+        "source_title": source_title,
+        "source_uri": source_uri,
+        "as_of": "2026-08-05",
+        "snapshot_id": "kr-trade-v2-snapshot-20260805",
+        "coverage": "covered",
+    }
+
+
 @pytest.mark.parametrize(
     "source_uri",
     [
@@ -496,6 +692,83 @@ def test_mixed_assistant_answer_keeps_case_and_official_guidance_sections_separa
         },
         run=_matching_result(),
     )
+
+
+def test_case_application_requires_v2_resolution_and_separated_citations() -> None:
+    guidance = _v2_guidance_citation(
+        source_id="record-v2-import-clearance",
+        source_title="수입 통관",
+        source_uri=(
+            "https://www.customs.go.kr/kcs/cm/cntnts/cntntsView.do?cntntsId=817&mi=2819"
+        ),
+    )
+    resolution = _v2_guidance_resolution(
+        topic="customs_clearance",
+        scope="import_clearance_flow",
+        requested_direction="import",
+        applicable_directions=["import"],
+    )
+    matrix._assert_case_application_sections(
+        {
+            "role": "assistant",
+            "answer_scope": "case_grounded",
+            "content": "현재 사건의 수량 비교와 일반 수입 통관 안내를 구분해 다음 확인 항목을 정리했습니다.",
+            "citations": [{"kind": "comparison"}, guidance],
+            "suggested_questions": [],
+            "guidance_resolution": resolution,
+            "answer_sections": [
+                {
+                    "kind": "case_analysis",
+                    "title": "현재 사건 기준",
+                    "content": "현재 심사 결과에서는 수량 비교 항목을 먼저 확인해야 합니다.",
+                    "citations": [{"kind": "comparison"}],
+                },
+                {
+                    "kind": "general_guidance",
+                    "title": "일반 통관 안내",
+                    "content": "공식 수입 통관 안내의 절차 범위를 확인할 수 있습니다.",
+                    "citations": [guidance],
+                },
+                {
+                    "kind": "case_application",
+                    "title": "사건 적용·다음 확인",
+                    "content": "현재 사건에서는 수량 비교를 유지한 채 필요한 통관 절차 문서를 추가로 확인해 주세요.",
+                    "citations": [{"kind": "comparison"}, guidance],
+                },
+            ],
+        },
+        run=_matching_result(),
+    )
+
+
+def test_v2_guidance_uri_must_match_the_exact_manifest_page() -> None:
+    citation = _v2_guidance_citation(
+        source_id="record-v2-import-clearance",
+        source_title="수입 통관",
+        source_uri=(
+            "https://www.customs.go.kr/kcs/cm/cntnts/cntntsView.do?cntntsId=817&mi=2819"
+        ),
+    )
+    resolution = _v2_guidance_resolution(
+        topic="customs_clearance",
+        scope="import_clearance_flow",
+        requested_direction="import",
+        applicable_directions=["import"],
+    )
+    matrix._assert_official_guidance_citations(
+        [citation],
+        expected_as_of="2026-08-05",
+        code="v2_guidance",
+        guidance_resolution=resolution,
+    )
+    citation["source_uri"] += "&unregistered=1"
+    with pytest.raises(matrix.MatrixError, match="v2_guidance_registry_source"):
+        matrix._assert_official_guidance_citations(
+            [citation],
+            expected_as_of="2026-08-05",
+            code="v2_guidance",
+            guidance_resolution=resolution,
+        )
 
 
 def test_export_matrix_scenario_requires_agent_export_document_facts_and_comparisons() -> None:
@@ -553,8 +826,20 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
     calls: list[tuple[str, str, dict[str, Any] | None]] = []
     verified: list[Path] = []
     provider_traces: list[Path] = []
-    no_coverage_traces: list[Path] = []
-    guidance = _official_guidance_citation()
+    export_guidance = _v2_guidance_citation(
+        source_id="record-v2-export-requirements",
+        source_title="수출 통관",
+        source_uri=(
+            "https://www2.customs.go.kr/kcs/cm/cntnts/cntntsView.do?cntntsId=818&mi=2820"
+        ),
+    )
+    fta_guidance = _v2_guidance_citation(
+        source_id="record-v2-fta-procedure",
+        source_title="원산지증명서 개요",
+        source_uri=(
+            "https://www.customs.go.kr/ftaportalkor/cm/cntnts/cntntsView.do?cntntsId=1061&mi=3401"
+        ),
+    )
     knowledge_turn_count = 0
 
     class FakeApi:
@@ -592,10 +877,30 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
                             "citations": [],
                             "answer_sections": [],
                             "knowledge_coverage": "no_coverage",
-                            "knowledge_snapshot_id": "kr-trade-snapshot-20260805",
                             "knowledge_as_of": "2026-08-05",
+                            "guidance_resolution": _v2_guidance_resolution(
+                                topic="customs_duty",
+                                scope="customs_value_basics",
+                                requested_direction="export",
+                                applicable_directions=["import"],
+                                coverage="no_coverage",
+                                snapshot_id=None,
+                            ),
                         }
                     }
+                guidance = export_guidance if knowledge_turn_count == 1 else fta_guidance
+                resolution = (
+                    _v2_guidance_resolution(
+                        topic="export_requirements",
+                        scope="agency_confirmation_and_supporting_documents",
+                    )
+                    if knowledge_turn_count == 1
+                    else _v2_guidance_resolution(
+                        topic="fta_procedure",
+                        scope="preference_procedure",
+                        applicable_directions=["import", "export"],
+                    )
+                )
                 return {
                     "assistant_message": {
                         "role": "assistant",
@@ -604,8 +909,9 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
                         "citations": [guidance],
                         "answer_sections": [{"kind": "general_guidance", "citations": [guidance]}],
                         "knowledge_coverage": "covered",
-                        "knowledge_snapshot_id": "kr-trade-snapshot-20260805",
+                        "knowledge_snapshot_id": "kr-trade-v2-snapshot-20260805",
                         "knowledge_as_of": "2026-08-05",
+                        "guidance_resolution": resolution,
                     }
                 }
             if method == "GET" and path.endswith("/messages"):
@@ -614,18 +920,15 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
                         {"role": "user"},
                         {
                             "role": "assistant",
-                            "knowledge_snapshot_id": "kr-trade-snapshot-20260805",
+                            "knowledge_snapshot_id": "kr-trade-v2-snapshot-20260805",
                         },
                         {"role": "user"},
                         {
                             "role": "assistant",
-                            "knowledge_snapshot_id": "kr-trade-snapshot-20260805",
+                            "knowledge_snapshot_id": "kr-trade-v2-snapshot-20260805",
                         },
                         {"role": "user"},
-                        {
-                            "role": "assistant",
-                            "knowledge_snapshot_id": "kr-trade-snapshot-20260805",
-                        },
+                        {"role": "assistant"},
                     ]
                 }
             if method == "GET" and path == "/knowledge/conversations":
@@ -633,7 +936,7 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
                     "items": [
                         {
                             "conversation_id": "knowledge-conversation-1",
-                            "snapshot_id": "kr-trade-snapshot-20260805",
+                            "snapshot_id": "kr-trade-v2-snapshot-20260805",
                         }
                     ]
                 }
@@ -644,18 +947,12 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
         "_knowledge_turn_directories",
         lambda _conversation_id, *, expected_count: (
             [
-                Path("turn-" + "c" * 32),
                 Path("turn-" + "a" * 32),
                 Path("turn-" + "b" * 32),
             ]
-            if expected_count == 3
+            if expected_count == 2
             else (_ for _ in ()).throw(AssertionError("unexpected turn count"))
         ),
-    )
-    monkeypatch.setattr(
-        matrix,
-        "_assert_knowledge_provider_not_called_for_no_coverage",
-        lambda turn_directory: no_coverage_traces.append(turn_directory) or 1,
     )
     monkeypatch.setattr(
         matrix,
@@ -666,18 +963,14 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
         matrix,
         "_assert_real_knowledge_provider_trace",
         lambda turn_directory: (
-            (_ for _ in ()).throw(matrix.MatrixError("knowledge_claude_provider_answer_unaccepted"))
-            if turn_directory.name == "turn-" + "c" * 32
-            else (
-                provider_traces.append(turn_directory)
-                or {
-                    "knowledge_provider": "anthropic",
-                    "knowledge_claude_event_count": 2,
-                    "knowledge_provider_attempt_count": 1,
-                    "knowledge_provider_accepted_count": 1,
-                    "knowledge_provider_safe_fallback_count": 0,
-                }
-            )
+            provider_traces.append(turn_directory)
+            or {
+                "knowledge_provider": "anthropic",
+                "knowledge_claude_event_count": 2,
+                "knowledge_provider_attempt_count": 1,
+                "knowledge_provider_accepted_count": 1,
+                "knowledge_provider_safe_fallback_count": 0,
+            }
         ),
     )
 
@@ -688,13 +981,17 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
         "official_guidance_citations_verified": 2,
         "snapshot_pinned": True,
         "agent_knowledge_transcript_verified": True,
-        "knowledge_turns_verified": 3,
+        "knowledge_turns_verified": 2,
         "knowledge_recent_history_verified": 1,
         "knowledge_no_coverage_verified": 1,
-        "knowledge_no_coverage_not_called_count": 1,
+        "knowledge_direction_inapplicable_skip_verified": True,
+        "knowledge_direction_inapplicable_transcript_turns": 0,
+        "knowledge_direction_inapplicable_data_dispatches": 0,
+        "knowledge_direction_inapplicable_claude_dispatches": 0,
         "knowledge_rejected_inputs_verified": 1,
         "knowledge_rejected_agent_dispatches": 0,
         "knowledge_rejected_exchanges": 0,
+        "knowledge_data_no_coverage_non_call_turn_count": 0,
         "knowledge_provider": "anthropic",
         "knowledge_claude_event_count": 4,
         "knowledge_provider_attempt_count": 2,
@@ -703,13 +1000,9 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
     }
     assert "knowledge-conversation-1" not in repr(receipt)
     assert "수출 요건을 공식 자료 범위에서 알려 주세요." not in repr(receipt)
-    assert verified == [
-        Path("turn-" + "c" * 32),
-        Path("turn-" + "a" * 32),
-        Path("turn-" + "b" * 32),
-    ]
+    assert verified == [Path("turn-" + "a" * 32), Path("turn-" + "b" * 32)]
     assert provider_traces == [Path("turn-" + "a" * 32), Path("turn-" + "b" * 32)]
-    assert no_coverage_traces == [Path("turn-" + "c" * 32)]
+    assert knowledge_turn_count == 3
     assert calls[0] == (
         "POST",
         "/knowledge/conversations",
@@ -725,7 +1018,7 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
     ] == [
         "수출 요건을 공식 자료 범위에서 알려 주세요.",
         "FTA 특혜 적용 절차도 공식 자료 범위에서 알려 주세요.",
-        "수출 운송 서류도 공식 자료 범위에서 알려 주세요.",
+        "수출 과세가격의 기본을 공식 자료 범위에서 알려 주세요.",
     ]
 
 
@@ -756,12 +1049,13 @@ def test_agent_knowledge_transcript_verifier_runs_with_safe_result_only(
     assert invoked[0]["encoding"] == "utf-8"
 
 
-def test_matrix_run_includes_export_mixed_and_safe_standalone_knowledge_receipt(
+def test_matrix_run_keeps_v2_direction_skip_and_case_paste_boundaries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     scenarios = matrix._scenario_matrix()
     created: list[str] = []
     mixed: list[str] = []
+    document_paste_runs: list[str] = []
     standalone_calls: list[bool] = []
 
     class FakeOidc:
@@ -799,6 +1093,24 @@ def test_matrix_run_includes_export_mixed_and_safe_standalone_knowledge_receipt(
     monkeypatch.setattr(matrix, "_conversation", lambda *_args, **_kwargs: "conversation")
     monkeypatch.setattr(
         matrix,
+        "_assert_case_document_paste_zero_dispatch",
+        lambda _api, *, run_id, run: (
+            document_paste_runs.append(run_id)
+            or {
+                "status": "passed",
+                "case_document_paste_notice_verified": True,
+                "case_document_paste_agent_http_exchanges": 0,
+                "case_document_paste_public_transcript_exchanges": 0,
+                "case_document_paste_agent_data_dispatches": 0,
+                "case_document_paste_claude_dispatches": 0,
+                "case_document_paste_fact_changes": 0,
+                "case_document_paste_finding_changes": 0,
+                "case_document_paste_correction_changes": 0,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        matrix,
         "_mixed_conversation",
         lambda _api, *, run_id, run: mixed.append(run_id),
     )
@@ -812,6 +1124,12 @@ def test_matrix_run_includes_export_mixed_and_safe_standalone_knowledge_receipt(
                 "official_guidance_citations_verified": 1,
                 "snapshot_pinned": True,
                 "agent_knowledge_transcript_verified": True,
+                "knowledge_turns_verified": 2,
+                "knowledge_direction_inapplicable_skip_verified": True,
+                "knowledge_direction_inapplicable_transcript_turns": 0,
+                "knowledge_direction_inapplicable_data_dispatches": 0,
+                "knowledge_direction_inapplicable_claude_dispatches": 0,
+                "knowledge_data_no_coverage_non_call_turn_count": 0,
                 "knowledge_provider": "anthropic",
                 "knowledge_claude_event_count": 2,
                 "knowledge_provider_accepted_count": 1,
@@ -843,14 +1161,33 @@ def test_matrix_run_includes_export_mixed_and_safe_standalone_knowledge_receipt(
 
     assert result["scenario_count"] == 7
     assert result["review_run_count"] == 9
+    assert result["guidance_profile"] == "functional-uat-kr-trade-v2"
     assert created == [scenario.name for scenario in scenarios]
     assert "run-all-documents-match" in mixed
+    assert document_paste_runs == ["run-all-documents-match"]
+    assert result["case_document_paste"] == {
+        "status": "passed",
+        "case_document_paste_notice_verified": True,
+        "case_document_paste_agent_http_exchanges": 0,
+        "case_document_paste_public_transcript_exchanges": 0,
+        "case_document_paste_agent_data_dispatches": 0,
+        "case_document_paste_claude_dispatches": 0,
+        "case_document_paste_fact_changes": 0,
+        "case_document_paste_finding_changes": 0,
+        "case_document_paste_correction_changes": 0,
+    }
     assert standalone_calls == [True]
     assert result["knowledge_guidance"] == {
         "status": "passed",
         "official_guidance_citations_verified": 1,
         "snapshot_pinned": True,
         "agent_knowledge_transcript_verified": True,
+        "knowledge_turns_verified": 2,
+        "knowledge_direction_inapplicable_skip_verified": True,
+        "knowledge_direction_inapplicable_transcript_turns": 0,
+        "knowledge_direction_inapplicable_data_dispatches": 0,
+        "knowledge_direction_inapplicable_claude_dispatches": 0,
+        "knowledge_data_no_coverage_non_call_turn_count": 0,
         "knowledge_provider": "anthropic",
         "knowledge_claude_event_count": 2,
         "knowledge_provider_accepted_count": 1,
@@ -917,6 +1254,65 @@ def _write_provider_trace(tmp_path: Path, run_id: str, events: list[dict[str, An
     )
 
 
+def _document_trace_with_focused_reextraction_failure(
+    *,
+    event: str = "response_invalid",
+    error_code: str = "provider_output_invalid",
+) -> list[dict[str, Any]]:
+    """Safe event-only fixture: two initial calls, then one retry failure."""
+
+    provider = {"provider": "anthropic", "model": "claude-test"}
+    initial = {**provider, "analysis_phase": "initial_extraction"}
+    focused = {**provider, "analysis_phase": "focused_reextraction"}
+    failure = {
+        "event": event,
+        "payload": {**focused, "error_code": error_code},
+    }
+    retry_terminal = (
+        [] if event == "request_failed" else [{"event": "response_received", "payload": focused}]
+    )
+    return [
+        {"event": "request_started", "payload": initial},
+        {"event": "response_received", "payload": initial},
+        {"event": "request_started", "payload": initial},
+        {"event": "response_received", "payload": initial},
+        {"event": "request_started", "payload": focused},
+        *retry_terminal,
+        failure,
+    ]
+
+
+def _write_focused_reextraction_partial_receipt(tmp_path: Path, run_id: str) -> None:
+    """Write only the safe workflow metadata used by the Matrix verifier."""
+
+    directory = tmp_path / run_id
+    workflow = {
+        "status": "partial",
+        "stages": [
+            {"stage": "classify_documents", "status": "completed", "attempt_count": 2},
+            {"stage": "extract_facts", "status": "completed", "attempt_count": 3},
+            {"stage": "reextract_documents", "status": "needs_review", "attempt_count": 1},
+        ],
+        "reextractions": [{"status": "unavailable", "attempt_count": 1}],
+    }
+    (directory / "summary.json").write_text(
+        json.dumps({"status": "completed", "execution_status": "partial"}),
+        encoding="utf-8",
+    )
+    (directory / "backend-agent.jsonl").write_text(
+        json.dumps(
+            {
+                "event": "review_response",
+                "payload": {
+                    "response_body": {"execution_status": "partial", "workflow": workflow}
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _write_knowledge_provider_trace(tmp_path: Path, events: list[dict[str, Any]]) -> Path:
     turn = tmp_path / "knowledge" / "knowledge-conversation" / ("turn-" + "a" * 32)
     turn.mkdir(parents=True)
@@ -979,7 +1375,7 @@ def test_real_knowledge_provider_trace_records_an_accepted_anthropic_answer_in_s
     assert "안전한 응답" not in repr(receipt)
 
 
-def test_knowledge_no_coverage_trace_requires_explicit_safe_non_call(tmp_path: Path) -> None:
+def test_data_no_coverage_trace_requires_explicit_safe_non_call(tmp_path: Path) -> None:
     turn = _write_knowledge_provider_trace(tmp_path, _knowledge_no_coverage_trace())
 
     assert matrix._assert_knowledge_provider_not_called_for_no_coverage(turn) == 1
@@ -999,13 +1395,51 @@ def test_knowledge_no_coverage_trace_requires_explicit_safe_non_call(tmp_path: P
         },
     ],
 )
-def test_knowledge_no_coverage_trace_rejects_any_provider_or_reason_deviation(
+def test_data_no_coverage_trace_rejects_any_provider_or_reason_deviation(
     tmp_path: Path, event: dict[str, Any]
 ) -> None:
     turn = _write_knowledge_provider_trace(tmp_path, [event])
 
     with pytest.raises(matrix.MatrixError, match="knowledge_no_coverage_claude"):
         matrix._assert_knowledge_provider_not_called_for_no_coverage(turn)
+
+
+def test_direction_inapplicable_skip_rejects_an_extra_data_no_coverage_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """V2 direction policy skips Data/Claude instead of creating a third turn."""
+
+    turns = [
+        Path("turn-" + "a" * 32),
+        Path("turn-" + "b" * 32),
+        Path("turn-" + "c" * 32),
+    ]
+    monkeypatch.setattr(matrix, "_verify_agent_knowledge_transcript", lambda _turn: None)
+    monkeypatch.setattr(
+        matrix,
+        "_assert_knowledge_provider_not_called_for_no_coverage",
+        lambda _turn: 1,
+    )
+
+    def classify(turn: Path) -> dict[str, Any]:
+        if turn.name == "turn-" + "c" * 32:
+            raise matrix.MatrixError("knowledge_claude_provider_answer_unaccepted")
+        return {
+            "knowledge_provider": "anthropic",
+            "knowledge_claude_event_count": 2,
+            "knowledge_provider_attempt_count": 1,
+            "knowledge_provider_accepted_count": 1,
+            "knowledge_provider_safe_fallback_count": 0,
+        }
+
+    monkeypatch.setattr(matrix, "_assert_real_knowledge_provider_trace", classify)
+
+    with pytest.raises(matrix.MatrixError, match="knowledge_claude_provider_payload_invalid"):
+        matrix._assert_knowledge_provider_turns(
+            turns,
+            expected_covered_turns=2,
+            expected_data_no_coverage_non_call_turns=0,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1161,7 +1595,11 @@ def test_knowledge_provider_turns_do_not_count_safe_fallback_as_accepted_claude(
     monkeypatch.setattr(matrix, "_assert_real_knowledge_provider_trace", classify)
 
     with pytest.raises(matrix.MatrixError, match="knowledge_claude_provider_answer_unaccepted"):
-        matrix._assert_knowledge_provider_turns(turns)
+        matrix._assert_knowledge_provider_turns(
+            turns,
+            expected_covered_turns=2,
+            expected_data_no_coverage_non_call_turns=1,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1210,7 +1648,103 @@ def test_real_provider_trace_accepts_grounded_results_with_safe_fallbacks(
         "provider_report_fallback_count": 1,
         "provider_assistant_accepted_count": 1,
         "provider_assistant_fallback_count": 1,
+        "provider_focused_reextraction_unavailable_count": 0,
     }
+
+
+def test_real_provider_trace_accepts_only_safe_focused_reextraction_partial_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = "run-focused-reextraction-partial"
+    _write_provider_trace(
+        tmp_path,
+        run_id,
+        _document_trace_with_focused_reextraction_failure(
+            event="response_invalid",
+            error_code="provider_output_invalid",
+        )
+        + _provider_trace(report_accepted=True, assistant_accepted=True),
+    )
+    _write_focused_reextraction_partial_receipt(tmp_path, run_id)
+    monkeypatch.setattr(matrix, "workspace_transcript_root", lambda: tmp_path)
+
+    receipt = matrix._assert_real_provider_trace([run_id])
+
+    assert receipt["provider_focused_reextraction_unavailable_count"] == 1
+    assert receipt["provider_report_accepted_count"] == 1
+    assert receipt["provider_assistant_accepted_count"] == 1
+    assert "run-focused-reextraction-partial" not in repr(receipt)
+
+
+def test_real_provider_trace_rejects_focused_reextraction_request_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = "run-focused-reextraction-request-failure"
+    _write_provider_trace(
+        tmp_path,
+        run_id,
+        _document_trace_with_focused_reextraction_failure(
+            event="request_failed",
+            error_code="provider_request_failed",
+        )
+        + _provider_trace(report_accepted=True, assistant_accepted=True),
+    )
+    _write_focused_reextraction_partial_receipt(tmp_path, run_id)
+    monkeypatch.setattr(matrix, "workspace_transcript_root", lambda: tmp_path)
+
+    with pytest.raises(matrix.MatrixError, match="claude_provider_request_or_json_failed"):
+        matrix._assert_real_provider_trace([run_id])
+
+
+def test_real_provider_trace_requires_explicit_focused_reextraction_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = "run-focused-reextraction-phase-missing"
+    events = _document_trace_with_focused_reextraction_failure()
+    events[4]["payload"].pop("analysis_phase")
+    _write_provider_trace(
+        tmp_path,
+        run_id,
+        events + _provider_trace(report_accepted=True, assistant_accepted=True),
+    )
+    _write_focused_reextraction_partial_receipt(tmp_path, run_id)
+    monkeypatch.setattr(matrix, "workspace_transcript_root", lambda: tmp_path)
+
+    with pytest.raises(matrix.MatrixError, match="claude_provider_payload_invalid"):
+        matrix._assert_real_provider_trace([run_id])
+
+
+def test_real_provider_trace_rejects_initial_document_failure_despite_partial_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = "run-initial-document-failure"
+    provider = {
+        "provider": "anthropic",
+        "model": "claude-test",
+        "analysis_phase": "initial_extraction",
+    }
+    events = [
+        {"event": "request_started", "payload": provider},
+        {
+            "event": "response_invalid",
+            "payload": {**provider, "error_code": "provider_output_invalid"},
+        },
+        {"event": "request_started", "payload": provider},
+        {"event": "response_received", "payload": provider},
+        {"event": "request_started", "payload": provider},
+        {"event": "response_received", "payload": provider},
+    ]
+    _write_provider_trace(
+        tmp_path,
+        run_id,
+        events + _provider_trace(report_accepted=True, assistant_accepted=True),
+    )
+    _write_focused_reextraction_partial_receipt(tmp_path, run_id)
+    monkeypatch.setattr(matrix, "workspace_transcript_root", lambda: tmp_path)
+
+    with pytest.raises(matrix.MatrixError, match="claude_provider_request_or_json_failed"):
+        matrix._assert_real_provider_trace([run_id])
 
 
 @pytest.mark.parametrize(
