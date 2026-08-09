@@ -826,7 +826,6 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
     calls: list[tuple[str, str, dict[str, Any] | None]] = []
     verified: list[Path] = []
     provider_traces: list[Path] = []
-    no_coverage_traces: list[Path] = []
     export_guidance = _v2_guidance_citation(
         source_id="record-v2-export-requirements",
         source_title="수출 통관",
@@ -948,18 +947,12 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
         "_knowledge_turn_directories",
         lambda _conversation_id, *, expected_count: (
             [
-                Path("turn-" + "c" * 32),
                 Path("turn-" + "a" * 32),
                 Path("turn-" + "b" * 32),
             ]
-            if expected_count == 3
+            if expected_count == 2
             else (_ for _ in ()).throw(AssertionError("unexpected turn count"))
         ),
-    )
-    monkeypatch.setattr(
-        matrix,
-        "_assert_knowledge_provider_not_called_for_no_coverage",
-        lambda turn_directory: no_coverage_traces.append(turn_directory) or 1,
     )
     monkeypatch.setattr(
         matrix,
@@ -970,18 +963,14 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
         matrix,
         "_assert_real_knowledge_provider_trace",
         lambda turn_directory: (
-            (_ for _ in ()).throw(matrix.MatrixError("knowledge_claude_provider_answer_unaccepted"))
-            if turn_directory.name == "turn-" + "c" * 32
-            else (
-                provider_traces.append(turn_directory)
-                or {
-                    "knowledge_provider": "anthropic",
-                    "knowledge_claude_event_count": 2,
-                    "knowledge_provider_attempt_count": 1,
-                    "knowledge_provider_accepted_count": 1,
-                    "knowledge_provider_safe_fallback_count": 0,
-                }
-            )
+            provider_traces.append(turn_directory)
+            or {
+                "knowledge_provider": "anthropic",
+                "knowledge_claude_event_count": 2,
+                "knowledge_provider_attempt_count": 1,
+                "knowledge_provider_accepted_count": 1,
+                "knowledge_provider_safe_fallback_count": 0,
+            }
         ),
     )
 
@@ -992,13 +981,17 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
         "official_guidance_citations_verified": 2,
         "snapshot_pinned": True,
         "agent_knowledge_transcript_verified": True,
-        "knowledge_turns_verified": 3,
+        "knowledge_turns_verified": 2,
         "knowledge_recent_history_verified": 1,
         "knowledge_no_coverage_verified": 1,
-        "knowledge_no_coverage_not_called_count": 1,
+        "knowledge_direction_inapplicable_skip_verified": True,
+        "knowledge_direction_inapplicable_transcript_turns": 0,
+        "knowledge_direction_inapplicable_data_dispatches": 0,
+        "knowledge_direction_inapplicable_claude_dispatches": 0,
         "knowledge_rejected_inputs_verified": 1,
         "knowledge_rejected_agent_dispatches": 0,
         "knowledge_rejected_exchanges": 0,
+        "knowledge_data_no_coverage_non_call_turn_count": 0,
         "knowledge_provider": "anthropic",
         "knowledge_claude_event_count": 4,
         "knowledge_provider_attempt_count": 2,
@@ -1007,13 +1000,9 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
     }
     assert "knowledge-conversation-1" not in repr(receipt)
     assert "수출 요건을 공식 자료 범위에서 알려 주세요." not in repr(receipt)
-    assert verified == [
-        Path("turn-" + "c" * 32),
-        Path("turn-" + "a" * 32),
-        Path("turn-" + "b" * 32),
-    ]
+    assert verified == [Path("turn-" + "a" * 32), Path("turn-" + "b" * 32)]
     assert provider_traces == [Path("turn-" + "a" * 32), Path("turn-" + "b" * 32)]
-    assert no_coverage_traces == [Path("turn-" + "c" * 32)]
+    assert knowledge_turn_count == 3
     assert calls[0] == (
         "POST",
         "/knowledge/conversations",
@@ -1060,7 +1049,7 @@ def test_agent_knowledge_transcript_verifier_runs_with_safe_result_only(
     assert invoked[0]["encoding"] == "utf-8"
 
 
-def test_matrix_run_includes_export_mixed_and_safe_standalone_knowledge_receipt(
+def test_matrix_run_keeps_v2_direction_skip_and_case_paste_boundaries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     scenarios = matrix._scenario_matrix()
@@ -1135,6 +1124,12 @@ def test_matrix_run_includes_export_mixed_and_safe_standalone_knowledge_receipt(
                 "official_guidance_citations_verified": 1,
                 "snapshot_pinned": True,
                 "agent_knowledge_transcript_verified": True,
+                "knowledge_turns_verified": 2,
+                "knowledge_direction_inapplicable_skip_verified": True,
+                "knowledge_direction_inapplicable_transcript_turns": 0,
+                "knowledge_direction_inapplicable_data_dispatches": 0,
+                "knowledge_direction_inapplicable_claude_dispatches": 0,
+                "knowledge_data_no_coverage_non_call_turn_count": 0,
                 "knowledge_provider": "anthropic",
                 "knowledge_claude_event_count": 2,
                 "knowledge_provider_accepted_count": 1,
@@ -1187,6 +1182,12 @@ def test_matrix_run_includes_export_mixed_and_safe_standalone_knowledge_receipt(
         "official_guidance_citations_verified": 1,
         "snapshot_pinned": True,
         "agent_knowledge_transcript_verified": True,
+        "knowledge_turns_verified": 2,
+        "knowledge_direction_inapplicable_skip_verified": True,
+        "knowledge_direction_inapplicable_transcript_turns": 0,
+        "knowledge_direction_inapplicable_data_dispatches": 0,
+        "knowledge_direction_inapplicable_claude_dispatches": 0,
+        "knowledge_data_no_coverage_non_call_turn_count": 0,
         "knowledge_provider": "anthropic",
         "knowledge_claude_event_count": 2,
         "knowledge_provider_accepted_count": 1,
@@ -1315,7 +1316,7 @@ def test_real_knowledge_provider_trace_records_an_accepted_anthropic_answer_in_s
     assert "안전한 응답" not in repr(receipt)
 
 
-def test_knowledge_no_coverage_trace_requires_explicit_safe_non_call(tmp_path: Path) -> None:
+def test_data_no_coverage_trace_requires_explicit_safe_non_call(tmp_path: Path) -> None:
     turn = _write_knowledge_provider_trace(tmp_path, _knowledge_no_coverage_trace())
 
     assert matrix._assert_knowledge_provider_not_called_for_no_coverage(turn) == 1
@@ -1335,13 +1336,51 @@ def test_knowledge_no_coverage_trace_requires_explicit_safe_non_call(tmp_path: P
         },
     ],
 )
-def test_knowledge_no_coverage_trace_rejects_any_provider_or_reason_deviation(
+def test_data_no_coverage_trace_rejects_any_provider_or_reason_deviation(
     tmp_path: Path, event: dict[str, Any]
 ) -> None:
     turn = _write_knowledge_provider_trace(tmp_path, [event])
 
     with pytest.raises(matrix.MatrixError, match="knowledge_no_coverage_claude"):
         matrix._assert_knowledge_provider_not_called_for_no_coverage(turn)
+
+
+def test_direction_inapplicable_skip_rejects_an_extra_data_no_coverage_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """V2 direction policy skips Data/Claude instead of creating a third turn."""
+
+    turns = [
+        Path("turn-" + "a" * 32),
+        Path("turn-" + "b" * 32),
+        Path("turn-" + "c" * 32),
+    ]
+    monkeypatch.setattr(matrix, "_verify_agent_knowledge_transcript", lambda _turn: None)
+    monkeypatch.setattr(
+        matrix,
+        "_assert_knowledge_provider_not_called_for_no_coverage",
+        lambda _turn: 1,
+    )
+
+    def classify(turn: Path) -> dict[str, Any]:
+        if turn.name == "turn-" + "c" * 32:
+            raise matrix.MatrixError("knowledge_claude_provider_answer_unaccepted")
+        return {
+            "knowledge_provider": "anthropic",
+            "knowledge_claude_event_count": 2,
+            "knowledge_provider_attempt_count": 1,
+            "knowledge_provider_accepted_count": 1,
+            "knowledge_provider_safe_fallback_count": 0,
+        }
+
+    monkeypatch.setattr(matrix, "_assert_real_knowledge_provider_trace", classify)
+
+    with pytest.raises(matrix.MatrixError, match="knowledge_claude_provider_payload_invalid"):
+        matrix._assert_knowledge_provider_turns(
+            turns,
+            expected_covered_turns=2,
+            expected_data_no_coverage_non_call_turns=0,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1497,7 +1536,11 @@ def test_knowledge_provider_turns_do_not_count_safe_fallback_as_accepted_claude(
     monkeypatch.setattr(matrix, "_assert_real_knowledge_provider_trace", classify)
 
     with pytest.raises(matrix.MatrixError, match="knowledge_claude_provider_answer_unaccepted"):
-        matrix._assert_knowledge_provider_turns(turns)
+        matrix._assert_knowledge_provider_turns(
+            turns,
+            expected_covered_turns=2,
+            expected_data_no_coverage_non_call_turns=1,
+        )
 
 
 @pytest.mark.parametrize(

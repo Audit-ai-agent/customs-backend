@@ -1935,18 +1935,26 @@ def _assert_knowledge_provider_not_called_for_no_coverage(turn_directory: Path) 
     return 1
 
 
-def _assert_knowledge_provider_turns(turn_directories: Sequence[Path]) -> dict[str, Any]:
-    """Validate two covered Claude attempts and one exact no-coverage turn.
+def _assert_knowledge_provider_turns(
+    turn_directories: Sequence[Path],
+    *,
+    expected_covered_turns: int,
+    expected_data_no_coverage_non_call_turns: int,
+) -> dict[str, Any]:
+    """Validate covered provider turns separately from Data no-coverage turns.
 
     Knowledge turn IDs are UUID-derived and have no temporal meaning.  Classify
     every verified turn by its own safe event sequence instead of relying on
     directory ordering.  A covered turn can safely fall back after a real
-    Anthropic attempt; the exact no-coverage non-call is the only permitted
-    turn without one.
+    Anthropic attempt; a Data ``no_coverage`` lookup records one exact
+    non-call turn.  A direction-inapplicable policy is different: it must not
+    allocate a turn at all, so callers require zero such turns.
     """
 
+    if expected_covered_turns < 1 or expected_data_no_coverage_non_call_turns < 0:
+        raise MatrixError("knowledge_claude_provider_expectation_invalid")
     provider_traces: list[dict[str, Any]] = []
-    no_coverage_not_called_count = 0
+    data_no_coverage_non_call_count = 0
     for turn_directory in turn_directories:
         _verify_agent_knowledge_transcript(turn_directory)
         try:
@@ -1954,7 +1962,7 @@ def _assert_knowledge_provider_turns(turn_directories: Sequence[Path]) -> dict[s
         except MatrixError as exc:
             if str(exc) != "knowledge_claude_provider_answer_unaccepted":
                 raise
-            no_coverage_not_called_count += _assert_knowledge_provider_not_called_for_no_coverage(
+            data_no_coverage_non_call_count += _assert_knowledge_provider_not_called_for_no_coverage(
                 turn_directory
             )
     accepted_count = sum(trace["knowledge_provider_accepted_count"] for trace in provider_traces)
@@ -1962,10 +1970,11 @@ def _assert_knowledge_provider_turns(turn_directories: Sequence[Path]) -> dict[s
         trace["knowledge_provider_safe_fallback_count"] for trace in provider_traces
     )
     if (
-        len(provider_traces) != 2
-        or no_coverage_not_called_count != 1
+        len(provider_traces) != expected_covered_turns
+        or data_no_coverage_non_call_count != expected_data_no_coverage_non_call_turns
         or {trace["knowledge_provider"] for trace in provider_traces} != {"anthropic"}
-        or sum(trace["knowledge_provider_attempt_count"] for trace in provider_traces) != 2
+        or sum(trace["knowledge_provider_attempt_count"] for trace in provider_traces)
+        != expected_covered_turns
     ):
         raise MatrixError("knowledge_claude_provider_payload_invalid")
     # The happy-path Functional-UAT specifically proves that both covered
@@ -1973,10 +1982,10 @@ def _assert_knowledge_provider_turns(turn_directories: Sequence[Path]) -> dict[s
     # is a correct degraded product outcome (and is covered by controlled
     # failure tests), but it must not make this actual-provider acceptance
     # gate appear green.
-    if accepted_count != 2 or safe_fallback_count != 0:
+    if accepted_count != expected_covered_turns or safe_fallback_count != 0:
         raise MatrixError("knowledge_claude_provider_answer_unaccepted")
     return {
-        "knowledge_no_coverage_not_called_count": no_coverage_not_called_count,
+        "knowledge_data_no_coverage_non_call_turn_count": data_no_coverage_non_call_count,
         "knowledge_provider": "anthropic",
         "knowledge_claude_event_count": sum(
             trace["knowledge_claude_event_count"] for trace in provider_traces
@@ -2047,7 +2056,7 @@ def _assert_standalone_knowledge_assistant(
 
 def _assert_standalone_knowledge_no_coverage(
     assistant: Mapping[str, Any], *, expected_as_of: str, code: str
-) -> None:
+) -> Mapping[str, Any]:
     """Validate the explicit no-coverage boundary without model inference."""
 
     if (
@@ -2086,6 +2095,7 @@ def _assert_standalone_knowledge_no_coverage(
         or assistant.get("knowledge_as_of") != expected_as_of
     ):
         raise MatrixError(f"{code}_provenance_invalid")
+    return resolution
 
 
 def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
@@ -2146,11 +2156,18 @@ def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
     no_coverage = _require_mapping(
         no_coverage_exchange.get("assistant_message"), code="knowledge_no_coverage_message_invalid"
     )
-    _assert_standalone_knowledge_no_coverage(
+    direction_skip_resolution = _assert_standalone_knowledge_no_coverage(
         no_coverage,
         expected_as_of=expected_as_of,
         code="knowledge_no_coverage",
     )
+    if (
+        direction_skip_resolution.get("topic") != "customs_duty"
+        or direction_skip_resolution.get("scope") != "customs_value_basics"
+        or direction_skip_resolution.get("requested_direction") != "export"
+        or direction_skip_resolution.get("applicable_directions") != ["import"]
+    ):
+        raise MatrixError("knowledge_direction_inapplicable_resolution_invalid")
     # The standalone assistant is Case-independent.  Verify the public
     # ingress boundary with synthetic structural markers only; ``PublicApi``
     # intentionally does not retain or print request bodies.
@@ -2186,8 +2203,17 @@ def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
     matching = [item for item in listed_items if item.get("conversation_id") == conversation_id]
     if len(matching) != 1 or matching[0].get("snapshot_id") != snapshot_id:
         raise MatrixError("knowledge_snapshot_pin_invalid")
-    turn_directories = _knowledge_turn_directories(conversation_id, expected_count=3)
-    provider_receipt = _assert_knowledge_provider_turns(turn_directories)
+    # The third public answer is a V2 direction-inapplicable policy skip:
+    # export customs-value guidance is outside an import-only scope.  It must
+    # return no-coverage without allocating an Agent-owned turn, querying
+    # Data, or invoking Claude.  Exactly two turn directories after all three
+    # public messages is the safe non-dispatch proof.
+    turn_directories = _knowledge_turn_directories(conversation_id, expected_count=2)
+    provider_receipt = _assert_knowledge_provider_turns(
+        turn_directories,
+        expected_covered_turns=2,
+        expected_data_no_coverage_non_call_turns=0,
+    )
     return {
         "status": "passed",
         "official_guidance_citations_verified": citation_count + follow_up_citation_count,
@@ -2196,6 +2222,10 @@ def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
         "knowledge_turns_verified": len(turn_directories),
         "knowledge_recent_history_verified": 1,
         "knowledge_no_coverage_verified": 1,
+        "knowledge_direction_inapplicable_skip_verified": True,
+        "knowledge_direction_inapplicable_transcript_turns": 0,
+        "knowledge_direction_inapplicable_data_dispatches": 0,
+        "knowledge_direction_inapplicable_claude_dispatches": 0,
         "knowledge_rejected_inputs_verified": 1,
         "knowledge_rejected_agent_dispatches": 0,
         "knowledge_rejected_exchanges": 0,
