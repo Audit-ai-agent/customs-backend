@@ -217,6 +217,28 @@ def test_global_knowledge_rejects_unicode_line_separator_before_agent_call() -> 
     )
 
 
+def test_global_knowledge_rejects_numeric_identifier_in_new_user_message_before_agent_call() -> (
+    None
+):
+    harness = _harness()
+    conversation_id = _new_knowledge_conversation(harness)
+    numeric_marker = "12345678901234567890"
+
+    rejected = harness.client.post(
+        f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+        json={"content": f"공식 참고번호 {numeric_marker}를 확인해 주세요."},
+        headers={**_auth(), "Idempotency-Key": "knowledge-numeric-new-user-001"},
+    )
+
+    assert rejected.status_code == 422
+    assert rejected.json()["code"] == "knowledge_input_not_allowed"
+    assert numeric_marker not in rejected.text
+    assert harness.knowledge_calls == []
+    assert (
+        harness.repository.list_knowledge_messages("local-dev", "reviewer-1", conversation_id) == []
+    )
+
+
 def test_global_knowledge_legacy_unsafe_history_is_preserved_but_never_dispatched() -> None:
     harness = _harness()
     conversation_id = _new_knowledge_conversation(harness)
@@ -260,7 +282,52 @@ def test_global_knowledge_legacy_unsafe_history_is_preserved_but_never_dispatche
     )
 
 
-def test_global_knowledge_allows_normal_multiline_assistant_history() -> None:
+def test_global_knowledge_rejects_numeric_identifier_in_persisted_user_history_before_agent_call() -> (
+    None
+):
+    harness = _harness()
+    conversation_id = _new_knowledge_conversation(harness)
+    now = utc_now()
+    numeric_marker = "12345678901234567890"
+    harness.repository.append_knowledge_message_exchange(
+        user_message=ConversationMessageRecord(
+            message_id="numeric-user-message",
+            conversation_id=conversation_id,
+            role=ConversationMessageRole.user,
+            content=f"이전 일반 질문 {numeric_marker}",
+            created_by="reviewer-1",
+            created_at=now,
+        ),
+        assistant_message=ConversationMessageRecord(
+            message_id="numeric-user-history-assistant-message",
+            conversation_id=conversation_id,
+            role=ConversationMessageRole.assistant,
+            content="기존 응답",
+            created_by="legacy-agent",
+            created_at=now,
+        ),
+        knowledge_snapshot_id=None,
+        idempotency_key="numeric-user-history-exchange-key",
+        idempotency_request_digest="2" * 64,
+    )
+
+    rejected = harness.client.post(
+        f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+        json={"content": "수출 신고 절차를 알려 주세요."},
+        headers={**_auth(), "Idempotency-Key": "knowledge-numeric-user-history-001"},
+    )
+
+    assert rejected.status_code == 422
+    assert rejected.json()["code"] == "knowledge_input_not_allowed"
+    assert numeric_marker not in rejected.text
+    assert harness.knowledge_calls == []
+    assert (
+        len(harness.repository.list_knowledge_messages("local-dev", "reviewer-1", conversation_id))
+        == 2
+    )
+
+
+def test_global_knowledge_does_not_replay_assistant_history_or_rewrite_persisted_content() -> None:
     harness = _harness()
     conversation_id = _new_knowledge_conversation(harness)
     now = utc_now()
@@ -295,13 +362,84 @@ def test_global_knowledge_allows_normal_multiline_assistant_history() -> None:
 
     assert answer.status_code == 200, answer.text
     assert len(harness.knowledge_calls) == 1
+    agent_wire = harness.knowledge_calls[0].to_agent_wire()
+    assert harness.knowledge_calls[0].recent_turns == []
+    assert agent_wire["recent_turns"] == []
+    assert assistant_content not in str(agent_wire)
     assert any(
-        turn.role.value == "assistant" and turn.content == assistant_content
-        for turn in harness.knowledge_calls[0].recent_turns
+        item.role == ConversationMessageRole.assistant and item.content == assistant_content
+        for item in harness.repository.list_knowledge_messages(
+            "local-dev", "reviewer-1", conversation_id
+        )
+    )
+    visible = harness.client.get(
+        f"/api/v1/knowledge/conversations/{conversation_id}/messages", headers=_auth()
+    )
+    assert visible.status_code == 200, visible.text
+    assert any(
+        item["role"] == "assistant" and item["content"] == assistant_content
+        for item in visible.json()["items"]
     )
     assert (
         len(harness.repository.list_knowledge_messages("local-dev", "reviewer-1", conversation_id))
         == 4
+    )
+
+
+def test_global_knowledge_does_not_replay_numeric_assistant_reference_before_agent_call() -> None:
+    harness = _harness()
+    conversation_id = _new_knowledge_conversation(harness)
+    now = utc_now()
+    numeric_marker = "12345678901234567890"
+    assistant_content = f"공식 발췌의 참고번호는 {numeric_marker}입니다."
+    harness.repository.append_knowledge_message_exchange(
+        user_message=ConversationMessageRecord(
+            message_id="safe-user-message",
+            conversation_id=conversation_id,
+            role=ConversationMessageRole.user,
+            content="수출 신고 절차를 알려 주세요.",
+            created_by="reviewer-1",
+            created_at=now,
+        ),
+        assistant_message=ConversationMessageRecord(
+            message_id="poisoned-assistant-message",
+            conversation_id=conversation_id,
+            role=ConversationMessageRole.assistant,
+            content=assistant_content,
+            created_by="agent",
+            created_at=now,
+        ),
+        knowledge_snapshot_id=None,
+        idempotency_key="poisoned-assistant-exchange-key",
+        idempotency_request_digest="3" * 64,
+    )
+
+    answer = harness.client.post(
+        f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+        json={"content": "원산지 확인 절차도 알려 주세요."},
+        headers={**_auth(), "Idempotency-Key": "knowledge-poisoned-assistant-001"},
+    )
+
+    assert answer.status_code == 200, answer.text
+    assert len(harness.knowledge_calls) == 1
+    agent_wire = harness.knowledge_calls[0].to_agent_wire()
+    assert harness.knowledge_calls[0].recent_turns == []
+    assert agent_wire["recent_turns"] == []
+    assert numeric_marker not in str(agent_wire)
+    assert assistant_content not in str(agent_wire)
+    assert any(
+        item.role == ConversationMessageRole.assistant and item.content == assistant_content
+        for item in harness.repository.list_knowledge_messages(
+            "local-dev", "reviewer-1", conversation_id
+        )
+    )
+    visible = harness.client.get(
+        f"/api/v1/knowledge/conversations/{conversation_id}/messages", headers=_auth()
+    )
+    assert visible.status_code == 200, visible.text
+    assert any(
+        item["role"] == "assistant" and item["content"] == assistant_content
+        for item in visible.json()["items"]
     )
 
 

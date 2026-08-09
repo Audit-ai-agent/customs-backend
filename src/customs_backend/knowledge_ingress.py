@@ -26,6 +26,7 @@ _INTERNAL_IDENTIFIER = re.compile(
     r"job|message|fact)[_-][a-z0-9][a-z0-9_-]{5,}\b"
     r"|\b[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\b"
     r"|\b[a-f0-9]{24,}\b"
+    r"|(?<![A-Za-z0-9._:-])[0-9]{16,}(?![A-Za-z0-9._:-])"
     r"|\b(?:sha(?:256)?|hash)\s*[:=]\s*[a-f0-9]{16,}\b"
     r")"
 )
@@ -113,15 +114,12 @@ def require_safe_knowledge_message(content: str) -> None:
 
 
 def require_safe_knowledge_history(*, title: str | None, turns: Iterable[tuple[str, str]]) -> None:
-    """Reject legacy unsafe context without deleting or rewriting it.
+    """Validate durable user history without replaying any history to Agent.
 
-    The caller deliberately performs this check before constructing the Agent
-    request.  It therefore keeps historical raw content out of Agent and
-    Claude while preserving the existing database records for audit/recovery.
-    User text retains the strict one-line boundary.  Agent-authored assistant
-    prose may legitimately contain paragraph/list separators, so it keeps
-    those separators but is still rejected for every document or internal
-    structural marker.
+    Standalone knowledge answers use no prior-turn context.  Assistant text is
+    therefore retained only for the public conversation and is never examined
+    or forwarded as Agent/Data/Claude input.  Historical user text retains the
+    strict one-line boundary of a new user message before another turn may run.
     """
 
     require_safe_knowledge_title(title)
@@ -129,7 +127,6 @@ def require_safe_knowledge_history(*, title: str | None, turns: Iterable[tuple[s
         if role == "user":
             require_safe_knowledge_message(content)
         elif role == "assistant":
-            if _looks_like_unsafe_knowledge_input(content):
-                raise KnowledgeInputRejectedError()
+            continue
         else:
             raise KnowledgeInputRejectedError()

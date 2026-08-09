@@ -1408,8 +1408,9 @@ class WorkbenchService:
             )
             if existing is not None:
                 return existing
-            # Re-read under the per-turn lock.  An old unsafe record is not
-            # altered, but it must never become recent context for Agent.
+            # Re-read under the per-turn lock.  Historical user turns remain
+            # fail-closed, and standalone knowledge never replays historical
+            # prose to Agent, Data, Claude, or a transcript.
             history = self.repository.list_knowledge_messages(
                 principal.org_id, principal.subject, conversation_id
             )
@@ -1417,16 +1418,12 @@ class WorkbenchService:
                 title=conversation.title,
                 turns=((item.role.value, item.content) for item in history),
             )
-            recent_history = history[-8:]
             answer_request = AgentKnowledgeAnswerRequest(
                 conversation_id=conversation_id,
                 question=request.content,
                 trade_type=conversation.trade_type,
                 as_of=conversation.as_of,
-                recent_turns=[
-                    AgentConversationTurn(role=item.role, content=item.content)
-                    for item in recent_history
-                ],
+                recent_turns=[],
             )
             answer_wire = answer_request.to_agent_wire()
             try:
