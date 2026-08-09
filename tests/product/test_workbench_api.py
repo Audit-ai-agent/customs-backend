@@ -1961,7 +1961,16 @@ def test_case_document_shaped_chat_is_persisted_but_never_forwarded_to_agent() -
     assert CASE_DOCUMENT_CONTEXT_PLACEHOLDER in json.dumps(transcript_value, ensure_ascii=False)
 
 
-def test_functional_case_document_paste_skips_public_transcript_dispatch(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "pasted_document",
+    [
+        pytest.param("상업송장\n수량: 10\n금액: 100", id="heading-and-fields"),
+        pytest.param("품명: 냉동 고등어\n단가: USD 10", id="product-and-unit-price-fields"),
+    ],
+)
+def test_functional_case_document_paste_skips_public_transcript_dispatch(
+    tmp_path: Path, pasted_document: str
+) -> None:
     """The raw Case audit record must not create any transcript event."""
 
     assistant_calls = 0
@@ -1999,7 +2008,6 @@ def test_functional_case_document_paste_skips_public_transcript_dispatch(tmp_pat
         ),
     )
 
-    pasted_document = "상업송장\n수량: 10\n금액: 100"
     with TestClient(app) as client:
         case_id = client.post(
             "/api/v1/cases", json={"title": "문서형 전사 경계"}, headers=_auth()
