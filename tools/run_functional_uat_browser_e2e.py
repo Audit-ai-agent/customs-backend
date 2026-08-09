@@ -34,8 +34,21 @@ from customs_backend.scenario_transcript import (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class BrowserFailureLocation:
+    """The only failure location that may cross the Browser subprocess boundary."""
+
+    file: str
+    line: int
+    column: int
+
+
 class BrowserE2eError(RuntimeError):
     """A local Browser Functional-UAT precondition or receipt was unsafe."""
+
+    def __init__(self, reason: str, *, first_failure: BrowserFailureLocation | None = None) -> None:
+        super().__init__(reason)
+        self.first_failure = first_failure
 
 
 _PROFILE_REQUIRED = frozenset(
@@ -64,6 +77,18 @@ _RECEIPT_KEYS = frozenset(
         "browser_api_origins",
     }
 )
+_FAILURE_RECEIPT_SCHEMA = "functional-uat-browser-failure/v1"
+_FAILURE_RECEIPT_KEYS = frozenset(
+    {
+        "schema_version",
+        "status",
+        "failure_count",
+        "first_failure",
+    }
+)
+_FAILURE_LOCATION_KEYS = frozenset({"file", "line", "column"})
+_FAILURE_FILE_NAME = "failure.json"
+_FAILURE_SPEC_FILE = "functional-uat-browser.spec.ts"
 _REQUIRED_CHECKS = frozenset(
     {
         "reviewer_login",
@@ -101,7 +126,9 @@ _REQUIRED_CHECKS = frozenset(
     }
 )
 _SAFE_RUN_ID = re.compile(r"^run_[0-9a-f]{32}$")
+_SAFE_E2E_RUN_DIRECTORY = re.compile(r"^[0-9a-f]{32}$")
 _MAX_RECEIPT_BYTES = 16 * 1024
+_MAX_FAILURE_RECEIPT_BYTES = 1024
 _BACKEND_API_URL = "http://127.0.0.1:18081/api/v1"
 _FRONTEND_URL = "http://127.0.0.1:5173"
 _CHILD_ENVIRONMENT_KEYS = (
@@ -140,6 +167,14 @@ class BrowserReceipt:
 
     checks: tuple[str, ...]
     review_run_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserFailureReceipt:
+    """Strictly bounded failure metadata emitted by the Frontend reporter."""
+
+    failure_count: int
+    first_failure: BrowserFailureLocation | None
 
 
 def _workspace_root() -> Path:
@@ -293,9 +328,9 @@ def _validate_readiness(*, backend_api_url: str, frontend_url: str) -> None:
 
 
 def _child_environment(
-    *, profile: Mapping[str, str], frontend_url: str, receipt_path: Path
+    *, profile: Mapping[str, str], frontend_url: str, receipt_path: Path, failure_path: Path
 ) -> dict[str, str]:
-    """Pass only OS necessities plus the seven declared Browser inputs to Node."""
+    """Pass only OS necessities plus the declared Browser inputs to Node."""
 
     allowed_names = {name.casefold() for name in _CHILD_ENVIRONMENT_KEYS}
     allowed = {key: value for key, value in os.environ.items() if key.casefold() in allowed_names}
@@ -316,6 +351,7 @@ def _child_environment(
                 "CUSTOMS_FUNCTIONAL_APPROVER_PASSWORD"
             ],
             "CUSTOMS_FUNCTIONAL_UAT_BROWSER_RECEIPT_PATH": str(receipt_path),
+            "CUSTOMS_FUNCTIONAL_UAT_SAFE_FAILURE_FILE": str(failure_path),
         }
     )
     return allowed
@@ -335,6 +371,26 @@ def _receipt_path(receipt_root: Path) -> Path:
     if not run_directory.is_dir():
         raise BrowserE2eError("functional_uat_browser_receipt_root_unsafe")
     return run_directory / "receipt.json"
+
+
+def _failure_receipt_path(*, receipt_path: Path, receipt_root: Path) -> Path:
+    """Reserve an absent sidecar path in the same task-local Browser run directory."""
+
+    run_directory = receipt_path.parent
+    failure_path = run_directory / _FAILURE_FILE_NAME
+    if (
+        not receipt_path.is_absolute()
+        or receipt_path.name != "receipt.json"
+        or not receipt_root.is_absolute()
+        or run_directory.parent != receipt_root
+        or not _SAFE_E2E_RUN_DIRECTORY.fullmatch(run_directory.name)
+        or not run_directory.is_dir()
+        or run_directory.is_symlink()
+        or failure_path.exists()
+        or failure_path.is_symlink()
+    ):
+        raise BrowserE2eError("functional_uat_browser_failure_receipt_path_unsafe")
+    return failure_path
 
 
 def _load_receipt(path: Path) -> BrowserReceipt:
@@ -372,6 +428,54 @@ def _load_receipt(path: Path) -> BrowserReceipt:
     return BrowserReceipt(checks=tuple(sorted(checks)), review_run_ids=tuple(review_run_ids))
 
 
+def _positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _load_failure_receipt(path: Path) -> BrowserFailureReceipt:
+    """Load a Frontend failure receipt without reading or surfacing process output."""
+
+    try:
+        if path.is_symlink():
+            raise BrowserE2eError("functional_uat_browser_failure_receipt_invalid")
+        if not path.exists():
+            raise BrowserE2eError("functional_uat_browser_failure_receipt_missing")
+        if not path.is_file() or path.stat().st_size > _MAX_FAILURE_RECEIPT_BYTES:
+            raise BrowserE2eError("functional_uat_browser_failure_receipt_invalid")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except BrowserE2eError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BrowserE2eError("functional_uat_browser_failure_receipt_invalid") from exc
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != _FAILURE_RECEIPT_KEYS
+        or payload.get("schema_version") != _FAILURE_RECEIPT_SCHEMA
+        or payload.get("status") != "failed"
+        or not _positive_int(payload.get("failure_count"))
+    ):
+        raise BrowserE2eError("functional_uat_browser_failure_receipt_invalid")
+    first_failure = payload.get("first_failure")
+    if first_failure is None:
+        return BrowserFailureReceipt(failure_count=payload["failure_count"], first_failure=None)
+    if (
+        not isinstance(first_failure, Mapping)
+        or set(first_failure) != _FAILURE_LOCATION_KEYS
+        or first_failure.get("file") != _FAILURE_SPEC_FILE
+        or not _positive_int(first_failure.get("line"))
+        or not _positive_int(first_failure.get("column"))
+    ):
+        raise BrowserE2eError("functional_uat_browser_failure_receipt_invalid")
+    return BrowserFailureReceipt(
+        failure_count=payload["failure_count"],
+        first_failure=BrowserFailureLocation(
+            file=first_failure["file"],
+            line=first_failure["line"],
+            column=first_failure["column"],
+        ),
+    )
+
+
 def _verify_transcripts(receipt: BrowserReceipt) -> int:
     verified_count = 0
     for review_run_id in receipt.review_run_ids:
@@ -406,6 +510,7 @@ def run(
     profile = _load_profile(_profile_path(str(profile_path)))
     safe_root = _receipt_root(str(output_root))
     receipt_path = _receipt_path(safe_root)
+    failure_path = _failure_receipt_path(receipt_path=receipt_path, receipt_root=safe_root)
     try:
         completed = runner(
             (_corepack_command(), "npm", "run", "functional-uat:browser"),
@@ -414,6 +519,7 @@ def run(
                 profile=profile,
                 frontend_url=frontend_url,
                 receipt_path=receipt_path,
+                failure_path=failure_path,
             ),
             check=False,
             stdout=subprocess.DEVNULL,
@@ -425,7 +531,10 @@ def run(
     except OSError as exc:
         raise BrowserE2eError("functional_uat_browser_command_unavailable") from exc
     if completed.returncode != 0:
-        raise BrowserE2eError("functional_uat_browser_command_failed")
+        failure = _load_failure_receipt(failure_path)
+        raise BrowserE2eError(
+            "functional_uat_browser_command_failed", first_failure=failure.first_failure
+        )
     receipt = _load_receipt(receipt_path)
     transcripts_verified = _verify_transcripts(receipt)
     return {
@@ -459,11 +568,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             receipt_root=args.receipt_root,
         )
     except BrowserE2eError as exc:
-        print(
-            json.dumps(
-                {"functional_uat_browser_e2e": "failed", "reason": str(exc)}, ensure_ascii=False
-            )
-        )
+        payload: dict[str, Any] = {"functional_uat_browser_e2e": "failed", "reason": str(exc)}
+        if exc.first_failure is not None:
+            payload["first_failure"] = {
+                "file": exc.first_failure.file,
+                "line": exc.first_failure.line,
+            }
+        print(json.dumps(payload, ensure_ascii=False))
         return 1
     print(json.dumps({"functional_uat_browser_e2e": "passed", **result}, ensure_ascii=False))
     return 0
