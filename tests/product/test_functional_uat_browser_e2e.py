@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 from pathlib import Path
@@ -34,6 +35,32 @@ def _receipt() -> dict[str, object]:
     }
 
 
+def _failure_receipt(*, first_failure: dict[str, object] | None = None) -> dict[str, object]:
+    return {
+        "schema_version": "functional-uat-browser-failure/v1",
+        "status": "failed",
+        "failure_count": 1,
+        "first_failure": first_failure,
+    }
+
+
+def _prepare_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, Path]:
+    profile_path = tmp_path / "backend.env"
+    profile_path.write_text("ignored", encoding="utf-8")
+    receipt_root = tmp_path / "_local" / "state" / "e2e-runs"
+    monkeypatch.setattr(browser_e2e, "_workspace_root", lambda: tmp_path)
+    monkeypatch.setattr(browser_e2e, "_validate_workspace_main", lambda _workspace: None)
+    monkeypatch.setattr(browser_e2e, "_validate_frontend_command", lambda _frontend: None)
+    monkeypatch.setattr(
+        browser_e2e,
+        "_validate_readiness",
+        lambda *, backend_api_url, frontend_url: None,
+    )
+    monkeypatch.setattr(browser_e2e, "_profile_path", lambda _value: profile_path)
+    monkeypatch.setattr(browser_e2e, "_load_profile", lambda _path: PROFILE)
+    return profile_path, receipt_root
+
+
 def test_receipt_accepts_only_the_safe_browser_summary_shape(tmp_path: Path) -> None:
     path = tmp_path / "receipt.json"
     path.write_text(json.dumps(_receipt()), encoding="utf-8")
@@ -42,6 +69,39 @@ def test_receipt_accepts_only_the_safe_browser_summary_shape(tmp_path: Path) -> 
 
     assert receipt.checks == tuple(sorted(browser_e2e._REQUIRED_CHECKS))
     assert receipt.review_run_ids == RUN_IDS
+
+
+def test_failure_receipt_accepts_only_the_strict_safe_failure_shape(tmp_path: Path) -> None:
+    path = tmp_path / "failure.json"
+    path.write_text(
+        json.dumps(
+            _failure_receipt(
+                first_failure={
+                    "file": "functional-uat-browser.spec.ts",
+                    "line": 71,
+                    "column": 9,
+                }
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    receipt = browser_e2e._load_failure_receipt(path)
+
+    assert receipt.failure_count == 1
+    assert receipt.first_failure == browser_e2e.BrowserFailureLocation(
+        file="functional-uat-browser.spec.ts", line=71, column=9
+    )
+
+
+def test_failure_receipt_allows_a_null_first_failure_without_detail(tmp_path: Path) -> None:
+    path = tmp_path / "failure.json"
+    path.write_text(json.dumps(_failure_receipt()), encoding="utf-8")
+
+    receipt = browser_e2e._load_failure_receipt(path)
+
+    assert receipt.failure_count == 1
+    assert receipt.first_failure is None
 
 
 def test_corepack_command_is_executable_on_windows_and_posix() -> None:
@@ -83,6 +143,7 @@ def test_child_environment_is_narrow_and_keeps_only_declared_credentials(
         profile=PROFILE,
         frontend_url="http://127.0.0.1:5173",
         receipt_path=tmp_path / "receipt.json",
+        failure_path=tmp_path / "failure.json",
     )
 
     assert child["Path"] == "C:\\safe-node-bin"
@@ -95,11 +156,60 @@ def test_child_environment_is_narrow_and_keeps_only_declared_credentials(
     )
     assert child["CUSTOMS_FUNCTIONAL_UAT_BROWSER_REVIEWER_PASSWORD"] == ("reviewer-local-value")
     assert child["CUSTOMS_FUNCTIONAL_UAT_BROWSER_APPROVER_PASSWORD"] == ("approver-local-value")
+    assert child["CUSTOMS_FUNCTIONAL_UAT_SAFE_FAILURE_FILE"] == str(tmp_path / "failure.json")
     assert "ANTHROPIC_API_KEY" not in child
     assert not any(
-        key.startswith("CUSTOMS_") and not key.startswith("CUSTOMS_FUNCTIONAL_UAT_BROWSER_")
+        key.startswith("CUSTOMS_")
+        and not key.startswith("CUSTOMS_FUNCTIONAL_UAT_BROWSER_")
+        and key != "CUSTOMS_FUNCTIONAL_UAT_SAFE_FAILURE_FILE"
         for key in child
     )
+
+
+@pytest.mark.parametrize("link_parts", [("_local",), ("_local", "state")])
+def test_receipt_root_rejects_a_symlinked_workspace_ancestor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, link_parts: tuple[str, ...]
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = workspace.joinpath(*link_parts)
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this host")
+    monkeypatch.setattr(browser_e2e, "_workspace_root", lambda: workspace)
+
+    with pytest.raises(argparse.ArgumentTypeError, match="receipt root is unsafe"):
+        browser_e2e._receipt_root(str(workspace / "_local" / "state" / "e2e-runs"))
+
+
+def test_receipt_path_derives_the_workspace_root_instead_of_accepting_an_outside_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setattr(browser_e2e, "_workspace_root", lambda: workspace)
+
+    with pytest.raises(browser_e2e.BrowserE2eError, match="receipt_root_unsafe"):
+        browser_e2e._receipt_path(outside)
+
+
+def test_receipt_root_rejects_a_non_directory_local_e2e_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    unsafe_root = workspace / "_local" / "state" / "e2e-runs"
+    unsafe_root.parent.mkdir(parents=True)
+    unsafe_root.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setattr(browser_e2e, "_workspace_root", lambda: workspace)
+
+    with pytest.raises(argparse.ArgumentTypeError, match="receipt root is unsafe"):
+        browser_e2e._receipt_root(str(unsafe_root))
 
 
 def test_workspace_validation_requires_clean_main_product_siblings(
@@ -150,25 +260,10 @@ def test_workspace_validation_requires_the_checked_out_origin_main_revision(
 def test_run_invokes_frontend_without_forwarding_output_or_unrelated_secret(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    profile_path = tmp_path / "backend.env"
-    profile_path.write_text("ignored", encoding="utf-8")
-    receipt_root = tmp_path / "e2e-runs"
-    receipt_path = receipt_root / "run" / "receipt.json"
     observed: dict[str, object] = {}
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-reach-node")
-    monkeypatch.setattr(browser_e2e, "_workspace_root", lambda: tmp_path)
-    monkeypatch.setattr(browser_e2e, "_validate_workspace_main", lambda _workspace: None)
-    monkeypatch.setattr(browser_e2e, "_validate_frontend_command", lambda _frontend: None)
-    monkeypatch.setattr(
-        browser_e2e,
-        "_validate_readiness",
-        lambda *, backend_api_url, frontend_url: None,
-    )
-    monkeypatch.setattr(browser_e2e, "_profile_path", lambda _value: profile_path)
-    monkeypatch.setattr(browser_e2e, "_receipt_root", lambda _value: receipt_root)
-    monkeypatch.setattr(browser_e2e, "_load_profile", lambda _path: PROFILE)
-    monkeypatch.setattr(browser_e2e, "_receipt_path", lambda _root: receipt_path)
+    profile_path, receipt_root = _prepare_run(monkeypatch, tmp_path)
     monkeypatch.setattr(
         browser_e2e,
         "_load_receipt",
@@ -208,6 +303,107 @@ def test_run_invokes_frontend_without_forwarding_output_or_unrelated_secret(
     environment = kwargs["env"]
     assert environment["CUSTOMS_FUNCTIONAL_UAT_BROWSER_E2E"] == "1"
     assert "ANTHROPIC_API_KEY" not in environment
+    receipt_path = Path(environment["CUSTOMS_FUNCTIONAL_UAT_BROWSER_RECEIPT_PATH"])
+    failure_path = Path(environment["CUSTOMS_FUNCTIONAL_UAT_SAFE_FAILURE_FILE"])
+    assert receipt_path.is_absolute()
+    assert failure_path == receipt_path.with_name("failure.json")
+    assert failure_path.parent.name == receipt_path.parent.name
+    assert browser_e2e._SAFE_E2E_RUN_DIRECTORY.fullmatch(receipt_path.parent.name)
+    assert not receipt_path.exists()
+    assert not failure_path.exists()
+
+
+def test_run_nonzero_uses_only_the_validated_safe_failure_location(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile_path, receipt_root = _prepare_run(monkeypatch, tmp_path)
+    observed: dict[str, object] = {}
+
+    def failed_runner(arguments, **kwargs):
+        observed["kwargs"] = kwargs
+        failure_path = Path(kwargs["env"]["CUSTOMS_FUNCTIONAL_UAT_SAFE_FAILURE_FILE"])
+        failure_path.write_text(
+            json.dumps(
+                _failure_receipt(
+                    first_failure={
+                        "file": "functional-uat-browser.spec.ts",
+                        "line": 71,
+                        "column": 9,
+                    }
+                )
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(arguments, 1, stdout="untrusted", stderr="untrusted")
+
+    with pytest.raises(browser_e2e.BrowserE2eError, match="command_failed") as captured:
+        browser_e2e.run(
+            profile_file=profile_path,
+            receipt_root=receipt_root,
+            runner=failed_runner,
+        )
+
+    assert captured.value.first_failure == browser_e2e.BrowserFailureLocation(
+        file="functional-uat-browser.spec.ts", line=71, column=9
+    )
+    assert observed["kwargs"]["stdout"] is subprocess.DEVNULL
+    assert observed["kwargs"]["stderr"] is subprocess.DEVNULL
+
+
+def test_run_nonzero_without_a_failure_receipt_uses_a_safe_missing_code(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile_path, receipt_root = _prepare_run(monkeypatch, tmp_path)
+
+    def failed_runner(arguments, **_kwargs):
+        return subprocess.CompletedProcess(arguments, 1, stdout="untrusted", stderr="untrusted")
+
+    with pytest.raises(browser_e2e.BrowserE2eError, match="failure_receipt_missing"):
+        browser_e2e.run(
+            profile_file=profile_path,
+            receipt_root=receipt_root,
+            runner=failed_runner,
+        )
+
+
+def test_run_nonzero_with_an_invalid_failure_receipt_uses_a_safe_invalid_code(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile_path, receipt_root = _prepare_run(monkeypatch, tmp_path)
+
+    def failed_runner(arguments, **kwargs):
+        failure_path = Path(kwargs["env"]["CUSTOMS_FUNCTIONAL_UAT_SAFE_FAILURE_FILE"])
+        failure_path.write_text(json.dumps({"unexpected": "not allowed"}), encoding="utf-8")
+        return subprocess.CompletedProcess(arguments, 1, stdout="untrusted", stderr="untrusted")
+
+    with pytest.raises(browser_e2e.BrowserE2eError, match="failure_receipt_invalid"):
+        browser_e2e.run(
+            profile_file=profile_path,
+            receipt_root=receipt_root,
+            runner=failed_runner,
+        )
+
+
+def test_main_emits_only_the_validated_relative_failure_file_and_line(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fail(**_kwargs):
+        raise browser_e2e.BrowserE2eError(
+            "functional_uat_browser_command_failed",
+            first_failure=browser_e2e.BrowserFailureLocation(
+                file="functional-uat-browser.spec.ts", line=71, column=9
+            ),
+        )
+
+    monkeypatch.setattr(browser_e2e, "run", fail)
+
+    assert browser_e2e.main([]) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "functional_uat_browser_e2e": "failed",
+        "reason": "functional_uat_browser_command_failed",
+        "first_failure": {"file": "functional-uat-browser.spec.ts", "line": 71},
+    }
 
 
 def test_browser_receipt_requires_current_workbench_correctness_checks() -> None:
