@@ -1254,6 +1254,65 @@ def _write_provider_trace(tmp_path: Path, run_id: str, events: list[dict[str, An
     )
 
 
+def _document_trace_with_focused_reextraction_failure(
+    *,
+    event: str = "response_invalid",
+    error_code: str = "provider_output_invalid",
+) -> list[dict[str, Any]]:
+    """Safe event-only fixture: two initial calls, then one retry failure."""
+
+    provider = {"provider": "anthropic", "model": "claude-test"}
+    initial = {**provider, "analysis_phase": "initial_extraction"}
+    focused = {**provider, "analysis_phase": "focused_reextraction"}
+    failure = {
+        "event": event,
+        "payload": {**focused, "error_code": error_code},
+    }
+    retry_terminal = (
+        [] if event == "request_failed" else [{"event": "response_received", "payload": focused}]
+    )
+    return [
+        {"event": "request_started", "payload": initial},
+        {"event": "response_received", "payload": initial},
+        {"event": "request_started", "payload": initial},
+        {"event": "response_received", "payload": initial},
+        {"event": "request_started", "payload": focused},
+        *retry_terminal,
+        failure,
+    ]
+
+
+def _write_focused_reextraction_partial_receipt(tmp_path: Path, run_id: str) -> None:
+    """Write only the safe workflow metadata used by the Matrix verifier."""
+
+    directory = tmp_path / run_id
+    workflow = {
+        "status": "partial",
+        "stages": [
+            {"stage": "classify_documents", "status": "completed", "attempt_count": 2},
+            {"stage": "extract_facts", "status": "completed", "attempt_count": 3},
+            {"stage": "reextract_documents", "status": "needs_review", "attempt_count": 1},
+        ],
+        "reextractions": [{"status": "unavailable", "attempt_count": 1}],
+    }
+    (directory / "summary.json").write_text(
+        json.dumps({"status": "completed", "execution_status": "partial"}),
+        encoding="utf-8",
+    )
+    (directory / "backend-agent.jsonl").write_text(
+        json.dumps(
+            {
+                "event": "review_response",
+                "payload": {
+                    "response_body": {"execution_status": "partial", "workflow": workflow}
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _write_knowledge_provider_trace(tmp_path: Path, events: list[dict[str, Any]]) -> Path:
     turn = tmp_path / "knowledge" / "knowledge-conversation" / ("turn-" + "a" * 32)
     turn.mkdir(parents=True)
@@ -1589,7 +1648,103 @@ def test_real_provider_trace_accepts_grounded_results_with_safe_fallbacks(
         "provider_report_fallback_count": 1,
         "provider_assistant_accepted_count": 1,
         "provider_assistant_fallback_count": 1,
+        "provider_focused_reextraction_unavailable_count": 0,
     }
+
+
+def test_real_provider_trace_accepts_only_safe_focused_reextraction_partial_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = "run-focused-reextraction-partial"
+    _write_provider_trace(
+        tmp_path,
+        run_id,
+        _document_trace_with_focused_reextraction_failure(
+            event="response_invalid",
+            error_code="provider_output_invalid",
+        )
+        + _provider_trace(report_accepted=True, assistant_accepted=True),
+    )
+    _write_focused_reextraction_partial_receipt(tmp_path, run_id)
+    monkeypatch.setattr(matrix, "workspace_transcript_root", lambda: tmp_path)
+
+    receipt = matrix._assert_real_provider_trace([run_id])
+
+    assert receipt["provider_focused_reextraction_unavailable_count"] == 1
+    assert receipt["provider_report_accepted_count"] == 1
+    assert receipt["provider_assistant_accepted_count"] == 1
+    assert "run-focused-reextraction-partial" not in repr(receipt)
+
+
+def test_real_provider_trace_rejects_focused_reextraction_request_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = "run-focused-reextraction-request-failure"
+    _write_provider_trace(
+        tmp_path,
+        run_id,
+        _document_trace_with_focused_reextraction_failure(
+            event="request_failed",
+            error_code="provider_request_failed",
+        )
+        + _provider_trace(report_accepted=True, assistant_accepted=True),
+    )
+    _write_focused_reextraction_partial_receipt(tmp_path, run_id)
+    monkeypatch.setattr(matrix, "workspace_transcript_root", lambda: tmp_path)
+
+    with pytest.raises(matrix.MatrixError, match="claude_provider_request_or_json_failed"):
+        matrix._assert_real_provider_trace([run_id])
+
+
+def test_real_provider_trace_requires_explicit_focused_reextraction_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = "run-focused-reextraction-phase-missing"
+    events = _document_trace_with_focused_reextraction_failure()
+    events[4]["payload"].pop("analysis_phase")
+    _write_provider_trace(
+        tmp_path,
+        run_id,
+        events + _provider_trace(report_accepted=True, assistant_accepted=True),
+    )
+    _write_focused_reextraction_partial_receipt(tmp_path, run_id)
+    monkeypatch.setattr(matrix, "workspace_transcript_root", lambda: tmp_path)
+
+    with pytest.raises(matrix.MatrixError, match="claude_provider_payload_invalid"):
+        matrix._assert_real_provider_trace([run_id])
+
+
+def test_real_provider_trace_rejects_initial_document_failure_despite_partial_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = "run-initial-document-failure"
+    provider = {
+        "provider": "anthropic",
+        "model": "claude-test",
+        "analysis_phase": "initial_extraction",
+    }
+    events = [
+        {"event": "request_started", "payload": provider},
+        {
+            "event": "response_invalid",
+            "payload": {**provider, "error_code": "provider_output_invalid"},
+        },
+        {"event": "request_started", "payload": provider},
+        {"event": "response_received", "payload": provider},
+        {"event": "request_started", "payload": provider},
+        {"event": "response_received", "payload": provider},
+    ]
+    _write_provider_trace(
+        tmp_path,
+        run_id,
+        events + _provider_trace(report_accepted=True, assistant_accepted=True),
+    )
+    _write_focused_reextraction_partial_receipt(tmp_path, run_id)
+    monkeypatch.setattr(matrix, "workspace_transcript_root", lambda: tmp_path)
+
+    with pytest.raises(matrix.MatrixError, match="claude_provider_request_or_json_failed"):
+        matrix._assert_real_provider_trace([run_id])
 
 
 @pytest.mark.parametrize(

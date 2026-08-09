@@ -61,10 +61,21 @@ _PROVIDER_RESPONSE_REQUEST_EVENTS = {
     response_event: request_event
     for request_event, response_event in _PROVIDER_REQUEST_RESPONSE_EVENTS.items()
 }
+_DOCUMENT_PROVIDER_REQUEST_EVENT = "request_started"
+_DOCUMENT_PROVIDER_RESPONSE_EVENT = "response_received"
+_DOCUMENT_PROVIDER_FAILURE_EVENTS = frozenset({"request_failed", "response_invalid"})
+_DOCUMENT_ANALYSIS_INITIAL_PHASE = "initial_extraction"
+_DOCUMENT_ANALYSIS_FOCUSED_PHASE = "focused_reextraction"
+_DOCUMENT_ANALYSIS_PHASES = frozenset(
+    {_DOCUMENT_ANALYSIS_INITIAL_PHASE, _DOCUMENT_ANALYSIS_FOCUSED_PHASE}
+)
+_DOCUMENT_PROVIDER_FAILURE_ERROR_CODES = {
+    "request_failed": frozenset({"provider_request_failed"}),
+    "response_invalid": frozenset({"provider_response_invalid", "provider_output_invalid"}),
+}
 _PROVIDER_FAILURE_EVENTS = frozenset(
     {
-        "request_failed",
-        "response_invalid",
+        *_DOCUMENT_PROVIDER_FAILURE_EVENTS,
         *(
             f"{purpose}_{failure}"
             for purpose in ("review_report", "assistant_answer")
@@ -2413,6 +2424,117 @@ def _verify_transcript(run_id: str) -> dict[str, Any]:
     return verified
 
 
+def _assert_focused_reextraction_provider_failures(
+    root: Path,
+    run_id: str,
+    *,
+    document_attempt_count: int,
+    failed_attempt_numbers: Sequence[int],
+) -> int:
+    """Allow only the workflow's explicit partial re-extraction fallback.
+
+    A document-analyzer provider failure is ordinarily fatal.  The bounded
+    workflow deliberately catches one *focused* retry failure per document,
+    however, preserves the first extraction, and returns a human-review
+    partial result.  The caller has already required Agent's explicit
+    ``analysis_phase=focused_reextraction`` marker; this helper additionally
+    correlates it with public-safe workflow attempt counts, an unavailable
+    re-extraction, and the terminal partial result.  Nothing from the source
+    document, prompt, provider output, or Agent result is returned.
+    """
+
+    if not failed_attempt_numbers or document_attempt_count < 1:
+        raise MatrixError("claude_focused_reextraction_receipt_invalid")
+    directory = root / run_id
+    summary_path = directory / "summary.json"
+    backend_path = directory / "backend-agent.jsonl"
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        backend_events = [
+            json.loads(line) for line in backend_path.read_text(encoding="utf-8").splitlines() if line
+        ]
+    except (OSError, json.JSONDecodeError) as exc:
+        raise MatrixError("claude_focused_reextraction_receipt_invalid") from exc
+    if (
+        not isinstance(summary, Mapping)
+        or summary.get("status") != "completed"
+        or summary.get("execution_status") != "partial"
+        or not backend_events
+        or not all(isinstance(event, Mapping) for event in backend_events)
+    ):
+        raise MatrixError("claude_focused_reextraction_receipt_invalid")
+    review_responses = [event for event in backend_events if event.get("event") == "review_response"]
+    if len(review_responses) != 1 or not isinstance(review_responses[0].get("payload"), Mapping):
+        raise MatrixError("claude_focused_reextraction_receipt_invalid")
+    response_body = review_responses[0]["payload"].get("response_body")
+    if not isinstance(response_body, Mapping) or response_body.get("execution_status") != "partial":
+        raise MatrixError("claude_focused_reextraction_receipt_invalid")
+    workflow = response_body.get("workflow")
+    if not isinstance(workflow, Mapping) or workflow.get("status") != "partial":
+        raise MatrixError("claude_focused_reextraction_receipt_invalid")
+    reextractions = workflow.get("reextractions")
+    stages = workflow.get("stages")
+    if (
+        not isinstance(reextractions, list)
+        or not reextractions
+        or not isinstance(stages, list)
+        or any(not isinstance(item, Mapping) for item in reextractions)
+        or any(not isinstance(stage, Mapping) for stage in stages)
+    ):
+        raise MatrixError("claude_focused_reextraction_receipt_invalid")
+    unavailable_count = sum(item.get("status") == "unavailable" for item in reextractions)
+    if unavailable_count != len(failed_attempt_numbers):
+        raise MatrixError("claude_focused_reextraction_receipt_invalid")
+    required_stage_names = (
+        "classify_documents",
+        "extract_facts",
+        "reextract_documents",
+    )
+    if any(
+        sum(stage.get("stage") == stage_name for stage in stages) != 1
+        for stage_name in required_stage_names
+    ):
+        raise MatrixError("claude_focused_reextraction_receipt_invalid")
+    stage_by_name = {
+        stage.get("stage"): stage
+        for stage in stages
+        if isinstance(stage.get("stage"), str)
+    }
+    initial_stage = stage_by_name.get("classify_documents")
+    extraction_stage = stage_by_name.get("extract_facts")
+    reextraction_stage = stage_by_name.get("reextract_documents")
+    if (
+        not isinstance(initial_stage, Mapping)
+        or not isinstance(extraction_stage, Mapping)
+        or not isinstance(reextraction_stage, Mapping)
+    ):
+        raise MatrixError("claude_focused_reextraction_receipt_invalid")
+    initial_attempt_count = initial_stage.get("attempt_count")
+    extraction_attempt_count = extraction_stage.get("attempt_count")
+    if (
+        not isinstance(initial_attempt_count, int)
+        or initial_attempt_count < 1
+        or not isinstance(extraction_attempt_count, int)
+        or extraction_attempt_count != initial_attempt_count + len(reextractions)
+        or document_attempt_count != extraction_attempt_count
+        or reextraction_stage.get("status") != "needs_review"
+        or reextraction_stage.get("attempt_count") != len(reextractions)
+        or any(
+            not isinstance(item.get("attempt_count"), int)
+            or item["attempt_count"] not in {1, 2}
+            or item.get("status") not in {"completed", "unavailable"}
+            for item in reextractions
+        )
+        or any(
+            attempt_number <= initial_attempt_count
+            or attempt_number > extraction_attempt_count
+            for attempt_number in failed_attempt_numbers
+        )
+    ):
+        raise MatrixError("claude_focused_reextraction_receipt_invalid")
+    return unavailable_count
+
+
 def _assert_real_provider_trace(run_ids: Sequence[str]) -> dict[str, Any]:
     root = workspace_transcript_root()
     total_claude_events = 0
@@ -2422,6 +2544,7 @@ def _assert_real_provider_trace(run_ids: Sequence[str]) -> dict[str, Any]:
     report_fallback_count = 0
     assistant_accepted_count = 0
     assistant_fallback_count = 0
+    focused_reextraction_unavailable_count = 0
     for run_id in run_ids:
         path = root / run_id / "claude.jsonl"
         try:
@@ -2446,9 +2569,70 @@ def _assert_real_provider_trace(run_ids: Sequence[str]) -> dict[str, Any]:
         request_states = {
             request_event: "idle" for request_event in _PROVIDER_REQUEST_RESPONSE_EVENTS
         }
+        document_request_state = "idle"
+        document_attempt_phase: str | None = None
+        document_attempt_count = 0
+        document_failure_attempt_numbers: list[int] = []
         for event in events:
             event_name = event["event"]
             payload = event.get("payload")
+            if event_name == _DOCUMENT_PROVIDER_REQUEST_EVENT:
+                if document_request_state not in {"idle", "responded"}:
+                    raise MatrixError("claude_provider_sequence_invalid")
+                if (
+                    not isinstance(payload, Mapping)
+                    or payload.get("provider") != "anthropic"
+                    or not isinstance(payload.get("model"), str)
+                    or not payload["model"].strip()
+                    or payload.get("analysis_phase") not in _DOCUMENT_ANALYSIS_PHASES
+                ):
+                    raise MatrixError("claude_provider_payload_invalid")
+                document_attempt_count += 1
+                document_attempt_phase = payload["analysis_phase"]
+                document_request_state = "requested"
+                continue
+            if event_name == _DOCUMENT_PROVIDER_RESPONSE_EVENT:
+                if document_request_state != "requested":
+                    raise MatrixError("claude_provider_sequence_invalid")
+                if (
+                    not isinstance(payload, Mapping)
+                    or payload.get("provider") != "anthropic"
+                    or not isinstance(payload.get("model"), str)
+                    or not payload["model"].strip()
+                    or payload.get("analysis_phase") != document_attempt_phase
+                ):
+                    raise MatrixError("claude_provider_payload_invalid")
+                document_request_state = "responded"
+                continue
+            if event_name in _DOCUMENT_PROVIDER_FAILURE_EVENTS:
+                accepted_states = (
+                    {"requested", "responded"}
+                    if event_name == "response_invalid"
+                    else {"requested"}
+                )
+                if document_request_state not in accepted_states:
+                    raise MatrixError("claude_provider_sequence_invalid")
+                if (
+                    not isinstance(payload, Mapping)
+                    or set(payload) != {"provider", "model", "error_code", "analysis_phase"}
+                    or payload.get("provider") != "anthropic"
+                    or not isinstance(payload.get("model"), str)
+                    or not payload["model"].strip()
+                    or payload.get("error_code")
+                    not in _DOCUMENT_PROVIDER_FAILURE_ERROR_CODES[event_name]
+                    or payload.get("analysis_phase") != document_attempt_phase
+                ):
+                    raise MatrixError("claude_provider_payload_invalid")
+                if (
+                    event_name != "response_invalid"
+                    or payload.get("error_code") != "provider_output_invalid"
+                    or document_attempt_phase != _DOCUMENT_ANALYSIS_FOCUSED_PHASE
+                ):
+                    raise MatrixError("claude_provider_request_or_json_failed")
+                document_failure_attempt_numbers.append(document_attempt_count)
+                document_request_state = "idle"
+                document_attempt_phase = None
+                continue
             if event_name in _PROVIDER_FAILURE_EVENTS:
                 raise MatrixError("claude_provider_request_or_json_failed")
             if event_name in _PROVIDER_REQUEST_RESPONSE_EVENTS:
@@ -2528,12 +2712,23 @@ def _assert_real_provider_trace(run_ids: Sequence[str]) -> dict[str, Any]:
                 raise MatrixError("claude_assistant_context_invalid")
             max_recent_turns = max(max_recent_turns, len(recent_turns))
             observed_eight_turn_boundary = observed_eight_turn_boundary or len(recent_turns) == 8
+        if document_request_state not in {"idle", "responded"}:
+            raise MatrixError("claude_provider_sequence_invalid")
         for request_event, state in request_states.items():
             if request_event == "assistant_answer_request_started" and state == "responded":
                 assistant_accepted_count += 1
                 continue
             if state != "idle":
                 raise MatrixError("claude_provider_sequence_invalid")
+        if document_failure_attempt_numbers:
+            focused_reextraction_unavailable_count += (
+                _assert_focused_reextraction_provider_failures(
+                    root,
+                    run_id,
+                    document_attempt_count=document_attempt_count,
+                    failed_attempt_numbers=document_failure_attempt_numbers,
+                )
+            )
         total_claude_events += len(events)
     if report_accepted_count < 1:
         raise MatrixError("claude_provider_report_unaccepted")
@@ -2549,6 +2744,7 @@ def _assert_real_provider_trace(run_ids: Sequence[str]) -> dict[str, Any]:
         "provider_report_fallback_count": report_fallback_count,
         "provider_assistant_accepted_count": assistant_accepted_count,
         "provider_assistant_fallback_count": assistant_fallback_count,
+        "provider_focused_reextraction_unavailable_count": focused_reextraction_unavailable_count,
     }
 
 
