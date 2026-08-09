@@ -97,6 +97,13 @@ _SAFE_LOCAL_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SAFE_KNOWLEDGE_TURN_ID = re.compile(r"^turn-[a-f0-9]{32}$")
 _GUIDANCE_TOKEN = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
 _V2_GUIDANCE_PROFILE = "functional-uat-kr-trade-v2"
+_CASE_DOCUMENT_PASTE_CONTENT = "품명: 합성 검증 품목\n단가: USD 1"
+_CASE_DOCUMENT_PASTE_STREAMS = (
+    "public-api",
+    "backend-agent",
+    "agent-data",
+    "claude",
+)
 _OFFICIAL_GUIDANCE_SOURCE_KINDS = frozenset(
     {
         "official_law",
@@ -1563,6 +1570,153 @@ def _mixed_conversation(api: PublicApi, *, run_id: str, run: Mapping[str, Any]) 
     _assert_case_application_sections(assistant, run=run)
 
 
+def _case_paste_transcript_metadata(review_run_id: str) -> dict[str, tuple[int, int]]:
+    """Read only local stream metadata for one already-created Functional-UAT run.
+
+    The document-shaped input itself must never be read from a transcript by
+    this checker.  File size and modification time are sufficient to prove
+    that the Case paste did not append a public exchange, Backend-to-Agent
+    request, Agent-to-Data request, or Claude turn.
+    """
+
+    if _SAFE_LOCAL_IDENTIFIER.fullmatch(review_run_id) is None:
+        raise MatrixError("case_document_paste_transcript_identity_invalid")
+    root = workspace_transcript_root()
+    try:
+        resolved_root = root.resolve(strict=True)
+        directory = (root / review_run_id).resolve(strict=True)
+    except OSError as exc:
+        raise MatrixError("case_document_paste_transcript_unavailable") from exc
+    if directory.parent != resolved_root:
+        raise MatrixError("case_document_paste_transcript_layout_invalid")
+
+    metadata: dict[str, tuple[int, int]] = {}
+    for stream in _CASE_DOCUMENT_PASTE_STREAMS:
+        path = directory / f"{stream}.jsonl"
+        try:
+            if path.is_symlink() or not path.is_file():
+                raise MatrixError("case_document_paste_transcript_unavailable")
+            details = path.stat()
+        except OSError as exc:
+            raise MatrixError("case_document_paste_transcript_unavailable") from exc
+        metadata[stream] = (details.st_size, details.st_mtime_ns)
+    return metadata
+
+
+def _case_paste_review_aggregate(run: Mapping[str, Any]) -> tuple[int, int]:
+    """Return fact/finding counts without examining Case fact values."""
+
+    fact_count = 0
+    analyses = _mapping_list(
+        run.get("document_analyses"), code="case_document_paste_document_analyses_invalid"
+    )
+    for analysis in analyses:
+        facts = analysis.get("facts")
+        line_items = analysis.get("line_items")
+        if (
+            not isinstance(facts, list)
+            or not isinstance(line_items, list)
+            or any(not isinstance(item, Mapping) for item in line_items)
+        ):
+            raise MatrixError("case_document_paste_facts_invalid")
+        fact_count += len(facts)
+        for item in line_items:
+            item_facts = item.get("facts")
+            if not isinstance(item_facts, list):
+                raise MatrixError("case_document_paste_facts_invalid")
+            fact_count += len(item_facts)
+    findings = _mapping_list(run.get("findings"), code="case_document_paste_findings_invalid")
+    return fact_count, len(findings)
+
+
+def _case_paste_correction_count(value: Mapping[str, Any]) -> int:
+    """Count correction records only; proposal values must not enter the receipt."""
+
+    return len(
+        _mapping_list(
+            value.get("items"), code="case_document_paste_corrections_invalid"
+        )
+    )
+
+
+def _assert_case_document_paste_zero_dispatch(
+    api: PublicApi, *, run_id: str, run: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Exercise the Case paste boundary without retaining or inspecting its body.
+
+    The synthetic two-field record is deliberately submitted through the real
+    public Case-chat API.  Its fixed notice and zero stream deltas prove that
+    it was retained only in the authorised Case conversation, not forwarded
+    into Agent, Data, Claude, or any Functional-UAT transcript stream.
+    """
+
+    created = api.require(
+        "POST",
+        f"/review-runs/{run_id}/assistant/conversations",
+        body={"title": "문서형 붙여넣기 경계"},
+        expected=201,
+    )
+    conversation_id = created.get("conversation_id")
+    if (
+        not isinstance(conversation_id, str)
+        or _SAFE_LOCAL_IDENTIFIER.fullmatch(conversation_id) is None
+    ):
+        raise MatrixError("case_document_paste_conversation_identity_invalid")
+
+    before_facts, before_findings = _case_paste_review_aggregate(run)
+    before_corrections = _case_paste_correction_count(
+        api.require("GET", f"/review-runs/{run_id}/correction-proposals")
+    )
+    before_streams = _case_paste_transcript_metadata(run_id)
+
+    exchange = api.require(
+        "POST",
+        f"/assistant/conversations/{conversation_id}/messages",
+        body={"content": _CASE_DOCUMENT_PASTE_CONTENT},
+        idempotency_key=f"functional-matrix-document-paste-{uuid.uuid4().hex}",
+    )
+    # Do not inspect ``user_message`` or assistant prose: only fixed public
+    # state fields are used here, so the synthetic input never reaches the
+    # matrix output or a MatrixError.
+    assistant = _require_mapping(
+        exchange.get("assistant_message"), code="case_document_paste_assistant_invalid"
+    )
+    if (
+        assistant.get("role") != "assistant"
+        or assistant.get("answer_scope") != "insufficient_evidence"
+        or assistant.get("case_input_notice") != "unregistered_document_text"
+        or assistant.get("citations") != []
+        or assistant.get("answer_sections") != []
+        or assistant.get("correction_draft") is not None
+        or assistant.get("guidance_resolution") is not None
+    ):
+        raise MatrixError("case_document_paste_notice_invalid")
+    if _case_paste_transcript_metadata(run_id) != before_streams:
+        raise MatrixError("case_document_paste_transcript_dispatch")
+
+    after_run = api.require("GET", f"/review-runs/{run_id}")
+    after_facts, after_findings = _case_paste_review_aggregate(after_run)
+    after_corrections = _case_paste_correction_count(
+        api.require("GET", f"/review-runs/{run_id}/correction-proposals")
+    )
+    if (after_facts, after_findings) != (before_facts, before_findings):
+        raise MatrixError("case_document_paste_review_state_changed")
+    if after_corrections != before_corrections:
+        raise MatrixError("case_document_paste_correction_state_changed")
+
+    return {
+        "status": "passed",
+        "case_document_paste_notice_verified": True,
+        "case_document_paste_agent_http_exchanges": 0,
+        "case_document_paste_public_transcript_exchanges": 0,
+        "case_document_paste_agent_data_dispatches": 0,
+        "case_document_paste_claude_dispatches": 0,
+        "case_document_paste_fact_changes": 0,
+        "case_document_paste_finding_changes": 0,
+        "case_document_paste_correction_changes": 0,
+    }
+
+
 def _knowledge_turn_directories(conversation_id: str, *, expected_count: int) -> list[Path]:
     """Find an exact number of safe standalone turns without exposing them.
 
@@ -2453,6 +2607,11 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
         )
         matching_run_id = runs["all-documents-match"][2]
         matching_run = runs["all-documents-match"][3]
+        case_document_paste = _assert_case_document_paste_zero_dispatch(
+            reviewer,
+            run_id=matching_run_id,
+            run=matching_run,
+        )
         _conversation(
             reviewer,
             run_id=matching_run_id,
@@ -2505,6 +2664,7 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
             "child_run_id": child_run_id,
             "replacement_run_id": replacement_run_id,
             "transcripts_verified": len(transcripts),
+            "case_document_paste": case_document_paste,
             "knowledge_guidance": knowledge_guidance,
             **trace,
         }

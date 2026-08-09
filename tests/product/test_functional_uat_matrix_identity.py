@@ -201,6 +201,163 @@ def test_matrix_replacement_document_uses_a_korean_business_filename() -> None:
     assert matrix._REPLACEMENT_DOCUMENT_FILENAME == "상업송장_보완본.txt"
 
 
+def _prepare_case_document_paste_streams(tmp_path: Path, run_id: str) -> None:
+    directory = tmp_path / run_id
+    directory.mkdir()
+    for stream in matrix._CASE_DOCUMENT_PASTE_STREAMS:
+        (directory / f"{stream}.jsonl").write_bytes(b"opaque-existing-event\n")
+
+
+def _case_document_paste_assistant() -> dict[str, Any]:
+    # Deliberately omit user/assistant prose: the matrix guard must validate
+    # fixed safe fields without looking at a pasted body or generated prose.
+    return {
+        "role": "assistant",
+        "answer_scope": "insufficient_evidence",
+        "case_input_notice": "unregistered_document_text",
+        "citations": [],
+        "answer_sections": [],
+    }
+
+
+def test_case_document_paste_matrix_keeps_safe_aggregate_zero_dispatch_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = "run-case-document-paste"
+    _prepare_case_document_paste_streams(tmp_path, run_id)
+    review = _matching_result()
+    sent_paste_count = 0
+
+    class FakeApi:
+        def require(
+            self,
+            method: str,
+            path: str,
+            *,
+            body: dict[str, Any] | None = None,
+            **_kwargs: Any,
+        ) -> dict[str, Any]:
+            nonlocal sent_paste_count
+            if method == "POST" and path.endswith("/assistant/conversations"):
+                return {"conversation_id": "conversation-case-document-paste"}
+            if method == "POST" and path.endswith("/messages"):
+                assert body == {"content": matrix._CASE_DOCUMENT_PASTE_CONTENT}
+                sent_paste_count += 1
+                return {"assistant_message": _case_document_paste_assistant()}
+            if method == "GET" and path == f"/review-runs/{run_id}":
+                return deepcopy(review)
+            if method == "GET" and path.endswith("/correction-proposals"):
+                return {"items": []}
+            raise AssertionError(f"unexpected request: {method} {path}")
+
+    monkeypatch.setattr(matrix, "workspace_transcript_root", lambda: tmp_path)
+
+    receipt = matrix._assert_case_document_paste_zero_dispatch(
+        FakeApi(), run_id=run_id, run=review
+    )
+
+    assert sent_paste_count == 1
+    assert receipt == {
+        "status": "passed",
+        "case_document_paste_notice_verified": True,
+        "case_document_paste_agent_http_exchanges": 0,
+        "case_document_paste_public_transcript_exchanges": 0,
+        "case_document_paste_agent_data_dispatches": 0,
+        "case_document_paste_claude_dispatches": 0,
+        "case_document_paste_fact_changes": 0,
+        "case_document_paste_finding_changes": 0,
+        "case_document_paste_correction_changes": 0,
+    }
+    assert matrix._CASE_DOCUMENT_PASTE_CONTENT not in repr(receipt)
+    assert "conversation-case-document-paste" not in repr(receipt)
+
+
+@pytest.mark.parametrize("changed_stream", matrix._CASE_DOCUMENT_PASTE_STREAMS)
+def test_case_document_paste_matrix_rejects_any_dispatch_stream_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_stream: str
+) -> None:
+    run_id = "run-case-document-paste-dispatch"
+    _prepare_case_document_paste_streams(tmp_path, run_id)
+    review = _matching_result()
+
+    class FakeApi:
+        def require(
+            self,
+            method: str,
+            path: str,
+            *,
+            body: dict[str, Any] | None = None,
+            **_kwargs: Any,
+        ) -> dict[str, Any]:
+            if method == "POST" and path.endswith("/assistant/conversations"):
+                return {"conversation_id": "conversation-case-document-paste"}
+            if method == "POST" and path.endswith("/messages"):
+                assert body == {"content": matrix._CASE_DOCUMENT_PASTE_CONTENT}
+                with (tmp_path / run_id / f"{changed_stream}.jsonl").open("ab") as handle:
+                    handle.write(b"unexpected-dispatch\n")
+                return {"assistant_message": _case_document_paste_assistant()}
+            if method == "GET" and path.endswith("/correction-proposals"):
+                return {"items": []}
+            raise AssertionError(f"unexpected request: {method} {path}")
+
+    monkeypatch.setattr(matrix, "workspace_transcript_root", lambda: tmp_path)
+
+    with pytest.raises(matrix.MatrixError, match="case_document_paste_transcript_dispatch"):
+        matrix._assert_case_document_paste_zero_dispatch(FakeApi(), run_id=run_id, run=review)
+
+
+@pytest.mark.parametrize(
+    ("changed_state", "error"),
+    [
+        ("facts", "case_document_paste_review_state_changed"),
+        ("findings", "case_document_paste_review_state_changed"),
+        ("corrections", "case_document_paste_correction_state_changed"),
+    ],
+)
+def test_case_document_paste_matrix_rejects_fact_finding_or_correction_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_state: str,
+    error: str,
+) -> None:
+    run_id = "run-case-document-paste-state"
+    _prepare_case_document_paste_streams(tmp_path, run_id)
+    review = _matching_result()
+    pasted = False
+
+    class FakeApi:
+        def require(
+            self,
+            method: str,
+            path: str,
+            *,
+            body: dict[str, Any] | None = None,
+            **_kwargs: Any,
+        ) -> dict[str, Any]:
+            nonlocal pasted
+            if method == "POST" and path.endswith("/assistant/conversations"):
+                return {"conversation_id": "conversation-case-document-paste"}
+            if method == "POST" and path.endswith("/messages"):
+                assert body == {"content": matrix._CASE_DOCUMENT_PASTE_CONTENT}
+                pasted = True
+                return {"assistant_message": _case_document_paste_assistant()}
+            if method == "GET" and path == f"/review-runs/{run_id}":
+                value = deepcopy(review)
+                if pasted and changed_state == "facts":
+                    value["document_analyses"][0]["facts"].append({})
+                if pasted and changed_state == "findings":
+                    value["findings"].append({})
+                return value
+            if method == "GET" and path.endswith("/correction-proposals"):
+                return {"items": [{}] if pasted and changed_state == "corrections" else []}
+            raise AssertionError(f"unexpected request: {method} {path}")
+
+    monkeypatch.setattr(matrix, "workspace_transcript_root", lambda: tmp_path)
+
+    with pytest.raises(matrix.MatrixError, match=error):
+        matrix._assert_case_document_paste_zero_dispatch(FakeApi(), run_id=run_id, run=review)
+
+
 def _matching_result() -> dict[str, Any]:
     return {
         "review_as_of": "2026-08-05",
@@ -909,6 +1066,7 @@ def test_matrix_run_includes_export_mixed_and_safe_standalone_knowledge_receipt(
     scenarios = matrix._scenario_matrix()
     created: list[str] = []
     mixed: list[str] = []
+    document_paste_runs: list[str] = []
     standalone_calls: list[bool] = []
 
     class FakeOidc:
@@ -944,6 +1102,24 @@ def test_matrix_run_includes_export_mixed_and_safe_standalone_knowledge_receipt(
     monkeypatch.setattr(matrix, "PublicApi", FakeApi)
     monkeypatch.setattr(matrix, "_create_case_and_review", create_case)
     monkeypatch.setattr(matrix, "_conversation", lambda *_args, **_kwargs: "conversation")
+    monkeypatch.setattr(
+        matrix,
+        "_assert_case_document_paste_zero_dispatch",
+        lambda _api, *, run_id, run: (
+            document_paste_runs.append(run_id)
+            or {
+                "status": "passed",
+                "case_document_paste_notice_verified": True,
+                "case_document_paste_agent_http_exchanges": 0,
+                "case_document_paste_public_transcript_exchanges": 0,
+                "case_document_paste_agent_data_dispatches": 0,
+                "case_document_paste_claude_dispatches": 0,
+                "case_document_paste_fact_changes": 0,
+                "case_document_paste_finding_changes": 0,
+                "case_document_paste_correction_changes": 0,
+            }
+        ),
+    )
     monkeypatch.setattr(
         matrix,
         "_mixed_conversation",
@@ -993,6 +1169,18 @@ def test_matrix_run_includes_export_mixed_and_safe_standalone_knowledge_receipt(
     assert result["guidance_profile"] == "functional-uat-kr-trade-v2"
     assert created == [scenario.name for scenario in scenarios]
     assert "run-all-documents-match" in mixed
+    assert document_paste_runs == ["run-all-documents-match"]
+    assert result["case_document_paste"] == {
+        "status": "passed",
+        "case_document_paste_notice_verified": True,
+        "case_document_paste_agent_http_exchanges": 0,
+        "case_document_paste_public_transcript_exchanges": 0,
+        "case_document_paste_agent_data_dispatches": 0,
+        "case_document_paste_claude_dispatches": 0,
+        "case_document_paste_fact_changes": 0,
+        "case_document_paste_finding_changes": 0,
+        "case_document_paste_correction_changes": 0,
+    }
     assert standalone_calls == [True]
     assert result["knowledge_guidance"] == {
         "status": "passed",
