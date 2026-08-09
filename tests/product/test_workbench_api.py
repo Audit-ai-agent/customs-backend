@@ -2223,7 +2223,7 @@ def test_v2_no_coverage_with_null_snapshot_preserves_an_existing_knowledge_pin()
         second = client.post(
             f"/api/v1/knowledge/conversations/{conversation_id}/messages",
             json={"content": "수출 과세가격의 기본을 알려 주세요."},
-            headers={**_auth(), "Idempotency-Key": "v2-null-pin-second-001"},
+            headers={**_auth(), "Idempotency-Key": "case-turn-02"},
         )
         listed = client.get("/api/v1/knowledge/conversations", headers=_auth())
 
