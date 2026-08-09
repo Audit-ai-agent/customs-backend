@@ -559,8 +559,13 @@ class InMemoryWorkbenchRepository:
                 return self._knowledge_exchange(user_id, assistant_id), False
             if user_message.role.value != "user" or assistant_message.role.value != "assistant":
                 raise ConflictError("knowledge conversation exchange roles are invalid")
+            # A classified V2 no-coverage turn may have no Data snapshot at
+            # all.  Preserve an existing conversation pin, while continuing
+            # to reject a different non-null snapshot on a later covered
+            # turn.
             if (
                 conversation.snapshot_id is not None
+                and knowledge_snapshot_id is not None
                 and knowledge_snapshot_id != conversation.snapshot_id
             ):
                 raise ConflictError("knowledge conversation cannot switch its resolved snapshot")

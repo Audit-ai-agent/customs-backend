@@ -12,8 +12,9 @@ from fastapi.testclient import TestClient
 from tests.product.agent_v3_fixture import build_agent_v3_result
 
 from customs_backend.adapters import CallableAgentClient, HttpAgentClient, InMemoryObjectStore
-from customs_backend.api import Container, create_app
+from customs_backend.api import Container, _safe_case_transcript_response, create_app
 from customs_backend.auth import StaticTokenVerifier
+from customs_backend.case_input_boundary import CASE_DOCUMENT_CONTEXT_PLACEHOLDER
 from customs_backend.domain import (
     AgentReviewRequest,
     ConversationMessageCreate,
@@ -21,6 +22,7 @@ from customs_backend.domain import (
     Role,
     canonical_digest,
 )
+from customs_backend.guidance_registry import guidance_registry_projection
 from customs_backend.repository import InMemoryWorkbenchRepository
 from customs_backend.scenario_transcript import (
     FunctionalTranscriptController,
@@ -118,6 +120,55 @@ def _functional_settings() -> Settings:
         oidc_authorization_endpoint="http://127.0.0.1:18088/realms/customs/protocol/openid-connect/auth",
         oidc_token_endpoint="http://127.0.0.1:18088/realms/customs/protocol/openid-connect/token",
     )
+
+
+def _v1_guidance(
+    *,
+    source_id: str,
+    record_id: str,
+    as_of: str,
+    snapshot_id: str,
+    coverage: str,
+) -> dict[str, str]:
+    """Build one live V1 citation from Backend's exact safe projection."""
+
+    source = guidance_registry_projection("1.0").sources[source_id]
+    return {
+        "kind": "guidance_evidence",
+        "source_id": record_id,
+        "registry_source_id": source_id,
+        "source_kind": source.source_kind,
+        "source_title": source.title,
+        "source_uri": source.official_uri,
+        "as_of": as_of,
+        "snapshot_id": snapshot_id,
+        "coverage": coverage,
+    }
+
+
+def _v1_resolution(
+    *,
+    topic: str,
+    requested_direction: str,
+    as_of: str,
+    snapshot_id: str,
+    coverage: str,
+) -> dict[str, object]:
+    registry = guidance_registry_projection("1.0")
+    scope = registry.scopes[(topic, "legacy_topic")]
+    return {
+        "topic": topic,
+        "scope": "legacy_topic",
+        "requested_direction": requested_direction,
+        "applicable_directions": list(scope.directions),
+        "coverage": coverage,
+        "snapshot_id": snapshot_id,
+        "as_of": as_of,
+        "registry_version": "1.0",
+    }
+
+
+_V1_GUIDANCE_REGISTRY_SHA256 = "6fed779ee0ec1cd2358972925fe1b2788838a197d4f33e62e461fcfed2bb7d6c"
 
 
 def _local_development_settings() -> Settings:
@@ -351,6 +402,27 @@ def test_reviewer_decisions_are_append_only_and_do_not_change_agent_result_diges
 def test_only_v1_browser_paths_are_public() -> None:
     with _client() as client:
         assert client.get("/api/v2/cases", headers=_auth()).status_code == 404
+
+
+def test_public_openapi_excludes_internal_guidance_registry_provenance() -> None:
+    with _client() as client:
+        specification = client.get("/openapi.json").json()
+
+    serialized = json.dumps(specification)
+    assert "registry_source_id" not in serialized
+    assert "guidance_registry_sha256" not in serialized
+    schemas = specification["components"]["schemas"]
+    resolution = schemas["GuidanceResolution"]["properties"]
+    assert set(resolution) == {
+        "topic",
+        "scope",
+        "requested_direction",
+        "applicable_directions",
+        "coverage",
+        "snapshot_id",
+        "as_of",
+        "registry_version",
+    }
 
 
 def test_invalid_agent_response_becomes_a_simple_failed_job() -> None:
@@ -683,16 +755,13 @@ def test_grounded_assistant_conversation_is_persisted_and_idempotent() -> None:
 
 def test_case_assistant_persists_additive_case_and_guidance_sections() -> None:
     def answer_handler(request):
-        guidance = {
-            "kind": "guidance_evidence",
-            "source_id": "guide-export-001",
-            "source_kind": "official_law",
-            "source_title": "수출 통관 안내",
-            "source_uri": "https://www.customs.go.kr/guide/export",
-            "as_of": "2026-08-05",
-            "snapshot_id": "kr-trade-2026-08-05",
-            "coverage": "covered",
-        }
+        guidance = _v1_guidance(
+            source_id="kcs_customs_guidance",
+            record_id="guide-export-001",
+            as_of="2026-08-05",
+            snapshot_id="kr-trade-2026-08-05",
+            coverage="covered",
+        )
         return {
             "schema_version": "1.0",
             "case_id": request.case_id,
@@ -720,6 +789,14 @@ def test_case_assistant_persists_additive_case_and_guidance_sections() -> None:
             ],
             "suggested_questions": [],
             "correction_draft": None,
+            "guidance_resolution": _v1_resolution(
+                topic="customs_clearance",
+                requested_direction="export",
+                as_of="2026-08-05",
+                snapshot_id="kr-trade-2026-08-05",
+                coverage="covered",
+            ),
+            "guidance_registry_sha256": _V1_GUIDANCE_REGISTRY_SHA256,
             "engine": {"kind": "deterministic", "model_id": "section-fixture"},
         }
 
@@ -770,19 +847,24 @@ def test_case_assistant_rejects_guidance_from_another_review_date() -> None:
             "direct_answer": "현재 사건의 수량 차이를 먼저 확인해야 합니다.",
             "citations": [
                 {"kind": "comparison", "reference_id": "cmp_fixture_quantity"},
-                {
-                    "kind": "guidance_evidence",
-                    "source_id": "guide-wrong-date",
-                    "source_kind": "official_law",
-                    "source_title": "수출 통관 안내",
-                    "source_uri": "https://www.customs.go.kr/guide/export",
-                    "as_of": "2026-08-06",
-                    "snapshot_id": "kr-trade-2026-08-06",
-                    "coverage": "covered",
-                },
+                _v1_guidance(
+                    source_id="kcs_customs_guidance",
+                    record_id="guide-wrong-date",
+                    as_of="2026-08-06",
+                    snapshot_id="kr-trade-2026-08-06",
+                    coverage="covered",
+                ),
             ],
             "suggested_questions": [],
             "correction_draft": None,
+            "guidance_resolution": _v1_resolution(
+                topic="customs_clearance",
+                requested_direction="export",
+                as_of="2026-08-06",
+                snapshot_id="kr-trade-2026-08-06",
+                coverage="covered",
+            ),
+            "guidance_registry_sha256": _V1_GUIDANCE_REGISTRY_SHA256,
             "engine": {"kind": "deterministic", "model_id": "date-fixture"},
         }
 
@@ -819,16 +901,13 @@ def test_official_knowledge_conversation_is_separate_and_snapshot_grounded() -> 
 
     def knowledge_handler(request):
         observed.update(request.to_agent_wire())
-        guidance = {
-            "kind": "guidance_evidence",
-            "source_id": "official-export-guide-2026",
-            "source_kind": "official_law",
-            "source_title": "관세청 수출 통관 안내",
-            "source_uri": "https://www.customs.go.kr/guide/export",
-            "as_of": "2026-08-05",
-            "snapshot_id": "kr-trade-2026-08-05",
-            "coverage": "covered",
-        }
+        guidance = _v1_guidance(
+            source_id="kcs_customs_guidance",
+            record_id="official-export-guide-2026",
+            as_of="2026-08-05",
+            snapshot_id="kr-trade-2026-08-05",
+            coverage="covered",
+        )
         return {
             "schema_version": "1.0",
             "conversation_id": request.conversation_id,
@@ -847,6 +926,14 @@ def test_official_knowledge_conversation_is_separate_and_snapshot_grounded() -> 
             "coverage": "covered",
             "snapshot_id": "kr-trade-2026-08-05",
             "as_of": "2026-08-05",
+            "guidance_resolution": _v1_resolution(
+                topic="customs_clearance",
+                requested_direction="export",
+                as_of="2026-08-05",
+                snapshot_id="kr-trade-2026-08-05",
+                coverage="covered",
+            ),
+            "guidance_registry_sha256": _V1_GUIDANCE_REGISTRY_SHA256,
             "engine": {"kind": "deterministic", "model_id": "knowledge-fixture"},
         }
 
@@ -882,7 +969,7 @@ def test_official_knowledge_conversation_is_separate_and_snapshot_grounded() -> 
         assert assistant["answer_scope"] == "general_customs_guidance"
         assert assistant["citations"][0]["kind"] == "guidance_evidence"
         assert assistant["citations"][0]["source_id"] == "official-export-guide-2026"
-        assert assistant["citations"][0]["source_kind"] == "official_law"
+        assert assistant["citations"][0]["source_kind"] == "official_agency_guidance"
         assert assistant["answer_sections"][0]["kind"] == "general_guidance"
         assert assistant["knowledge_coverage"] == "covered"
         assert assistant["knowledge_snapshot_id"] == "kr-trade-2026-08-05"
@@ -1093,16 +1180,13 @@ def test_knowledge_conversation_rejects_snapshot_drift_and_preserves_answer_prov
         nonlocal answer_count
         answer_count += 1
         snapshot_id = "kr-trade-2026-08-05-a" if answer_count == 1 else "kr-trade-2026-08-05-b"
-        guidance = {
-            "kind": "guidance_evidence",
-            "source_id": "official-guide-001",
-            "source_kind": "official_law",
-            "source_title": "관세청 수출 통관 안내",
-            "source_uri": "https://www.customs.go.kr/guide/export",
-            "as_of": request.as_of.isoformat(),
-            "snapshot_id": snapshot_id,
-            "coverage": "partial",
-        }
+        guidance = _v1_guidance(
+            source_id="kcs_customs_guidance",
+            record_id="official-guide-001",
+            as_of=request.as_of.isoformat(),
+            snapshot_id=snapshot_id,
+            coverage="partial",
+        )
         return {
             "schema_version": "1.0",
             "conversation_id": request.conversation_id,
@@ -1114,6 +1198,14 @@ def test_knowledge_conversation_rejects_snapshot_drift_and_preserves_answer_prov
             "coverage": "partial",
             "snapshot_id": snapshot_id,
             "as_of": request.as_of.isoformat(),
+            "guidance_resolution": _v1_resolution(
+                topic="customs_clearance",
+                requested_direction="import",
+                as_of=request.as_of.isoformat(),
+                snapshot_id=snapshot_id,
+                coverage="partial",
+            ),
+            "guidance_registry_sha256": _V1_GUIDANCE_REGISTRY_SHA256,
             "engine": {"kind": "deterministic", "model_id": "knowledge-fixture"},
         }
 
@@ -1149,8 +1241,15 @@ def test_knowledge_conversation_rejects_snapshot_drift_and_preserves_answer_prov
 
 
 @pytest.mark.parametrize(
-    "source_kind",
+    ("registry_source_id", "topic", "requested_direction"),
     (
+        ("law_001556", "customs_clearance", "import"),
+        ("law_kr_trade_fta_scope", "fta_procedure", "import"),
+        ("kcs_customs_guidance", "customs_clearance", "import"),
+        ("ccct_public_requirements", "import_requirements", "import"),
+        ("kotra_trade_guidance", "trade_terms", "export"),
+    ),
+    ids=(
         "official_law",
         "official_law_catalog",
         "official_agency_guidance",
@@ -1159,21 +1258,20 @@ def test_knowledge_conversation_rejects_snapshot_drift_and_preserves_answer_prov
     ),
 )
 def test_functional_uat_accepts_every_official_guidance_registry_source_kind(
-    source_kind: str,
+    registry_source_id: str,
+    topic: str,
+    requested_direction: str,
 ) -> None:
     """Official registry categories remain distinct but all work in Functional-UAT."""
 
     def knowledge_handler(request):
-        guidance = {
-            "kind": "guidance_evidence",
-            "source_id": f"guide-{source_kind}",
-            "source_kind": source_kind,
-            "source_title": "공식 통관 안내",
-            "source_uri": "https://www.customs.go.kr/guide",
-            "as_of": request.as_of.isoformat(),
-            "snapshot_id": "kr-trade-2026-08-05",
-            "coverage": "covered",
-        }
+        guidance = _v1_guidance(
+            source_id=registry_source_id,
+            record_id=f"guide-{registry_source_id}",
+            as_of=request.as_of.isoformat(),
+            snapshot_id="kr-trade-2026-08-05",
+            coverage="covered",
+        )
         return {
             "schema_version": "1.0",
             "conversation_id": request.conversation_id,
@@ -1192,6 +1290,14 @@ def test_functional_uat_accepts_every_official_guidance_registry_source_kind(
             "coverage": "covered",
             "snapshot_id": "kr-trade-2026-08-05",
             "as_of": request.as_of.isoformat(),
+            "guidance_resolution": _v1_resolution(
+                topic=topic,
+                requested_direction=requested_direction,
+                as_of=request.as_of.isoformat(),
+                snapshot_id="kr-trade-2026-08-05",
+                coverage="covered",
+            ),
+            "guidance_registry_sha256": _V1_GUIDANCE_REGISTRY_SHA256,
             "engine": {"kind": "deterministic", "model_id": "knowledge-fixture"},
         }
 
@@ -1206,13 +1312,15 @@ def test_functional_uat_accepts_every_official_guidance_registry_source_kind(
             json={"content": "공식 통관 안내를 알려 주세요."},
             headers={
                 "Authorization": "Bearer test-token",
-                "Idempotency-Key": f"official-{source_kind}",
+                "Idempotency-Key": f"official-{registry_source_id}",
             },
         )
 
     assert response.status_code == 200, response.text
     citation = response.json()["assistant_message"]["citations"][0]
-    assert citation["source_kind"] == source_kind
+    assert citation["source_kind"] == guidance_registry_projection("1.0").sources[
+        registry_source_id
+    ].source_kind
     assert citation["snapshot_id"] == "kr-trade-2026-08-05"
 
 
@@ -1675,3 +1783,448 @@ def test_agent_result_without_human_review_action_is_rejected_without_chat_conte
     assert review.status_code == 202
     assert review.json()["job"]["status"] == "failed"
     assert review.json()["job"]["error_code"] == "ConflictError"
+
+
+def test_case_assistant_persists_v1_guidance_application_without_internal_source_id() -> None:
+    def answer_handler(request):
+        guidance = {
+            "kind": "guidance_evidence",
+            "source_id": "record-trade-terms-001",
+            "registry_source_id": "kotra_trade_guidance",
+            "source_kind": "official_public_guidance",
+            "source_title": "KOTRA 공개 무역 실무 안내",
+            "source_uri": "https://dream.kotra.or.kr/dream/cms/com/index.do?MENU_ID=4070",
+            "as_of": "2026-08-05",
+            "snapshot_id": "kr-trade-2026-08-05",
+            "coverage": "covered",
+        }
+        return {
+            "schema_version": "1.0",
+            "case_id": request.case_id,
+            "review_run_id": request.review_run_id,
+            "conversation_id": request.conversation_id,
+            "answer_scope": "case_grounded",
+            "direct_answer": "현재 사건의 수량 비교와 거래조건 확인을 함께 진행해야 합니다.",
+            "citations": [
+                {"kind": "comparison", "reference_id": "cmp_fixture_quantity"},
+                guidance,
+            ],
+            "answer_sections": [
+                {
+                    "kind": "case_analysis",
+                    "title": "현재 사건 기준",
+                    "content": "문서 간 수량 차이를 먼저 확인해야 합니다.",
+                    "citations": [
+                        {"kind": "comparison", "reference_id": "cmp_fixture_quantity"}
+                    ],
+                },
+                {
+                    "kind": "general_guidance",
+                    "title": "일반 통관 안내",
+                    "content": "공개 무역 실무 안내의 거래조건 범위를 확인할 수 있습니다.",
+                    "citations": [guidance],
+                },
+                {
+                    "kind": "case_application",
+                    "title": "사건 적용·다음 확인",
+                    "content": "현재 수량 차이 확인과 거래조건 문서 확인을 분리해 검토해 주세요.",
+                    "citations": [
+                        {"kind": "comparison", "reference_id": "cmp_fixture_quantity"},
+                        guidance,
+                    ],
+                },
+            ],
+            "suggested_questions": [],
+            "correction_draft": None,
+            "guidance_resolution": {
+                "topic": "trade_terms",
+                "scope": "legacy_topic",
+                "requested_direction": "export",
+                "applicable_directions": ["import", "export"],
+                "coverage": "covered",
+                "snapshot_id": "kr-trade-2026-08-05",
+                "as_of": "2026-08-05",
+                "registry_version": "1.0",
+            },
+            "guidance_registry_sha256": (
+                "6fed779ee0ec1cd2358972925fe1b2788838a197d4f33e62e461fcfed2bb7d6c"
+            ),
+            "engine": {"kind": "deterministic", "model_id": "v1-application-fixture"},
+        }
+
+    with _client(include_finding=True, answer_handler=answer_handler) as client:
+        case_id = client.post("/api/v1/cases", json={"title": "적용 요약"}, headers=_auth()).json()[
+            "case_id"
+        ]
+        client.post(
+            f"/api/v1/cases/{case_id}/documents",
+            json={"document_type": "CI", "filename": "invoice.txt", "content_text": "INV-001"},
+            headers=_auth(),
+        )
+        run_id = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={"trade_type": "export", "review_as_of": "2026-08-05"},
+            headers={**_auth(), "Idempotency-Key": "application-v1-review-001"},
+        ).json()["job"]["review_run_id"]
+        conversation_id = client.post(
+            f"/api/v1/review-runs/{run_id}/assistant/conversations", json={}, headers=_auth()
+        ).json()["conversation_id"]
+        response = client.post(
+            f"/api/v1/assistant/conversations/{conversation_id}/messages",
+            json={"content": "현재 사건에 거래조건 안내를 적용하면 무엇을 확인해야 하나요?"},
+            headers={**_auth(), "Idempotency-Key": "application-v1-answer-001"},
+        )
+
+    assert response.status_code == 200, response.text
+    assistant = response.json()["assistant_message"]
+    assert [section["kind"] for section in assistant["answer_sections"]] == [
+        "case_analysis",
+        "general_guidance",
+        "case_application",
+    ]
+    assert assistant["guidance_resolution"] == {
+        "topic": "trade_terms",
+        "scope": "legacy_topic",
+        "requested_direction": "export",
+        "applicable_directions": ["import", "export"],
+        "coverage": "covered",
+        "snapshot_id": "kr-trade-2026-08-05",
+        "as_of": "2026-08-05",
+        "registry_version": "1.0",
+    }
+    assert "registry_source_id" not in json.dumps(assistant)
+    assert "guidance_registry_sha256" not in json.dumps(assistant)
+
+
+def test_case_document_shaped_chat_is_persisted_but_never_forwarded_to_agent() -> None:
+    observed: list[object] = []
+
+    def answer_handler(request):
+        observed.append(request)
+        return {
+            "schema_version": "1.0",
+            "case_id": request.case_id,
+            "review_run_id": request.review_run_id,
+            "conversation_id": request.conversation_id,
+            "answer_scope": "case_grounded",
+            "direct_answer": "현재 사건의 수량 비교를 확인해 주세요.",
+            "citations": [{"kind": "comparison", "reference_id": "cmp_fixture_quantity"}],
+            "suggested_questions": [],
+            "correction_draft": None,
+            "engine": {"kind": "deterministic", "model_id": "case-input-boundary"},
+        }
+
+    pasted_document = "상업송장\n수량: 10\n금액: 100"
+    with _client(include_finding=True, answer_handler=answer_handler) as client:
+        case_id = client.post("/api/v1/cases", json={"title": "문서형 입력"}, headers=_auth()).json()[
+            "case_id"
+        ]
+        client.post(
+            f"/api/v1/cases/{case_id}/documents",
+            json={"document_type": "CI", "filename": "invoice.txt", "content_text": "INV-001"},
+            headers=_auth(),
+        )
+        run_id = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={"review_as_of": "2026-08-05"},
+            headers={**_auth(), "Idempotency-Key": "document-input-review-001"},
+        ).json()["job"]["review_run_id"]
+        conversation_id = client.post(
+            f"/api/v1/review-runs/{run_id}/assistant/conversations", json={}, headers=_auth()
+        ).json()["conversation_id"]
+        first = client.post(
+            f"/api/v1/assistant/conversations/{conversation_id}/messages",
+            json={"content": pasted_document},
+            headers={**_auth(), "Idempotency-Key": "document-input-answer-001"},
+        )
+        second = client.post(
+            f"/api/v1/assistant/conversations/{conversation_id}/messages",
+            json={"content": "현재 사건의 수량 차이를 설명해 주세요."},
+            headers={**_auth(), "Idempotency-Key": "document-input-answer-002"},
+        )
+
+    assert first.status_code == 200, first.text
+    first_exchange = first.json()
+    assert observed and len(observed) == 1
+    assert first_exchange["user_message"]["content"] == pasted_document
+    assert first_exchange["assistant_message"]["case_input_notice"] == "unregistered_document_text"
+    assert first_exchange["assistant_message"]["answer_scope"] == "insufficient_evidence"
+    assert first_exchange["assistant_message"]["citations"] == []
+    assert first_exchange["assistant_message"]["answer_sections"] == []
+    assert "새 근거로 사용하지 않았습니다" in first_exchange["assistant_message"]["content"]
+    assert second.status_code == 200, second.text
+    recent_turns = observed[0].recent_turns
+    assert pasted_document not in json.dumps([turn.model_dump() for turn in recent_turns])
+    assert any(turn.content == CASE_DOCUMENT_CONTEXT_PLACEHOLDER for turn in recent_turns)
+    transcript_value = _safe_case_transcript_response(first_exchange)
+    assert pasted_document not in json.dumps(transcript_value)
+    assert CASE_DOCUMENT_CONTEXT_PLACEHOLDER in json.dumps(transcript_value, ensure_ascii=False)
+
+
+def test_functional_case_document_paste_skips_public_transcript_dispatch(tmp_path: Path) -> None:
+    """The raw Case audit record must not create any transcript event."""
+
+    assistant_calls = 0
+
+    def answer_handler(_request):
+        nonlocal assistant_calls
+        assistant_calls += 1
+        raise AssertionError("a document-shaped Case paste must not call Agent")
+
+    settings = _functional_settings()
+    principal = Principal(
+        subject="reviewer-1", org_id="local-dev", roles=frozenset({Role.reviewer})
+    )
+    repository = InMemoryWorkbenchRepository()
+    objects = InMemoryObjectStore()
+    agent = CallableAgentClient(
+        lambda request: build_agent_v3_result(request, include_finding=True),
+        answer=answer_handler,
+    )
+    service = WorkbenchService(repository=repository, object_store=objects, agent=agent)
+    transcript_root = tmp_path / "_local" / "state" / "scenario-runs"
+    transcript = FunctionalTranscriptController(
+        root=ScenarioTranscriptRoot.create(transcript_root)
+    )
+    app = create_app(
+        settings=settings,
+        container=Container(
+            settings=settings,
+            repository=repository,
+            object_store=objects,
+            agent=agent,
+            token_verifier=StaticTokenVerifier({"test-token": principal}),
+            service=service,
+            transcript=transcript,
+        ),
+    )
+
+    pasted_document = "상업송장\n수량: 10\n금액: 100"
+    with TestClient(app) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "문서형 전사 경계"}, headers=_auth()
+        ).json()["case_id"]
+        assert client.post(
+            f"/api/v1/cases/{case_id}/documents",
+            json={"document_type": "CI", "filename": "invoice.txt", "content_text": "INV-001"},
+            headers=_auth(),
+        ).status_code == 201
+        run_id = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={"review_as_of": "2026-08-05"},
+            headers={**_auth(), "Idempotency-Key": "document-transcript-review-001"},
+        ).json()["job"]["review_run_id"]
+        conversation_id = client.post(
+            f"/api/v1/review-runs/{run_id}/assistant/conversations",
+            json={},
+            headers=_auth(),
+        ).json()["conversation_id"]
+        public_transcript = transcript_root / run_id / "public-api.jsonl"
+        before = public_transcript.read_bytes()
+        response = client.post(
+            f"/api/v1/assistant/conversations/{conversation_id}/messages",
+            json={"content": pasted_document},
+            headers={**_auth(), "Idempotency-Key": "document-transcript-answer-001"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["assistant_message"]["case_input_notice"] == "unregistered_document_text"
+    assert assistant_calls == 0
+    assert public_transcript.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("source_uri", "registry_sha256", "expected_status"),
+    [
+        (
+            "https://www2.customs.go.kr/kcs/cm/cntnts/cntntsView.do?cntntsId=818&mi=2820",
+            "a450ae6286d9a12729c5459543a35fd9c1c3df2ff59977700f72887c3df6543e",
+            200,
+        ),
+        (
+            "https://www2.customs.go.kr/kcs/cm/cntnts/cntntsView.do?cntntsId=818",
+            "a450ae6286d9a12729c5459543a35fd9c1c3df2ff59977700f72887c3df6543e",
+            409,
+        ),
+        (
+            "https://www2.customs.go.kr/kcs/cm/cntnts/cntntsView.do?cntntsId=818&mi=2820",
+            "0" * 64,
+            409,
+        ),
+    ],
+)
+def test_knowledge_answer_validates_v2_registry_source_projection(
+    source_uri: str, registry_sha256: str, expected_status: int
+) -> None:
+    def knowledge_handler(request):
+        guidance = {
+            "kind": "guidance_evidence",
+            "source_id": "record-v2-export-clearance-001",
+            "registry_source_id": "v2_kcs_export_clearance",
+            "source_kind": "official_agency_guidance",
+            "source_title": "수출 통관",
+            "source_uri": source_uri,
+            "as_of": request.as_of.isoformat(),
+            "snapshot_id": "kr-trade-v2-2026-08-05",
+            "coverage": "covered",
+        }
+        return {
+            "schema_version": "1.0",
+            "conversation_id": request.conversation_id,
+            "answer_scope": "general_customs_guidance",
+            "direct_answer": "공식 수출 통관 안내를 확인할 수 있습니다.",
+            "citations": [guidance],
+            "answer_sections": [
+                {
+                    "kind": "general_guidance",
+                    "title": "일반 수출 통관 안내",
+                    "content": "공식 수출 통관 안내를 확인할 수 있습니다.",
+                    "citations": [guidance],
+                }
+            ],
+            "suggested_questions": [],
+            "coverage": "covered",
+            "snapshot_id": "kr-trade-v2-2026-08-05",
+            "as_of": request.as_of.isoformat(),
+            "guidance_resolution": {
+                "topic": "customs_clearance",
+                "scope": "export_clearance_flow",
+                "requested_direction": "export",
+                "applicable_directions": ["export"],
+                "coverage": "covered",
+                "snapshot_id": "kr-trade-v2-2026-08-05",
+                "as_of": request.as_of.isoformat(),
+                "registry_version": "2.0",
+            },
+            "guidance_registry_sha256": registry_sha256,
+            "engine": {"kind": "deterministic", "model_id": "v2-projection-fixture"},
+        }
+
+    with _client(knowledge_answer_handler=knowledge_handler) as client:
+        conversation_id = client.post(
+            "/api/v1/knowledge/conversations",
+            json={"trade_type": "export", "as_of": "2026-08-05"},
+            headers=_auth(),
+        ).json()["conversation_id"]
+        response = client.post(
+            f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+            json={"content": "수출 통관 흐름을 알려 주세요."},
+            headers={**_auth(), "Idempotency-Key": f"v2-projection-{expected_status}"},
+        )
+
+    assert response.status_code == expected_status, response.text
+    if expected_status == 200:
+        assistant = response.json()["assistant_message"]
+        assert assistant["guidance_resolution"]["registry_version"] == "2.0"
+        assert assistant["guidance_resolution"]["scope"] == "export_clearance_flow"
+        assert "registry_source_id" not in json.dumps(assistant)
+        assert "guidance_registry_sha256" not in json.dumps(assistant)
+
+
+def test_v2_no_coverage_with_null_snapshot_preserves_an_existing_knowledge_pin() -> None:
+    answer_count = 0
+
+    def knowledge_handler(request):
+        nonlocal answer_count
+        answer_count += 1
+        if answer_count == 2:
+            return {
+                "schema_version": "1.0",
+                "conversation_id": request.conversation_id,
+                "answer_scope": "insufficient_evidence",
+                "direct_answer": "현재 공식 지식 스냅샷 범위에서는 수출 과세가격 기초를 확인할 수 없습니다.",
+                "citations": [],
+                "answer_sections": [],
+                "suggested_questions": [],
+                "coverage": "no_coverage",
+                "snapshot_id": None,
+                "as_of": request.as_of.isoformat(),
+                "guidance_resolution": {
+                    "topic": "customs_duty",
+                    "scope": "customs_value_basics",
+                    "requested_direction": "export",
+                    "applicable_directions": ["import"],
+                    "coverage": "no_coverage",
+                    "snapshot_id": None,
+                    "as_of": request.as_of.isoformat(),
+                    "registry_version": "2.0",
+                },
+                "guidance_registry_sha256": (
+                    "a450ae6286d9a12729c5459543a35fd9c1c3df2ff59977700f72887c3df6543e"
+                ),
+                "engine": {"kind": "deterministic", "model_id": "v2-no-coverage"},
+            }
+        guidance = {
+            "kind": "guidance_evidence",
+            "source_id": "record-v2-export-clearance-pin",
+            "registry_source_id": "v2_kcs_export_clearance",
+            "source_kind": "official_agency_guidance",
+            "source_title": "수출 통관",
+            "source_uri": (
+                "https://www2.customs.go.kr/kcs/cm/cntnts/cntntsView.do?cntntsId=818&mi=2820"
+            ),
+            "as_of": request.as_of.isoformat(),
+            "snapshot_id": "kr-trade-v2-2026-08-05",
+            "coverage": "covered",
+        }
+        return {
+            "schema_version": "1.0",
+            "conversation_id": request.conversation_id,
+            "answer_scope": "general_customs_guidance",
+            "direct_answer": "공식 수출 통관 안내를 확인할 수 있습니다.",
+            "citations": [guidance],
+            "answer_sections": [
+                {
+                    "kind": "general_guidance",
+                    "title": "일반 수출 통관 안내",
+                    "content": "공식 수출 통관 안내를 확인할 수 있습니다.",
+                    "citations": [guidance],
+                }
+            ],
+            "suggested_questions": [],
+            "coverage": "covered",
+            "snapshot_id": "kr-trade-v2-2026-08-05",
+            "as_of": request.as_of.isoformat(),
+            "guidance_resolution": {
+                "topic": "customs_clearance",
+                "scope": "export_clearance_flow",
+                "requested_direction": "export",
+                "applicable_directions": ["export"],
+                "coverage": "covered",
+                "snapshot_id": "kr-trade-v2-2026-08-05",
+                "as_of": request.as_of.isoformat(),
+                "registry_version": "2.0",
+            },
+            "guidance_registry_sha256": (
+                "a450ae6286d9a12729c5459543a35fd9c1c3df2ff59977700f72887c3df6543e"
+            ),
+            "engine": {"kind": "deterministic", "model_id": "v2-pin"},
+        }
+
+    with _client(knowledge_answer_handler=knowledge_handler) as client:
+        conversation_id = client.post(
+            "/api/v1/knowledge/conversations",
+            json={"trade_type": "export", "as_of": "2026-08-05"},
+            headers=_auth(),
+        ).json()["conversation_id"]
+        first = client.post(
+            f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+            json={"content": "수출 통관 흐름을 알려 주세요."},
+            headers={**_auth(), "Idempotency-Key": "v2-null-pin-first-001"},
+        )
+        second = client.post(
+            f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+            json={"content": "수출 과세가격의 기본을 알려 주세요."},
+            headers={**_auth(), "Idempotency-Key": "v2-null-pin-second-001"},
+        )
+        listed = client.get("/api/v1/knowledge/conversations", headers=_auth())
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    no_coverage = second.json()["assistant_message"]
+    assert no_coverage["knowledge_coverage"] == "no_coverage"
+    assert "knowledge_snapshot_id" not in no_coverage
+    assert no_coverage["guidance_resolution"]["coverage"] == "no_coverage"
+    assert no_coverage["guidance_resolution"].get("snapshot_id") is None
+    assert "guidance_registry_sha256" not in json.dumps(no_coverage)
+    assert listed.json()["items"][0]["snapshot_id"] == "kr-trade-v2-2026-08-05"

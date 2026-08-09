@@ -19,6 +19,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from customs_backend.adapters import HttpAgentClient, InMemoryObjectStore
 from customs_backend.agent_contract import BackendConfigurationError, validate_agent_contract_bundle
 from customs_backend.auth import StaticTokenVerifier, principal_dependency, require_roles
+from customs_backend.case_input_boundary import case_input_notice, safe_case_transcript_content
 from customs_backend.domain import (
     CaseCreate,
     CaseRecord,
@@ -514,6 +515,30 @@ def build_container(settings: Settings) -> Container:
 
 def _service(request: Request) -> WorkbenchService:
     return request.app.state.container.service
+
+
+def _safe_case_transcript_request(body: ConversationMessageCreate) -> dict[str, str]:
+    """Keep authorised Case persistence separate from transcript retention."""
+
+    return {"content": safe_case_transcript_content(body.content)}
+
+
+def _safe_case_transcript_response(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Redact only document-shaped user message bodies from transcript output."""
+
+    def redact(item: Any) -> Any:
+        if isinstance(item, list):
+            return [redact(entry) for entry in item]
+        if not isinstance(item, dict):
+            return item
+        copied = {key: redact(entry) for key, entry in item.items()}
+        if copied.get("role") in {"user", "assistant"} and isinstance(copied.get("content"), str):
+            copied["content"] = safe_case_transcript_content(copied["content"])
+        return copied
+
+    redacted = redact(dict(value))
+    assert isinstance(redacted, dict)
+    return redacted
 
 
 def _verifier_ready(verifier: TokenVerifier) -> bool:
@@ -1031,6 +1056,12 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         service: WorkbenchService = Depends(_service),
     ) -> ConversationMessageExchange:
         run = service.get_conversation_run(principal, conversation_id)
+        # A raw document-shaped paste is retained only in the authorised Case
+        # conversation.  Do not create a Functional-UAT public-transcript
+        # event for it: the fixed assistant notice is sufficient evidence of
+        # the boundary and the pasted source text must not enter any
+        # transcript stream.
+        document_paste = case_input_notice(body.content) is not None
         result = service.send_conversation_message(
             principal,
             conversation_id,
@@ -1038,15 +1069,18 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             idempotency_key,
             functional_uat=actual_container.settings.environment == "functional-uat",
         )
-        record_public_exchange(
-            case_id=run.case_id,
-            method="POST",
-            path=f"/api/v1/assistant/conversations/{conversation_id}/messages",
-            request_body=body.model_dump(mode="json"),
-            response_status=200,
-            response_body=result.model_dump(mode="json", exclude_none=True),
-            review_run_id=run.review_run_id,
-        )
+        if not document_paste:
+            record_public_exchange(
+                case_id=run.case_id,
+                method="POST",
+                path=f"/api/v1/assistant/conversations/{conversation_id}/messages",
+                request_body=_safe_case_transcript_request(body),
+                response_status=200,
+                response_body=_safe_case_transcript_response(
+                    result.model_dump(mode="json", exclude_none=True)
+                ),
+                review_run_id=run.review_run_id,
+            )
         return result
 
     @app.get(
@@ -1069,7 +1103,9 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             path=f"/api/v1/assistant/conversations/{conversation_id}/messages",
             request_body=None,
             response_status=200,
-            response_body=result.model_dump(mode="json", exclude_none=True),
+            response_body=_safe_case_transcript_response(
+                result.model_dump(mode="json", exclude_none=True)
+            ),
             review_run_id=run.review_run_id,
         )
         return result

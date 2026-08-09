@@ -52,7 +52,8 @@
       "AnswerSectionKind": {
         "enum": [
           "case_analysis",
-          "general_guidance"
+          "general_guidance",
+          "case_application"
         ],
         "title": "AnswerSectionKind",
         "type": "string"
@@ -397,9 +398,21 @@
             "items": {
               "$ref": "#/components/schemas/AnswerSection"
             },
-            "maxItems": 2,
+            "maxItems": 3,
             "title": "Answer Sections",
             "type": "array"
+          },
+          "case_input_notice": {
+            "anyOf": [
+              {
+                "const": "unregistered_document_text",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Case Input Notice"
           },
           "citations": {
             "items": {
@@ -437,6 +450,16 @@
           "created_by": {
             "title": "Created By",
             "type": "string"
+          },
+          "guidance_resolution": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GuidanceResolution"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "knowledge_as_of": {
             "anyOf": [
@@ -1208,6 +1231,95 @@
         ],
         "title": "FindingDecisionStatus",
         "type": "string"
+      },
+      "GuidanceResolution": {
+        "additionalProperties": false,
+        "description": "Safe, public snapshot-resolution metadata for one guidance attempt.\n\nThis contains only a fixed topic/scope projection, date, direction, and\ncoverage state.  Registry hash and source-internal identifiers never\nappear here; Backend uses its packaged registry projection internally.",
+        "properties": {
+          "applicable_directions": {
+            "items": {
+              "enum": [
+                "import",
+                "export"
+              ],
+              "type": "string"
+            },
+            "maxItems": 2,
+            "minItems": 1,
+            "title": "Applicable Directions",
+            "type": "array"
+          },
+          "as_of": {
+            "format": "date",
+            "title": "As Of",
+            "type": "string"
+          },
+          "coverage": {
+            "enum": [
+              "covered",
+              "no_coverage",
+              "partial",
+              "unavailable"
+            ],
+            "title": "Coverage",
+            "type": "string"
+          },
+          "registry_version": {
+            "enum": [
+              "1.0",
+              "2.0"
+            ],
+            "title": "Registry Version",
+            "type": "string"
+          },
+          "requested_direction": {
+            "enum": [
+              "import",
+              "export",
+              "both"
+            ],
+            "title": "Requested Direction",
+            "type": "string"
+          },
+          "scope": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9_]{0,127}$",
+            "title": "Scope",
+            "type": "string"
+          },
+          "snapshot_id": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Id"
+          },
+          "topic": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9_]{0,127}$",
+            "title": "Topic",
+            "type": "string"
+          }
+        },
+        "required": [
+          "topic",
+          "scope",
+          "requested_direction",
+          "applicable_directions",
+          "coverage",
+          "as_of",
+          "registry_version"
+        ],
+        "title": "GuidanceResolution",
+        "type": "object"
       },
       "InputDocumentManifestEntry": {
         "additionalProperties": false,

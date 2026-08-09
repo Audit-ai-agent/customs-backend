@@ -183,18 +183,32 @@ Agent의 실제 Data 연결은 같은 bearer/mode 값과 함께 Agent의 좁은 
 ```powershell
 Push-Location ..\customs-ai-agent
 uv sync --locked --group dev --extra functional-uat --python 3.11
-. .\tools\Import-AgentProfile.ps1 -Profile functional-uat-3law
+. .\tools\Import-AgentProfile.ps1 -Profile functional-uat-kr-trade-v2 `
+  -EvidencePort 18083 -GuidancePort 18094
 uv run --no-sync customs-ai-agent-functional-uat-serve
 ```
 
-Data의 `functional-uat-3law build --as-of 2026-08-05`와 serve를 먼저 완료하고, Agent
-터미널에서 Git이 무시하는 `../_local/secrets/.env`에 개인
+TASK-0046 Functional-UAT는 Data의 기존 `functional-uat-3law` Evidence build·serve와
+별도 `functional-uat-kr-trade-v2 build-v2`·`verify-v2`·`serve-guidance-v2 --port 18094`를
+모두 먼저 완료한다. 위 profile은 3법 Evidence(`18083`)와 준비 상태가 검증된 V2 공식
+안내 snapshot(`18094`)을 명시적으로 조합하며, 기존 V1 endpoint로 조용히 대체하지 않는다.
+Agent 터미널에서 Git이 무시하는 `../_local/secrets/.env`에 개인
 `ANTHROPIC_API_KEY=personal-key` 한 줄을 만든 뒤 `..\customs-ai-agent`에서 위 명령을
 실행한다. Functional-UAT Agent importer만 그 파일을 현재 세션에 읽고 값을 출력하지
 않는다. 해당 파일은 Git·Docker image·공유 ZIP·채팅에 넣지 않는다.
 심사 기준일은 `2026-08-05`로 고정한다. `GET /health/functional-uat-ready`가
 Backend의 로컬 의존성과 Agent HTTP 준비 상태를 확인한다. 실행을 끝내면 같은 compose
 명령에 `down`을 붙여 로컬 컨테이너만 종료한다.
+
+기존 V1/r3 일반 안내 회귀를 별도로 확인할 때만 아래 preserved profile을 사용한다.
+이는 V2 Functional-UAT 예시가 아니며 guidance peer는 `18093`이다.
+
+```powershell
+Push-Location ..\customs-ai-agent
+. .\tools\Import-AgentProfile.ps1 -Profile functional-uat-kr-trade `
+  -EvidencePort 18083 -GuidancePort 18093
+uv run --no-sync customs-ai-agent-functional-uat-serve
+```
 
 생성된 `_local/profiles/**/backend.env`와 `customs-realm.json`은 개인 로컬 설정이다.
 Git, 채팅, 공유 압축 파일에 포함하지 않는다.

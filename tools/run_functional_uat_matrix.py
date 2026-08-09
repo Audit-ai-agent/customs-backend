@@ -32,6 +32,7 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 
 import httpx
 
+from customs_backend.guidance_registry import guidance_registry_projection
 from customs_backend.scenario_transcript import (
     ScenarioTranscriptError,
     verify_run,
@@ -94,6 +95,8 @@ _KNOWLEDGE_RESPONSE_INVALID_ERROR_CODES = frozenset(
 )
 _SAFE_LOCAL_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SAFE_KNOWLEDGE_TURN_ID = re.compile(r"^turn-[a-f0-9]{32}$")
+_GUIDANCE_TOKEN = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
+_V2_GUIDANCE_PROFILE = "functional-uat-kr-trade-v2"
 _OFFICIAL_GUIDANCE_SOURCE_KINDS = frozenset(
     {
         "official_law",
@@ -1091,6 +1094,8 @@ def _assert_assistant_message(
     expected_scope: str,
     run: Mapping[str, Any],
     required_terms: Sequence[str] = (),
+    require_guidance_resolution: bool = False,
+    required_registry_version: str | None = None,
 ) -> None:
     if assistant.get("role") != "assistant" or assistant.get("answer_scope") != expected_scope:
         raise MatrixError(f"assistant_scope_{expected_scope}")
@@ -1130,10 +1135,18 @@ def _assert_assistant_message(
     if expected_scope == "evidence_grounded" and "evidence" not in citation_kinds:
         raise MatrixError("assistant_evidence_citation_missing")
     if expected_scope == "general_customs_guidance":
+        resolution = _assert_guidance_resolution(
+            assistant.get("guidance_resolution"),
+            expected_as_of=str(run.get("review_as_of")),
+            code="assistant_general_guidance",
+            required=require_guidance_resolution,
+            required_registry_version=required_registry_version,
+        )
         _assert_official_guidance_citations(
             citations,
             expected_as_of=str(run.get("review_as_of")),
             code="assistant_general_guidance",
+            guidance_resolution=resolution,
         )
     if (
         expected_scope
@@ -1149,11 +1162,120 @@ def _assert_assistant_message(
         raise MatrixError("assistant_answer_topic_missing")
 
 
+def _assert_guidance_resolution(
+    value: object,
+    *,
+    expected_as_of: str,
+    code: str,
+    required: bool = False,
+    required_registry_version: str | None = None,
+) -> Mapping[str, Any] | None:
+    """Validate the public-safe topic/scope resolution without registry hash.
+
+    Existing V1 messages can omit this additive object.  When it is present,
+    V2 must match Backend's exact checked-in public registry projection.  The
+    Browser response must never carry registry hashes or registry source IDs.
+    """
+
+    if value is None:
+        if required:
+            raise MatrixError(f"{code}_resolution_missing")
+        return None
+    resolution = _require_mapping(value, code=f"{code}_resolution_invalid")
+    allowed = {
+        "topic",
+        "scope",
+        "requested_direction",
+        "applicable_directions",
+        "coverage",
+        "snapshot_id",
+        "as_of",
+        "registry_version",
+    }
+    if set(resolution).difference(allowed):
+        raise MatrixError(f"{code}_resolution_internal_field")
+    topic = resolution.get("topic")
+    scope = resolution.get("scope")
+    requested_direction = resolution.get("requested_direction")
+    applicable = resolution.get("applicable_directions")
+    coverage = resolution.get("coverage")
+    registry_version = resolution.get("registry_version")
+    snapshot_id = resolution.get("snapshot_id")
+    if (
+        not isinstance(topic, str)
+        or _GUIDANCE_TOKEN.fullmatch(topic) is None
+        or not isinstance(scope, str)
+        or _GUIDANCE_TOKEN.fullmatch(scope) is None
+        or requested_direction not in {"import", "export", "both"}
+        or not isinstance(applicable, list)
+        or not 1 <= len(applicable) <= 2
+        or any(direction not in {"import", "export"} for direction in applicable)
+        or len(applicable) != len(set(applicable))
+        or applicable != [direction for direction in ("import", "export") if direction in applicable]
+        or coverage not in {"covered", "no_coverage", "partial", "unavailable"}
+        or registry_version not in {"1.0", "2.0"}
+        or (
+            required_registry_version is not None
+            and registry_version != required_registry_version
+        )
+        or resolution.get("as_of") != expected_as_of
+        or snapshot_id is not None and (not isinstance(snapshot_id, str) or not snapshot_id)
+        or coverage in {"covered", "partial"} and snapshot_id is None
+    ):
+        raise MatrixError(f"{code}_resolution_invalid")
+    if registry_version == "2.0":
+        registry = guidance_registry_projection("2.0")
+        expected_scope = registry.scopes.get((topic, scope))
+        if expected_scope is None or applicable != list(expected_scope.directions):
+            raise MatrixError(f"{code}_resolution_registry")
+        if (
+            requested_direction != "both"
+            and requested_direction not in expected_scope.directions
+            and coverage in {"covered", "partial"}
+        ):
+            raise MatrixError(f"{code}_resolution_direction")
+    return resolution
+
+
+def _assert_v2_public_guidance_citation(
+    citation: Mapping[str, Any], *, resolution: Mapping[str, Any], code: str
+) -> None:
+    """Map a public V2 citation back to one exact safe registry page.
+
+    ``registry_source_id`` is intentionally absent from Browser/API output.
+    Matching the public source kind/title/URI and the selected topic/scope is
+    therefore the strongest independent check available in the UAT harness.
+    """
+
+    registry = guidance_registry_projection("2.0")
+    topic = str(resolution["topic"])
+    scope = str(resolution["scope"])
+    applicable = resolution["applicable_directions"]
+    requested_direction = str(resolution["requested_direction"])
+    required_directions = (
+        set(applicable)
+        if requested_direction == "both"
+        else {requested_direction}
+    )
+    candidates = [
+        source
+        for source in registry.sources.values()
+        if source.source_kind == citation.get("source_kind")
+        and source.title == citation.get("source_title")
+        and source.official_uri == citation.get("source_uri")
+        and (source_directions := source.scope_directions.get((topic, scope))) is not None
+        and required_directions.issubset(source_directions)
+    ]
+    if len(candidates) != 1:
+        raise MatrixError(f"{code}_registry_source")
+
+
 def _assert_official_guidance_citations(
     citations: object,
     *,
     expected_as_of: str,
     code: str,
+    guidance_resolution: Mapping[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Validate official provenance without returning source bodies or IDs."""
 
@@ -1167,7 +1289,11 @@ def _assert_official_guidance_citations(
             raise MatrixError(f"{code}_citation_kind")
         if citation.get("source_kind") not in _OFFICIAL_GUIDANCE_SOURCE_KINDS:
             raise MatrixError(f"{code}_source_kind")
-        if not _is_safe_official_guidance_uri(citation.get("source_uri")):
+        if guidance_resolution is not None and guidance_resolution["registry_version"] == "2.0":
+            _assert_v2_public_guidance_citation(
+                citation, resolution=guidance_resolution, code=code
+            )
+        elif not _is_safe_official_guidance_uri(citation.get("source_uri")):
             raise MatrixError(f"{code}_source_uri")
         if citation.get("as_of") != expected_as_of:
             raise MatrixError(f"{code}_as_of")
@@ -1179,6 +1305,11 @@ def _assert_official_guidance_citations(
             or coverage not in {"covered", "partial"}
         ):
             raise MatrixError(f"{code}_provenance")
+        if guidance_resolution is not None and (
+            snapshot_id != guidance_resolution.get("snapshot_id")
+            or coverage != guidance_resolution.get("coverage")
+        ):
+            raise MatrixError(f"{code}_resolution_provenance")
         snapshots.add(snapshot_id)
         coverages.add(coverage)
     if len(snapshots) != 1 or len(coverages) != 1:
@@ -1214,7 +1345,11 @@ def _is_safe_official_guidance_uri(value: object) -> bool:
 
 
 def _assert_mixed_assistant_sections(
-    assistant: Mapping[str, Any], *, run: Mapping[str, Any]
+    assistant: Mapping[str, Any],
+    *,
+    run: Mapping[str, Any],
+    require_guidance_resolution: bool = False,
+    required_registry_version: str | None = None,
 ) -> None:
     """Require a Case answer and official general guidance to remain separate."""
 
@@ -1226,6 +1361,13 @@ def _assert_mixed_assistant_sections(
     sections = _mapping_list(assistant.get("answer_sections"), code="mixed_sections_invalid")
     if [section.get("kind") for section in sections] != ["case_analysis", "general_guidance"]:
         raise MatrixError("mixed_sections_missing")
+    resolution = _assert_guidance_resolution(
+        assistant.get("guidance_resolution"),
+        expected_as_of=str(run.get("review_as_of")),
+        code="mixed_guidance",
+        required=require_guidance_resolution,
+        required_registry_version=required_registry_version,
+    )
     analyses = _mapping_list(run.get("document_analyses"), code="document_analyses_invalid")
     filenames = {
         filename
@@ -1257,7 +1399,100 @@ def _assert_mixed_assistant_sections(
         sections[1].get("citations"),
         expected_as_of=str(run.get("review_as_of")),
         code="mixed_guidance",
+        guidance_resolution=resolution,
     )
+
+
+def _assert_case_application_sections(
+    assistant: Mapping[str, Any], *, run: Mapping[str, Any]
+) -> None:
+    """Verify a three-part Case/general/application answer stays separated.
+
+    ``case_application`` is deliberately a next-check template, not a third
+    factual source.  It can exist only when it repeats at least one current
+    Case citation and one independently verified official-guidance citation.
+    """
+
+    _assert_assistant_message(
+        assistant,
+        expected_scope="case_grounded",
+        run=run,
+    )
+    sections = _mapping_list(assistant.get("answer_sections"), code="application_sections_invalid")
+    if [section.get("kind") for section in sections] != [
+        "case_analysis",
+        "general_guidance",
+        "case_application",
+    ]:
+        raise MatrixError("application_sections_missing")
+    resolution = _assert_guidance_resolution(
+        assistant.get("guidance_resolution"),
+        expected_as_of=str(run.get("review_as_of")),
+        code="application_guidance",
+        required=True,
+        required_registry_version="2.0",
+    )
+    assert resolution is not None  # narrowed after the required check above
+    analyses = _mapping_list(run.get("document_analyses"), code="document_analyses_invalid")
+    filenames = {
+        filename
+        for analysis in analyses
+        if isinstance((filename := analysis.get("filename")), str) and filename
+    }
+    internal_markers = _run_internal_markers(run)
+    for index, section in enumerate(sections, start=1):
+        _assert_user_text(
+            section.get("title"),
+            code=f"application_section_title_{index}",
+            filenames=filenames,
+            internal_markers=internal_markers,
+        )
+        _assert_user_text(
+            section.get("content"),
+            code=f"application_section_content_{index}",
+            filenames=filenames,
+            internal_markers=internal_markers,
+        )
+    case_citations = _mapping_list(
+        sections[0].get("citations"), code="application_case_citations_invalid"
+    )
+    if not any(
+        citation.get("kind") in {"fact", "comparison", "evidence"}
+        for citation in case_citations
+    ):
+        raise MatrixError("application_case_citation_missing")
+    guidance_snapshot, guidance_coverage = _assert_official_guidance_citations(
+        sections[1].get("citations"),
+        expected_as_of=str(run.get("review_as_of")),
+        code="application_guidance",
+        guidance_resolution=resolution,
+    )
+    application_citations = _mapping_list(
+        sections[2].get("citations"), code="application_citations_invalid"
+    )
+    application_case_citations = [
+        citation
+        for citation in application_citations
+        if citation.get("kind") in {"fact", "comparison", "evidence"}
+    ]
+    application_guidance_citations = [
+        citation
+        for citation in application_citations
+        if citation.get("kind") == "guidance_evidence"
+    ]
+    if not application_case_citations or not application_guidance_citations:
+        raise MatrixError("application_citation_boundary_missing")
+    application_snapshot, application_coverage = _assert_official_guidance_citations(
+        application_guidance_citations,
+        expected_as_of=str(run.get("review_as_of")),
+        code="application_guidance_citations",
+        guidance_resolution=resolution,
+    )
+    if (
+        application_snapshot != guidance_snapshot
+        or application_coverage != guidance_coverage
+    ):
+        raise MatrixError("application_guidance_provenance_mismatch")
 
 
 def _conversation(
@@ -1269,6 +1504,8 @@ def _conversation(
     question: str,
     expected_scope: str,
     required_terms: Sequence[str] = (),
+    require_guidance_resolution: bool = False,
+    required_registry_version: str | None = None,
 ) -> str:
     created = api.require(
         "POST",
@@ -1293,12 +1530,14 @@ def _conversation(
         expected_scope=expected_scope,
         run=run,
         required_terms=required_terms,
+        require_guidance_resolution=require_guidance_resolution,
+        required_registry_version=required_registry_version,
     )
     return conversation_id
 
 
 def _mixed_conversation(api: PublicApi, *, run_id: str, run: Mapping[str, Any]) -> None:
-    """Exercise one Case question that also requests bounded general guidance."""
+    """Exercise Case facts, official guidance, and an explicit next-check template."""
 
     created = api.require(
         "POST",
@@ -1312,11 +1551,16 @@ def _mixed_conversation(api: PublicApi, *, run_id: str, run: Mapping[str, Any]) 
     exchange = api.require(
         "POST",
         f"/assistant/conversations/{conversation_id}/messages",
-        body={"content": "현재 사건의 문서 비교 결과와 일반 수입 통관 절차를 함께 설명해 주세요."},
+        body={
+            "content": (
+                "현재 사건의 문서 비교 결과에 일반 수입 통관 절차를 적용하면 "
+                "다음에 무엇을 확인해야 하나요?"
+            )
+        },
         idempotency_key=f"functional-matrix-mixed-{uuid.uuid4().hex}",
     )
     assistant = _require_mapping(exchange.get("assistant_message"), code="mixed_assistant_invalid")
-    _assert_mixed_assistant_sections(assistant, run=run)
+    _assert_case_application_sections(assistant, run=run)
 
 
 def _knowledge_turn_directories(conversation_id: str, *, expected_count: int) -> list[Path]:
@@ -1612,10 +1856,19 @@ def _assert_standalone_knowledge_assistant(
         filenames=set(),
         internal_markers=set(),
     )
+    resolution = _assert_guidance_resolution(
+        assistant.get("guidance_resolution"),
+        expected_as_of=expected_as_of,
+        code=code,
+        required=True,
+        required_registry_version="2.0",
+    )
+    assert resolution is not None  # narrowed after the required check above
     snapshot_id, coverage = _assert_official_guidance_citations(
         assistant.get("citations"),
         expected_as_of=expected_as_of,
         code=code,
+        guidance_resolution=resolution,
     )
     if (
         assistant.get("knowledge_coverage") != coverage
@@ -1630,6 +1883,7 @@ def _assert_standalone_knowledge_assistant(
         sections[0].get("citations"),
         expected_as_of=expected_as_of,
         code=f"{code}_section",
+        guidance_resolution=resolution,
     )
     if section_snapshot != snapshot_id or section_coverage != coverage:
         raise MatrixError(f"{code}_section_provenance_invalid")
@@ -1639,7 +1893,7 @@ def _assert_standalone_knowledge_assistant(
 
 def _assert_standalone_knowledge_no_coverage(
     assistant: Mapping[str, Any], *, expected_as_of: str, code: str
-) -> str:
+) -> None:
     """Validate the explicit no-coverage boundary without model inference."""
 
     if (
@@ -1658,19 +1912,26 @@ def _assert_standalone_knowledge_no_coverage(
         filenames=set(),
         internal_markers=set(),
     )
+    resolution = _assert_guidance_resolution(
+        assistant.get("guidance_resolution"),
+        expected_as_of=expected_as_of,
+        code=code,
+        required=True,
+        required_registry_version="2.0",
+    )
+    assert resolution is not None  # narrowed after the required check above
+    if resolution.get("coverage") != "no_coverage" or resolution.get("snapshot_id") is not None:
+        raise MatrixError(f"{code}_resolution_provenance_invalid")
     if _mapping_list(assistant.get("citations"), code=f"{code}_citations_invalid"):
         raise MatrixError(f"{code}_citation_present")
     if _mapping_list(assistant.get("answer_sections"), code=f"{code}_sections_invalid"):
         raise MatrixError(f"{code}_sections_invalid")
-    snapshot_id = assistant.get("knowledge_snapshot_id")
     if (
         assistant.get("knowledge_coverage") != "no_coverage"
-        or not isinstance(snapshot_id, str)
-        or not snapshot_id
+        or assistant.get("knowledge_snapshot_id") is not None
         or assistant.get("knowledge_as_of") != expected_as_of
     ):
         raise MatrixError(f"{code}_provenance_invalid")
-    return snapshot_id
 
 
 def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
@@ -1725,19 +1986,17 @@ def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
     no_coverage_exchange = api.require(
         "POST",
         f"/knowledge/conversations/{conversation_id}/messages",
-        body={"content": "수출 운송 서류도 공식 자료 범위에서 알려 주세요."},
+        body={"content": "수출 과세가격의 기본을 공식 자료 범위에서 알려 주세요."},
         idempotency_key=f"functional-matrix-knowledge-no-coverage-{uuid.uuid4().hex}",
     )
     no_coverage = _require_mapping(
         no_coverage_exchange.get("assistant_message"), code="knowledge_no_coverage_message_invalid"
     )
-    no_coverage_snapshot = _assert_standalone_knowledge_no_coverage(
+    _assert_standalone_knowledge_no_coverage(
         no_coverage,
         expected_as_of=expected_as_of,
         code="knowledge_no_coverage",
     )
-    if no_coverage_snapshot != snapshot_id:
-        raise MatrixError("knowledge_no_coverage_snapshot_pin_invalid")
     # The standalone assistant is Case-independent.  Verify the public
     # ingress boundary with synthetic structural markers only; ``PublicApi``
     # intentionally does not retain or print request bodies.
@@ -1761,11 +2020,12 @@ def _standalone_knowledge_conversation(api: PublicApi) -> dict[str, Any]:
         "assistant",
     ]:
         raise MatrixError("knowledge_message_history_invalid")
-    if any(
-        item.get("knowledge_snapshot_id") != snapshot_id
-        for item in message_items
-        if item.get("role") == "assistant"
-    ):
+    assistants = [item for item in message_items if item.get("role") == "assistant"]
+    if [item.get("knowledge_snapshot_id") for item in assistants] != [
+        snapshot_id,
+        snapshot_id,
+        None,
+    ]:
         raise MatrixError("knowledge_message_snapshot_invalid")
     listed = api.require("GET", "/knowledge/conversations")
     listed_items = _mapping_list(listed.get("items"), code="knowledge_conversation_list_invalid")
@@ -2162,6 +2422,8 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
             title="General customs guidance",
             question="원산지 증명서 확인 절차는 무엇인가요?",
             expected_scope="general_customs_guidance",
+            require_guidance_resolution=True,
+            required_registry_version="2.0",
         )
         _conversation(
             reviewer,
@@ -2236,6 +2498,7 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
         return {
             "status": "passed",
             "profile": "functional-uat",
+            "guidance_profile": _V2_GUIDANCE_PROFILE,
             "scenario_count": len(executed),
             "review_run_count": len(all_run_ids),
             "scenarios": executed,

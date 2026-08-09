@@ -47,6 +47,7 @@ include = ["customs_backend*"]
 [tool.setuptools.package-data]
 customs_backend = [
   "contracts/agent/v3/*.schema.json",
+  "contracts/evidence/v3/*.json",
 ]
 
 [tool.pytest.ini_options]

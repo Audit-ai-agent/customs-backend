@@ -450,6 +450,45 @@ def _official_guidance_citation() -> dict[str, str]:
     }
 
 
+def _v2_guidance_resolution(
+    *,
+    topic: str,
+    scope: str,
+    requested_direction: str = "export",
+    applicable_directions: list[str] | None = None,
+    coverage: str = "covered",
+    snapshot_id: str | None = "kr-trade-v2-snapshot-20260805",
+) -> dict[str, Any]:
+    return {
+        "topic": topic,
+        "scope": scope,
+        "requested_direction": requested_direction,
+        "applicable_directions": applicable_directions or [requested_direction],
+        "coverage": coverage,
+        "snapshot_id": snapshot_id,
+        "as_of": "2026-08-05",
+        "registry_version": "2.0",
+    }
+
+
+def _v2_guidance_citation(
+    *,
+    source_id: str,
+    source_title: str,
+    source_uri: str,
+) -> dict[str, str]:
+    return {
+        "kind": "guidance_evidence",
+        "source_id": source_id,
+        "source_kind": "official_agency_guidance",
+        "source_title": source_title,
+        "source_uri": source_uri,
+        "as_of": "2026-08-05",
+        "snapshot_id": "kr-trade-v2-snapshot-20260805",
+        "coverage": "covered",
+    }
+
+
 @pytest.mark.parametrize(
     "source_uri",
     [
@@ -496,6 +535,83 @@ def test_mixed_assistant_answer_keeps_case_and_official_guidance_sections_separa
         },
         run=_matching_result(),
     )
+
+
+def test_case_application_requires_v2_resolution_and_separated_citations() -> None:
+    guidance = _v2_guidance_citation(
+        source_id="record-v2-import-clearance",
+        source_title="수입 통관",
+        source_uri=(
+            "https://www.customs.go.kr/kcs/cm/cntnts/cntntsView.do?cntntsId=817&mi=2819"
+        ),
+    )
+    resolution = _v2_guidance_resolution(
+        topic="customs_clearance",
+        scope="import_clearance_flow",
+        requested_direction="import",
+        applicable_directions=["import"],
+    )
+    matrix._assert_case_application_sections(
+        {
+            "role": "assistant",
+            "answer_scope": "case_grounded",
+            "content": "현재 사건의 수량 비교와 일반 수입 통관 안내를 구분해 다음 확인 항목을 정리했습니다.",
+            "citations": [{"kind": "comparison"}, guidance],
+            "suggested_questions": [],
+            "guidance_resolution": resolution,
+            "answer_sections": [
+                {
+                    "kind": "case_analysis",
+                    "title": "현재 사건 기준",
+                    "content": "현재 심사 결과에서는 수량 비교 항목을 먼저 확인해야 합니다.",
+                    "citations": [{"kind": "comparison"}],
+                },
+                {
+                    "kind": "general_guidance",
+                    "title": "일반 통관 안내",
+                    "content": "공식 수입 통관 안내의 절차 범위를 확인할 수 있습니다.",
+                    "citations": [guidance],
+                },
+                {
+                    "kind": "case_application",
+                    "title": "사건 적용·다음 확인",
+                    "content": "현재 사건에서는 수량 비교를 유지한 채 필요한 통관 절차 문서를 추가로 확인해 주세요.",
+                    "citations": [{"kind": "comparison"}, guidance],
+                },
+            ],
+        },
+        run=_matching_result(),
+    )
+
+
+def test_v2_guidance_uri_must_match_the_exact_manifest_page() -> None:
+    citation = _v2_guidance_citation(
+        source_id="record-v2-import-clearance",
+        source_title="수입 통관",
+        source_uri=(
+            "https://www.customs.go.kr/kcs/cm/cntnts/cntntsView.do?cntntsId=817&mi=2819"
+        ),
+    )
+    resolution = _v2_guidance_resolution(
+        topic="customs_clearance",
+        scope="import_clearance_flow",
+        requested_direction="import",
+        applicable_directions=["import"],
+    )
+    matrix._assert_official_guidance_citations(
+        [citation],
+        expected_as_of="2026-08-05",
+        code="v2_guidance",
+        guidance_resolution=resolution,
+    )
+    citation["source_uri"] += "&unregistered=1"
+    with pytest.raises(matrix.MatrixError, match="v2_guidance_registry_source"):
+        matrix._assert_official_guidance_citations(
+            [citation],
+            expected_as_of="2026-08-05",
+            code="v2_guidance",
+            guidance_resolution=resolution,
+        )
 
 
 def test_export_matrix_scenario_requires_agent_export_document_facts_and_comparisons() -> None:
@@ -554,7 +670,20 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
     verified: list[Path] = []
     provider_traces: list[Path] = []
     no_coverage_traces: list[Path] = []
-    guidance = _official_guidance_citation()
+    export_guidance = _v2_guidance_citation(
+        source_id="record-v2-export-requirements",
+        source_title="수출 통관",
+        source_uri=(
+            "https://www2.customs.go.kr/kcs/cm/cntnts/cntntsView.do?cntntsId=818&mi=2820"
+        ),
+    )
+    fta_guidance = _v2_guidance_citation(
+        source_id="record-v2-fta-procedure",
+        source_title="원산지증명서 개요",
+        source_uri=(
+            "https://www.customs.go.kr/ftaportalkor/cm/cntnts/cntntsView.do?cntntsId=1061&mi=3401"
+        ),
+    )
     knowledge_turn_count = 0
 
     class FakeApi:
@@ -592,10 +721,30 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
                             "citations": [],
                             "answer_sections": [],
                             "knowledge_coverage": "no_coverage",
-                            "knowledge_snapshot_id": "kr-trade-snapshot-20260805",
                             "knowledge_as_of": "2026-08-05",
+                            "guidance_resolution": _v2_guidance_resolution(
+                                topic="customs_duty",
+                                scope="customs_value_basics",
+                                requested_direction="export",
+                                applicable_directions=["import"],
+                                coverage="no_coverage",
+                                snapshot_id=None,
+                            ),
                         }
                     }
+                guidance = export_guidance if knowledge_turn_count == 1 else fta_guidance
+                resolution = (
+                    _v2_guidance_resolution(
+                        topic="export_requirements",
+                        scope="agency_confirmation_and_supporting_documents",
+                    )
+                    if knowledge_turn_count == 1
+                    else _v2_guidance_resolution(
+                        topic="fta_procedure",
+                        scope="preference_procedure",
+                        applicable_directions=["import", "export"],
+                    )
+                )
                 return {
                     "assistant_message": {
                         "role": "assistant",
@@ -604,8 +753,9 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
                         "citations": [guidance],
                         "answer_sections": [{"kind": "general_guidance", "citations": [guidance]}],
                         "knowledge_coverage": "covered",
-                        "knowledge_snapshot_id": "kr-trade-snapshot-20260805",
+                        "knowledge_snapshot_id": "kr-trade-v2-snapshot-20260805",
                         "knowledge_as_of": "2026-08-05",
+                        "guidance_resolution": resolution,
                     }
                 }
             if method == "GET" and path.endswith("/messages"):
@@ -614,18 +764,15 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
                         {"role": "user"},
                         {
                             "role": "assistant",
-                            "knowledge_snapshot_id": "kr-trade-snapshot-20260805",
+                            "knowledge_snapshot_id": "kr-trade-v2-snapshot-20260805",
                         },
                         {"role": "user"},
                         {
                             "role": "assistant",
-                            "knowledge_snapshot_id": "kr-trade-snapshot-20260805",
+                            "knowledge_snapshot_id": "kr-trade-v2-snapshot-20260805",
                         },
                         {"role": "user"},
-                        {
-                            "role": "assistant",
-                            "knowledge_snapshot_id": "kr-trade-snapshot-20260805",
-                        },
+                        {"role": "assistant"},
                     ]
                 }
             if method == "GET" and path == "/knowledge/conversations":
@@ -633,7 +780,7 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
                     "items": [
                         {
                             "conversation_id": "knowledge-conversation-1",
-                            "snapshot_id": "kr-trade-snapshot-20260805",
+                            "snapshot_id": "kr-trade-v2-snapshot-20260805",
                         }
                     ]
                 }
@@ -725,7 +872,7 @@ def test_standalone_knowledge_matrix_receipt_pins_official_snapshot_without_case
     ] == [
         "수출 요건을 공식 자료 범위에서 알려 주세요.",
         "FTA 특혜 적용 절차도 공식 자료 범위에서 알려 주세요.",
-        "수출 운송 서류도 공식 자료 범위에서 알려 주세요.",
+        "수출 과세가격의 기본을 공식 자료 범위에서 알려 주세요.",
     ]
 
 
@@ -843,6 +990,7 @@ def test_matrix_run_includes_export_mixed_and_safe_standalone_knowledge_receipt(
 
     assert result["scenario_count"] == 7
     assert result["review_run_count"] == 9
+    assert result["guidance_profile"] == "functional-uat-kr-trade-v2"
     assert created == [scenario.name for scenario in scenarios]
     assert "run-all-documents-match" in mixed
     assert standalone_calls == [True]
