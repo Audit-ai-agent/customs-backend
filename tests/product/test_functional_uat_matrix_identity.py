@@ -515,6 +515,35 @@ def test_matrix_selects_law_history_by_default_and_keeps_3law_explicit() -> None
         matrix._selected_matrix_scenarios("untrusted-profile")
 
 
+def test_no_requirement_boundary_is_profile_specific_and_requires_law_evidence() -> None:
+    assert (
+        matrix._no_evidence_expected_scope(matrix._LAW_HISTORY_EVIDENCE_PROFILE)
+        == "evidence_grounded"
+    )
+    assert (
+        matrix._no_evidence_expected_scope(matrix._LEGACY_3LAW_EVIDENCE_PROFILE)
+        == "insufficient_evidence"
+    )
+    with pytest.raises(matrix.MatrixError, match="functional_uat_evidence_profile_invalid"):
+        matrix._no_evidence_expected_scope("untrusted-profile")
+
+    law_evidence = _law_history_temporal_result(
+        review_as_of="2026-08-05", execution_status="succeeded"
+    )
+    matrix._assert_law_article_evidence(
+        law_evidence,
+        code="law_history_no_evidence_law_evidence_missing",
+    )
+
+    missing_law_evidence = deepcopy(law_evidence)
+    missing_law_evidence["evidence"][0]["source_type"] = "customs_requirement"
+    with pytest.raises(matrix.MatrixError, match="law_history_no_evidence_law_evidence_missing"):
+        matrix._assert_law_article_evidence(
+            missing_law_evidence,
+            code="law_history_no_evidence_law_evidence_missing",
+        )
+
+
 def test_law_history_temporal_context_is_exact_and_snapshot_mismatch_stays_partial() -> None:
     baseline_scenario = next(
         item for item in matrix._scenario_matrix() if item.name == "all-documents-match"
@@ -1193,6 +1222,8 @@ def test_matrix_run_keeps_v2_direction_skip_and_case_paste_boundaries(
     evidence_profiles: list[str] = []
     mixed: list[str] = []
     document_paste_runs: list[str] = []
+    conversations: list[tuple[str, str]] = []
+    law_evidence_assertions: list[tuple[dict[str, Any], str]] = []
     standalone_calls: list[bool] = []
     temporal_verifications: list[tuple[dict[str, Any], dict[str, Any]]] = []
 
@@ -1222,6 +1253,19 @@ def test_matrix_run_keeps_v2_direction_skip_and_case_paste_boundaries(
             {},
         )
 
+    def conversation(
+        _api: object,
+        *,
+        run_id: str,
+        expected_scope: str,
+        **_kwargs: Any,
+    ) -> str:
+        conversations.append((run_id, expected_scope))
+        return "conversation"
+
+    def assert_law_article_evidence(run: dict[str, Any], *, code: str) -> None:
+        law_evidence_assertions.append((run, code))
+
     monkeypatch.setattr(
         matrix.httpx, "get", lambda *_args, **_kwargs: SimpleNamespace(status_code=200)
     )
@@ -1229,7 +1273,8 @@ def test_matrix_run_keeps_v2_direction_skip_and_case_paste_boundaries(
     monkeypatch.setattr(matrix, "FunctionalUatOidc", FakeOidc)
     monkeypatch.setattr(matrix, "PublicApi", FakeApi)
     monkeypatch.setattr(matrix, "_create_case_and_review", create_case)
-    monkeypatch.setattr(matrix, "_conversation", lambda *_args, **_kwargs: "conversation")
+    monkeypatch.setattr(matrix, "_conversation", conversation)
+    monkeypatch.setattr(matrix, "_assert_law_article_evidence", assert_law_article_evidence)
     monkeypatch.setattr(
         matrix,
         "_assert_case_document_paste_zero_dispatch",
@@ -1319,6 +1364,10 @@ def test_matrix_run_keeps_v2_direction_skip_and_case_paste_boundaries(
     assert created == [scenario.name for scenario in scenarios]
     assert evidence_profiles == ["functional-uat-law-history"] * len(scenarios)
     assert "run-all-documents-match" in mixed
+    assert ("run-no-evidence", "evidence_grounded") in conversations
+    assert law_evidence_assertions == [
+        ({}, "law_history_no_evidence_law_evidence_missing"),
+    ]
     assert document_paste_runs == ["run-all-documents-match"]
     assert temporal_verifications == [({}, {})]
     assert result["case_document_paste"] == {

@@ -728,10 +728,11 @@ def _scenario_matrix() -> tuple[Scenario, ...]:
             missing_and_injection,
             (),
         ),
-        # A successful Data response with zero applicable Evidence is not a
-        # transport/data partial failure.  The follow-up assistant question
-        # below verifies the user-facing ``insufficient_evidence`` boundary.
-        Scenario("no-evidence", "기능 UAT · 법령 근거 부재 검토", no_evidence, ()),
+        # The legacy profile has zero applicable Evidence here and must retain
+        # the user-facing ``insufficient_evidence`` boundary.  Law history
+        # may independently return a verified law article despite no
+        # item-specific CCCT requirement; ``run`` asserts that profile path.
+        Scenario("no-evidence", "기능 UAT · 개별 요건 부재 검토", no_evidence, ()),
         Scenario(
             "export-documents-and-submission-evidence",
             "기능 UAT · 수출 서류 및 제출 증빙 확인",
@@ -893,12 +894,11 @@ def _assert_law_history_snapshot_mismatch_partial(
     if _workflow_stage(mismatch_run, "retrieve_evidence").get("status") != "needs_review":
         raise MatrixError("law_history_temporal_mismatch_retrieval")
     for label, run in (("baseline", baseline_run), ("mismatch", mismatch_run)):
-        evidence = _mapping_list(run.get("evidence"), code=f"law_history_{label}_evidence_invalid")
-        if not any(item.get("source_type") == "law_article" for item in evidence):
-            # The mismatch must not pass merely because no law version was
-            # available.  A retained temporal law citation proves the legal
-            # side was served; the exact snapshot dates explain the partial.
-            raise MatrixError(f"law_history_{label}_law_evidence_missing")
+        _assert_law_article_evidence(
+            run,
+            code=f"law_history_{label}_law_evidence_missing",
+            evidence_code=f"law_history_{label}_evidence_invalid",
+        )
     return {
         "baseline_review_as_of": _BASELINE_REVIEW_AS_OF,
         "law_as_of": _LAW_HISTORY_MISMATCH_REVIEW_AS_OF,
@@ -906,6 +906,29 @@ def _assert_law_history_snapshot_mismatch_partial(
         "requirements_snapshot_as_of": _LAW_HISTORY_REQUIREMENTS_SNAPSHOT_AS_OF,
         "mismatch_execution_status": "partial",
     }
+
+
+def _assert_law_article_evidence(
+    run: Mapping[str, Any],
+    *,
+    code: str,
+    evidence_code: str | None = None,
+) -> None:
+    """Require an actual temporal law citation without exposing its source body."""
+
+    evidence = _mapping_list(run.get("evidence"), code=evidence_code or f"{code}_invalid")
+    if not any(item.get("source_type") == "law_article" for item in evidence):
+        raise MatrixError(code)
+
+
+def _no_evidence_expected_scope(evidence_profile: str) -> str:
+    """Keep the legacy empty-Evidence boundary while exercising law-history support."""
+
+    if evidence_profile == _LAW_HISTORY_EVIDENCE_PROFILE:
+        return "evidence_grounded"
+    if evidence_profile == _LEGACY_3LAW_EVIDENCE_PROFILE:
+        return "insufficient_evidence"
+    raise MatrixError("functional_uat_evidence_profile_invalid")
 
 
 def _fact_name_values(analysis: Mapping[str, Any]) -> list[str]:
@@ -2966,13 +2989,23 @@ def run(
         )
         no_evidence_run_id = runs["no-evidence"][2]
         no_evidence_run = runs["no-evidence"][3]
+        no_evidence_scope = _no_evidence_expected_scope(evidence_profile)
+        if evidence_profile == _LAW_HISTORY_EVIDENCE_PROFILE:
+            # The 65-law profile can supply a temporal legal citation even
+            # when the fixed CCCT snapshot has no item-specific requirement.
+            # Verify that source explicitly instead of treating a valid legal
+            # result as the legacy empty-Evidence boundary.
+            _assert_law_article_evidence(
+                no_evidence_run,
+                code="law_history_no_evidence_law_evidence_missing",
+            )
         _conversation(
             reviewer,
             run_id=no_evidence_run_id,
             run=no_evidence_run,
-            title="Insufficient-evidence boundary",
+            title="No-requirement evidence boundary",
             question="현재 사건의 법령 근거를 보여 주세요.",
-            expected_scope="insufficient_evidence",
+            expected_scope=no_evidence_scope,
         )
         matching_run_id = runs["all-documents-match"][2]
         matching_run = runs["all-documents-match"][3]
