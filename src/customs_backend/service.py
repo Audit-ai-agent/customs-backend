@@ -79,6 +79,7 @@ from customs_backend.domain import (
     ReviewEnqueueRequest,
     ReviewRunRecord,
     Role,
+    TemporalContext,
     TextDocumentCreate,
     canonical_digest,
     canonical_json_bytes,
@@ -456,6 +457,21 @@ def _result_digest(
     )
 
 
+def _agent_result_hash_payload(result: dict[str, Any]) -> dict[str, Any]:
+    """Return the Agent-defined canonical payload for ``result_sha256``.
+
+    ``temporal_context`` is an additive field.  Its explicit ``null`` value
+    means that no temporal provenance was supplied, so the Agent deliberately
+    hashes it exactly like a historic result where the field was absent.  A
+    populated context remains part of the provider hash.
+    """
+
+    payload = {key: value for key, value in result.items() if key != "result_sha256"}
+    if payload.get("temporal_context") is None:
+        payload.pop("temporal_context", None)
+    return payload
+
+
 def _agent_result_snapshot(run: ReviewRunRecord) -> dict[str, Any]:
     """Rebuild the immutable schema-owned Agent result for a chat turn.
 
@@ -487,10 +503,14 @@ def _agent_result_snapshot(run: ReviewRunRecord) -> dict[str, Any]:
     }
     if run.agent_engine is not None:
         result["engine"] = run.agent_engine
-    if (
-        canonical_digest({key: value for key, value in result.items() if key != "result_sha256"})
-        != run.provider_result_sha256
-    ):
+
+    # The nullable field is exposed consistently to the current Agent.  Its
+    # null value has the same canonical provider hash as the absent field in a
+    # historic result, while a populated context is hash-protected.
+    result["temporal_context"] = (
+        run.temporal_context.model_dump(mode="json") if run.temporal_context is not None else None
+    )
+    if canonical_digest(_agent_result_hash_payload(result)) != run.provider_result_sha256:
         raise ConflictError("persisted Agent result is not hash-consistent for assistant context")
     return result
 
@@ -877,13 +897,18 @@ class WorkbenchService:
             workflow = dict(result["workflow"])
             document_analyses = list(result["document_analyses"])
             comparisons = list(result["comparisons"])
+            temporal_context = (
+                TemporalContext.model_validate(result["temporal_context"])
+                if result.get("temporal_context") is not None
+                else None
+            )
+            if temporal_context is not None and temporal_context.law_as_of != review_as_of:
+                raise ValueError("temporal law_as_of must match review_as_of")
         except (AgentContractPayloadError, KeyError, TypeError, ValueError, ValidationError) as exc:
             raise ConflictError("Agent result does not satisfy the V3 review contract") from exc
-        expected_provider_result_sha256 = canonical_digest(
-            {key: value for key, value in result.items() if key != "result_sha256"}
-        )
+        expected_provider_result_sha256 = canonical_digest(_agent_result_hash_payload(result))
         if provider_result_sha256 != expected_provider_result_sha256:
-            raise ConflictError("Agent result hash does not cover the complete V3.2 result")
+            raise ConflictError("Agent result hash does not cover the canonical V3.2 result")
         comparison_ids = [
             str(item.get("comparison_id"))
             for item in comparisons
@@ -961,6 +986,7 @@ class WorkbenchService:
             agent_engine=agent_engine,
             agent_jurisdiction=agent_jurisdiction,
             agent_requires_human_review=True,
+            temporal_context=temporal_context,
             review_disposition=ReviewDisposition.human_review_required,
             assurance_level=AssuranceLevel.diagnostic,
             completion_eligibility=eligibility,

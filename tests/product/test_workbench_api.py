@@ -254,8 +254,167 @@ def test_v1_case_document_review_flow_always_needs_human_review() -> None:
         assert detail.json()["agent_schema_version"] == "3.2"
         assert detail.json()["agent_jurisdiction"] == "KR"
         assert detail.json()["agent_requires_human_review"] is True
+        assert detail.json()["temporal_context"] is None
         assert detail.json()["workflow"]["status"] == "completed"
         assert detail.json()["document_analyses"]
+
+
+def test_temporal_context_is_persisted_and_forwarded_to_case_assistant() -> None:
+    observed_review_contexts: list[dict[str, object]] = []
+
+    def review_handler(request: AgentReviewRequest) -> dict[str, object]:
+        result = build_agent_v3_result(request)
+        context = {
+            "law_as_of": request.review_as_of.isoformat(),
+            "hsk_snapshot_as_of": "2026-01-01",
+            "requirements_snapshot_as_of": "2026-07-26",
+        }
+        result["temporal_context"] = context
+        result["result_sha256"] = canonical_digest(
+            {key: value for key, value in result.items() if key != "result_sha256"}
+        )
+        return result
+
+    def answer_handler(request):
+        observed_review_contexts.append(request.review_result)
+        return {
+            "schema_version": "1.0",
+            "case_id": request.case_id,
+            "review_run_id": request.review_run_id,
+            "conversation_id": request.conversation_id,
+            "answer_scope": "clarification_needed",
+            "direct_answer": "검토 결과의 시점 문맥을 확인했습니다.",
+            "citations": [],
+            "suggested_questions": [],
+            "correction_draft": None,
+            "engine": {"kind": "deterministic", "model_id": "temporal-fixture"},
+        }
+
+    expected_context = {
+        "law_as_of": "2025-12-30",
+        "hsk_snapshot_as_of": "2026-01-01",
+        "requirements_snapshot_as_of": "2026-07-26",
+    }
+    with _client(review_handler=review_handler, answer_handler=answer_handler) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Temporal context"}, headers=_auth()
+        ).json()["case_id"]
+        client.post(
+            f"/api/v1/cases/{case_id}/documents",
+            json={"document_type": "CI", "filename": "invoice.txt", "content_text": "INV-001"},
+            headers=_auth(),
+        )
+        review = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={"review_as_of": "2025-12-30"},
+            headers={**_auth(), "Idempotency-Key": "temporal-context-review-001"},
+        )
+        assert review.status_code == 202, review.text
+        run_id = review.json()["job"]["review_run_id"]
+        detail = client.get(f"/api/v1/review-runs/{run_id}", headers=_auth())
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["temporal_context"] == expected_context
+
+        conversation_id = client.post(
+            f"/api/v1/review-runs/{run_id}/assistant/conversations", json={}, headers=_auth()
+        ).json()["conversation_id"]
+        answer = client.post(
+            f"/api/v1/assistant/conversations/{conversation_id}/messages",
+            json={"content": "이 심사의 시점 기준을 설명해 주세요."},
+            headers={**_auth(), "Idempotency-Key": "temporal-context-answer-001"},
+        )
+
+    assert answer.status_code == 200, answer.text
+    assert observed_review_contexts[0]["temporal_context"] == expected_context
+
+
+def test_null_temporal_context_remains_compatible_with_legacy_result_hash() -> None:
+    observed_review_contexts: list[dict[str, object]] = []
+
+    def review_handler(request: AgentReviewRequest) -> dict[str, object]:
+        result = build_agent_v3_result(request)
+        # The current Agent writes explicit null, but canonicalizes it to the
+        # historical hash payload where this additive field is absent.
+        result["temporal_context"] = None
+        return result
+
+    def answer_handler(request):
+        observed_review_contexts.append(request.review_result)
+        return {
+            "schema_version": "1.0",
+            "case_id": request.case_id,
+            "review_run_id": request.review_run_id,
+            "conversation_id": request.conversation_id,
+            "answer_scope": "clarification_needed",
+            "direct_answer": "기존 심사 결과입니다.",
+            "citations": [],
+            "suggested_questions": [],
+            "correction_draft": None,
+            "engine": {"kind": "deterministic", "model_id": "legacy-fixture"},
+        }
+
+    with _client(review_handler=review_handler, answer_handler=answer_handler) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Legacy temporal context"}, headers=_auth()
+        ).json()["case_id"]
+        client.post(
+            f"/api/v1/cases/{case_id}/documents",
+            json={"document_type": "CI", "filename": "invoice.txt", "content_text": "INV-001"},
+            headers=_auth(),
+        )
+        review = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={},
+            headers={**_auth(), "Idempotency-Key": "legacy-temporal-review-001"},
+        )
+        run_id = review.json()["job"]["review_run_id"]
+        assert client.get(f"/api/v1/review-runs/{run_id}", headers=_auth()).json()[
+            "temporal_context"
+        ] is None
+        conversation_id = client.post(
+            f"/api/v1/review-runs/{run_id}/assistant/conversations", json={}, headers=_auth()
+        ).json()["conversation_id"]
+        answer = client.post(
+            f"/api/v1/assistant/conversations/{conversation_id}/messages",
+            json={"content": "기존 결과를 설명해 주세요."},
+            headers={**_auth(), "Idempotency-Key": "legacy-temporal-answer-001"},
+        )
+
+    assert answer.status_code == 200, answer.text
+    assert observed_review_contexts[0]["temporal_context"] is None
+
+
+def test_temporal_context_law_date_must_match_the_immutable_review_date() -> None:
+    def review_handler(request: AgentReviewRequest) -> dict[str, object]:
+        result = build_agent_v3_result(request)
+        result["temporal_context"] = {
+            "law_as_of": "2025-12-29",
+            "hsk_snapshot_as_of": "2026-01-01",
+            "requirements_snapshot_as_of": "2026-07-26",
+        }
+        result["result_sha256"] = canonical_digest(
+            {key: value for key, value in result.items() if key != "result_sha256"}
+        )
+        return result
+
+    with _client(review_handler=review_handler) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Temporal mismatch"}, headers=_auth()
+        ).json()["case_id"]
+        client.post(
+            f"/api/v1/cases/{case_id}/documents",
+            json={"document_type": "CI", "filename": "invoice.txt", "content_text": "INV-001"},
+            headers=_auth(),
+        )
+        review = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={"review_as_of": "2025-12-30"},
+            headers={**_auth(), "Idempotency-Key": "temporal-context-mismatch-001"},
+        )
+
+    assert review.status_code == 202, review.text
+    assert review.json()["job"]["status"] == "failed"
+    assert review.json()["job"]["error_code"] == "ConflictError"
 
 
 def test_document_replacement_preserves_old_run_and_excludes_superseded_input() -> None:

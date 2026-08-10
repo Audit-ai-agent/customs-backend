@@ -778,6 +778,21 @@ class InputDocumentManifestEntry(BaseModel):
     content_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
 
 
+class TemporalContext(BaseModel):
+    """Immutable Evidence snapshot dates supplied by the Agent.
+
+    The values are provenance only.  They do not decide whether an HSK or
+    requirement snapshot applies to a particular historical case; the Agent
+    has already validated that ``law_as_of`` is bound to the review date.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    law_as_of: date
+    hsk_snapshot_as_of: date
+    requirements_snapshot_as_of: date
+
+
 class ReviewRunRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -804,6 +819,9 @@ class ReviewRunRecord(BaseModel):
     agent_engine: dict[str, Any] | None = None
     agent_jurisdiction: Literal["KR"] = "KR"
     agent_requires_human_review: Literal[True] = True
+    # Additive Evidence provenance.  Historic Agent results did not carry
+    # this context and must remain readable as ``null``.
+    temporal_context: TemporalContext | None = None
     review_disposition: ReviewDisposition = ReviewDisposition.human_review_required
     assurance_level: AssuranceLevel = AssuranceLevel.diagnostic
     completion_eligibility: CompletionEligibility
