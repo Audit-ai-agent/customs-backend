@@ -58,6 +58,29 @@ def test_public_api_resolves_a_token_supplier_for_each_request(
     client.close()
 
 
+def test_public_api_timeout_keeps_the_backend_agent_budget_inside_the_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    class CapturingClient:
+        def __init__(self, **kwargs: object) -> None:
+            observed.update(kwargs)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(matrix.httpx, "Client", CapturingClient)
+    client = matrix.PublicApi(base_url="http://127.0.0.1:18081/api/v1", access_token="test-token")
+
+    timeout = observed["timeout"]
+    assert isinstance(timeout, httpx.Timeout)
+    assert matrix._MATRIX_PUBLIC_API_TIMEOUT_SECONDS == 195.0
+    assert timeout.connect == matrix._MATRIX_PUBLIC_API_CONNECT_TIMEOUT_SECONDS == 5.0
+    assert timeout.read == timeout.write == timeout.pool == matrix._MATRIX_PUBLIC_API_TIMEOUT_SECONDS
+    client.close()
+
+
 def test_public_api_reauthenticates_once_for_a_read_after_an_expired_token_401(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -118,6 +118,12 @@ _BASELINE_REVIEW_AS_OF = "2026-08-05"
 _LAW_HISTORY_MISMATCH_REVIEW_AS_OF = "2026-08-06"
 _LAW_HISTORY_HSK_SNAPSHOT_AS_OF = "2026-08-05"
 _LAW_HISTORY_REQUIREMENTS_SNAPSHOT_AS_OF = "2026-08-05"
+# A review endpoint returns a 202 envelope, but its current local Backend
+# implementation waits synchronously for the Agent before that envelope is
+# returned.  Keep the Matrix client above Backend's 180-second Agent bound so
+# a permitted 90-second Evidence/Claude operation is not preempted here.
+_MATRIX_PUBLIC_API_TIMEOUT_SECONDS = 195.0
+_MATRIX_PUBLIC_API_CONNECT_TIMEOUT_SECONDS = 5.0
 _CASE_DOCUMENT_PASTE_CONTENT = "품명: 합성 검증 품목\n단가: USD 1"
 _CASE_DOCUMENT_PASTE_STREAMS = (
     "public-api",
@@ -387,7 +393,13 @@ class PublicApi:
         access_token: str | Callable[[], str],
         renew_access_token: Callable[[], str] | None = None,
     ) -> None:
-        self._client = httpx.Client(base_url=base_url, timeout=httpx.Timeout(90.0, connect=5.0))
+        self._client = httpx.Client(
+            base_url=base_url,
+            timeout=httpx.Timeout(
+                _MATRIX_PUBLIC_API_TIMEOUT_SECONDS,
+                connect=_MATRIX_PUBLIC_API_CONNECT_TIMEOUT_SECONDS,
+            ),
+        )
         self._access_token = access_token
         self._renew_access_token = renew_access_token
 
