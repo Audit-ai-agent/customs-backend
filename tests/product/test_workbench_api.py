@@ -328,6 +328,51 @@ def test_temporal_context_is_persisted_and_forwarded_to_case_assistant() -> None
     assert observed_review_contexts[0]["temporal_context"] == expected_context
 
 
+def test_functional_uat_review_preserves_explicit_law_history_date_and_defaults_baseline() -> None:
+    observed_dates: list[str] = []
+
+    def review_handler(request: AgentReviewRequest) -> dict[str, object]:
+        observed_dates.append(request.review_as_of.isoformat())
+        return build_agent_v3_result(request)
+
+    def enqueue(client: TestClient, *, title: str, body: dict[str, object], key: str) -> None:
+        case = client.post("/api/v1/cases", json={"title": title}, headers=_auth())
+        assert case.status_code == 201, case.text
+        case_id = case.json()["case_id"]
+        document = client.post(
+            f"/api/v1/cases/{case_id}/documents",
+            json={
+                "document_type": "CI",
+                "filename": "invoice.txt",
+                "content_text": "INV-001",
+            },
+            headers=_auth(),
+        )
+        assert document.status_code == 201, document.text
+        review = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json=body,
+            headers={**_auth(), "Idempotency-Key": key},
+        )
+        assert review.status_code == 202, review.text
+
+    with _client(settings=_functional_settings(), review_handler=review_handler) as client:
+        enqueue(
+            client,
+            title="Functional law history date",
+            body={"review_as_of": "2026-08-06"},
+            key="functional-law-history-date-001",
+        )
+        enqueue(
+            client,
+            title="Functional default date",
+            body={},
+            key="functional-law-history-date-002",
+        )
+
+    assert observed_dates == ["2026-08-06", "2026-08-05"]
+
+
 def test_null_temporal_context_remains_compatible_with_legacy_result_hash() -> None:
     observed_review_contexts: list[dict[str, object]] = []
 

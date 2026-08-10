@@ -866,12 +866,14 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             # moves beyond that fixture date.
             body = body.model_copy(update={"review_as_of": _DEV_FIXTURE_REVIEW_AS_OF})
         elif actual_container.settings.environment == "functional-uat":
-            required_as_of = actual_container.settings.functional_uat_as_of
-            if body.review_as_of is not None and body.review_as_of != required_as_of:
-                raise HTTPException(
-                    status_code=422, detail="functional UAT uses its configured review date"
+            # A missing date remains reproducible at the Functional-UAT
+            # baseline.  An explicit date must reach Agent/Data unchanged:
+            # law-history coverage and its partial status are owned there,
+            # not silently replaced by Backend's HSK/requirements baseline.
+            if body.review_as_of is None:
+                body = body.model_copy(
+                    update={"review_as_of": actual_container.settings.functional_uat_as_of}
                 )
-            body = body.model_copy(update={"review_as_of": required_as_of})
         job, created = service.review(principal, case_id, body, idempotency_key)
         result = JobResponse(
             job=JobView.model_validate(job.model_dump(mode="json")), idempotency_reused=not created
@@ -1126,8 +1128,8 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
     ) -> KnowledgeConversationView:
         # The public field is optional for a simple general-question start,
         # but Agent/Data must never receive an ambiguous knowledge date.
-        # Functional-UAT uses the same fixed date as a review; the lightweight
-        # fixture has its own stable reference date.
+        # Functional-UAT general knowledge remains on its independently fixed
+        # snapshot date; document reviews may use a law-history date instead.
         if actual_container.settings.environment == "functional-uat":
             resolved_as_of = actual_container.settings.functional_uat_as_of
             if body.as_of is not None and body.as_of != resolved_as_of:
