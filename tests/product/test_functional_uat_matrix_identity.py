@@ -58,6 +58,29 @@ def test_public_api_resolves_a_token_supplier_for_each_request(
     client.close()
 
 
+def test_public_api_timeout_keeps_the_backend_agent_budget_inside_the_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    class CapturingClient:
+        def __init__(self, **kwargs: object) -> None:
+            observed.update(kwargs)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(matrix.httpx, "Client", CapturingClient)
+    client = matrix.PublicApi(base_url="http://127.0.0.1:18081/api/v1", access_token="test-token")
+
+    timeout = observed["timeout"]
+    assert isinstance(timeout, httpx.Timeout)
+    assert matrix._MATRIX_PUBLIC_API_TIMEOUT_SECONDS == 195.0
+    assert timeout.connect == matrix._MATRIX_PUBLIC_API_CONNECT_TIMEOUT_SECONDS == 5.0
+    assert timeout.read == timeout.write == timeout.pool == matrix._MATRIX_PUBLIC_API_TIMEOUT_SECONDS
+    client.close()
+
+
 def test_public_api_reauthenticates_once_for_a_read_after_an_expired_token_401(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -458,6 +481,148 @@ def _matching_result() -> dict[str, Any]:
             ],
         },
     }
+
+
+def _law_history_temporal_result(*, review_as_of: str, execution_status: str) -> dict[str, Any]:
+    result = _matching_result()
+    result["review_as_of"] = review_as_of
+    result["execution_status"] = execution_status
+    result["workflow"]["status"] = "partial" if execution_status == "partial" else "completed"
+    result["workflow"]["stages"][0]["status"] = (
+        "needs_review" if execution_status == "partial" else "completed"
+    )
+    result["temporal_context"] = {
+        "law_as_of": review_as_of,
+        "hsk_snapshot_as_of": "2026-08-05",
+        "requirements_snapshot_as_of": "2026-08-05",
+    }
+    result["evidence"][0]["source_type"] = "law_article"
+    return result
+
+
+def test_matrix_selects_law_history_by_default_and_keeps_3law_explicit() -> None:
+    default = matrix._selected_matrix_scenarios(matrix._LAW_HISTORY_EVIDENCE_PROFILE)
+    legacy = matrix._selected_matrix_scenarios(matrix._LEGACY_3LAW_EVIDENCE_PROFILE)
+
+    assert len(default) == 8
+    assert default[-1].name == "law-history-temporal-snapshot-mismatch"
+    assert default[-1].review_as_of == "2026-08-06"
+    assert default[-1].expected_execution == "partial"
+    assert default[-1].expected_retrieval_status == "needs_review"
+    assert len(legacy) == 7
+    assert all(item.name != "law-history-temporal-snapshot-mismatch" for item in legacy)
+    with pytest.raises(matrix.MatrixError, match="functional_uat_evidence_profile_invalid"):
+        matrix._selected_matrix_scenarios("untrusted-profile")
+
+
+def test_no_requirement_boundary_is_profile_specific_and_requires_law_evidence() -> None:
+    assert (
+        matrix._no_evidence_expected_scope(matrix._LAW_HISTORY_EVIDENCE_PROFILE)
+        == "evidence_grounded"
+    )
+    assert (
+        matrix._no_evidence_expected_scope(matrix._LEGACY_3LAW_EVIDENCE_PROFILE)
+        == "insufficient_evidence"
+    )
+    with pytest.raises(matrix.MatrixError, match="functional_uat_evidence_profile_invalid"):
+        matrix._no_evidence_expected_scope("untrusted-profile")
+
+    law_evidence = _law_history_temporal_result(
+        review_as_of="2026-08-05", execution_status="succeeded"
+    )
+    matrix._assert_law_article_evidence(
+        law_evidence,
+        code="law_history_no_evidence_law_evidence_missing",
+    )
+
+    missing_law_evidence = deepcopy(law_evidence)
+    missing_law_evidence["evidence"][0]["source_type"] = "customs_requirement"
+    with pytest.raises(matrix.MatrixError, match="law_history_no_evidence_law_evidence_missing"):
+        matrix._assert_law_article_evidence(
+            missing_law_evidence,
+            code="law_history_no_evidence_law_evidence_missing",
+        )
+
+
+def test_law_history_temporal_context_is_exact_and_snapshot_mismatch_stays_partial() -> None:
+    baseline_scenario = next(
+        item for item in matrix._scenario_matrix() if item.name == "all-documents-match"
+    )
+    mismatch_scenario = matrix._law_history_temporal_mismatch_scenario()
+    baseline = _law_history_temporal_result(
+        review_as_of="2026-08-05", execution_status="succeeded"
+    )
+    mismatch = _law_history_temporal_result(
+        review_as_of="2026-08-06", execution_status="partial"
+    )
+
+    matrix._assert_law_history_temporal_context(baseline, baseline_scenario)
+    matrix._assert_law_history_temporal_context(mismatch, mismatch_scenario)
+    assert matrix._assert_law_history_snapshot_mismatch_partial(
+        baseline_run=baseline,
+        mismatch_run=mismatch,
+    ) == {
+        "baseline_review_as_of": "2026-08-05",
+        "law_as_of": "2026-08-06",
+        "hsk_snapshot_as_of": "2026-08-05",
+        "requirements_snapshot_as_of": "2026-08-05",
+        "mismatch_execution_status": "partial",
+    }
+
+    missing = deepcopy(mismatch)
+    missing["temporal_context"] = None
+    with pytest.raises(matrix.MatrixError, match="temporal_context_missing"):
+        matrix._assert_law_history_temporal_context(missing, mismatch_scenario)
+
+    wrong_date = deepcopy(mismatch)
+    wrong_date["temporal_context"]["law_as_of"] = "2026-08-05"
+    with pytest.raises(matrix.MatrixError, match="temporal_context_invalid"):
+        matrix._assert_law_history_temporal_context(wrong_date, mismatch_scenario)
+
+    extra_date = deepcopy(mismatch)
+    extra_date["temporal_context"]["unverified_date"] = "2026-08-06"
+    with pytest.raises(matrix.MatrixError, match="temporal_context_invalid"):
+        matrix._assert_law_history_temporal_context(extra_date, mismatch_scenario)
+
+    hidden_mismatch = deepcopy(mismatch)
+    hidden_mismatch["temporal_context"]["hsk_snapshot_as_of"] = "2026-08-06"
+    with pytest.raises(matrix.MatrixError, match="temporal_context_invalid"):
+        matrix._assert_law_history_temporal_context(hidden_mismatch, mismatch_scenario)
+
+    missing_law_evidence = deepcopy(mismatch)
+    missing_law_evidence["evidence"][0]["source_type"] = "customs_requirement"
+    with pytest.raises(matrix.MatrixError, match="mismatch_law_evidence_missing"):
+        matrix._assert_law_history_snapshot_mismatch_partial(
+            baseline_run=baseline,
+            mismatch_run=missing_law_evidence,
+        )
+
+    no_partial = deepcopy(mismatch)
+    no_partial["execution_status"] = "succeeded"
+    with pytest.raises(matrix.MatrixError, match="temporal_mismatch_not_partial"):
+        matrix._assert_law_history_snapshot_mismatch_partial(
+            baseline_run=baseline,
+            mismatch_run=no_partial,
+        )
+
+
+def test_legacy_3law_matrix_rejects_an_unexpected_temporal_context() -> None:
+    scenario = next(item for item in matrix._scenario_matrix() if item.requires_temporal_context)
+    legacy = _law_history_temporal_result(review_as_of="2026-08-05", execution_status="succeeded")
+
+    with pytest.raises(matrix.MatrixError, match="legacy_temporal_context_unexpected"):
+        matrix._assert_evidence_profile_temporal_context(
+            legacy,
+            scenario=scenario,
+            evidence_profile=matrix._LEGACY_3LAW_EVIDENCE_PROFILE,
+        )
+
+    legacy["temporal_context"] = None
+    matrix._assert_evidence_profile_temporal_context(
+        legacy,
+        scenario=scenario,
+        evidence_profile=matrix._LEGACY_3LAW_EVIDENCE_PROFILE,
+    )
 
 
 def test_matching_scenario_requires_hs_alias_grouped_requirement_and_korean_prose() -> None:
@@ -1052,11 +1217,15 @@ def test_agent_knowledge_transcript_verifier_runs_with_safe_result_only(
 def test_matrix_run_keeps_v2_direction_skip_and_case_paste_boundaries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    scenarios = matrix._scenario_matrix()
+    scenarios = matrix._selected_matrix_scenarios(matrix._LAW_HISTORY_EVIDENCE_PROFILE)
     created: list[str] = []
+    evidence_profiles: list[str] = []
     mixed: list[str] = []
     document_paste_runs: list[str] = []
+    conversations: list[tuple[str, str]] = []
+    law_evidence_assertions: list[tuple[dict[str, Any], str]] = []
     standalone_calls: list[bool] = []
+    temporal_verifications: list[tuple[dict[str, Any], dict[str, Any]]] = []
 
     class FakeOidc:
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
@@ -1073,15 +1242,29 @@ def test_matrix_run_keeps_v2_direction_skip_and_case_paste_boundaries(
             return None
 
     def create_case(
-        _api: object, scenario: matrix.Scenario
+        _api: object, scenario: matrix.Scenario, *, evidence_profile: str
     ) -> tuple[str, list[dict[str, str]], str, dict[str, Any]]:
         created.append(scenario.name)
+        evidence_profiles.append(evidence_profile)
         return (
             f"case-{scenario.name}",
             [{"document_id": f"document-{scenario.name}", "document_type": "CI"}],
             f"run-{scenario.name}",
             {},
         )
+
+    def conversation(
+        _api: object,
+        *,
+        run_id: str,
+        expected_scope: str,
+        **_kwargs: Any,
+    ) -> str:
+        conversations.append((run_id, expected_scope))
+        return "conversation"
+
+    def assert_law_article_evidence(run: dict[str, Any], *, code: str) -> None:
+        law_evidence_assertions.append((run, code))
 
     monkeypatch.setattr(
         matrix.httpx, "get", lambda *_args, **_kwargs: SimpleNamespace(status_code=200)
@@ -1090,7 +1273,8 @@ def test_matrix_run_keeps_v2_direction_skip_and_case_paste_boundaries(
     monkeypatch.setattr(matrix, "FunctionalUatOidc", FakeOidc)
     monkeypatch.setattr(matrix, "PublicApi", FakeApi)
     monkeypatch.setattr(matrix, "_create_case_and_review", create_case)
-    monkeypatch.setattr(matrix, "_conversation", lambda *_args, **_kwargs: "conversation")
+    monkeypatch.setattr(matrix, "_conversation", conversation)
+    monkeypatch.setattr(matrix, "_assert_law_article_evidence", assert_law_article_evidence)
     monkeypatch.setattr(
         matrix,
         "_assert_case_document_paste_zero_dispatch",
@@ -1139,6 +1323,20 @@ def test_matrix_run_keeps_v2_direction_skip_and_case_paste_boundaries(
     monkeypatch.setattr(matrix, "_assert_recent_context_limit", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         matrix,
+        "_assert_law_history_snapshot_mismatch_partial",
+        lambda *, baseline_run, mismatch_run: (
+            temporal_verifications.append((baseline_run, mismatch_run))
+            or {
+                "baseline_review_as_of": "2026-08-05",
+                "law_as_of": "2026-08-06",
+                "hsk_snapshot_as_of": "2026-08-05",
+                "requirements_snapshot_as_of": "2026-08-05",
+                "mismatch_execution_status": "partial",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        matrix,
         "_assert_human_correction_flow",
         lambda *_args, **_kwargs: ("run-child", "run-replacement"),
     )
@@ -1159,12 +1357,19 @@ def test_matrix_run_keeps_v2_direction_skip_and_case_paste_boundaries(
         redirect_uri="http://127.0.0.1:5173/",
     )
 
-    assert result["scenario_count"] == 7
-    assert result["review_run_count"] == 9
+    assert result["scenario_count"] == 8
+    assert result["review_run_count"] == 10
+    assert result["evidence_profile"] == "functional-uat-law-history"
     assert result["guidance_profile"] == "functional-uat-kr-trade-v2"
     assert created == [scenario.name for scenario in scenarios]
+    assert evidence_profiles == ["functional-uat-law-history"] * len(scenarios)
     assert "run-all-documents-match" in mixed
+    assert ("run-no-evidence", "evidence_grounded") in conversations
+    assert law_evidence_assertions == [
+        ({}, "law_history_no_evidence_law_evidence_missing"),
+    ]
     assert document_paste_runs == ["run-all-documents-match"]
+    assert temporal_verifications == [({}, {})]
     assert result["case_document_paste"] == {
         "status": "passed",
         "case_document_paste_notice_verified": True,
@@ -1191,6 +1396,13 @@ def test_matrix_run_keeps_v2_direction_skip_and_case_paste_boundaries(
         "knowledge_provider": "anthropic",
         "knowledge_claude_event_count": 2,
         "knowledge_provider_accepted_count": 1,
+    }
+    assert result["temporal_context_verification"] == {
+        "baseline_review_as_of": "2026-08-05",
+        "law_as_of": "2026-08-06",
+        "hsk_snapshot_as_of": "2026-08-05",
+        "requirements_snapshot_as_of": "2026-08-05",
+        "mismatch_execution_status": "partial",
     }
 
 

@@ -16,7 +16,9 @@ Data 호출을 소유한다. 형제 저장소 import, Browser의 Agent/Data cred
 Law API, Claude key 없이 네 HTTP 흐름을 점검한다.
 
 `functional-uat`는 로컬 PostgreSQL·MinIO·Keycloak과 실제 Agent/Data를 사용한다.
-Backend는 `2026-08-05` 기준일을 고정하고 심사 요청을 한 번 처리한다.
+심사 기준일을 생략하면 Backend는 `2026-08-05` baseline을 적용한다. 명시한 법령
+기준일은 Agent/Data에 그대로 전달하며, 법령 이력 coverage와 `partial` 판정은 그 경계가
+소유한다.
 
 공통 경계는 다음뿐이다.
 

@@ -190,6 +190,16 @@
       "required": ["evidence_id", "item_id", "title", "text", "source_uri", "source_type", "source_hash", "law_id", "law_name"],
       "type": "object"
     },
+    "TemporalContext": {
+      "additionalProperties": false,
+      "properties": {
+        "law_as_of": {"type": "string", "format": "date"},
+        "hsk_snapshot_as_of": {"type": "string", "format": "date"},
+        "requirements_snapshot_as_of": {"type": "string", "format": "date"}
+      },
+      "required": ["law_as_of", "hsk_snapshot_as_of", "requirements_snapshot_as_of"],
+      "type": "object"
+    },
     "Finding": {
       "additionalProperties": false,
       "properties": {
@@ -251,6 +261,7 @@
     "input_manifest_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
     "jurisdiction": {"const": "KR", "type": "string"},
     "report": {"$ref": "#/$defs/Report"},
+    "temporal_context": {"anyOf": [{"$ref": "#/$defs/TemporalContext"}, {"type": "null"}]},
     "workflow": {"$ref": "#/$defs/Workflow"},
     "document_analyses": {"type": "array", "minItems": 1, "maxItems": 20, "items": {"$ref": "#/$defs/DocumentAnalysis"}},
     "comparisons": {"type": "array", "maxItems": 2000, "items": {"$ref": "#/$defs/Comparison"}},

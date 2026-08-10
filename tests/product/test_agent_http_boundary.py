@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from customs_backend.adapters import HttpAgentClient
-from customs_backend.agent_contract import validate_agent_v3_payload
+from customs_backend.agent_contract import AgentContractPayloadError, validate_agent_v3_payload
 from customs_backend.domain import (
     AgentAssistantAnswerRequest,
     AgentDocumentInput,
@@ -38,6 +38,30 @@ def test_packaged_agent_v3_request_schema_accepts_backend_projection() -> None:
     request = _request()
 
     validate_agent_v3_payload("review_request", request.to_agent_wire())
+
+
+def test_packaged_review_schema_accepts_nullable_temporal_context_additively() -> None:
+    request = _request()
+    legacy = build_agent_v3_result(request)
+
+    # Existing Agent outputs omitted this additive field.  Keep them valid.
+    validate_agent_v3_payload("review_result", legacy)
+
+    context = {
+        "law_as_of": request.review_as_of.isoformat(),
+        "hsk_snapshot_as_of": "2026-01-01",
+        "requirements_snapshot_as_of": "2026-07-26",
+    }
+    current = {**legacy, "temporal_context": context}
+    current["result_sha256"] = "0" * 64
+    validate_agent_v3_payload("review_result", current)
+
+    null_context = {**legacy, "temporal_context": None}
+    validate_agent_v3_payload("review_result", null_context)
+
+    invalid = {**current, "temporal_context": {"law_as_of": "not-a-date"}}
+    with pytest.raises(AgentContractPayloadError):
+        validate_agent_v3_payload("review_result", invalid)
 
 
 def test_packaged_assistant_schemas_accept_the_bounded_backend_projection() -> None:

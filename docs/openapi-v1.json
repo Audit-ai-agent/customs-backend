@@ -2122,6 +2122,16 @@
             "title": "Reviewer Decisions",
             "type": "array"
           },
+          "temporal_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TemporalContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "trade_type": {
             "enum": [
               "import",
@@ -2309,6 +2319,34 @@
           "roles"
         ],
         "title": "SessionResponse",
+        "type": "object"
+      },
+      "TemporalContext": {
+        "additionalProperties": false,
+        "description": "Immutable Evidence snapshot dates supplied by the Agent.\n\nThe values are provenance only.  They do not decide whether an HSK or\nrequirement snapshot applies to a particular historical case; the Agent\nhas already validated that ``law_as_of`` is bound to the review date.",
+        "properties": {
+          "hsk_snapshot_as_of": {
+            "format": "date",
+            "title": "Hsk Snapshot As Of",
+            "type": "string"
+          },
+          "law_as_of": {
+            "format": "date",
+            "title": "Law As Of",
+            "type": "string"
+          },
+          "requirements_snapshot_as_of": {
+            "format": "date",
+            "title": "Requirements Snapshot As Of",
+            "type": "string"
+          }
+        },
+        "required": [
+          "law_as_of",
+          "hsk_snapshot_as_of",
+          "requirements_snapshot_as_of"
+        ],
+        "title": "TemporalContext",
         "type": "object"
       },
       "TextDocumentCreate": {
