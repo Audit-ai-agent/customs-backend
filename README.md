@@ -179,29 +179,90 @@ Set-Clipboard -Value ''
 값은 읽거나 출력하지 않는다. 비밀번호와 clipboard 내용은 Git·채팅·공유 파일에 넣지 않는다.
 
 Agent의 실제 Data 연결은 같은 bearer/mode 값과 함께 Agent의 좁은 importer가 읽는다.
+기본 Functional-UAT 토폴로지는 아래처럼 **분리된 두 Data peer**를 조합한다.
+
+| 역할 | Data local profile | 포트 | Agent 선택 |
+| --- | --- | --- | --- |
+| 문서 심사 Evidence | `functional-uat-law-history` (65법령 이력) | `18083` | `functional-uat-kr-trade-v2-law-history` |
+| 일반 통관 안내 | `functional-uat-kr-trade`의 검증된 V2 snapshot | `18094` | 같은 profile의 V2 guidance peer |
+
+Data 저장소에서 먼저 65법령 baseline을 만들고, Matrix의 시점 차이 검증용으로 법령 이력을
+하루만 명시적으로 갱신한다. `LAW_API_OC`와 V2 원문 staging은 모두 Git 밖 Data profile에만
+두며, 정확한 staging manifest 형식은 Data README를 따른다.
+
+```powershell
+Push-Location ..\customs-data-platform
+uv sync --locked --group dev --extra store --extra rag --extra ingestion --python 3.11
+uv run --locked --no-sync --group dev --extra store --extra rag --extra ingestion python tools/functional_uat_law_history.py init
+# Git이 무시하는 functional-uat-law-history config에만 개인 LAW_API_OC를 추가
+uv run --locked --no-sync --group dev --extra store --extra rag --extra ingestion python tools/functional_uat_law_history.py compose up
+uv run --locked --no-sync --group dev --extra store --extra rag --extra ingestion python tools/functional_uat_law_history.py build --as-of 2026-08-05
+uv run --locked --no-sync --group dev --extra store --extra rag --extra ingestion python tools/functional_uat_law_history.py refresh --from 2026-08-06 --to 2026-08-06
+uv run --locked --no-sync --group dev --extra store --extra rag --extra ingestion python tools/functional_uat_law_history.py verify-store
+uv run --locked --no-sync --group dev --extra store --extra rag --extra ingestion python tools/functional_uat_law_history.py serve --host 127.0.0.1 --port 18083
+```
+
+별도 Data 터미널에서는 준비된 V2 공식 페이지 snapshot만 `18094`에 제공한다. 이 peer는
+문서 심사 Evidence store를 대체하지 않는다.
+
+```powershell
+Push-Location ..\customs-data-platform
+uv run --locked --no-sync --group dev python tools/functional_uat_kr_trade.py init
+uv run --locked --no-sync --group dev python tools/functional_uat_kr_trade.py build-v2 `
+  --source-manifest data/guidance-sources/<승인된-V2-staging>/source-build-v2.json
+uv run --locked --no-sync --group dev python tools/functional_uat_kr_trade.py verify-v2
+uv run --locked --no-sync --group dev python tools/functional_uat_kr_trade.py serve-guidance-v2 `
+  --host 127.0.0.1 --port 18094
+```
+
+Agent 터미널에서 Git이 무시하는 `../_local/secrets/.env`에 개인
+`ANTHROPIC_API_KEY=personal-key` 한 줄을 먼저 만든다. Functional-UAT Agent importer만 이
+파일을 현재 세션에 읽고 값을 출력하지 않는다. 해당 파일은 Git·Docker image·공유 ZIP·채팅에
+넣지 않는다. 두 peer가 준비된 뒤에만 Agent를 다음 기본 조합으로 시작한다.
 
 ```powershell
 Push-Location ..\customs-ai-agent
 uv sync --locked --group dev --extra functional-uat --python 3.11
-. .\tools\Import-AgentProfile.ps1 -Profile functional-uat-kr-trade-v2 `
+. .\tools\Import-AgentProfile.ps1 -Profile functional-uat-kr-trade-v2-law-history `
   -EvidencePort 18083 -GuidancePort 18094
 uv run --no-sync customs-ai-agent-functional-uat-serve
 ```
 
-TASK-0046 Functional-UAT는 Data의 기존 `functional-uat-3law` Evidence build·serve와
-별도 `functional-uat-kr-trade-v2 build-v2`·`verify-v2`·`serve-guidance-v2 --port 18094`를
-모두 먼저 완료한다. 위 profile은 3법 Evidence(`18083`)와 준비 상태가 검증된 V2 공식
-안내 snapshot(`18094`)을 명시적으로 조합하며, 기존 V1 endpoint로 조용히 대체하지 않는다.
-Agent 터미널에서 Git이 무시하는 `../_local/secrets/.env`에 개인
-`ANTHROPIC_API_KEY=personal-key` 한 줄을 만든 뒤 `..\customs-ai-agent`에서 위 명령을
-실행한다. Functional-UAT Agent importer만 그 파일을 현재 세션에 읽고 값을 출력하지
-않는다. 해당 파일은 Git·Docker image·공유 ZIP·채팅에 넣지 않는다.
-심사 기준일은 `2026-08-05`로 고정한다. `GET /health/functional-uat-ready`가
-Backend의 로컬 의존성과 Agent HTTP 준비 상태를 확인한다. 실행을 끝내면 같은 compose
-명령에 `down`을 붙여 로컬 컨테이너만 종료한다.
+Backend·Agent·두 Data peer가 모두 ready인 뒤에는 Backend 터미널에서 선택 인자 없이 Matrix를
+실행한다. 이 기본값이 `functional-uat-law-history`다.
 
-기존 V1/r3 일반 안내 회귀를 별도로 확인할 때만 아래 preserved profile을 사용한다.
-이는 V2 Functional-UAT 예시가 아니며 guidance peer는 `18093`이다.
+```powershell
+Push-Location ..\customs-backend
+uv run --no-sync python tools/run_functional_uat_matrix.py
+```
+
+기본 Matrix는 baseline `2026-08-05`의 7개 시나리오에 더해 같은 수입 문서를
+`2026-08-06` 법령 기준일로 한 번 더 심사한다. 전자는 세 날짜가 모두 `2026-08-05`인지,
+후자는 `law_as_of=2026-08-06`, HSK·요건 기준일이 각각 `2026-08-05`인지, 그리고
+`law_as_of=review_as_of`·법령 근거 유지·`partial` 상태가 함께 성립하는지를
+fail-closed로 확인한다. 즉 법령 이력은 새 날짜를 사용하되 HSK·요건은 아직 baseline이라는
+한계를 정상 완료처럼 숨기지 않는다. `GET /health/functional-uat-ready`가 Backend의 로컬
+의존성과 Agent HTTP 준비 상태를 확인한다. 실행을 끝내면 같은 compose 명령에 `down`을
+붙여 로컬 컨테이너만 종료한다.
+
+기존 3법 Evidence는 삭제하지 않은 명시적 호환 경로다. law-history peer를 중지하거나 다른
+loopback 포트를 사용한 뒤 Data의 `functional-uat-3law` Evidence를 준비하고, 아래처럼
+명시적으로 선택한다. 이 경로는 2026-08-05 단일 기준일만 사용하므로 이력 전용 시점 차이
+시나리오는 실행하지 않으며 nullable `temporal_context`가 `null`인 기존 계약을 확인한다.
+
+```powershell
+Push-Location ..\customs-ai-agent
+. .\tools\Import-AgentProfile.ps1 -Profile functional-uat-kr-trade-v2 `
+  -EvidencePort 18083 -GuidancePort 18094
+uv run --no-sync customs-ai-agent-functional-uat-serve
+
+Push-Location ..\customs-backend
+uv run --no-sync python tools/run_functional_uat_matrix.py `
+  --evidence-profile functional-uat-3law
+```
+
+기존 V1/r3 일반 안내 회귀는 더 좁은 별도 경로로 유지한다. 이는 V2 또는 기본 law-history
+Functional-UAT 예시가 아니며 guidance peer는 `18093`이다.
 
 ```powershell
 Push-Location ..\customs-ai-agent

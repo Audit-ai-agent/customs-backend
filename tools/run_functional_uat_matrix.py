@@ -1,10 +1,13 @@
 """Run the text-only Functional-UAT matrix through real local OIDC and public APIs.
 
-The runner deliberately stays local-only.  It uses the existing reviewer and
-approver accounts through Authorization Code + PKCE, keeps credentials and
-tokens in memory, and prints only a compact non-secret summary.  Detailed
-document, HTTP, Data, and Claude evidence remains in the normal local
-``_local/state/scenario-runs`` transcript owned by the services.
+The default topology is the 65-law time-aware Evidence profile with the
+separately verified V2 official-guidance peer.  The preserved three-law
+topology is selectable only explicitly.  The runner deliberately stays
+local-only.  It uses the existing reviewer and approver accounts through
+Authorization Code + PKCE, keeps credentials and tokens in memory, and prints
+only a compact non-secret summary.  Detailed document, HTTP, Data, and Claude
+evidence remains in the normal local ``_local/state/scenario-runs`` transcript
+owned by the services.
 
 It is not a release gate and it does not start, stop, rebuild, or publish a
 service.  Run it only after the documented Functional-UAT services are ready.
@@ -23,7 +26,7 @@ import subprocess
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
@@ -107,7 +110,14 @@ _KNOWLEDGE_RESPONSE_INVALID_ERROR_CODES = frozenset(
 _SAFE_LOCAL_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SAFE_KNOWLEDGE_TURN_ID = re.compile(r"^turn-[a-f0-9]{32}$")
 _GUIDANCE_TOKEN = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
+_LAW_HISTORY_EVIDENCE_PROFILE = "functional-uat-law-history"
+_LEGACY_3LAW_EVIDENCE_PROFILE = "functional-uat-3law"
+_EVIDENCE_PROFILES = frozenset({_LAW_HISTORY_EVIDENCE_PROFILE, _LEGACY_3LAW_EVIDENCE_PROFILE})
 _V2_GUIDANCE_PROFILE = "functional-uat-kr-trade-v2"
+_BASELINE_REVIEW_AS_OF = "2026-08-05"
+_LAW_HISTORY_MISMATCH_REVIEW_AS_OF = "2026-08-06"
+_LAW_HISTORY_HSK_SNAPSHOT_AS_OF = "2026-08-05"
+_LAW_HISTORY_REQUIREMENTS_SNAPSHOT_AS_OF = "2026-08-05"
 _CASE_DOCUMENT_PASTE_CONTENT = "품명: 합성 검증 품목\n단가: USD 1"
 _CASE_DOCUMENT_PASTE_STREAMS = (
     "public-api",
@@ -156,6 +166,9 @@ class Scenario:
     required_document_types: tuple[str, ...] = ()
     required_comparison_codes: tuple[str, ...] = ()
     required_fact_names: tuple[str, ...] = ()
+    review_as_of: str = _BASELINE_REVIEW_AS_OF
+    requires_temporal_context: bool = False
+    expects_temporal_snapshot_mismatch: bool = False
 
 
 class _LoginFormParser(HTMLParser):
@@ -669,6 +682,7 @@ def _scenario_matrix() -> tuple[Scenario, ...]:
             expected_retrieval_status="completed",
             expected_regulatory_finding_count=1,
             requires_certificate_hs=True,
+            requires_temporal_context=True,
         ),
         Scenario(
             "all-comparison-mismatches",
@@ -747,6 +761,39 @@ def _scenario_matrix() -> tuple[Scenario, ...]:
     )
 
 
+def _law_history_temporal_mismatch_scenario() -> Scenario:
+    """Reuse the matching import documents at the first post-baseline law date.
+
+    The dedicated run proves that the legal collection can serve a newer
+    review date while the independently versioned HSK and requirements inputs
+    remain at their declared baseline.  It is intentionally unavailable to
+    the retained three-law profile, which supports only its one baseline date.
+    """
+
+    matching = next(item for item in _scenario_matrix() if item.name == "all-documents-match")
+    return replace(
+        matching,
+        name="law-history-temporal-snapshot-mismatch",
+        case_title="기능 UAT · 법령 이력과 기준 스냅샷 차이 확인",
+        expected_execution="partial",
+        expected_retrieval_status="needs_review",
+        expected_regulatory_finding_count=None,
+        review_as_of=_LAW_HISTORY_MISMATCH_REVIEW_AS_OF,
+        expects_temporal_snapshot_mismatch=True,
+    )
+
+
+def _selected_matrix_scenarios(evidence_profile: str) -> tuple[Scenario, ...]:
+    """Select the default temporal path or the preserved explicit legacy path."""
+
+    if evidence_profile not in _EVIDENCE_PROFILES:
+        raise MatrixError("functional_uat_evidence_profile_invalid")
+    scenarios = _scenario_matrix()
+    if evidence_profile == _LAW_HISTORY_EVIDENCE_PROFILE:
+        return (*scenarios, _law_history_temporal_mismatch_scenario())
+    return scenarios
+
+
 def _job_id(payload: Mapping[str, Any]) -> tuple[str, str]:
     job = payload.get("job")
     if not isinstance(job, Mapping):
@@ -781,6 +828,72 @@ def _mapping_list(value: object, *, code: str) -> list[Mapping[str, Any]]:
     if not isinstance(value, list) or any(not isinstance(item, Mapping) for item in value):
         raise MatrixError(code)
     return list(value)
+
+
+def _assert_law_history_temporal_context(run: Mapping[str, Any], scenario: Scenario) -> None:
+    """Require the exact, public three-date context for one temporal review."""
+
+    if run.get("review_as_of") != scenario.review_as_of:
+        raise MatrixError(f"{scenario.name}_review_as_of")
+    temporal_context = run.get("temporal_context")
+    if not isinstance(temporal_context, Mapping):
+        raise MatrixError(f"{scenario.name}_temporal_context_missing")
+    expected = {
+        "law_as_of": scenario.review_as_of,
+        "hsk_snapshot_as_of": _LAW_HISTORY_HSK_SNAPSHOT_AS_OF,
+        "requirements_snapshot_as_of": _LAW_HISTORY_REQUIREMENTS_SNAPSHOT_AS_OF,
+    }
+    if dict(temporal_context) != expected:
+        raise MatrixError(f"{scenario.name}_temporal_context_invalid")
+    if temporal_context["law_as_of"] != run["review_as_of"]:
+        raise MatrixError(f"{scenario.name}_temporal_context_law_date")
+    if scenario.expects_temporal_snapshot_mismatch and (
+        temporal_context["hsk_snapshot_as_of"] == temporal_context["law_as_of"]
+        or temporal_context["requirements_snapshot_as_of"] == temporal_context["law_as_of"]
+    ):
+        raise MatrixError(f"{scenario.name}_temporal_snapshot_mismatch_missing")
+
+
+def _assert_evidence_profile_temporal_context(
+    run: Mapping[str, Any], *, scenario: Scenario, evidence_profile: str
+) -> None:
+    """Keep the default temporal contract strict without changing legacy results."""
+
+    if evidence_profile == _LEGACY_3LAW_EVIDENCE_PROFILE:
+        if run.get("temporal_context") is not None:
+            raise MatrixError(f"{scenario.name}_legacy_temporal_context_unexpected")
+        return
+    if evidence_profile != _LAW_HISTORY_EVIDENCE_PROFILE:
+        raise MatrixError("functional_uat_evidence_profile_invalid")
+    if scenario.requires_temporal_context:
+        _assert_law_history_temporal_context(run, scenario)
+
+
+def _assert_law_history_snapshot_mismatch_partial(
+    *, baseline_run: Mapping[str, Any], mismatch_run: Mapping[str, Any]
+) -> dict[str, object]:
+    """Prove a newer legal date works and its HSK/requirements mismatch stays partial."""
+
+    if baseline_run.get("execution_status") != "succeeded":
+        raise MatrixError("law_history_temporal_baseline_not_succeeded")
+    if mismatch_run.get("execution_status") != "partial":
+        raise MatrixError("law_history_temporal_mismatch_not_partial")
+    if _workflow_stage(mismatch_run, "retrieve_evidence").get("status") != "needs_review":
+        raise MatrixError("law_history_temporal_mismatch_retrieval")
+    for label, run in (("baseline", baseline_run), ("mismatch", mismatch_run)):
+        evidence = _mapping_list(run.get("evidence"), code=f"law_history_{label}_evidence_invalid")
+        if not any(item.get("source_type") == "law_article" for item in evidence):
+            # The mismatch must not pass merely because no law version was
+            # available.  A retained temporal law citation proves the legal
+            # side was served; the exact snapshot dates explain the partial.
+            raise MatrixError(f"law_history_{label}_law_evidence_missing")
+    return {
+        "baseline_review_as_of": _BASELINE_REVIEW_AS_OF,
+        "law_as_of": _LAW_HISTORY_MISMATCH_REVIEW_AS_OF,
+        "hsk_snapshot_as_of": _LAW_HISTORY_HSK_SNAPSHOT_AS_OF,
+        "requirements_snapshot_as_of": _LAW_HISTORY_REQUIREMENTS_SNAPSHOT_AS_OF,
+        "mismatch_execution_status": "partial",
+    }
 
 
 def _fact_name_values(analysis: Mapping[str, Any]) -> list[str]:
@@ -1012,7 +1125,9 @@ def _assert_scenario_semantics(run: Mapping[str, Any], scenario: Scenario) -> No
             raise MatrixError(f"{scenario.name}_regulatory_document_grouping")
 
 
-def _assert_agent_result(run: Mapping[str, Any], scenario: Scenario) -> None:
+def _assert_agent_result(
+    run: Mapping[str, Any], *, scenario: Scenario, evidence_profile: str
+) -> None:
     if run.get("review_disposition") != "human_review_required":
         raise MatrixError(f"{scenario.name}_human_review_boundary")
     eligibility = _require_mapping(run.get("completion_eligibility"), code="completion_invalid")
@@ -1055,6 +1170,11 @@ def _assert_agent_result(run: Mapping[str, Any], scenario: Scenario) -> None:
             for item in comparisons
         ):
             raise MatrixError(f"{scenario.name}_{rule_code}_{expected_status}")
+    _assert_evidence_profile_temporal_context(
+        run,
+        scenario=scenario,
+        evidence_profile=evidence_profile,
+    )
     _assert_scenario_semantics(run, scenario)
     _assert_run_user_prose(run)
 
@@ -1072,7 +1192,7 @@ def _case_create_body(scenario: Scenario) -> dict[str, Any]:
 
 
 def _create_case_and_review(
-    api: PublicApi, scenario: Scenario
+    api: PublicApi, scenario: Scenario, *, evidence_profile: str
 ) -> tuple[str, list[dict[str, str]], str, dict[str, Any]]:
     created = api.require("POST", "/cases", body=_case_create_body(scenario))
     case_id = created.get("case_id")
@@ -1097,12 +1217,12 @@ def _create_case_and_review(
     review = api.require(
         "POST",
         f"/cases/{case_id}/reviews",
-        body={"trade_type": scenario.trade_type, "review_as_of": "2026-08-05"},
+        body={"trade_type": scenario.trade_type, "review_as_of": scenario.review_as_of},
         idempotency_key=f"functional-matrix-{uuid.uuid4().hex}",
     )
     job_id, run_id = _job_id(review)
     run = _wait_for_run(api, job_id=job_id, run_id=run_id)
-    _assert_agent_result(run, scenario)
+    _assert_agent_result(run, scenario=scenario, evidence_profile=evidence_profile)
     return case_id, documents, run_id, run
 
 
@@ -2748,7 +2868,14 @@ def _assert_real_provider_trace(run_ids: Sequence[str]) -> dict[str, Any]:
     }
 
 
-def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, Any]:
+def run(
+    *,
+    base_url: str,
+    profile_path: Path,
+    redirect_uri: str,
+    evidence_profile: str = _LAW_HISTORY_EVIDENCE_PROFILE,
+) -> dict[str, Any]:
+    scenarios = _selected_matrix_scenarios(evidence_profile)
     health = httpx.get(
         base_url.rsplit("/api/v1", 1)[0] + "/health/functional-uat-ready", timeout=15.0
     )
@@ -2769,11 +2896,15 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
     try:
         executed: list[dict[str, Any]] = []
         runs: dict[str, tuple[str, list[dict[str, str]], str, dict[str, Any]]] = {}
-        for scenario in _scenario_matrix():
-            case_id, documents, run_id, review_run = _create_case_and_review(reviewer, scenario)
+        for scenario in scenarios:
+            case_id, documents, run_id, review_run = _create_case_and_review(
+                reviewer,
+                scenario,
+                evidence_profile=evidence_profile,
+            )
             runs[scenario.name] = (case_id, documents, run_id, review_run)
             executed.append({"scenario": scenario.name, "review_run_id": run_id})
-        if len(executed) != 7:
+        if len(executed) != len(scenarios):
             raise MatrixError("functional_uat_scenario_count_invalid")
 
         mismatch_case, mismatch_documents, mismatch_run_id, mismatch_run = runs[
@@ -2833,6 +2964,12 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
         )
         matching_run_id = runs["all-documents-match"][2]
         matching_run = runs["all-documents-match"][3]
+        temporal_context_verification: dict[str, object] | None = None
+        if evidence_profile == _LAW_HISTORY_EVIDENCE_PROFILE:
+            temporal_context_verification = _assert_law_history_snapshot_mismatch_partial(
+                baseline_run=matching_run,
+                mismatch_run=runs["law-history-temporal-snapshot-mismatch"][3],
+            )
         case_document_paste = _assert_case_document_paste_zero_dispatch(
             reviewer,
             run_id=matching_run_id,
@@ -2876,13 +3013,14 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
         )
 
         all_run_ids = [entry[2] for entry in runs.values()] + [child_run_id, replacement_run_id]
-        if len(all_run_ids) != 9 or len(all_run_ids) != len(set(all_run_ids)):
+        if len(all_run_ids) != len(scenarios) + 2 or len(all_run_ids) != len(set(all_run_ids)):
             raise MatrixError("functional_uat_review_run_count_invalid")
         transcripts = [_verify_transcript(run_id) for run_id in all_run_ids]
         trace = _assert_real_provider_trace(all_run_ids)
         return {
             "status": "passed",
             "profile": "functional-uat",
+            "evidence_profile": evidence_profile,
             "guidance_profile": _V2_GUIDANCE_PROFILE,
             "scenario_count": len(executed),
             "review_run_count": len(all_run_ids),
@@ -2892,6 +3030,7 @@ def run(*, base_url: str, profile_path: Path, redirect_uri: str) -> dict[str, An
             "transcripts_verified": len(transcripts),
             "case_document_paste": case_document_paste,
             "knowledge_guidance": knowledge_guidance,
+            "temporal_context_verification": temporal_context_verification,
             **trace,
         }
     finally:
@@ -2907,6 +3046,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=_profile_path,
         default=_workspace_root() / "_local" / "profiles" / "functional-uat" / "backend.env",
     )
+    parser.add_argument(
+        "--evidence-profile",
+        choices=tuple(sorted(_EVIDENCE_PROFILES)),
+        default=_LAW_HISTORY_EVIDENCE_PROFILE,
+        help="Data Evidence profile; the 65-law history profile is the default",
+    )
     parser.add_argument("--redirect-uri", type=_redirect_uri, default="http://127.0.0.1:5173/")
     args = parser.parse_args(argv)
     try:
@@ -2914,6 +3059,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             base_url=args.base_url,
             profile_path=args.profile_file,
             redirect_uri=args.redirect_uri,
+            evidence_profile=args.evidence_profile,
         )
     except MatrixError as exc:
         print(
