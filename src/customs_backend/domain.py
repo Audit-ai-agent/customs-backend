@@ -33,9 +33,13 @@ def canonical_digest(value: Any) -> str:
 
 MAX_TEXT_DOCUMENT_CHARACTERS = 200_000
 MAX_TEXT_DOCUMENT_UTF8_BYTES = MAX_TEXT_DOCUMENT_CHARACTERS * 4
-MAX_DOCUMENT_ASSET_BYTES = 20 * 1024 * 1024
+# Keep the public upload boundary no larger than the Agent's independently
+# enforced default.  Accepting a larger asset here would persist a binary that
+# the isolated preview service must reject later, which is neither useful nor
+# a safe preview workflow.
+MAX_DOCUMENT_ASSET_BYTES = 16 * 1024 * 1024
 MAX_DOCUMENT_ASSET_PAGES = 20
-MAX_DOCUMENT_ASSET_PIXELS = 80_000_000
+MAX_DOCUMENT_ASSET_PIXELS = 40_000_000
 # Keep the compact legacy codes while adding the text documents needed for a
 # normal export workbench.  They are only labels for text input; this does not
 # imply PDF/image/OCR support.
@@ -220,6 +224,15 @@ class DocumentAssetRecord(BaseModel):
     pixel_count: int = Field(ge=0, le=MAX_DOCUMENT_ASSET_PIXELS)
     created_by: str = Field(min_length=1, max_length=256)
     created_at: datetime
+
+    @field_validator("filename")
+    @classmethod
+    def safe_binary_filename(cls, value: str) -> str:
+        """Keep stored Browser-visible filenames out of path/control syntax."""
+
+        if not value.strip() or any(character in value for character in ("/", "\\", "\r", "\n", "\x00")):
+            raise ValueError("document asset filename is invalid")
+        return value
 
 
 class ExtractionBoundingBox(BaseModel):

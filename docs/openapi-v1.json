@@ -3605,17 +3605,10 @@
           {
             "in": "header",
             "name": "content-type",
-            "required": false,
+            "required": true,
             "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Content-Type"
+              "title": "Content-Type",
+              "type": "string"
             }
           }
         ],

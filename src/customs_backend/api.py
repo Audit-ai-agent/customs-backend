@@ -43,6 +43,7 @@ from customs_backend.domain import (
     JobStatus,
     KnowledgeConversationCreate,
     KnowledgeConversationRecord,
+    MAX_DOCUMENT_ASSET_BYTES,
     Principal,
     RevisionCreate,
     ReviewEnqueueRequest,
@@ -75,7 +76,7 @@ IdempotencyKey = Annotated[
     Header(alias="Idempotency-Key", min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$"),
 ]
 MAX_PUBLIC_REQUEST_BODY_BYTES = 4 * 1024 * 1024
-MAX_DOCUMENT_ASSET_REQUEST_BODY_BYTES = 20 * 1024 * 1024
+MAX_DOCUMENT_ASSET_REQUEST_BODY_BYTES = MAX_DOCUMENT_ASSET_BYTES
 _DEV_FIXTURE_REVIEW_AS_OF = date(2026, 8, 5)
 _DOCUMENT_ASSET_UPLOAD_PATH = re.compile(r"^/api/v1/cases/[^/]+/document-assets$")
 
@@ -1010,14 +1011,12 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
     async def add_document_asset_endpoint(
         case_id: str,
         request: Request,
+        content_type: Annotated[str, Header()],
         document_type: DocumentType = Query(...),
         filename: str = Query(..., min_length=1, max_length=255),
-        content_type: Annotated[str | None, Header()] = None,
         principal: Principal = Depends(writers),
         service: WorkbenchService = Depends(_service),
     ) -> DocumentAssetView:
-        if content_type is None:
-            raise ValueError("document asset content type is required")
         asset = service.add_document_asset(
             principal,
             case_id,

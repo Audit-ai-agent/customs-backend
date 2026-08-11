@@ -21,6 +21,7 @@ from customs_backend.case_input_boundary import CASE_DOCUMENT_CONTEXT_PLACEHOLDE
 from customs_backend.domain import (
     AgentReviewRequest,
     ConversationMessageCreate,
+    MAX_DOCUMENT_ASSET_BYTES,
     Principal,
     Role,
     canonical_digest,
@@ -378,6 +379,61 @@ def test_binary_asset_magic_mismatch_is_rejected_before_storage() -> None:
         assert response.json()["code"] == "invalid_operation"
         assets = client.get(f"/api/v1/cases/{case_id}/document-assets", headers=_auth())
         assert assets.json() == {"items": []}
+
+
+@pytest.mark.parametrize("unsafe_filename", ["../invoice.png", "invoice\r\ncopy.png", "   "])
+def test_binary_asset_unsafe_filename_is_rejected_before_storage(unsafe_filename: str) -> None:
+    with _client() as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Unsafe asset name"}, headers=_auth()
+        ).json()["case_id"]
+        response = client.post(
+            f"/api/v1/cases/{case_id}/document-assets",
+            params={"document_type": "CI", "filename": unsafe_filename},
+            content=_tiny_png(),
+            headers={**_auth(), "Content-Type": "image/png"},
+        )
+        assert response.status_code == 422
+        assets = client.get(f"/api/v1/cases/{case_id}/document-assets", headers=_auth())
+        assert assets.json() == {"items": []}
+
+
+def test_binary_asset_content_type_and_size_limit_are_required_at_public_boundary() -> None:
+    with _client() as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Bounded asset"}, headers=_auth()
+        ).json()["case_id"]
+        path = f"/api/v1/cases/{case_id}/document-assets"
+        params = {"document_type": "CI", "filename": "invoice.png"}
+
+        missing_type = client.post(path, params=params, content=_tiny_png(), headers=_auth())
+        assert missing_type.status_code == 422
+        assert missing_type.json()["code"] == "request_validation_failed"
+
+        too_large = client.build_request(
+            "POST",
+            path,
+            params=params,
+            content=b"not-read",
+            headers={
+                **_auth(),
+                "Content-Type": "image/png",
+                "Content-Length": str(MAX_DOCUMENT_ASSET_BYTES + 1),
+            },
+        )
+        rejected = client.send(too_large)
+        assert rejected.status_code == 413
+        assert rejected.json()["code"] == "request_body_too_large"
+
+        specification = client.get("/openapi.json").json()
+        header = next(
+            value
+            for value in specification["paths"]["/api/v1/cases/{case_id}/document-assets"]["post"][
+                "parameters"
+            ]
+            if value["in"] == "header" and value["name"] == "content-type"
+        )
+        assert header["required"] is True
 
 
 def test_temporal_context_is_persisted_and_forwarded_to_case_assistant() -> None:
