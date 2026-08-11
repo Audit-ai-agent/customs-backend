@@ -10,9 +10,11 @@ from typing import Any
 import httpx
 
 from customs_backend.domain import (
+    AgentDocumentExtractionRequest,
     AgentAssistantAnswerRequest,
     AgentKnowledgeAnswerRequest,
     AgentReviewRequest,
+    MAX_DOCUMENT_ASSET_BYTES,
     MAX_TEXT_DOCUMENT_UTF8_BYTES,
     canonical_json_bytes,
 )
@@ -21,24 +23,48 @@ from customs_backend.ports import AgentResponseRejectedError, KnowledgeInputReje
 
 class InMemoryObjectStore:
     def __init__(self) -> None:
-        self._objects: dict[str, str] = {}
+        self._objects: dict[str, bytes] = {}
 
     def health(self) -> bool:
         return True
 
     def put_text(self, *, key: str, content: str, content_sha256: str) -> None:
-        if hashlib.sha256(content.encode("utf-8")).hexdigest() != content_sha256:
+        self.put_bytes(
+            key=key,
+            content=content.encode("utf-8"),
+            content_sha256=content_sha256,
+            media_type="text/plain; charset=utf-8",
+        )
+
+    def get_text(self, *, key: str, expected_sha256: str) -> str:
+        payload = self.get_bytes(
+            key=key,
+            expected_sha256=expected_sha256,
+            maximum_bytes=MAX_TEXT_DOCUMENT_UTF8_BYTES,
+        )
+        try:
+            return payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("object is not valid UTF-8") from exc
+
+    def put_bytes(
+        self, *, key: str, content: bytes, content_sha256: str, media_type: str
+    ) -> None:
+        del media_type  # The test adapter has no content-type metadata surface.
+        if hashlib.sha256(content).hexdigest() != content_sha256:
             raise ValueError("object content hash does not match metadata")
         existing = self._objects.get(key)
         if existing is not None and existing != content:
             raise ValueError("immutable object key already contains different content")
-        self._objects[key] = content
+        self._objects[key] = bytes(content)
 
-    def get_text(self, *, key: str, expected_sha256: str) -> str:
+    def get_bytes(self, *, key: str, expected_sha256: str, maximum_bytes: int) -> bytes:
         content = self._objects[key]
-        if hashlib.sha256(content.encode("utf-8")).hexdigest() != expected_sha256:
+        if len(content) > maximum_bytes:
+            raise ValueError("object exceeds the requested byte safety limit")
+        if hashlib.sha256(content).hexdigest() != expected_sha256:
             raise ValueError("object readback hash mismatch")
-        return content
+        return bytes(content)
 
 
 class MinioObjectStore:
@@ -65,38 +91,56 @@ class MinioObjectStore:
         return bool(self._client.bucket_exists(self._bucket))
 
     def put_text(self, *, key: str, content: str, content_sha256: str) -> None:
+        payload = content.encode("utf-8")
+        self.put_bytes(
+            key=key,
+            content=payload,
+            content_sha256=content_sha256,
+            media_type="text/plain; charset=utf-8",
+        )
+
+    def put_bytes(
+        self, *, key: str, content: bytes, content_sha256: str, media_type: str
+    ) -> None:
         from io import BytesIO
 
-        payload = content.encode("utf-8")
-        if hashlib.sha256(payload).hexdigest() != content_sha256:
+        if hashlib.sha256(content).hexdigest() != content_sha256:
             raise ValueError("object content hash does not match metadata")
         self._client.put_object(
             self._bucket,
             key,
-            BytesIO(payload),
-            length=len(payload),
-            content_type="text/plain; charset=utf-8",
+            BytesIO(content),
+            length=len(content),
+            content_type=media_type,
             metadata={"sha256": content_sha256},
         )
 
     def get_text(self, *, key: str, expected_sha256: str) -> str:
-        response = self._client.get_object(self._bucket, key)
-        try:
-            content_length = response.headers.get("content-length")
-            if content_length is not None and int(content_length) > MAX_TEXT_DOCUMENT_UTF8_BYTES:
-                raise ValueError("object exceeds the text document byte safety limit")
-            payload = response.read(MAX_TEXT_DOCUMENT_UTF8_BYTES + 1)
-        finally:
-            response.close()
-            response.release_conn()
-        if len(payload) > MAX_TEXT_DOCUMENT_UTF8_BYTES:
-            raise ValueError("object exceeds the text document byte safety limit")
-        if hashlib.sha256(payload).hexdigest() != expected_sha256:
-            raise ValueError("object readback hash mismatch")
+        payload = self.get_bytes(
+            key=key,
+            expected_sha256=expected_sha256,
+            maximum_bytes=MAX_TEXT_DOCUMENT_UTF8_BYTES,
+        )
         try:
             return payload.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ValueError("object is not valid UTF-8") from exc
+
+    def get_bytes(self, *, key: str, expected_sha256: str, maximum_bytes: int) -> bytes:
+        response = self._client.get_object(self._bucket, key)
+        try:
+            content_length = response.headers.get("content-length")
+            if content_length is not None and int(content_length) > maximum_bytes:
+                raise ValueError("object exceeds the requested byte safety limit")
+            payload = response.read(maximum_bytes + 1)
+        finally:
+            response.close()
+            response.release_conn()
+        if len(payload) > maximum_bytes:
+            raise ValueError("object exceeds the requested byte safety limit")
+        if hashlib.sha256(payload).hexdigest() != expected_sha256:
+            raise ValueError("object readback hash mismatch")
+        return payload
 
 
 class HttpAgentClient:
@@ -219,6 +263,41 @@ class HttpAgentClient:
         )
         return result
 
+    def extract_document(
+        self, request: AgentDocumentExtractionRequest, content: bytes
+    ) -> dict[str, Any]:
+        """Call the isolated binary-preview endpoint without tracing source bytes."""
+
+        if len(content) != request.byte_size or len(content) > MAX_DOCUMENT_ASSET_BYTES:
+            raise ValueError("document extraction source bytes do not match the declared size")
+        if hashlib.sha256(content).hexdigest() != request.source_sha256:
+            raise ValueError("document extraction source bytes do not match the declared hash")
+        try:
+            response = self._client.post(
+                "/internal/agent/v2/document-extractions",
+                content=content,
+                headers={
+                    "Content-Type": request.media_type,
+                    "X-Document-Asset-ID": request.document_asset_id,
+                    "X-Extraction-Request-ID": request.extraction_request_id,
+                    "X-Document-SHA256": request.source_sha256,
+                },
+            )
+        except httpx.HTTPError as exc:
+            raise AgentResponseRejectedError("Agent document extraction transport failed") from exc
+        try:
+            self._require_service_mode(response)
+            response.raise_for_status()
+            return self._decode_object(
+                response, maximum_bytes=8_000_000, label="document extraction"
+            )
+        except (AgentResponseRejectedError, httpx.HTTPStatusError) as exc:
+            if isinstance(exc, httpx.HTTPStatusError):
+                raise AgentResponseRejectedError(
+                    f"Agent document extraction returned HTTP {response.status_code}"
+                ) from exc
+            raise
+
     def answer(self, request: AgentAssistantAnswerRequest) -> dict[str, Any]:
         """Call the one bounded, synchronous assistant endpoint."""
 
@@ -335,15 +414,36 @@ class CallableAgentClient:
         *,
         answer: Callable[[AgentAssistantAnswerRequest], dict[str, Any]] | None = None,
         knowledge_answer: Callable[[AgentKnowledgeAnswerRequest], dict[str, Any]] | None = None,
+        extract_document: Callable[[AgentDocumentExtractionRequest, bytes], dict[str, Any]] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
         self._review = review
         self._answer = answer
         self._knowledge_answer = knowledge_answer
+        self._extract_document = extract_document
         self._metadata = metadata or {"status": "ready"}
 
     def review(self, request: AgentReviewRequest) -> dict[str, Any]:
         return self._review(request)
+
+    def extract_document(
+        self, request: AgentDocumentExtractionRequest, content: bytes
+    ) -> dict[str, Any]:
+        if self._extract_document is not None:
+            return self._extract_document(request, content)
+        return {
+            "schema_version": "1.0",
+            "document_asset_id": request.document_asset_id,
+            "extraction_request_id": request.extraction_request_id,
+            "status": "unavailable",
+            "media_type": request.media_type,
+            "byte_size": request.byte_size,
+            "source_sha256": request.source_sha256,
+            "canonical_text_sha256": None,
+            "extractor_revision": None,
+            "pages": [],
+            "warnings": [{"code": "preview_engine_unavailable"}],
+        }
 
     def answer(self, request: AgentAssistantAnswerRequest) -> dict[str, Any]:
         if self._answer is not None:

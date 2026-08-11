@@ -1,0 +1,67 @@
+{
+  "$id": "https://schemas.customs.local/agent/v3/document-extraction-result.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Human-review-only preview metadata and extracted text spans for one immutable binary asset. The result never includes raw bytes or base64 and does not authorize automatic review, findings, or customs decisions.",
+  "$defs": {
+    "BoundingBox": {
+      "additionalProperties": false,
+      "properties": {
+        "x": {"type": "number", "minimum": 0, "maximum": 1},
+        "y": {"type": "number", "minimum": 0, "maximum": 1},
+        "width": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+        "height": {"type": "number", "exclusiveMinimum": 0, "maximum": 1}
+      },
+      "required": ["x", "y", "width", "height"],
+      "type": "object"
+    },
+    "Span": {
+      "additionalProperties": false,
+      "properties": {
+        "span_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
+        "ordinal": {"type": "integer", "minimum": 1, "maximum": 100000},
+        "text": {"type": "string", "minLength": 1, "maxLength": 8000},
+        "bbox": {"anyOf": [{"$ref": "#/$defs/BoundingBox"}, {"type": "null"}]},
+        "reading_order": {"type": "integer", "minimum": 1, "maximum": 100000}
+      },
+      "required": ["span_id", "ordinal", "text", "bbox", "reading_order"],
+      "type": "object"
+    },
+    "Page": {
+      "additionalProperties": false,
+      "properties": {
+        "page_number": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "width": {"type": "integer", "minimum": 1, "maximum": 100000},
+        "height": {"type": "integer", "minimum": 1, "maximum": 100000},
+        "coordinate_unit": {"type": "string", "enum": ["pixels", "pdf_points"]},
+        "spans": {"type": "array", "maxItems": 10000, "items": {"$ref": "#/$defs/Span"}}
+      },
+      "required": ["page_number", "width", "height", "coordinate_unit", "spans"],
+      "type": "object"
+    },
+    "Warning": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-z][a-z0-9_]{1,127}$"}
+      },
+      "required": ["code"],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "schema_version": {"const": "1.0", "type": "string"},
+    "document_asset_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
+    "extraction_request_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
+    "status": {"type": "string", "enum": ["preview_ready", "needs_review", "unavailable"]},
+    "media_type": {"type": "string", "enum": ["application/pdf", "image/jpeg", "image/png"]},
+    "byte_size": {"type": "integer", "minimum": 1, "maximum": 33554432},
+    "source_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "canonical_text_sha256": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
+    "extractor_revision": {"type": ["string", "null"], "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
+    "pages": {"type": "array", "maxItems": 1000, "items": {"$ref": "#/$defs/Page"}},
+    "warnings": {"type": "array", "maxItems": 32, "items": {"$ref": "#/$defs/Warning"}}
+  },
+  "required": ["schema_version", "document_asset_id", "extraction_request_id", "status", "media_type", "byte_size", "source_sha256", "canonical_text_sha256", "extractor_revision", "pages", "warnings"],
+  "title": "Customs AI Agent document extraction preview result",
+  "type": "object"
+}

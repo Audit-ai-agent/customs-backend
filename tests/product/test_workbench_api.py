@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 from pathlib import Path
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from tests.product.agent_v3_fixture import build_agent_v3_result
 
@@ -39,6 +41,7 @@ def _client(
     review_handler=None,
     answer_handler=None,
     knowledge_answer_handler=None,
+    extract_handler=None,
     settings: Settings | None = None,
 ) -> TestClient:
     settings = settings or Settings(_env_file=None, environment="test")
@@ -59,6 +62,7 @@ def _client(
         or (lambda request: build_agent_v3_result(request, include_finding=include_finding)),
         answer=answer_handler,
         knowledge_answer=knowledge_answer_handler,
+        extract_document=extract_handler,
     )
     service = WorkbenchService(
         repository=repository,
@@ -100,6 +104,14 @@ def _approver_auth() -> dict[str, str]:
 
 def _reviewer_approver_auth() -> dict[str, str]:
     return {"Authorization": "Bearer reviewer-approver-token"}
+
+
+def _tiny_png() -> bytes:
+    """A synthetic one-pixel fixture; it is not a user document."""
+
+    output = BytesIO()
+    Image.new("RGB", (1, 1), color=(0, 0, 0)).save(output, format="PNG")
+    return output.getvalue()
 
 
 def _functional_settings() -> Settings:
@@ -257,6 +269,111 @@ def test_v1_case_document_review_flow_always_needs_human_review() -> None:
         assert detail.json()["temporal_context"] is None
         assert detail.json()["workflow"]["status"] == "completed"
         assert detail.json()["document_analyses"]
+
+
+def test_binary_preview_stays_outside_text_review_until_human_confirmation() -> None:
+    observed: list[tuple[object, bytes]] = []
+
+    def extraction_handler(request, content: bytes) -> dict[str, object]:
+        observed.append((request, content))
+        return {
+            "schema_version": "1.0",
+            "document_asset_id": request.document_asset_id,
+            "extraction_request_id": request.extraction_request_id,
+            "status": "preview_ready",
+            "media_type": request.media_type,
+            "byte_size": request.byte_size,
+            "source_sha256": request.source_sha256,
+            "canonical_text_sha256": "a" * 64,
+            "extractor_revision": "local-preview-test-r1",
+            "pages": [
+                {
+                    "page_number": 1,
+                    "width": 1,
+                    "height": 1,
+                    "coordinate_unit": "pixels",
+                    "spans": [
+                        {
+                            "span_id": "span-preview-1",
+                            "ordinal": 1,
+                            "text": "candidate preview text",
+                            "bbox": {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0},
+                            "reading_order": 1,
+                        }
+                    ],
+                }
+            ],
+            "warnings": [{"code": "human_confirmation_required"}],
+        }
+
+    with _client(extract_handler=extraction_handler) as client:
+        case = client.post("/api/v1/cases", json={"title": "Preview only"}, headers=_auth())
+        assert case.status_code == 201
+        case_id = case.json()["case_id"]
+        payload = _tiny_png()
+
+        uploaded = client.post(
+            f"/api/v1/cases/{case_id}/document-assets",
+            params={"document_type": "CI", "filename": "invoice.png"},
+            content=payload,
+            headers={**_auth(), "Content-Type": "image/png"},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        asset = uploaded.json()
+        assert asset["media_type"] == "image/png"
+        assert "source_sha256" not in asset
+        assert "object_key" not in asset
+
+        # Uploading an asset must not alter the ordinary text-review inputs.
+        documents = client.get(f"/api/v1/cases/{case_id}/documents", headers=_auth())
+        assert documents.status_code == 200
+        assert documents.json() == {"items": []}
+
+        preview = client.post(
+            f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/extractions",
+            headers=_auth(),
+        )
+        assert preview.status_code == 202, preview.text
+        job = preview.json()["job"]
+        assert job["status"] == "preview_ready"
+        assert job["result"]["pages"][0]["spans"][0]["text"] == "candidate preview text"
+        assert "source_sha256" not in job["result"]
+        assert "canonical_text_sha256" not in job["result"]
+        assert len(observed) == 1
+        assert observed[0][1] == payload
+
+        confirmed = client.post(
+            f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/confirmed-document",
+            json={
+                "extraction_job_id": job["extraction_job_id"],
+                "filename": "invoice-confirmed.txt",
+                "content_text": "human-confirmed review text",
+            },
+            headers=_auth(),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+        # The review document remains text-only; binary provenance stays on
+        # the operational asset/extraction records rather than this public DTO.
+        assert "source_asset_id" not in confirmed.json()["record"]
+        documents = client.get(f"/api/v1/cases/{case_id}/documents", headers=_auth())
+        assert len(documents.json()["items"]) == 1
+
+
+def test_binary_asset_magic_mismatch_is_rejected_before_storage() -> None:
+    with _client() as client:
+        case = client.post("/api/v1/cases", json={"title": "Reject mismatch"}, headers=_auth())
+        assert case.status_code == 201
+        case_id = case.json()["case_id"]
+        response = client.post(
+            f"/api/v1/cases/{case_id}/document-assets",
+            params={"document_type": "CI", "filename": "wrong.pdf"},
+            content=_tiny_png(),
+            headers={**_auth(), "Content-Type": "application/pdf"},
+        )
+        assert response.status_code == 422
+        assert response.json()["code"] == "invalid_operation"
+        assets = client.get(f"/api/v1/cases/{case_id}/document-assets", headers=_auth())
+        assert assets.json() == {"items": []}
 
 
 def test_temporal_context_is_persisted_and_forwarded_to_case_assistant() -> None:

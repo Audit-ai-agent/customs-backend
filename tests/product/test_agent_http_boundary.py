@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import date
 
@@ -10,6 +11,7 @@ from customs_backend.adapters import HttpAgentClient
 from customs_backend.agent_contract import AgentContractPayloadError, validate_agent_v3_payload
 from customs_backend.domain import (
     AgentAssistantAnswerRequest,
+    AgentDocumentExtractionRequest,
     AgentDocumentInput,
     AgentKnowledgeAnswerRequest,
     AgentReviewRequest,
@@ -38,6 +40,46 @@ def test_packaged_agent_v3_request_schema_accepts_backend_projection() -> None:
     request = _request()
 
     validate_agent_v3_payload("review_request", request.to_agent_wire())
+
+
+def test_packaged_document_extraction_schemas_accept_only_header_metadata_and_preview() -> None:
+    source_sha256 = "a" * 64
+    metadata = {
+        "document_asset_id": "asset-boundary",
+        "extraction_request_id": "extract-boundary",
+        "source_sha256": source_sha256,
+        "media_type": "image/png",
+    }
+    validate_agent_v3_payload("document_extraction_request", metadata)
+    validate_agent_v3_payload(
+        "document_extraction_result",
+        {
+            "schema_version": "1.0",
+            **metadata,
+            "status": "preview_ready",
+            "byte_size": 32,
+            "canonical_text_sha256": "b" * 64,
+            "extractor_revision": "local-preview-r1",
+            "pages": [
+                {
+                    "page_number": 1,
+                    "width": 100,
+                    "height": 200,
+                    "coordinate_unit": "pixels",
+                    "spans": [
+                        {
+                            "span_id": "span-1",
+                            "ordinal": 1,
+                            "text": "candidate",
+                            "bbox": {"x": 0, "y": 0, "width": 1, "height": 1},
+                            "reading_order": 1,
+                        }
+                    ],
+                }
+            ],
+            "warnings": [{"code": "human_confirmation_required"}],
+        },
+    )
 
 
 def test_packaged_review_schema_accepts_nullable_temporal_context_additively() -> None:
@@ -250,6 +292,62 @@ def test_review_uses_the_one_bearer_and_mode_bound_http_endpoint() -> None:
         "review_run_id",
         "trade_type",
     }
+
+
+def test_document_extraction_uses_raw_body_without_review_trace_or_filename() -> None:
+    source = b"\x89PNG\r\n\x1a\nsynthetic-preview-source"
+    request = AgentDocumentExtractionRequest(
+        document_asset_id="asset-boundary",
+        extraction_request_id="extract-boundary",
+        media_type="image/png",
+        source_sha256=hashlib.sha256(source).hexdigest(),
+        byte_size=len(source),
+    )
+    events: list[tuple[str, str, dict[str, object]]] = []
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        assert http_request.method == "POST"
+        assert http_request.url.path == "/internal/agent/v2/document-extractions"
+        assert http_request.content == source
+        assert http_request.headers["Authorization"] == "Bearer test-token"
+        assert http_request.headers["X-Customs-Service-Mode"] == "local-development"
+        assert http_request.headers["Content-Type"] == "image/png"
+        assert http_request.headers["X-Document-Asset-ID"] == request.document_asset_id
+        assert http_request.headers["X-Extraction-Request-ID"] == request.extraction_request_id
+        assert http_request.headers["X-Document-SHA256"] == request.source_sha256
+        assert "filename" not in http_request.headers
+        return httpx.Response(
+            200,
+            json={
+                "schema_version": "1.0",
+                "document_asset_id": request.document_asset_id,
+                "extraction_request_id": request.extraction_request_id,
+                "status": "unavailable",
+                "media_type": request.media_type,
+                "byte_size": request.byte_size,
+                "source_sha256": request.source_sha256,
+                "canonical_text_sha256": None,
+                "extractor_revision": None,
+                "pages": [],
+                "warnings": [{"code": "preview_engine_unavailable"}],
+            },
+            headers={"X-Customs-Service-Mode": "local-development"},
+            request=http_request,
+        )
+
+    client = HttpAgentClient(
+        base_url="http://127.0.0.1:8090",
+        service_token="test-token",
+        service_mode="local-development",
+        review_trace=lambda run_id, event, payload: events.append((run_id, event, payload)),
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        assert client.extract_document(request, source)["status"] == "unavailable"
+    finally:
+        client.close()
+
+    assert events == []
 
 
 def test_assistant_uses_the_same_bearer_and_mode_bound_http_endpoint() -> None:

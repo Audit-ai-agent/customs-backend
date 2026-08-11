@@ -32,6 +32,9 @@ def canonical_digest(value: Any) -> str:
 
 MAX_TEXT_DOCUMENT_CHARACTERS = 200_000
 MAX_TEXT_DOCUMENT_UTF8_BYTES = MAX_TEXT_DOCUMENT_CHARACTERS * 4
+MAX_DOCUMENT_ASSET_BYTES = 20 * 1024 * 1024
+MAX_DOCUMENT_ASSET_PAGES = 20
+MAX_DOCUMENT_ASSET_PIXELS = 80_000_000
 # Keep the compact legacy codes while adding the text documents needed for a
 # normal export workbench.  They are only labels for text input; this does not
 # imply PDF/image/OCR support.
@@ -180,12 +183,188 @@ class DocumentRecord(BaseModel):
     character_count: int = Field(ge=1, le=MAX_TEXT_DOCUMENT_CHARACTERS)
     created_by: str
     created_at: datetime
+    # A reviewer-confirmed text document may have come from an unverified
+    # extraction preview.  The review contract still receives text only; this
+    # link is operational provenance and never authorises OCR-based findings.
+    source_asset_id: str | None = None
     # A document is immutable.  A correction creates a new record and marks
     # the earlier record as superseded, so historic review input snapshots
     # remain reproducible.
     replaces_document_id: str | None = None
     superseded_by_document_id: str | None = None
     superseded_at: datetime | None = None
+
+
+DocumentAssetMediaType = Literal["application/pdf", "image/jpeg", "image/png"]
+DocumentExtractionStatus = Literal["queued", "preview_ready", "needs_review", "unavailable", "failed"]
+
+
+class DocumentAssetRecord(BaseModel):
+    """Immutable binary source kept outside the text-review input boundary."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    asset_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+    case_id: str = Field(min_length=1, max_length=128)
+    org_id: str = Field(min_length=1, max_length=128)
+    document_type: DocumentType
+    filename: str = Field(min_length=1, max_length=255)
+    media_type: DocumentAssetMediaType
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    object_key: str = Field(min_length=1, max_length=512)
+    byte_size: int = Field(ge=1, le=MAX_DOCUMENT_ASSET_BYTES)
+    page_count: int = Field(ge=1, le=MAX_DOCUMENT_ASSET_PAGES)
+    pixel_count: int = Field(ge=0, le=MAX_DOCUMENT_ASSET_PIXELS)
+    created_by: str = Field(min_length=1, max_length=256)
+    created_at: datetime
+
+
+class ExtractionBoundingBox(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    x: float = Field(ge=0, le=1)
+    y: float = Field(ge=0, le=1)
+    width: float = Field(gt=0, le=1)
+    height: float = Field(gt=0, le=1)
+
+
+class ExtractionSpan(BaseModel):
+    """A human-visible OCR/text-layer candidate with optional page geometry."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    span_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+    ordinal: int = Field(ge=1, le=100_000)
+    text: str = Field(min_length=1, max_length=8_000)
+    bbox: ExtractionBoundingBox | None = None
+    reading_order: int = Field(ge=1, le=100_000)
+
+
+class ExtractionPage(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    page_number: int = Field(ge=1, le=MAX_DOCUMENT_ASSET_PAGES)
+    width: int = Field(ge=1, le=100_000)
+    height: int = Field(ge=1, le=100_000)
+    coordinate_unit: Literal["pixels", "pdf_points"]
+    spans: list[ExtractionSpan] = Field(default_factory=list, max_length=20_000)
+
+
+class ExtractionWarning(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    code: str = Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_]{1,127}$")
+
+
+class DocumentExtractionResult(BaseModel):
+    """Safe preview projection returned by the Agent; never contains source bytes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"] = "1.0"
+    document_asset_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+    extraction_request_id: str = Field(min_length=1, max_length=128)
+    status: Literal["preview_ready", "needs_review", "unavailable"]
+    media_type: DocumentAssetMediaType
+    byte_size: int = Field(ge=1, le=MAX_DOCUMENT_ASSET_BYTES)
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    canonical_text_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    extractor_revision: str | None = Field(default=None, min_length=1, max_length=256)
+    pages: list[ExtractionPage] = Field(default_factory=list, max_length=MAX_DOCUMENT_ASSET_PAGES)
+    warnings: list[ExtractionWarning] = Field(default_factory=list, max_length=32)
+
+    @model_validator(mode="after")
+    def preview_result_is_coherent(self) -> "DocumentExtractionResult":
+        if self.status == "preview_ready" and (
+            self.canonical_text_sha256 is None or not self.extractor_revision or not self.pages
+        ):
+            raise ValueError("a preview-ready extraction requires text provenance and pages")
+        if self.status != "preview_ready" and self.canonical_text_sha256 is not None:
+            raise ValueError("a non-preview extraction must not expose canonical text provenance")
+        return self
+
+
+class AgentDocumentExtractionRequest(BaseModel):
+    """Backend-owned metadata used to form the raw Agent extraction request.
+
+    The object is intentionally not a JSON wire body.  ``HttpAgentClient``
+    places these fields in the fixed request headers and sends only the
+    already-validated source bytes as the body.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    document_asset_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    )
+    extraction_request_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    )
+    media_type: DocumentAssetMediaType
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    byte_size: int = Field(ge=1, le=MAX_DOCUMENT_ASSET_BYTES)
+
+    def to_agent_wire(self) -> dict[str, str]:
+        return {
+            "document_asset_id": self.document_asset_id,
+            "extraction_request_id": self.extraction_request_id,
+            "source_sha256": self.source_sha256,
+            "media_type": self.media_type,
+        }
+
+
+class ExtractionJobRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    extraction_job_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    )
+    asset_id: str = Field(min_length=1, max_length=128)
+    case_id: str = Field(min_length=1, max_length=128)
+    org_id: str = Field(min_length=1, max_length=128)
+    status: DocumentExtractionStatus
+    result: DocumentExtractionResult | None = None
+    error_code: str | None = Field(default=None, min_length=1, max_length=128)
+    created_by: str = Field(min_length=1, max_length=256)
+    created_at: datetime
+    updated_at: datetime
+
+    @model_validator(mode="after")
+    def job_result_matches_status(self) -> "ExtractionJobRecord":
+        if self.status in {"preview_ready", "needs_review", "unavailable"} and self.result is None:
+            raise ValueError("a completed extraction job requires a result")
+        if self.status in {"queued", "failed"} and self.result is not None:
+            raise ValueError("a queued or failed extraction job must not contain a result")
+        return self
+
+
+class ConfirmedExtractedTextCreate(BaseModel):
+    """Human-confirmed text may enter the existing text-review workflow."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    extraction_job_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    )
+    content_text: str = Field(min_length=1, max_length=MAX_TEXT_DOCUMENT_CHARACTERS)
+    filename: str = Field(min_length=1, max_length=255)
+    replaces_document_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+
+    @field_validator("content_text")
+    @classmethod
+    def bounded_utf8_payload(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > MAX_TEXT_DOCUMENT_UTF8_BYTES:
+            raise ValueError("confirmed extracted text exceeds the UTF-8 byte safety limit")
+        return value
 
 
 class ReviewEnqueueRequest(BaseModel):

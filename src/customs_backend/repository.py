@@ -15,7 +15,9 @@ from customs_backend.domain import (
     CorrectionProposalRecord,
     CorrectionProposalStatus,
     CaseStatus,
+    DocumentAssetRecord,
     DocumentRecord,
+    ExtractionJobRecord,
     FindingDecisionHistoryEntry,
     FindingDecisionRecord,
     FindingDecisionStatus,
@@ -34,6 +36,8 @@ class InMemoryWorkbenchRepository:
         self._lock = RLock()
         self._cases: dict[str, CaseRecord] = {}
         self._documents: dict[str, DocumentRecord] = {}
+        self._document_assets: dict[str, DocumentAssetRecord] = {}
+        self._extraction_jobs: dict[str, ExtractionJobRecord] = {}
         self._jobs: dict[str, JobRecord] = {}
         self._idempotency: dict[tuple[str, str], str] = {}
         self._runs: dict[str, ReviewRunRecord] = {}
@@ -132,6 +136,71 @@ class InMemoryWorkbenchRepository:
             return self._copy(
                 sorted(records, key=lambda record: (record.created_at, record.document_id))
             )
+
+    def add_document_asset(self, record: DocumentAssetRecord) -> DocumentAssetRecord:
+        with self._lock:
+            case = self._cases.get(record.case_id)
+            if case is None or case.org_id != record.org_id:
+                raise ConflictError("case does not exist")
+            if record.asset_id in self._document_assets:
+                raise ConflictError("document asset already exists")
+            self._document_assets[record.asset_id] = self._copy(record)
+            return self._copy(record)
+
+    def list_document_assets(self, org_id: str, case_id: str) -> list[DocumentAssetRecord]:
+        with self._lock:
+            records = [
+                record
+                for record in self._document_assets.values()
+                if record.org_id == org_id and record.case_id == case_id
+            ]
+            return self._copy(
+                sorted(records, key=lambda record: (record.created_at, record.asset_id))
+            )
+
+    def get_document_asset(
+        self, org_id: str, case_id: str, asset_id: str
+    ) -> DocumentAssetRecord | None:
+        with self._lock:
+            record = self._document_assets.get(asset_id)
+            if record is None or record.org_id != org_id or record.case_id != case_id:
+                return None
+            return self._copy(record)
+
+    def create_extraction_job(self, job: ExtractionJobRecord) -> ExtractionJobRecord:
+        with self._lock:
+            asset = self._document_assets.get(job.asset_id)
+            if (
+                asset is None
+                or asset.org_id != job.org_id
+                or asset.case_id != job.case_id
+                or job.extraction_job_id in self._extraction_jobs
+            ):
+                raise ConflictError("document extraction job cannot be created")
+            self._extraction_jobs[job.extraction_job_id] = self._copy(job)
+            return self._copy(job)
+
+    def update_extraction_job(self, job: ExtractionJobRecord) -> ExtractionJobRecord:
+        with self._lock:
+            existing = self._extraction_jobs.get(job.extraction_job_id)
+            if (
+                existing is None
+                or existing.org_id != job.org_id
+                or existing.case_id != job.case_id
+                or existing.asset_id != job.asset_id
+            ):
+                raise ConflictError("document extraction job does not exist")
+            self._extraction_jobs[job.extraction_job_id] = self._copy(job)
+            return self._copy(job)
+
+    def get_extraction_job(
+        self, org_id: str, case_id: str, extraction_job_id: str
+    ) -> ExtractionJobRecord | None:
+        with self._lock:
+            record = self._extraction_jobs.get(extraction_job_id)
+            if record is None or record.org_id != org_id or record.case_id != case_id:
+                return None
+            return self._copy(record)
 
     def create_review_job(
         self, job: JobRecord, *, expected_case_revision: int
