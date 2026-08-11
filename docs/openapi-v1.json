@@ -34,6 +34,19 @@
           "kind": {
             "$ref": "#/components/schemas/AnswerSectionKind"
           },
+          "resolution_index": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolution Index"
+          },
           "title": {
             "maxLength": 200,
             "minLength": 1,
@@ -430,6 +443,18 @@
       "ConversationMessageRecord": {
         "additionalProperties": false,
         "properties": {
+          "answer_format": {
+            "anyOf": [
+              {
+                "const": "multi_scope_checklist",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answer Format"
+          },
           "answer_scope": {
             "anyOf": [
               {
@@ -444,7 +469,7 @@
             "items": {
               "$ref": "#/components/schemas/AnswerSection"
             },
-            "maxItems": 3,
+            "maxItems": 4,
             "title": "Answer Sections",
             "type": "array"
           },
@@ -506,6 +531,22 @@
                 "type": "null"
               }
             ]
+          },
+          "guidance_resolutions": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/GuidanceResolution"
+                },
+                "maxItems": 2,
+                "minItems": 2,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Guidance Resolutions"
           },
           "knowledge_as_of": {
             "anyOf": [
@@ -1981,6 +2022,19 @@
             ],
             "title": "Reference Id"
           },
+          "resolution_index": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolution Index"
+          },
           "snapshot_id": {
             "anyOf": [
               {
@@ -2483,6 +2537,16 @@
               }
             ]
           },
+          "temporal_coverage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TemporalCoverage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "trade_type": {
             "enum": [
               "import",
@@ -2698,6 +2762,43 @@
           "requirements_snapshot_as_of"
         ],
         "title": "TemporalContext",
+        "type": "object"
+      },
+      "TemporalCoverage": {
+        "additionalProperties": false,
+        "description": "Explicit Evidence availability for each independently dated source.",
+        "properties": {
+          "hsk": {
+            "enum": [
+              "covered",
+              "unavailable"
+            ],
+            "title": "Hsk",
+            "type": "string"
+          },
+          "law": {
+            "enum": [
+              "covered",
+              "unavailable"
+            ],
+            "title": "Law",
+            "type": "string"
+          },
+          "requirements": {
+            "enum": [
+              "covered",
+              "unavailable"
+            ],
+            "title": "Requirements",
+            "type": "string"
+          }
+        },
+        "required": [
+          "law",
+          "hsk",
+          "requirements"
+        ],
+        "title": "TemporalCoverage",
         "type": "object"
       },
       "TextDocumentCreate": {

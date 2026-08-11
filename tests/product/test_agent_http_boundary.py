@@ -82,7 +82,7 @@ def test_packaged_document_extraction_schemas_accept_only_header_metadata_and_pr
     )
 
 
-def test_packaged_review_schema_accepts_nullable_temporal_context_additively() -> None:
+def test_packaged_review_schema_accepts_nullable_temporal_context_and_coverage_additively() -> None:
     request = _request()
     legacy = build_agent_v3_result(request)
 
@@ -94,16 +94,22 @@ def test_packaged_review_schema_accepts_nullable_temporal_context_additively() -
         "hsk_snapshot_as_of": "2026-01-01",
         "requirements_snapshot_as_of": "2026-07-26",
     }
-    current = {**legacy, "temporal_context": context}
+    coverage = {"law": "covered", "hsk": "unavailable", "requirements": "unavailable"}
+    current = {**legacy, "temporal_context": context, "temporal_coverage": coverage}
     current["result_sha256"] = "0" * 64
     validate_agent_v3_payload("review_result", current)
 
     null_context = {**legacy, "temporal_context": None}
     validate_agent_v3_payload("review_result", null_context)
+    null_coverage = {**legacy, "temporal_context": context, "temporal_coverage": None}
+    validate_agent_v3_payload("review_result", null_coverage)
 
     invalid = {**current, "temporal_context": {"law_as_of": "not-a-date"}}
     with pytest.raises(AgentContractPayloadError):
         validate_agent_v3_payload("review_result", invalid)
+    invalid_coverage = {**current, "temporal_coverage": {"law": "partial"}}
+    with pytest.raises(AgentContractPayloadError):
+        validate_agent_v3_payload("review_result", invalid_coverage)
 
 
 def test_packaged_assistant_schemas_accept_the_bounded_backend_projection() -> None:
@@ -115,8 +121,11 @@ def test_packaged_assistant_schemas_accept_the_bounded_backend_projection() -> N
         review_result=build_agent_v3_result(review),
         question="What should be reviewed?",
         recent_turns=[],
+        expected_snapshot_id="kr-trade-v2-2026-08-05",
     )
-    validate_agent_v3_payload("assistant_answer_request", request.to_agent_wire())
+    assistant_wire = request.to_agent_wire()
+    assert assistant_wire["expected_snapshot_id"] == "kr-trade-v2-2026-08-05"
+    validate_agent_v3_payload("assistant_answer_request", assistant_wire)
     validate_agent_v3_payload(
         "assistant_answer_response",
         {
@@ -141,6 +150,7 @@ def test_packaged_knowledge_schemas_accept_a_snapshot_grounded_projection() -> N
         trade_type="export",
         as_of=date(2026, 8, 5),
         recent_turns=[],
+        expected_snapshot_id="kr-trade-v2-2026-08-05",
     )
     citation = {
         "kind": "guidance_evidence",
@@ -152,7 +162,9 @@ def test_packaged_knowledge_schemas_accept_a_snapshot_grounded_projection() -> N
         "snapshot_id": "kr-trade-2026-08-05",
         "coverage": "covered",
     }
-    validate_agent_v3_payload("knowledge_answer_request", request.to_agent_wire())
+    knowledge_wire = request.to_agent_wire()
+    assert knowledge_wire["expected_snapshot_id"] == "kr-trade-v2-2026-08-05"
+    validate_agent_v3_payload("knowledge_answer_request", knowledge_wire)
     validate_agent_v3_payload(
         "knowledge_answer_response",
         {
@@ -174,6 +186,100 @@ def test_packaged_knowledge_schemas_accept_a_snapshot_grounded_projection() -> N
             "snapshot_id": "kr-trade-2026-08-05",
             "as_of": "2026-08-05",
             "engine": {"kind": "deterministic", "model_id": "fixture"},
+        },
+    )
+
+
+def test_packaged_answer_schemas_accept_two_indexed_v2_guidance_resolutions() -> None:
+    citation_0 = {
+        "kind": "guidance_evidence",
+        "source_id": "official-duty-guide-2026",
+        "source_kind": "official_agency_guidance",
+        "source_title": "납세신고 및 납부방법",
+        "source_uri": "https://www.customs.go.kr/guide/duty",
+        "as_of": "2026-08-05",
+        "snapshot_id": "kr-trade-v2-2026-08-05",
+        "coverage": "covered",
+        "resolution_index": 0,
+    }
+    citation_1 = {
+        "kind": "guidance_evidence",
+        "source_id": "official-classification-guide-2026",
+        "source_kind": "official_agency_guidance",
+        "source_title": "품목분류 사전심사 신청방법",
+        "source_uri": "https://www.customs.go.kr/guide/classification",
+        "as_of": "2026-08-05",
+        "snapshot_id": "kr-trade-v2-2026-08-05",
+        "coverage": "covered",
+        "resolution_index": 1,
+    }
+    resolutions = [
+        {
+            "topic": "customs_duty",
+            "scope": "duty_payment_basics",
+            "requested_direction": "import",
+            "applicable_directions": ["import"],
+            "coverage": "covered",
+            "snapshot_id": "kr-trade-v2-2026-08-05",
+            "as_of": "2026-08-05",
+            "registry_version": "2.0",
+        },
+        {
+            "topic": "hs_classification",
+            "scope": "classification_principles",
+            "requested_direction": "import",
+            "applicable_directions": ["import", "export"],
+            "coverage": "covered",
+            "snapshot_id": "kr-trade-v2-2026-08-05",
+            "as_of": "2026-08-05",
+            "registry_version": "2.0",
+        },
+    ]
+    shared = {
+        "schema_version": "1.0",
+        "answer_scope": "general_customs_guidance",
+        "direct_answer": "두 공식 안내를 범위별로 분리했습니다.",
+        "citations": [citation_0, citation_1],
+        "answer_sections": [
+            {
+                "kind": "general_guidance",
+                "resolution_index": 0,
+                "title": "주제 1 공식 안내",
+                "content": "납세·납부 기준을 확인합니다.",
+                "citations": [citation_0],
+            },
+            {
+                "kind": "general_guidance",
+                "resolution_index": 1,
+                "title": "주제 2 공식 안내",
+                "content": "품목분류 기준을 확인합니다.",
+                "citations": [citation_1],
+            },
+        ],
+        "suggested_questions": [],
+        "guidance_resolutions": resolutions,
+        "answer_format": "multi_scope_checklist",
+        "guidance_registry_sha256": "a450ae6286d9a12729c5459543a35fd9c1c3df2ff59977700f72887c3df6543e",
+        "engine": {"kind": "deterministic", "model_id": "fixture"},
+    }
+    validate_agent_v3_payload(
+        "knowledge_answer_response",
+        {
+            **shared,
+            "conversation_id": "knowledge-boundary",
+            "coverage": "covered",
+            "snapshot_id": "kr-trade-v2-2026-08-05",
+            "as_of": "2026-08-05",
+        },
+    )
+    validate_agent_v3_payload(
+        "assistant_answer_response",
+        {
+            **shared,
+            "case_id": "case-boundary",
+            "review_run_id": "run-boundary",
+            "conversation_id": "conversation-boundary",
+            "correction_draft": None,
         },
     )
 

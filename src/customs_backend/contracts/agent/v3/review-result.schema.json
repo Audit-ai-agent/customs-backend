@@ -200,6 +200,16 @@
       "required": ["law_as_of", "hsk_snapshot_as_of", "requirements_snapshot_as_of"],
       "type": "object"
     },
+    "TemporalCoverage": {
+      "additionalProperties": false,
+      "properties": {
+        "law": {"type": "string", "enum": ["covered", "unavailable"]},
+        "hsk": {"type": "string", "enum": ["covered", "unavailable"]},
+        "requirements": {"type": "string", "enum": ["covered", "unavailable"]}
+      },
+      "required": ["law", "hsk", "requirements"],
+      "type": "object"
+    },
     "Finding": {
       "additionalProperties": false,
       "properties": {
@@ -262,6 +272,7 @@
     "jurisdiction": {"const": "KR", "type": "string"},
     "report": {"$ref": "#/$defs/Report"},
     "temporal_context": {"anyOf": [{"$ref": "#/$defs/TemporalContext"}, {"type": "null"}]},
+    "temporal_coverage": {"anyOf": [{"$ref": "#/$defs/TemporalCoverage"}, {"type": "null"}]},
     "workflow": {"$ref": "#/$defs/Workflow"},
     "document_analyses": {"type": "array", "minItems": 1, "maxItems": 20, "items": {"$ref": "#/$defs/DocumentAnalysis"}},
     "comparisons": {"type": "array", "maxItems": 2000, "items": {"$ref": "#/$defs/Comparison"}},

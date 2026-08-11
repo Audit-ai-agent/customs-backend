@@ -524,6 +524,11 @@ class ConversationRecord(BaseModel):
     review_run_id: str
     org_id: str
     title: str | None = None
+    # A Case conversation may later ask the Agent for V2 official guidance.
+    # Keep the immutable selection as Backend state, never as a client-supplied
+    # field.  Historic conversations remain readable with both values null.
+    snapshot_id: str | None = Field(default=None, min_length=1, max_length=512)
+    guidance_registry_version: GuidanceRegistryVersion | None = None
     created_by: str
     created_at: datetime
     updated_at: datetime
@@ -569,6 +574,10 @@ class KnowledgeConversationRecord(BaseModel):
     # immutable snapshot.  A later answer may not silently switch sources
     # while keeping the same as-of date.
     snapshot_id: str | None = Field(default=None, min_length=1, max_length=512)
+    # Only a V2 value enables the optional Data expected_snapshot_id selector.
+    # Older V1 pins are preserved as history but must not be sent to that V2
+    # selector, which would otherwise reject a compatible legacy conversation.
+    guidance_registry_version: GuidanceRegistryVersion | None = None
     created_by: str
     created_at: datetime
     updated_at: datetime
@@ -610,6 +619,10 @@ class MessageCitation(BaseModel):
     as_of: date | None = None
     snapshot_id: str | None = Field(default=None, min_length=1, max_length=512)
     coverage: GuidanceCoverage | None = None
+    # A two-scope checklist exposes the exact owning official-resolution
+    # position.  It is deliberately public, unlike registry_source_id, so the
+    # Browser can render citations without crossing scopes.
+    resolution_index: int | None = Field(default=None, ge=0, le=1)
     # The registry source is required for new V2 provenance verification but
     # was not part of the original Browser contract.  Keep it in the typed
     # Agent-boundary model and persisted object, while excluding it from all
@@ -652,6 +665,7 @@ class MessageCitation(BaseModel):
                 self.as_of,
                 self.snapshot_id,
                 self.coverage,
+                self.resolution_index,
                 self.registry_source_id,
             )
         ):
@@ -709,6 +723,9 @@ class AnswerSection(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     content: str = Field(min_length=1, max_length=4_000)
     citations: list[MessageCitation] = Field(default_factory=list, max_length=100)
+    # In a multi-scope checklist only each general-guidance section owns one
+    # index.  Case analysis and the final checklist remain unindexed.
+    resolution_index: int | None = Field(default=None, ge=0, le=1)
 
     @field_validator("title", "content")
     @classmethod
@@ -756,7 +773,7 @@ class ConversationMessageRecord(BaseModel):
     citations: list[MessageCitation] = Field(default_factory=list, max_length=100)
     # Optional and additive: existing persisted V3 messages without sections
     # remain valid and retain their legacy direct ``content`` field.
-    answer_sections: list[AnswerSection] = Field(default_factory=list, max_length=3)
+    answer_sections: list[AnswerSection] = Field(default_factory=list, max_length=4)
     suggested_questions: list[str] = Field(default_factory=list, max_length=3)
     correction_draft: CorrectionDraft | None = None
     # Standalone knowledge conversations retain the Agent/Data resolution for
@@ -768,6 +785,13 @@ class ConversationMessageRecord(BaseModel):
     # Case and standalone knowledge messages use this same safe projection.
     # It stays optional so existing persisted V3 messages remain readable.
     guidance_resolution: GuidanceResolution | None = None
+    # Two independently resolved V2 scopes are additive, but never coexist
+    # with the legacy singular resolution.  The fixed answer format makes the
+    # Browser/API surface unambiguous without broadening ordinary answers.
+    guidance_resolutions: list[GuidanceResolution] | None = Field(
+        default=None, min_length=2, max_length=2
+    )
+    answer_format: Literal["multi_scope_checklist"] | None = None
     case_input_notice: CaseInputNotice | None = None
     created_by: str
     created_at: datetime
@@ -783,6 +807,30 @@ class ConversationMessageRecord(BaseModel):
             raise ValueError("knowledge message provenance requires coverage and as_of")
         if self.guidance_resolution is not None and self.role != ConversationMessageRole.assistant:
             raise ValueError("guidance resolution belongs only to assistant messages")
+        if self.guidance_resolutions is not None and self.role != ConversationMessageRole.assistant:
+            raise ValueError("guidance resolutions belong only to assistant messages")
+        if self.answer_format is not None and self.role != ConversationMessageRole.assistant:
+            raise ValueError("answer format belongs only to assistant messages")
+        if self.guidance_resolution is not None and self.guidance_resolutions is not None:
+            raise ValueError("guidance resolution forms are mutually exclusive")
+        if self.guidance_resolutions is None and self.answer_format is not None:
+            raise ValueError("multi-scope format requires two guidance resolutions")
+        if self.guidance_resolutions is not None:
+            if self.answer_format != "multi_scope_checklist":
+                raise ValueError("two guidance resolutions require the multi-scope format")
+            if any(item.registry_version != "2.0" for item in self.guidance_resolutions):
+                raise ValueError("multi-scope guidance requires the V2 registry")
+            scopes = {(item.topic, item.scope) for item in self.guidance_resolutions}
+            if len(scopes) != 2:
+                raise ValueError("multi-scope guidance resolutions must be independent")
+        if self.guidance_resolutions is None and any(
+            item.resolution_index is not None for item in self.citations
+        ):
+            raise ValueError("single-scope citations cannot carry a resolution index")
+        if self.guidance_resolutions is None and any(
+            item.resolution_index is not None for item in self.answer_sections
+        ):
+            raise ValueError("single-scope sections cannot carry a resolution index")
         if self.case_input_notice is not None:
             if self.role != ConversationMessageRole.assistant:
                 raise ValueError("case input notice belongs only to assistant messages")
@@ -793,6 +841,8 @@ class ConversationMessageRecord(BaseModel):
                 or self.answer_sections
                 or self.correction_draft is not None
                 or self.guidance_resolution is not None
+                or self.guidance_resolutions is not None
+                or self.answer_format is not None
             ):
                 raise ValueError("case input notice cannot create review evidence")
         return self
@@ -824,9 +874,15 @@ class AgentAssistantAnswerRequest(BaseModel):
     review_result: dict[str, Any]
     question: str = Field(min_length=1, max_length=4000)
     recent_turns: list[AgentConversationTurn] = Field(default_factory=list, max_length=8)
+    expected_snapshot_id: str | None = Field(
+        default=None,
+        min_length=3,
+        max_length=81,
+        pattern=r"^[a-z0-9][a-z0-9-]{2,80}$",
+    )
 
     def to_agent_wire(self) -> dict[str, Any]:
-        return self.model_dump(mode="json")
+        return self.model_dump(mode="json", exclude_none=True)
 
 
 class AgentAssistantAnswerResponse(BaseModel):
@@ -839,10 +895,14 @@ class AgentAssistantAnswerResponse(BaseModel):
     answer_scope: AnswerScope
     direct_answer: str = Field(min_length=1, max_length=4000)
     citations: list[MessageCitation] = Field(default_factory=list, max_length=100)
-    answer_sections: list[AnswerSection] = Field(default_factory=list, max_length=3)
+    answer_sections: list[AnswerSection] = Field(default_factory=list, max_length=4)
     suggested_questions: list[str] = Field(default_factory=list, max_length=3)
     correction_draft: CorrectionDraft | None = None
     guidance_resolution: GuidanceResolution | None = None
+    guidance_resolutions: list[GuidanceResolution] | None = Field(
+        default=None, min_length=2, max_length=2
+    )
+    answer_format: Literal["multi_scope_checklist"] | None = None
     case_input_notice: CaseInputNotice | None = None
     # Agent→Backend provenance only.  The Backend compares this against its
     # exact packaged Data manifest before persistence, then excludes it from
@@ -868,9 +928,15 @@ class AgentKnowledgeAnswerRequest(BaseModel):
     trade_type: KnowledgeTradeType
     recent_turns: list[AgentConversationTurn] = Field(default_factory=list, max_length=8)
     as_of: date
+    expected_snapshot_id: str | None = Field(
+        default=None,
+        min_length=3,
+        max_length=81,
+        pattern=r"^[a-z0-9][a-z0-9-]{2,80}$",
+    )
 
     def to_agent_wire(self) -> dict[str, Any]:
-        return self.model_dump(mode="json")
+        return self.model_dump(mode="json", exclude_none=True)
 
 
 class AgentKnowledgeAnswerResponse(BaseModel):
@@ -892,6 +958,10 @@ class AgentKnowledgeAnswerResponse(BaseModel):
     snapshot_id: str | None = Field(default=None, min_length=1, max_length=512)
     as_of: date
     guidance_resolution: GuidanceResolution | None = None
+    guidance_resolutions: list[GuidanceResolution] | None = Field(
+        default=None, min_length=2, max_length=2
+    )
+    answer_format: Literal["multi_scope_checklist"] | None = None
     # Internal Agent→Backend registry digest; never copied into a stored
     # conversation message or public response.
     guidance_registry_sha256: str | None = Field(
@@ -1025,6 +1095,16 @@ class TemporalContext(BaseModel):
     requirements_snapshot_as_of: date
 
 
+class TemporalCoverage(BaseModel):
+    """Explicit Evidence availability for each independently dated source."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    law: Literal["covered", "unavailable"]
+    hsk: Literal["covered", "unavailable"]
+    requirements: Literal["covered", "unavailable"]
+
+
 class ReviewRunRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1054,6 +1134,10 @@ class ReviewRunRecord(BaseModel):
     # Additive Evidence provenance.  Historic Agent results did not carry
     # this context and must remain readable as ``null``.
     temporal_context: TemporalContext | None = None
+    # Availability is deliberately separate from dates.  A historical request
+    # can retain a baseline HSK/CCCT date while safely reporting that its
+    # corresponding official archive is unavailable.
+    temporal_coverage: TemporalCoverage | None = None
     review_disposition: ReviewDisposition = ReviewDisposition.human_review_required
     assurance_level: AssuranceLevel = AssuranceLevel.diagnostic
     completion_eligibility: CompletionEligibility
@@ -1078,6 +1162,8 @@ class ReviewRunRecord(BaseModel):
             raise ValueError("local Backend review runs always require human review")
         if self.assurance_level != AssuranceLevel.diagnostic:
             raise ValueError("local Backend review runs use diagnostic assurance only")
+        if self.temporal_coverage is not None and self.temporal_context is None:
+            raise ValueError("temporal coverage requires temporal context")
         return self
 
 

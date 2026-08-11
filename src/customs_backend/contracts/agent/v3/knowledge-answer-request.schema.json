@@ -20,7 +20,8 @@
     "question": {"type": "string", "minLength": 1, "maxLength": 4000},
     "trade_type": {"type": "string", "enum": ["import", "export", "both"]},
     "recent_turns": {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/RecentTurn"}},
-    "as_of": {"type": "string", "format": "date"}
+    "as_of": {"type": "string", "format": "date"},
+    "expected_snapshot_id": {"type": ["string", "null"], "minLength": 3, "maxLength": 81, "pattern": "^[a-z0-9][a-z0-9-]{2,80}$"}
   },
   "required": ["schema_version", "conversation_id", "question", "trade_type", "recent_turns", "as_of"],
   "title": "Customs AI Agent official-trade knowledge answer request",

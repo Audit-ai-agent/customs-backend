@@ -17,6 +17,7 @@ from customs_backend.domain import (
     ExtractionJobRecord,
     FindingDecisionRecord,
     FindingDecisionStatus,
+    GuidanceRegistryVersion,
     JobRecord,
     KnowledgeConversationRecord,
     ReviewRunRecord,
@@ -345,12 +346,16 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
         assistant_message: ConversationMessageRecord,
         idempotency_key: str,
         idempotency_request_digest: str,
+        conversation_snapshot_id: str | None = None,
+        guidance_registry_version: GuidanceRegistryVersion | None = None,
     ) -> tuple[ConversationMessageExchange, bool]:
         value = super().append_message_exchange(
             user_message=user_message,
             assistant_message=assistant_message,
             idempotency_key=idempotency_key,
             idempotency_request_digest=idempotency_request_digest,
+            conversation_snapshot_id=conversation_snapshot_id,
+            guidance_registry_version=guidance_registry_version,
         )
         if value[1]:
             self._persist()
@@ -371,6 +376,7 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
         knowledge_snapshot_id: str | None,
         idempotency_key: str,
         idempotency_request_digest: str,
+        guidance_registry_version: GuidanceRegistryVersion | None = None,
     ) -> tuple[ConversationMessageExchange, bool]:
         value = super().append_knowledge_message_exchange(
             user_message=user_message,
@@ -378,6 +384,7 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
             knowledge_snapshot_id=knowledge_snapshot_id,
             idempotency_key=idempotency_key,
             idempotency_request_digest=idempotency_request_digest,
+            guidance_registry_version=guidance_registry_version,
         )
         if value[1]:
             self._persist()

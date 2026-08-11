@@ -24,7 +24,8 @@
         "source_uri": {"type": "string", "minLength": 1, "maxLength": 2000},
         "as_of": {"type": "string", "format": "date"},
         "snapshot_id": {"type": "string", "minLength": 1, "maxLength": 512},
-        "coverage": {"type": "string", "enum": ["covered", "no_coverage", "partial", "unavailable"]}
+        "coverage": {"type": "string", "enum": ["covered", "no_coverage", "partial", "unavailable"]},
+        "resolution_index": {"type": ["integer", "null"], "minimum": 0, "maximum": 1}
       },
       "required": ["kind", "source_id", "source_kind", "source_title", "source_uri", "as_of", "snapshot_id", "coverage"],
       "type": "object"
@@ -41,7 +42,8 @@
         "kind": {"type": "string", "enum": ["case_analysis", "general_guidance", "case_application"]},
         "title": {"type": "string", "minLength": 1, "maxLength": 200},
         "content": {"type": "string", "minLength": 1, "maxLength": 4000},
-        "citations": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/Citation"}}
+        "citations": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/Citation"}},
+        "resolution_index": {"type": ["integer", "null"], "minimum": 0, "maximum": 1}
       },
       "required": ["kind", "title", "content", "citations"],
       "type": "object"
@@ -93,10 +95,12 @@
     "answer_scope": {"type": "string", "enum": ["case_grounded", "evidence_grounded", "general_customs_guidance", "clarification_needed", "insufficient_evidence", "out_of_scope"]},
     "direct_answer": {"type": "string", "minLength": 1, "maxLength": 4000},
     "citations": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/Citation"}},
-    "answer_sections": {"type": "array", "maxItems": 3, "items": {"$ref": "#/$defs/AnswerSection"}},
+    "answer_sections": {"type": "array", "maxItems": 4, "items": {"$ref": "#/$defs/AnswerSection"}},
     "suggested_questions": {"type": "array", "maxItems": 3, "items": {"type": "string", "minLength": 1, "maxLength": 4000}},
     "correction_draft": {"anyOf": [{"$ref": "#/$defs/CorrectionDraft"}, {"type": "null"}]},
     "guidance_resolution": {"anyOf": [{"$ref": "#/$defs/GuidanceResolution"}, {"type": "null"}]},
+    "guidance_resolutions": {"type": ["array", "null"], "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/GuidanceResolution"}},
+    "answer_format": {"anyOf": [{"const": "multi_scope_checklist", "type": "string"}, {"type": "null"}]},
     "guidance_registry_sha256": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
     "case_input_notice": {"anyOf": [{"const": "unregistered_document_text", "type": "string"}, {"type": "null"}]},
     "engine": {"$ref": "#/$defs/Engine"}

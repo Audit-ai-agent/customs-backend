@@ -190,6 +190,58 @@ def _v1_resolution(
 
 
 _V1_GUIDANCE_REGISTRY_SHA256 = "6fed779ee0ec1cd2358972925fe1b2788838a197d4f33e62e461fcfed2bb7d6c"
+_V2_GUIDANCE_REGISTRY_SHA256 = "a450ae6286d9a12729c5459543a35fd9c1c3df2ff59977700f72887c3df6543e"
+_V2_GUIDANCE_SNAPSHOT_ID = "kr-trade-v2-2026-08-05"
+
+
+def _v2_guidance(
+    *,
+    registry_source_id: str,
+    record_id: str,
+    as_of: str,
+    snapshot_id: str,
+    resolution_index: int | None = None,
+) -> dict[str, object]:
+    """Build one exact V2 citation from Backend's safe registry projection."""
+
+    source = guidance_registry_projection("2.0").sources[registry_source_id]
+    citation: dict[str, object] = {
+        "kind": "guidance_evidence",
+        "source_id": record_id,
+        "registry_source_id": registry_source_id,
+        "source_kind": source.source_kind,
+        "source_title": source.title,
+        "source_uri": source.official_uri,
+        "as_of": as_of,
+        "snapshot_id": snapshot_id,
+        "coverage": "covered",
+    }
+    if resolution_index is not None:
+        citation["resolution_index"] = resolution_index
+    return citation
+
+
+def _v2_resolution(
+    *,
+    topic: str,
+    scope: str,
+    requested_direction: str,
+    as_of: str,
+    snapshot_id: str | None,
+    coverage: str = "covered",
+) -> dict[str, object]:
+    registry = guidance_registry_projection("2.0")
+    projection = registry.scopes[(topic, scope)]
+    return {
+        "topic": topic,
+        "scope": scope,
+        "requested_direction": requested_direction,
+        "applicable_directions": list(projection.directions),
+        "coverage": coverage,
+        "snapshot_id": snapshot_id,
+        "as_of": as_of,
+        "registry_version": "2.0",
+    }
 
 
 def _local_development_settings() -> Settings:
@@ -577,6 +629,113 @@ def test_temporal_context_is_persisted_and_forwarded_to_case_assistant() -> None
 
     assert answer.status_code == 200, answer.text
     assert observed_review_contexts[0]["temporal_context"] == expected_context
+
+
+def test_temporal_coverage_is_hashed_persisted_and_forwarded_to_case_assistant() -> None:
+    observed_review_results: list[dict[str, object]] = []
+
+    def review_handler(request: AgentReviewRequest) -> dict[str, object]:
+        result = build_agent_v3_result(request)
+        result["temporal_context"] = {
+            "law_as_of": request.review_as_of.isoformat(),
+            "hsk_snapshot_as_of": "2026-08-05",
+            "requirements_snapshot_as_of": "2026-08-05",
+        }
+        result["temporal_coverage"] = {
+            "law": "covered",
+            "hsk": "unavailable",
+            "requirements": "unavailable",
+        }
+        # A populated additive value is part of the Agent-owned immutable
+        # result hash.  This protects persisted availability from later drift.
+        result["result_sha256"] = canonical_digest(
+            {key: value for key, value in result.items() if key != "result_sha256"}
+        )
+        return result
+
+    def answer_handler(request):
+        observed_review_results.append(request.review_result)
+        return {
+            "schema_version": "1.0",
+            "case_id": request.case_id,
+            "review_run_id": request.review_run_id,
+            "conversation_id": request.conversation_id,
+            "answer_scope": "clarification_needed",
+            "direct_answer": "시점별 근거 범위를 확인했습니다.",
+            "citations": [],
+            "suggested_questions": [],
+            "correction_draft": None,
+            "engine": {"kind": "deterministic", "model_id": "temporal-coverage-fixture"},
+        }
+
+    expected_coverage = {
+        "law": "covered",
+        "hsk": "unavailable",
+        "requirements": "unavailable",
+    }
+    with _client(review_handler=review_handler, answer_handler=answer_handler) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Temporal coverage"}, headers=_auth()
+        ).json()["case_id"]
+        assert client.post(
+            f"/api/v1/cases/{case_id}/documents",
+            json={"document_type": "CI", "filename": "invoice.txt", "content_text": "INV-001"},
+            headers=_auth(),
+        ).status_code == 201
+        review = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={"review_as_of": "2026-08-05"},
+            headers={**_auth(), "Idempotency-Key": "temporal-coverage-review-001"},
+        )
+        assert review.status_code == 202, review.text
+        run_id = review.json()["job"]["review_run_id"]
+        detail = client.get(f"/api/v1/review-runs/{run_id}", headers=_auth())
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["temporal_coverage"] == expected_coverage
+        conversation_id = client.post(
+            f"/api/v1/review-runs/{run_id}/assistant/conversations", json={}, headers=_auth()
+        ).json()["conversation_id"]
+        answer = client.post(
+            f"/api/v1/assistant/conversations/{conversation_id}/messages",
+            json={"content": "HSK와 요건 자료의 범위를 설명해 주세요."},
+            headers={**_auth(), "Idempotency-Key": "temporal-coverage-answer-001"},
+        )
+
+    assert answer.status_code == 200, answer.text
+    assert observed_review_results[0]["temporal_coverage"] == expected_coverage
+
+
+def test_temporal_coverage_without_context_fails_closed() -> None:
+    def review_handler(request: AgentReviewRequest) -> dict[str, object]:
+        result = build_agent_v3_result(request)
+        result["temporal_coverage"] = {
+            "law": "covered",
+            "hsk": "unavailable",
+            "requirements": "unavailable",
+        }
+        result["result_sha256"] = canonical_digest(
+            {key: value for key, value in result.items() if key != "result_sha256"}
+        )
+        return result
+
+    with _client(review_handler=review_handler) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Temporal coverage missing context"}, headers=_auth()
+        ).json()["case_id"]
+        assert client.post(
+            f"/api/v1/cases/{case_id}/documents",
+            json={"document_type": "CI", "filename": "invoice.txt", "content_text": "INV-001"},
+            headers=_auth(),
+        ).status_code == 201
+        review = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={},
+            headers={**_auth(), "Idempotency-Key": "temporal-coverage-invalid-001"},
+        )
+
+    assert review.status_code == 202, review.text
+    assert review.json()["job"]["status"] == "failed"
+    assert review.json()["job"]["error_code"] == "ConflictError"
 
 
 def test_functional_uat_review_preserves_explicit_law_history_date_and_defaults_baseline() -> None:
@@ -2586,9 +2745,11 @@ def test_knowledge_answer_validates_v2_registry_source_projection(
 
 def test_v2_no_coverage_with_null_snapshot_preserves_an_existing_knowledge_pin() -> None:
     answer_count = 0
+    observed_expected_snapshot_ids: list[str | None] = []
 
     def knowledge_handler(request):
         nonlocal answer_count
+        observed_expected_snapshot_ids.append(request.expected_snapshot_id)
         answer_count += 1
         if answer_count == 2:
             return {
@@ -2691,3 +2852,375 @@ def test_v2_no_coverage_with_null_snapshot_preserves_an_existing_knowledge_pin()
     assert no_coverage["guidance_resolution"].get("snapshot_id") is None
     assert "guidance_registry_sha256" not in json.dumps(no_coverage)
     assert listed.json()["items"][0]["snapshot_id"] == "kr-trade-v2-2026-08-05"
+    assert observed_expected_snapshot_ids == [None, "kr-trade-v2-2026-08-05"]
+
+
+def test_v2_multi_scope_knowledge_persists_a_single_pin_and_partitions_citations() -> None:
+    observed_expected_snapshot_ids: list[str | None] = []
+
+    def knowledge_handler(request):
+        observed_expected_snapshot_ids.append(request.expected_snapshot_id)
+        as_of = request.as_of.isoformat()
+        duty = _v2_guidance(
+            registry_source_id="v2_kcs_duty_payment",
+            record_id="record-v2-duty-payment-001",
+            as_of=as_of,
+            snapshot_id=_V2_GUIDANCE_SNAPSHOT_ID,
+            resolution_index=0,
+        )
+        classification = _v2_guidance(
+            registry_source_id="v2_cvnci_hs_advance_ruling",
+            record_id="record-v2-hs-classification-001",
+            as_of=as_of,
+            snapshot_id=_V2_GUIDANCE_SNAPSHOT_ID,
+            resolution_index=1,
+        )
+        return {
+            "schema_version": "1.0",
+            "conversation_id": request.conversation_id,
+            "answer_scope": "general_customs_guidance",
+            "direct_answer": "두 공식 안내를 범위별로 분리해 확인해야 합니다.",
+            "citations": [duty, classification],
+            "answer_sections": [
+                {
+                    "kind": "general_guidance",
+                    "resolution_index": 0,
+                    "title": "주제 1 공식 안내",
+                    "content": "수입 납세·납부의 공식 안내입니다.",
+                    "citations": [duty],
+                },
+                {
+                    "kind": "general_guidance",
+                    "resolution_index": 1,
+                    "title": "주제 2 공식 안내",
+                    "content": "품목분류 기본 원칙의 공식 안내입니다.",
+                    "citations": [classification],
+                },
+            ],
+            "suggested_questions": [],
+            "coverage": "covered",
+            "snapshot_id": _V2_GUIDANCE_SNAPSHOT_ID,
+            "as_of": as_of,
+            "guidance_resolutions": [
+                _v2_resolution(
+                    topic="customs_duty",
+                    scope="duty_payment_basics",
+                    requested_direction="import",
+                    as_of=as_of,
+                    snapshot_id=_V2_GUIDANCE_SNAPSHOT_ID,
+                ),
+                _v2_resolution(
+                    topic="hs_classification",
+                    scope="classification_principles",
+                    requested_direction="import",
+                    as_of=as_of,
+                    snapshot_id=_V2_GUIDANCE_SNAPSHOT_ID,
+                ),
+            ],
+            "answer_format": "multi_scope_checklist",
+            "guidance_registry_sha256": _V2_GUIDANCE_REGISTRY_SHA256,
+            "engine": {"kind": "deterministic", "model_id": "v2-multi-knowledge"},
+        }
+
+    with _client(knowledge_answer_handler=knowledge_handler) as client:
+        conversation_id = client.post(
+            "/api/v1/knowledge/conversations",
+            json={"trade_type": "import", "as_of": "2026-08-05"},
+            headers=_auth(),
+        ).json()["conversation_id"]
+        first = client.post(
+            f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+            json={"content": "HS 품목분류와 수입 관세를 함께 확인해 주세요."},
+            headers={**_auth(), "Idempotency-Key": "v2-multi-knowledge-first-001"},
+        )
+        second = client.post(
+            f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+            json={"content": "두 공식 안내의 확인 순서를 다시 알려 주세요."},
+            headers={**_auth(), "Idempotency-Key": "v2-multi-knowledge-second-001"},
+        )
+        listed = client.get("/api/v1/knowledge/conversations", headers=_auth())
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assistant = first.json()["assistant_message"]
+    assert assistant["answer_format"] == "multi_scope_checklist"
+    assert "guidance_resolution" not in assistant
+    assert [item["scope"] for item in assistant["guidance_resolutions"]] == [
+        "duty_payment_basics",
+        "classification_principles",
+    ]
+    assert {item["resolution_index"] for item in assistant["citations"]} == {0, 1}
+    assert [item["resolution_index"] for item in assistant["answer_sections"]] == [0, 1]
+    assert "registry_source_id" not in json.dumps(assistant)
+    assert "guidance_registry_sha256" not in json.dumps(assistant)
+    assert listed.json()["items"][0]["snapshot_id"] == _V2_GUIDANCE_SNAPSHOT_ID
+    assert observed_expected_snapshot_ids == [None, _V2_GUIDANCE_SNAPSHOT_ID]
+
+
+def test_v2_multi_scope_knowledge_rejects_a_cross_scope_section_citation() -> None:
+    def knowledge_handler(request):
+        as_of = request.as_of.isoformat()
+        duty = _v2_guidance(
+            registry_source_id="v2_kcs_duty_payment",
+            record_id="record-v2-duty-payment-cross",
+            as_of=as_of,
+            snapshot_id=_V2_GUIDANCE_SNAPSHOT_ID,
+            resolution_index=0,
+        )
+        classification = _v2_guidance(
+            registry_source_id="v2_cvnci_hs_advance_ruling",
+            record_id="record-v2-hs-classification-cross",
+            as_of=as_of,
+            snapshot_id=_V2_GUIDANCE_SNAPSHOT_ID,
+            resolution_index=1,
+        )
+        return {
+            "schema_version": "1.0",
+            "conversation_id": request.conversation_id,
+            "answer_scope": "general_customs_guidance",
+            "direct_answer": "범위를 섞지 않은 공식 안내가 필요합니다.",
+            "citations": [duty, classification],
+            "answer_sections": [
+                {
+                    "kind": "general_guidance",
+                    "resolution_index": 0,
+                    "title": "잘못된 주제 1 인용",
+                    "content": "이 인용은 다른 범위에 속합니다.",
+                    "citations": [classification],
+                },
+                {
+                    "kind": "general_guidance",
+                    "resolution_index": 1,
+                    "title": "주제 2 공식 안내",
+                    "content": "품목분류 기본 원칙의 공식 안내입니다.",
+                    "citations": [classification],
+                },
+            ],
+            "suggested_questions": [],
+            "coverage": "covered",
+            "snapshot_id": _V2_GUIDANCE_SNAPSHOT_ID,
+            "as_of": as_of,
+            "guidance_resolutions": [
+                _v2_resolution(
+                    topic="customs_duty",
+                    scope="duty_payment_basics",
+                    requested_direction="import",
+                    as_of=as_of,
+                    snapshot_id=_V2_GUIDANCE_SNAPSHOT_ID,
+                ),
+                _v2_resolution(
+                    topic="hs_classification",
+                    scope="classification_principles",
+                    requested_direction="import",
+                    as_of=as_of,
+                    snapshot_id=_V2_GUIDANCE_SNAPSHOT_ID,
+                ),
+            ],
+            "answer_format": "multi_scope_checklist",
+            "guidance_registry_sha256": _V2_GUIDANCE_REGISTRY_SHA256,
+            "engine": {"kind": "deterministic", "model_id": "v2-cross-scope"},
+        }
+
+    with _client(knowledge_answer_handler=knowledge_handler) as client:
+        conversation_id = client.post(
+            "/api/v1/knowledge/conversations",
+            json={"trade_type": "import", "as_of": "2026-08-05"},
+            headers=_auth(),
+        ).json()["conversation_id"]
+        response = client.post(
+            f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+            json={"content": "HS 품목분류와 수입 관세를 함께 확인해 주세요."},
+            headers={**_auth(), "Idempotency-Key": "v2-cross-scope-001"},
+        )
+
+    assert response.status_code == 409, response.text
+
+
+def test_v2_multi_scope_partial_stops_knowledge_synthesis_without_pinning() -> None:
+    def knowledge_handler(request):
+        as_of = request.as_of.isoformat()
+        return {
+            "schema_version": "1.0",
+            "conversation_id": request.conversation_id,
+            "answer_scope": "insufficient_evidence",
+            "direct_answer": "두 범위 중 하나의 공식 근거가 부분적이어서 종합하지 않았습니다.",
+            "citations": [],
+            "answer_sections": [],
+            "suggested_questions": [],
+            "coverage": "partial",
+            "snapshot_id": _V2_GUIDANCE_SNAPSHOT_ID,
+            "as_of": as_of,
+            "guidance_resolutions": [
+                _v2_resolution(
+                    topic="customs_duty",
+                    scope="duty_payment_basics",
+                    requested_direction="import",
+                    as_of=as_of,
+                    snapshot_id=_V2_GUIDANCE_SNAPSHOT_ID,
+                ),
+                _v2_resolution(
+                    topic="hs_classification",
+                    scope="classification_principles",
+                    requested_direction="import",
+                    as_of=as_of,
+                    snapshot_id=_V2_GUIDANCE_SNAPSHOT_ID,
+                    coverage="partial",
+                ),
+            ],
+            "answer_format": "multi_scope_checklist",
+            "guidance_registry_sha256": _V2_GUIDANCE_REGISTRY_SHA256,
+            "engine": {"kind": "deterministic", "model_id": "v2-partial"},
+        }
+
+    with _client(knowledge_answer_handler=knowledge_handler) as client:
+        conversation_id = client.post(
+            "/api/v1/knowledge/conversations",
+            json={"trade_type": "import", "as_of": "2026-08-05"},
+            headers=_auth(),
+        ).json()["conversation_id"]
+        response = client.post(
+            f"/api/v1/knowledge/conversations/{conversation_id}/messages",
+            json={"content": "HS 품목분류와 수입 관세를 함께 확인해 주세요."},
+            headers={**_auth(), "Idempotency-Key": "v2-partial-001"},
+        )
+        listed = client.get("/api/v1/knowledge/conversations", headers=_auth())
+
+    assert response.status_code == 200, response.text
+    assistant = response.json()["assistant_message"]
+    assert assistant["answer_scope"] == "insufficient_evidence"
+    assert assistant["citations"] == []
+    assert assistant["answer_sections"] == []
+    assert [item["coverage"] for item in assistant["guidance_resolutions"]] == [
+        "covered",
+        "partial",
+    ]
+    assert "snapshot_id" not in listed.json()["items"][0]
+
+
+def test_v2_multi_scope_case_uses_the_fixed_four_section_checklist_and_pin() -> None:
+    observed_expected_snapshot_ids: list[str | None] = []
+
+    def answer_handler(request):
+        observed_expected_snapshot_ids.append(request.expected_snapshot_id)
+        as_of = request.review_result["review_as_of"]
+        case_citation = {"kind": "comparison", "reference_id": "cmp_fixture_quantity"}
+        duty = _v2_guidance(
+            registry_source_id="v2_kcs_duty_payment",
+            record_id="record-v2-case-duty-payment",
+            as_of=as_of,
+            snapshot_id=_V2_GUIDANCE_SNAPSHOT_ID,
+            resolution_index=0,
+        )
+        classification = _v2_guidance(
+            registry_source_id="v2_cvnci_hs_advance_ruling",
+            record_id="record-v2-case-hs-classification",
+            as_of=as_of,
+            snapshot_id=_V2_GUIDANCE_SNAPSHOT_ID,
+            resolution_index=1,
+        )
+        return {
+            "schema_version": "1.0",
+            "case_id": request.case_id,
+            "review_run_id": request.review_run_id,
+            "conversation_id": request.conversation_id,
+            "answer_scope": "case_grounded",
+            "direct_answer": "사건 근거와 두 공식 안내를 분리한 확인 목록입니다.",
+            "citations": [case_citation, duty, classification],
+            "answer_sections": [
+                {
+                    "kind": "case_analysis",
+                    "title": "사건 분석",
+                    "content": "문서 비교의 수량 차이를 사람이 확인해야 합니다.",
+                    "citations": [case_citation],
+                },
+                {
+                    "kind": "general_guidance",
+                    "resolution_index": 0,
+                    "title": "주제 1 공식 안내",
+                    "content": "수입 납세·납부의 공식 안내입니다.",
+                    "citations": [duty],
+                },
+                {
+                    "kind": "general_guidance",
+                    "resolution_index": 1,
+                    "title": "주제 2 공식 안내",
+                    "content": "품목분류 기본 원칙의 공식 안내입니다.",
+                    "citations": [classification],
+                },
+                {
+                    "kind": "case_application",
+                    "title": "사건 확인 목록",
+                    "content": "사건 근거와 두 범위의 원문을 함께 사람이 확인합니다.",
+                    "citations": [case_citation, duty, classification],
+                },
+            ],
+            "suggested_questions": [],
+            "correction_draft": None,
+            "guidance_resolutions": [
+                _v2_resolution(
+                    topic="customs_duty",
+                    scope="duty_payment_basics",
+                    requested_direction="import",
+                    as_of=as_of,
+                    snapshot_id=_V2_GUIDANCE_SNAPSHOT_ID,
+                ),
+                _v2_resolution(
+                    topic="hs_classification",
+                    scope="classification_principles",
+                    requested_direction="import",
+                    as_of=as_of,
+                    snapshot_id=_V2_GUIDANCE_SNAPSHOT_ID,
+                ),
+            ],
+            "answer_format": "multi_scope_checklist",
+            "guidance_registry_sha256": _V2_GUIDANCE_REGISTRY_SHA256,
+            "engine": {"kind": "deterministic", "model_id": "v2-multi-case"},
+        }
+
+    with _client(include_finding=True, answer_handler=answer_handler) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "V2 multi-scope case"}, headers=_auth()
+        ).json()["case_id"]
+        assert client.post(
+            f"/api/v1/cases/{case_id}/documents",
+            json={"document_type": "CI", "filename": "invoice.txt", "content_text": "INV-001"},
+            headers=_auth(),
+        ).status_code == 201
+        review = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={"review_as_of": "2026-08-05"},
+            headers={**_auth(), "Idempotency-Key": "v2-multi-case-review-001"},
+        )
+        assert review.status_code == 202, review.text
+        run_id = review.json()["job"]["review_run_id"]
+        conversation_id = client.post(
+            f"/api/v1/review-runs/{run_id}/assistant/conversations", json={}, headers=_auth()
+        ).json()["conversation_id"]
+        first = client.post(
+            f"/api/v1/assistant/conversations/{conversation_id}/messages",
+            json={"content": "HS 품목분류와 수입 관세를 사건에 적용해 확인해 주세요."},
+            headers={**_auth(), "Idempotency-Key": "v2-multi-case-first-001"},
+        )
+        second = client.post(
+            f"/api/v1/assistant/conversations/{conversation_id}/messages",
+            json={"content": "두 공식 안내의 확인 순서를 다시 알려 주세요."},
+            headers={**_auth(), "Idempotency-Key": "v2-multi-case-second-001"},
+        )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assistant = first.json()["assistant_message"]
+    assert assistant["answer_format"] == "multi_scope_checklist"
+    assert [item["kind"] for item in assistant["answer_sections"]] == [
+        "case_analysis",
+        "general_guidance",
+        "general_guidance",
+        "case_application",
+    ]
+    assert [item.get("resolution_index") for item in assistant["answer_sections"]] == [
+        None,
+        0,
+        1,
+        None,
+    ]
+    assert observed_expected_snapshot_ids == [None, _V2_GUIDANCE_SNAPSHOT_ID]
