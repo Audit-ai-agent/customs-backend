@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from collections.abc import Mapping
@@ -486,7 +487,15 @@ class RequestBodyLimitMiddleware:
         await response(scope, receive, send)
 
 
-async def _read_document_asset_body(request: Request) -> bytes:
+@dataclass(frozen=True)
+class _DocumentAssetUploadBody:
+    """Bounded raw input with a digest computed while it is consumed."""
+
+    content: bytes
+    source_sha256: str
+
+
+async def _read_document_asset_body(request: Request) -> _DocumentAssetUploadBody:
     """Read one raw source with a second in-endpoint byte bound.
 
     This duplicate check is intentional: middleware guards all public paths,
@@ -495,13 +504,15 @@ async def _read_document_asset_body(request: Request) -> bytes:
     """
 
     body = bytearray()
+    digest = hashlib.sha256()
     async for chunk in request.stream():
         body.extend(chunk)
+        digest.update(chunk)
         if len(body) > MAX_DOCUMENT_ASSET_REQUEST_BODY_BYTES:
             raise _RequestBodyTooLarge
     if not body:
         raise ValueError("document asset body is required")
-    return bytes(body)
+    return _DocumentAssetUploadBody(content=bytes(body), source_sha256=digest.hexdigest())
 
 
 @dataclass
@@ -1017,13 +1028,15 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         principal: Principal = Depends(writers),
         service: WorkbenchService = Depends(_service),
     ) -> DocumentAssetView:
+        upload = await _read_document_asset_body(request)
         asset = service.add_document_asset(
             principal,
             case_id,
             document_type=document_type,
             filename=filename,
             declared_media_type=content_type,
-            content=await _read_document_asset_body(request),
+            content=upload.content,
+            source_sha256=upload.source_sha256,
         )
         result = DocumentAssetView.from_record(asset)
         # Source bytes, source hash, filename, and preview text are deliberately

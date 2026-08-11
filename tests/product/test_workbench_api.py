@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import threading
@@ -11,11 +12,17 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
+from starlette.requests import Request
 
 from tests.product.agent_v3_fixture import build_agent_v3_result
 
 from customs_backend.adapters import CallableAgentClient, HttpAgentClient, InMemoryObjectStore
-from customs_backend.api import Container, _safe_case_transcript_response, create_app
+from customs_backend.api import (
+    Container,
+    _read_document_asset_body,
+    _safe_case_transcript_response,
+    create_app,
+)
 from customs_backend.auth import StaticTokenVerifier
 from customs_backend.case_input_boundary import CASE_DOCUMENT_CONTEXT_PLACEHOLDER
 from customs_backend.domain import (
@@ -434,6 +441,73 @@ def test_binary_asset_content_type_and_size_limit_are_required_at_public_boundar
             if value["in"] == "header" and value["name"] == "content-type"
         )
         assert header["required"] is True
+
+
+def test_document_asset_upload_streams_the_persisted_source_hash() -> None:
+    """The public binary boundary hashes request chunks before service storage."""
+
+    observed_hashes: list[str] = []
+
+    def extraction_handler(request, content: bytes) -> dict[str, object]:
+        observed_hashes.append(request.source_sha256)
+        return {
+            "schema_version": "1.0",
+            "document_asset_id": request.document_asset_id,
+            "extraction_request_id": request.extraction_request_id,
+            "status": "unavailable",
+            "media_type": request.media_type,
+            "byte_size": len(content),
+            "source_sha256": request.source_sha256,
+            "canonical_text_sha256": None,
+            "extractor_revision": None,
+            "pages": [],
+            "warnings": [{"code": "preview_engine_unavailable"}],
+        }
+
+    with _client(extract_handler=extraction_handler) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Streamed source hash"}, headers=_auth()
+        ).json()["case_id"]
+        payload = _tiny_png()
+        uploaded = client.post(
+            f"/api/v1/cases/{case_id}/document-assets",
+            params={"document_type": "CI", "filename": "invoice.png"},
+            content=payload,
+            headers={**_auth(), "Content-Type": "image/png"},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+
+        # The public DTO intentionally hides the hash.  The extraction request
+        # is the controlled internal boundary that proves the persisted digest.
+        preview = client.post(
+            f"/api/v1/cases/{case_id}/document-assets/{uploaded.json()['asset_id']}/extractions",
+            headers=_auth(),
+        )
+        assert preview.status_code == 202, preview.text
+        assert observed_hashes == [hashlib.sha256(payload).hexdigest()]
+
+
+def test_document_asset_stream_hash_accumulates_chunked_request_body() -> None:
+    payload = _tiny_png()
+    chunks = [payload[:7], payload[7:19], payload[19:]]
+
+    async def receive() -> dict[str, object]:
+        if not chunks:
+            return {"type": "http.disconnect"}
+        return {
+            "type": "http.request",
+            "body": chunks.pop(0),
+            "more_body": bool(chunks),
+        }
+
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/document-assets", "headers": []},
+        receive,
+    )
+    upload = asyncio.run(_read_document_asset_body(request))
+
+    assert upload.content == payload
+    assert upload.source_sha256 == hashlib.sha256(payload).hexdigest()
 
 
 def test_temporal_context_is_persisted_and_forwarded_to_case_assistant() -> None:

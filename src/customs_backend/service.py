@@ -815,6 +815,7 @@ class WorkbenchService:
         filename: str,
         declared_media_type: str,
         content: bytes,
+        source_sha256: str | None = None,
     ) -> DocumentAssetRecord:
         """Store a verified binary source without adding it to text review."""
 
@@ -826,7 +827,17 @@ class WorkbenchService:
             payload=content, declared_media_type=declared_media_type
         )
         asset_id = _id("asset")
-        digest = hashlib.sha256(content).hexdigest()
+        # Public uploads calculate this digest while consuming the raw stream.
+        # Direct service callers retain the deterministic fallback.  The object
+        # store independently verifies the final bytes against this digest.
+        if source_sha256 is None:
+            digest = hashlib.sha256(content).hexdigest()
+        elif len(source_sha256) == 64 and all(
+            character in "0123456789abcdef" for character in source_sha256
+        ):
+            digest = source_sha256
+        else:
+            raise ValueError("document asset source hash is invalid")
         record = DocumentAssetRecord(
             asset_id=asset_id,
             case_id=case_id,
