@@ -966,8 +966,14 @@ class WorkbenchService:
         job = self.repository.get_extraction_job(
             principal.org_id, case_id, request.extraction_job_id
         )
-        if job is None or job.asset_id != asset.asset_id or job.status != "preview_ready":
-            raise ConflictError("a preview-ready extraction is required before text confirmation")
+        if (
+            job is None
+            or job.asset_id != asset.asset_id
+            or job.status not in {"preview_ready", "needs_review"}
+        ):
+            raise ConflictError(
+                "an available extraction preview is required before text confirmation"
+            )
         return self.add_document(
             principal,
             case_id,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -271,7 +272,10 @@ def test_v1_case_document_review_flow_always_needs_human_review() -> None:
         assert detail.json()["document_analyses"]
 
 
-def test_binary_preview_stays_outside_text_review_until_human_confirmation() -> None:
+@pytest.mark.parametrize("preview_status", ["preview_ready", "needs_review"])
+def test_binary_preview_stays_outside_text_review_until_human_confirmation(
+    preview_status: str,
+) -> None:
     observed: list[tuple[object, bytes]] = []
 
     def extraction_handler(request, content: bytes) -> dict[str, object]:
@@ -280,11 +284,11 @@ def test_binary_preview_stays_outside_text_review_until_human_confirmation() -> 
             "schema_version": "1.0",
             "document_asset_id": request.document_asset_id,
             "extraction_request_id": request.extraction_request_id,
-            "status": "preview_ready",
+            "status": preview_status,
             "media_type": request.media_type,
             "byte_size": request.byte_size,
             "source_sha256": request.source_sha256,
-            "canonical_text_sha256": "a" * 64,
+            "canonical_text_sha256": hashlib.sha256(b"candidate preview text").hexdigest(),
             "extractor_revision": "local-preview-test-r1",
             "pages": [
                 {
@@ -335,7 +339,7 @@ def test_binary_preview_stays_outside_text_review_until_human_confirmation() -> 
         )
         assert preview.status_code == 202, preview.text
         job = preview.json()["job"]
-        assert job["status"] == "preview_ready"
+        assert job["status"] == preview_status
         assert job["result"]["pages"][0]["spans"][0]["text"] == "candidate preview text"
         assert "source_sha256" not in job["result"]
         assert "canonical_text_sha256" not in job["result"]

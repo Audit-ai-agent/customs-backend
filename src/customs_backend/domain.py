@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import unicodedata
 from datetime import UTC, date, datetime
 from enum import Enum
 from typing import Any, Literal
@@ -196,7 +197,9 @@ class DocumentRecord(BaseModel):
 
 
 DocumentAssetMediaType = Literal["application/pdf", "image/jpeg", "image/png"]
-DocumentExtractionStatus = Literal["queued", "preview_ready", "needs_review", "unavailable", "failed"]
+DocumentExtractionStatus = Literal[
+    "queued", "preview_ready", "needs_review", "unavailable", "failed"
+]
 
 
 class DocumentAssetRecord(BaseModel):
@@ -227,6 +230,12 @@ class ExtractionBoundingBox(BaseModel):
     width: float = Field(gt=0, le=1)
     height: float = Field(gt=0, le=1)
 
+    @model_validator(mode="after")
+    def fits_inside_normalized_page(self) -> "ExtractionBoundingBox":
+        if self.x + self.width > 1 or self.y + self.height > 1:
+            raise ValueError("extraction bounding box exceeds its page")
+        return self
+
 
 class ExtractionSpan(BaseModel):
     """A human-visible OCR/text-layer candidate with optional page geometry."""
@@ -251,11 +260,37 @@ class ExtractionPage(BaseModel):
     coordinate_unit: Literal["pixels", "pdf_points"]
     spans: list[ExtractionSpan] = Field(default_factory=list, max_length=20_000)
 
+    @model_validator(mode="after")
+    def span_identity_and_order_are_consistent(self) -> "ExtractionPage":
+        span_ids = [span.span_id for span in self.spans]
+        ordinals = [span.ordinal for span in self.spans]
+        reading_order = [span.reading_order for span in self.spans]
+        if (
+            len(span_ids) != len(set(span_ids))
+            or len(ordinals) != len(set(ordinals))
+            or len(reading_order) != len(set(reading_order))
+            or ordinals != sorted(ordinals)
+            or reading_order != sorted(reading_order)
+        ):
+            raise ValueError("extraction spans are not uniquely ordered")
+        return self
+
 
 class ExtractionWarning(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     code: str = Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_]{1,127}$")
+
+
+def canonical_extraction_text_sha256(pages: list[ExtractionPage]) -> str:
+    """Bind the visible preview spans to the Agent-provided text receipt."""
+
+    text = "\n".join(
+        unicodedata.normalize("NFC", span.text).replace("\r\n", "\n").replace("\r", "\n")
+        for page in sorted(pages, key=lambda item: item.page_number)
+        for span in sorted(page.spans, key=lambda item: (item.reading_order, item.ordinal))
+    )
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 class DocumentExtractionResult(BaseModel):
@@ -279,12 +314,17 @@ class DocumentExtractionResult(BaseModel):
 
     @model_validator(mode="after")
     def preview_result_is_coherent(self) -> "DocumentExtractionResult":
-        if self.status == "preview_ready" and (
-            self.canonical_text_sha256 is None or not self.extractor_revision or not self.pages
-        ):
-            raise ValueError("a preview-ready extraction requires text provenance and pages")
-        if self.status != "preview_ready" and self.canonical_text_sha256 is not None:
-            raise ValueError("a non-preview extraction must not expose canonical text provenance")
+        page_numbers = [page.page_number for page in self.pages]
+        if page_numbers != list(range(1, len(page_numbers) + 1)):
+            raise ValueError("extraction page numbers must be contiguous")
+        if self.status == "unavailable":
+            if self.canonical_text_sha256 is not None or self.extractor_revision or self.pages:
+                raise ValueError("an unavailable extraction must not expose preview content")
+            return self
+        if self.canonical_text_sha256 is None or not self.extractor_revision or not self.pages:
+            raise ValueError("an available extraction requires text provenance and pages")
+        if self.canonical_text_sha256 != canonical_extraction_text_sha256(self.pages):
+            raise ValueError("extraction text receipt does not match preview spans")
         return self
 
 
@@ -619,9 +659,7 @@ class GuidanceResolution(BaseModel):
     topic: str = Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_]{0,127}$")
     scope: str = Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_]{0,127}$")
     requested_direction: GuidanceRequestedDirection
-    applicable_directions: list[GuidanceApplicableDirection] = Field(
-        min_length=1, max_length=2
-    )
+    applicable_directions: list[GuidanceApplicableDirection] = Field(min_length=1, max_length=2)
     coverage: GuidanceCoverage
     snapshot_id: str | None = Field(default=None, min_length=1, max_length=512)
     as_of: date
@@ -632,7 +670,9 @@ class GuidanceResolution(BaseModel):
         if len(self.applicable_directions) != len(set(self.applicable_directions)):
             raise ValueError("guidance applicable directions must be unique")
         canonical_directions = [
-            direction for direction in ("import", "export") if direction in self.applicable_directions
+            direction
+            for direction in ("import", "export")
+            if direction in self.applicable_directions
         ]
         if self.applicable_directions != canonical_directions:
             raise ValueError("guidance applicable directions must be canonical")
