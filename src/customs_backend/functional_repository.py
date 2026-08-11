@@ -12,7 +12,9 @@ from customs_backend.domain import (
     ConversationRecord,
     CorrectionProposalDecisionRecord,
     CorrectionProposalRecord,
+    DocumentAssetRecord,
     DocumentRecord,
+    ExtractionJobRecord,
     FindingDecisionRecord,
     FindingDecisionStatus,
     JobRecord,
@@ -111,6 +113,14 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
                 key: DocumentRecord.model_validate(value)
                 for key, value in dict(state.get("documents", {})).items()
             }
+            self._document_assets = {
+                key: DocumentAssetRecord.model_validate(value)
+                for key, value in dict(state.get("document_assets", {})).items()
+            }
+            self._extraction_jobs = {
+                key: ExtractionJobRecord.model_validate(value)
+                for key, value in dict(state.get("extraction_jobs", {})).items()
+            }
             self._jobs = {
                 key: JobRecord.model_validate(value)
                 for key, value in dict(state.get("jobs", {})).items()
@@ -170,6 +180,14 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
             "cases": {key: value.model_dump(mode="json") for key, value in self._cases.items()},
             "documents": {
                 key: value.model_dump(mode="json") for key, value in self._documents.items()
+            },
+            "document_assets": {
+                key: value.model_dump(mode="json")
+                for key, value in self._document_assets.items()
+            },
+            "extraction_jobs": {
+                key: value.model_dump(mode="json")
+                for key, value in self._extraction_jobs.items()
             },
             "jobs": {key: value.model_dump(mode="json") for key, value in self._jobs.items()},
             "idempotency": [[org, key, job_id] for (org, key), job_id in self._idempotency.items()],
@@ -241,6 +259,21 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
         value = super().add_document(
             record, expected_revision=expected_revision, new_manifest_digest=new_manifest_digest
         )
+        self._persist()
+        return value
+
+    def add_document_asset(self, record: DocumentAssetRecord) -> DocumentAssetRecord:
+        value = super().add_document_asset(record)
+        self._persist()
+        return value
+
+    def create_extraction_job(self, job: ExtractionJobRecord) -> ExtractionJobRecord:
+        value = super().create_extraction_job(job)
+        self._persist()
+        return value
+
+    def update_extraction_job(self, job: ExtractionJobRecord) -> ExtractionJobRecord:
+        value = super().update_extraction_job(job)
         self._persist()
         return value
 

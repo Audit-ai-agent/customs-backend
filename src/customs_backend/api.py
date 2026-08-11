@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from collections.abc import Mapping
@@ -10,7 +11,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 from starlette.responses import JSONResponse
@@ -23,6 +24,7 @@ from customs_backend.case_input_boundary import case_input_notice, safe_case_tra
 from customs_backend.domain import (
     CaseCreate,
     CaseRecord,
+    ConfirmedExtractedTextCreate,
     ConversationCreate,
     ConversationMessageCreate,
     ConversationMessageExchange,
@@ -34,11 +36,15 @@ from customs_backend.domain import (
     CorrectionProposalHistoryEntry,
     CorrectionProposalRecord,
     CorrectionProposalStatus,
+    DocumentAssetRecord,
+    DocumentType,
+    ExtractionJobRecord,
     FindingDecisionRecord,
     FindingDecisionRequest,
     JobStatus,
     KnowledgeConversationCreate,
     KnowledgeConversationRecord,
+    MAX_DOCUMENT_ASSET_BYTES,
     Principal,
     RevisionCreate,
     ReviewEnqueueRequest,
@@ -71,7 +77,9 @@ IdempotencyKey = Annotated[
     Header(alias="Idempotency-Key", min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$"),
 ]
 MAX_PUBLIC_REQUEST_BODY_BYTES = 4 * 1024 * 1024
+MAX_DOCUMENT_ASSET_REQUEST_BODY_BYTES = MAX_DOCUMENT_ASSET_BYTES
 _DEV_FIXTURE_REVIEW_AS_OF = date(2026, 8, 5)
+_DOCUMENT_ASSET_UPLOAD_PATH = re.compile(r"^/api/v1/cases/[^/]+/document-assets$")
 
 
 class ProblemDetailsV1(BaseModel):
@@ -141,6 +149,120 @@ class CaseListResponse(BaseModel):
 
 class DocumentListResponse(BaseModel):
     items: list[DocumentViewResponse]
+
+
+class DocumentAssetView(BaseModel):
+    """Safe Browser projection; object keys and source hashes stay internal."""
+
+    asset_id: str
+    case_id: str
+    document_type: str
+    filename: str
+    media_type: Literal["application/pdf", "image/jpeg", "image/png"]
+    byte_size: int = Field(ge=1)
+    page_count: int = Field(ge=1)
+    pixel_count: int = Field(ge=0)
+    created_by: str
+    created_at: datetime
+
+    @classmethod
+    def from_record(cls, record: DocumentAssetRecord) -> "DocumentAssetView":
+        return cls(
+            asset_id=record.asset_id,
+            case_id=record.case_id,
+            document_type=record.document_type,
+            filename=record.filename,
+            media_type=record.media_type,
+            byte_size=record.byte_size,
+            page_count=record.page_count,
+            pixel_count=record.pixel_count,
+            created_by=record.created_by,
+            created_at=record.created_at,
+        )
+
+
+class DocumentAssetListResponse(BaseModel):
+    items: list[DocumentAssetView]
+
+
+class ExtractionSpanView(BaseModel):
+    span_id: str
+    ordinal: int = Field(ge=1)
+    text: str
+    bbox: dict[str, float] | None = None
+    reading_order: int = Field(ge=1)
+
+
+class ExtractionPageView(BaseModel):
+    page_number: int = Field(ge=1)
+    width: int = Field(ge=1)
+    height: int = Field(ge=1)
+    coordinate_unit: Literal["pixels", "pdf_points"]
+    spans: list[ExtractionSpanView]
+
+
+class ExtractionPreviewView(BaseModel):
+    status: Literal["preview_ready", "needs_review", "unavailable"]
+    extractor_revision: str | None = None
+    pages: list[ExtractionPageView]
+    warnings: list[str]
+
+
+class ExtractionJobView(BaseModel):
+    extraction_job_id: str
+    asset_id: str
+    case_id: str
+    status: Literal["queued", "preview_ready", "needs_review", "unavailable", "failed"]
+    result: ExtractionPreviewView | None = None
+    error_code: str | None = None
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_record(cls, record: ExtractionJobRecord) -> "ExtractionJobView":
+        preview = None
+        if record.result is not None:
+            preview = ExtractionPreviewView(
+                status=record.result.status,
+                extractor_revision=record.result.extractor_revision,
+                pages=[
+                    ExtractionPageView(
+                        page_number=page.page_number,
+                        width=page.width,
+                        height=page.height,
+                        coordinate_unit=page.coordinate_unit,
+                        spans=[
+                            ExtractionSpanView(
+                                span_id=span.span_id,
+                                ordinal=span.ordinal,
+                                text=span.text,
+                                bbox=span.bbox.model_dump() if span.bbox is not None else None,
+                                reading_order=span.reading_order,
+                            )
+                            for span in page.spans
+                        ],
+                    )
+                    for page in record.result.pages
+                ],
+                warnings=[warning.code for warning in record.result.warnings],
+            )
+        return cls(
+            extraction_job_id=record.extraction_job_id,
+            asset_id=record.asset_id,
+            case_id=record.case_id,
+            status=record.status,
+            result=preview,
+            error_code=record.error_code,
+            created_by=record.created_by,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+        )
+
+
+class ExtractionJobResponse(BaseModel):
+    asset: DocumentAssetView
+    job: ExtractionJobView
 
 
 class ConversationView(BaseModel):
@@ -314,21 +436,28 @@ class _RequestBodyTooLarge(Exception):
 
 
 class RequestBodyLimitMiddleware:
-    """Bound public JSON bodies before FastAPI parses them."""
+    """Bound public bodies, with a separately bounded raw-document route."""
 
     def __init__(self, app: ASGIApp, *, max_bytes: int) -> None:
         self.app = app
         self.max_bytes = max_bytes
 
+    def _maximum_for_scope(self, scope: Scope) -> int:
+        path = str(scope.get("path", ""))
+        if scope.get("method") == "POST" and _DOCUMENT_ASSET_UPLOAD_PATH.fullmatch(path):
+            return MAX_DOCUMENT_ASSET_REQUEST_BODY_BYTES
+        return self.max_bytes
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http" or not str(scope.get("path", "")).startswith("/api/"):
             await self.app(scope, receive, send)
             return
+        maximum = self._maximum_for_scope(scope)
         headers = {key.lower(): value for key, value in scope.get("headers", [])}
         content_length = headers.get(b"content-length")
         if content_length is not None:
             try:
-                if int(content_length) > self.max_bytes:
+                if int(content_length) > maximum:
                     await self._reject(scope, receive, send)
                     return
             except ValueError:
@@ -341,7 +470,7 @@ class RequestBodyLimitMiddleware:
             message = await receive()
             if message["type"] == "http.request":
                 received += len(message.get("body", b""))
-                if received > self.max_bytes:
+                if received > maximum:
                     raise _RequestBodyTooLarge
             return message
 
@@ -356,6 +485,34 @@ class RequestBodyLimitMiddleware:
             413, "request_body_too_large", instance=str(scope.get("path", "/"))
         )
         await response(scope, receive, send)
+
+
+@dataclass(frozen=True)
+class _DocumentAssetUploadBody:
+    """Bounded raw input with a digest computed while it is consumed."""
+
+    content: bytes
+    source_sha256: str
+
+
+async def _read_document_asset_body(request: Request) -> _DocumentAssetUploadBody:
+    """Read one raw source with a second in-endpoint byte bound.
+
+    This duplicate check is intentional: middleware guards all public paths,
+    while this helper keeps the binary boundary safe if the app is mounted
+    under another ASGI stack later.
+    """
+
+    body = bytearray()
+    digest = hashlib.sha256()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        digest.update(chunk)
+        if len(body) > MAX_DOCUMENT_ASSET_REQUEST_BODY_BYTES:
+            raise _RequestBodyTooLarge
+    if not body:
+        raise ValueError("document asset body is required")
+    return _DocumentAssetUploadBody(content=bytes(body), source_sha256=digest.hexdigest())
 
 
 @dataclass
@@ -846,6 +1003,152 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             ),
             content_text=view.content_text,
         )
+
+    @app.post(
+        "/api/v1/cases/{case_id}/document-assets",
+        response_model=DocumentAssetView,
+        status_code=201,
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/pdf": {"schema": {"type": "string", "format": "binary"}},
+                    "image/jpeg": {"schema": {"type": "string", "format": "binary"}},
+                    "image/png": {"schema": {"type": "string", "format": "binary"}},
+                },
+            }
+        },
+    )
+    async def add_document_asset_endpoint(
+        case_id: str,
+        request: Request,
+        content_type: Annotated[str, Header()],
+        document_type: DocumentType = Query(...),
+        filename: str = Query(..., min_length=1, max_length=255),
+        principal: Principal = Depends(writers),
+        service: WorkbenchService = Depends(_service),
+    ) -> DocumentAssetView:
+        upload = await _read_document_asset_body(request)
+        asset = service.add_document_asset(
+            principal,
+            case_id,
+            document_type=document_type,
+            filename=filename,
+            declared_media_type=content_type,
+            content=upload.content,
+            source_sha256=upload.source_sha256,
+        )
+        result = DocumentAssetView.from_record(asset)
+        # Source bytes, source hash, filename, and preview text are deliberately
+        # excluded from the Functional-UAT transcript.
+        record_public_exchange(
+            case_id=case_id,
+            method="POST",
+            path=f"/api/v1/cases/{case_id}/document-assets",
+            request_body={
+                "document_type": asset.document_type,
+                "media_type": asset.media_type,
+                "byte_size": asset.byte_size,
+            },
+            response_status=201,
+            response_body={"asset_id": asset.asset_id, "media_type": asset.media_type},
+        )
+        return result
+
+    @app.get(
+        "/api/v1/cases/{case_id}/document-assets", response_model=DocumentAssetListResponse
+    )
+    def list_document_assets_endpoint(
+        case_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> DocumentAssetListResponse:
+        return DocumentAssetListResponse(
+            items=[
+                DocumentAssetView.from_record(item)
+                for item in service.list_document_assets(principal, case_id)
+            ]
+        )
+
+    @app.post(
+        "/api/v1/cases/{case_id}/document-assets/{asset_id}/extractions",
+        response_model=ExtractionJobResponse,
+        status_code=202,
+    )
+    def request_document_extraction_endpoint(
+        case_id: str,
+        asset_id: str,
+        principal: Principal = Depends(writers),
+        service: WorkbenchService = Depends(_service),
+    ) -> ExtractionJobResponse:
+        value = service.request_document_extraction(principal, case_id, asset_id)
+        result = ExtractionJobResponse(
+            asset=DocumentAssetView.from_record(value.asset),
+            job=ExtractionJobView.from_record(value.job),
+        )
+        # Never retain extracted span text in the public transcript either.
+        record_public_exchange(
+            case_id=case_id,
+            method="POST",
+            path=f"/api/v1/cases/{case_id}/document-assets/{asset_id}/extractions",
+            request_body={"asset_id": asset_id},
+            response_status=202,
+            response_body={
+                "asset_id": value.asset.asset_id,
+                "extraction_job_id": value.job.extraction_job_id,
+                "status": value.job.status,
+                "page_count": len(value.job.result.pages) if value.job.result else 0,
+            },
+        )
+        return result
+
+    @app.get(
+        "/api/v1/cases/{case_id}/document-assets/{asset_id}/extractions/{extraction_job_id}",
+        response_model=ExtractionJobResponse,
+    )
+    def get_document_extraction_endpoint(
+        case_id: str,
+        asset_id: str,
+        extraction_job_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> ExtractionJobResponse:
+        value = service.get_document_extraction(
+            principal, case_id, asset_id, extraction_job_id
+        )
+        return ExtractionJobResponse(
+            asset=DocumentAssetView.from_record(value.asset),
+            job=ExtractionJobView.from_record(value.job),
+        )
+
+    @app.post(
+        "/api/v1/cases/{case_id}/document-assets/{asset_id}/confirmed-document",
+        response_model=DocumentViewResponse,
+        status_code=201,
+    )
+    def confirm_extracted_text_endpoint(
+        case_id: str,
+        asset_id: str,
+        body: ConfirmedExtractedTextCreate,
+        principal: Principal = Depends(writers),
+        service: WorkbenchService = Depends(_service),
+    ) -> DocumentViewResponse:
+        _case, record = service.confirm_extracted_text(principal, case_id, asset_id, body)
+        result = DocumentViewResponse(
+            record=DocumentViewResponse.PublicDocumentRecord.model_validate(
+                record.model_dump(mode="json")
+            ),
+            content_text=body.content_text,
+        )
+        record_public_exchange(
+            case_id=case_id,
+            method="POST",
+            path=f"/api/v1/cases/{case_id}/document-assets/{asset_id}/confirmed-document",
+            request_body=body.model_dump(mode="json"),
+            response_status=201,
+            response_body=result.model_dump(mode="json"),
+        )
+        return result
 
     @app.post("/api/v1/cases/{case_id}/reviews", response_model=JobResponse, status_code=202)
     def enqueue_review_endpoint(

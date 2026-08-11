@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import unicodedata
 from datetime import UTC, date, datetime
 from enum import Enum
 from typing import Any, Literal
@@ -32,6 +33,13 @@ def canonical_digest(value: Any) -> str:
 
 MAX_TEXT_DOCUMENT_CHARACTERS = 200_000
 MAX_TEXT_DOCUMENT_UTF8_BYTES = MAX_TEXT_DOCUMENT_CHARACTERS * 4
+# Keep the public upload boundary no larger than the Agent's independently
+# enforced default.  Accepting a larger asset here would persist a binary that
+# the isolated preview service must reject later, which is neither useful nor
+# a safe preview workflow.
+MAX_DOCUMENT_ASSET_BYTES = 16 * 1024 * 1024
+MAX_DOCUMENT_ASSET_PAGES = 20
+MAX_DOCUMENT_ASSET_PIXELS = 40_000_000
 # Keep the compact legacy codes while adding the text documents needed for a
 # normal export workbench.  They are only labels for text input; this does not
 # imply PDF/image/OCR support.
@@ -180,12 +188,236 @@ class DocumentRecord(BaseModel):
     character_count: int = Field(ge=1, le=MAX_TEXT_DOCUMENT_CHARACTERS)
     created_by: str
     created_at: datetime
+    # A reviewer-confirmed text document may have come from an unverified
+    # extraction preview.  The review contract still receives text only; this
+    # link is operational provenance and never authorises OCR-based findings.
+    source_asset_id: str | None = None
     # A document is immutable.  A correction creates a new record and marks
     # the earlier record as superseded, so historic review input snapshots
     # remain reproducible.
     replaces_document_id: str | None = None
     superseded_by_document_id: str | None = None
     superseded_at: datetime | None = None
+
+
+DocumentAssetMediaType = Literal["application/pdf", "image/jpeg", "image/png"]
+DocumentExtractionStatus = Literal[
+    "queued", "preview_ready", "needs_review", "unavailable", "failed"
+]
+
+
+class DocumentAssetRecord(BaseModel):
+    """Immutable binary source kept outside the text-review input boundary."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    asset_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+    case_id: str = Field(min_length=1, max_length=128)
+    org_id: str = Field(min_length=1, max_length=128)
+    document_type: DocumentType
+    filename: str = Field(min_length=1, max_length=255)
+    media_type: DocumentAssetMediaType
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    object_key: str = Field(min_length=1, max_length=512)
+    byte_size: int = Field(ge=1, le=MAX_DOCUMENT_ASSET_BYTES)
+    page_count: int = Field(ge=1, le=MAX_DOCUMENT_ASSET_PAGES)
+    pixel_count: int = Field(ge=0, le=MAX_DOCUMENT_ASSET_PIXELS)
+    created_by: str = Field(min_length=1, max_length=256)
+    created_at: datetime
+
+    @field_validator("filename")
+    @classmethod
+    def safe_binary_filename(cls, value: str) -> str:
+        """Keep stored Browser-visible filenames out of path/control syntax."""
+
+        if not value.strip() or any(character in value for character in ("/", "\\", "\r", "\n", "\x00")):
+            raise ValueError("document asset filename is invalid")
+        return value
+
+
+class ExtractionBoundingBox(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    x: float = Field(ge=0, le=1)
+    y: float = Field(ge=0, le=1)
+    width: float = Field(gt=0, le=1)
+    height: float = Field(gt=0, le=1)
+
+    @model_validator(mode="after")
+    def fits_inside_normalized_page(self) -> "ExtractionBoundingBox":
+        if self.x + self.width > 1 or self.y + self.height > 1:
+            raise ValueError("extraction bounding box exceeds its page")
+        return self
+
+
+class ExtractionSpan(BaseModel):
+    """A human-visible OCR/text-layer candidate with optional page geometry."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    span_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+    ordinal: int = Field(ge=1, le=100_000)
+    text: str = Field(min_length=1, max_length=8_000)
+    bbox: ExtractionBoundingBox | None = None
+    reading_order: int = Field(ge=1, le=100_000)
+
+
+class ExtractionPage(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    page_number: int = Field(ge=1, le=MAX_DOCUMENT_ASSET_PAGES)
+    width: int = Field(ge=1, le=100_000)
+    height: int = Field(ge=1, le=100_000)
+    coordinate_unit: Literal["pixels", "pdf_points"]
+    spans: list[ExtractionSpan] = Field(default_factory=list, max_length=20_000)
+
+    @model_validator(mode="after")
+    def span_identity_and_order_are_consistent(self) -> "ExtractionPage":
+        span_ids = [span.span_id for span in self.spans]
+        ordinals = [span.ordinal for span in self.spans]
+        reading_order = [span.reading_order for span in self.spans]
+        if (
+            len(span_ids) != len(set(span_ids))
+            or len(ordinals) != len(set(ordinals))
+            or len(reading_order) != len(set(reading_order))
+            or ordinals != sorted(ordinals)
+            or reading_order != sorted(reading_order)
+        ):
+            raise ValueError("extraction spans are not uniquely ordered")
+        return self
+
+
+class ExtractionWarning(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    code: str = Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_]{1,127}$")
+
+
+def canonical_extraction_text_sha256(pages: list[ExtractionPage]) -> str:
+    """Bind the visible preview spans to the Agent-provided text receipt."""
+
+    text = "\n".join(
+        unicodedata.normalize("NFC", span.text).replace("\r\n", "\n").replace("\r", "\n")
+        for page in sorted(pages, key=lambda item: item.page_number)
+        for span in sorted(page.spans, key=lambda item: (item.reading_order, item.ordinal))
+    )
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+class DocumentExtractionResult(BaseModel):
+    """Safe preview projection returned by the Agent; never contains source bytes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"] = "1.0"
+    document_asset_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+    extraction_request_id: str = Field(min_length=1, max_length=128)
+    status: Literal["preview_ready", "needs_review", "unavailable"]
+    media_type: DocumentAssetMediaType
+    byte_size: int = Field(ge=1, le=MAX_DOCUMENT_ASSET_BYTES)
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    canonical_text_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    extractor_revision: str | None = Field(default=None, min_length=1, max_length=256)
+    pages: list[ExtractionPage] = Field(default_factory=list, max_length=MAX_DOCUMENT_ASSET_PAGES)
+    warnings: list[ExtractionWarning] = Field(default_factory=list, max_length=32)
+
+    @model_validator(mode="after")
+    def preview_result_is_coherent(self) -> "DocumentExtractionResult":
+        page_numbers = [page.page_number for page in self.pages]
+        if page_numbers != list(range(1, len(page_numbers) + 1)):
+            raise ValueError("extraction page numbers must be contiguous")
+        if self.status == "unavailable":
+            if self.canonical_text_sha256 is not None or self.extractor_revision or self.pages:
+                raise ValueError("an unavailable extraction must not expose preview content")
+            return self
+        if self.canonical_text_sha256 is None or not self.extractor_revision or not self.pages:
+            raise ValueError("an available extraction requires text provenance and pages")
+        if self.canonical_text_sha256 != canonical_extraction_text_sha256(self.pages):
+            raise ValueError("extraction text receipt does not match preview spans")
+        return self
+
+
+class AgentDocumentExtractionRequest(BaseModel):
+    """Backend-owned metadata used to form the raw Agent extraction request.
+
+    The object is intentionally not a JSON wire body.  ``HttpAgentClient``
+    places these fields in the fixed request headers and sends only the
+    already-validated source bytes as the body.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    document_asset_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    )
+    extraction_request_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    )
+    media_type: DocumentAssetMediaType
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    byte_size: int = Field(ge=1, le=MAX_DOCUMENT_ASSET_BYTES)
+
+    def to_agent_wire(self) -> dict[str, str]:
+        return {
+            "document_asset_id": self.document_asset_id,
+            "extraction_request_id": self.extraction_request_id,
+            "source_sha256": self.source_sha256,
+            "media_type": self.media_type,
+        }
+
+
+class ExtractionJobRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    extraction_job_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    )
+    asset_id: str = Field(min_length=1, max_length=128)
+    case_id: str = Field(min_length=1, max_length=128)
+    org_id: str = Field(min_length=1, max_length=128)
+    status: DocumentExtractionStatus
+    result: DocumentExtractionResult | None = None
+    error_code: str | None = Field(default=None, min_length=1, max_length=128)
+    created_by: str = Field(min_length=1, max_length=256)
+    created_at: datetime
+    updated_at: datetime
+
+    @model_validator(mode="after")
+    def job_result_matches_status(self) -> "ExtractionJobRecord":
+        if self.status in {"preview_ready", "needs_review", "unavailable"} and self.result is None:
+            raise ValueError("a completed extraction job requires a result")
+        if self.status in {"queued", "failed"} and self.result is not None:
+            raise ValueError("a queued or failed extraction job must not contain a result")
+        return self
+
+
+class ConfirmedExtractedTextCreate(BaseModel):
+    """Human-confirmed text may enter the existing text-review workflow."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    extraction_job_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    )
+    content_text: str = Field(min_length=1, max_length=MAX_TEXT_DOCUMENT_CHARACTERS)
+    filename: str = Field(min_length=1, max_length=255)
+    replaces_document_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+
+    @field_validator("content_text")
+    @classmethod
+    def bounded_utf8_payload(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > MAX_TEXT_DOCUMENT_UTF8_BYTES:
+            raise ValueError("confirmed extracted text exceeds the UTF-8 byte safety limit")
+        return value
 
 
 class ReviewEnqueueRequest(BaseModel):
@@ -440,9 +672,7 @@ class GuidanceResolution(BaseModel):
     topic: str = Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_]{0,127}$")
     scope: str = Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_]{0,127}$")
     requested_direction: GuidanceRequestedDirection
-    applicable_directions: list[GuidanceApplicableDirection] = Field(
-        min_length=1, max_length=2
-    )
+    applicable_directions: list[GuidanceApplicableDirection] = Field(min_length=1, max_length=2)
     coverage: GuidanceCoverage
     snapshot_id: str | None = Field(default=None, min_length=1, max_length=512)
     as_of: date
@@ -453,7 +683,9 @@ class GuidanceResolution(BaseModel):
         if len(self.applicable_directions) != len(set(self.applicable_directions)):
             raise ValueError("guidance applicable directions must be unique")
         canonical_directions = [
-            direction for direction in ("import", "export") if direction in self.applicable_directions
+            direction
+            for direction in ("import", "export")
+            if direction in self.applicable_directions
         ]
         if self.applicable_directions != canonical_directions:
             raise ValueError("guidance applicable directions must be canonical")

@@ -1,23 +1,34 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 from pathlib import Path
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
+from starlette.requests import Request
 
 from tests.product.agent_v3_fixture import build_agent_v3_result
 
 from customs_backend.adapters import CallableAgentClient, HttpAgentClient, InMemoryObjectStore
-from customs_backend.api import Container, _safe_case_transcript_response, create_app
+from customs_backend.api import (
+    Container,
+    _read_document_asset_body,
+    _safe_case_transcript_response,
+    create_app,
+)
 from customs_backend.auth import StaticTokenVerifier
 from customs_backend.case_input_boundary import CASE_DOCUMENT_CONTEXT_PLACEHOLDER
 from customs_backend.domain import (
     AgentReviewRequest,
     ConversationMessageCreate,
+    MAX_DOCUMENT_ASSET_BYTES,
     Principal,
     Role,
     canonical_digest,
@@ -39,6 +50,7 @@ def _client(
     review_handler=None,
     answer_handler=None,
     knowledge_answer_handler=None,
+    extract_handler=None,
     settings: Settings | None = None,
 ) -> TestClient:
     settings = settings or Settings(_env_file=None, environment="test")
@@ -59,6 +71,7 @@ def _client(
         or (lambda request: build_agent_v3_result(request, include_finding=include_finding)),
         answer=answer_handler,
         knowledge_answer=knowledge_answer_handler,
+        extract_document=extract_handler,
     )
     service = WorkbenchService(
         repository=repository,
@@ -100,6 +113,14 @@ def _approver_auth() -> dict[str, str]:
 
 def _reviewer_approver_auth() -> dict[str, str]:
     return {"Authorization": "Bearer reviewer-approver-token"}
+
+
+def _tiny_png() -> bytes:
+    """A synthetic one-pixel fixture; it is not a user document."""
+
+    output = BytesIO()
+    Image.new("RGB", (1, 1), color=(0, 0, 0)).save(output, format="PNG")
+    return output.getvalue()
 
 
 def _functional_settings() -> Settings:
@@ -257,6 +278,236 @@ def test_v1_case_document_review_flow_always_needs_human_review() -> None:
         assert detail.json()["temporal_context"] is None
         assert detail.json()["workflow"]["status"] == "completed"
         assert detail.json()["document_analyses"]
+
+
+@pytest.mark.parametrize("preview_status", ["preview_ready", "needs_review"])
+def test_binary_preview_stays_outside_text_review_until_human_confirmation(
+    preview_status: str,
+) -> None:
+    observed: list[tuple[object, bytes]] = []
+
+    def extraction_handler(request, content: bytes) -> dict[str, object]:
+        observed.append((request, content))
+        return {
+            "schema_version": "1.0",
+            "document_asset_id": request.document_asset_id,
+            "extraction_request_id": request.extraction_request_id,
+            "status": preview_status,
+            "media_type": request.media_type,
+            "byte_size": request.byte_size,
+            "source_sha256": request.source_sha256,
+            "canonical_text_sha256": hashlib.sha256(b"candidate preview text").hexdigest(),
+            "extractor_revision": "local-preview-test-r1",
+            "pages": [
+                {
+                    "page_number": 1,
+                    "width": 1,
+                    "height": 1,
+                    "coordinate_unit": "pixels",
+                    "spans": [
+                        {
+                            "span_id": "span-preview-1",
+                            "ordinal": 1,
+                            "text": "candidate preview text",
+                            "bbox": {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0},
+                            "reading_order": 1,
+                        }
+                    ],
+                }
+            ],
+            "warnings": [{"code": "human_confirmation_required"}],
+        }
+
+    with _client(extract_handler=extraction_handler) as client:
+        case = client.post("/api/v1/cases", json={"title": "Preview only"}, headers=_auth())
+        assert case.status_code == 201
+        case_id = case.json()["case_id"]
+        payload = _tiny_png()
+
+        uploaded = client.post(
+            f"/api/v1/cases/{case_id}/document-assets",
+            params={"document_type": "CI", "filename": "invoice.png"},
+            content=payload,
+            headers={**_auth(), "Content-Type": "image/png"},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        asset = uploaded.json()
+        assert asset["media_type"] == "image/png"
+        assert "source_sha256" not in asset
+        assert "object_key" not in asset
+
+        # Uploading an asset must not alter the ordinary text-review inputs.
+        documents = client.get(f"/api/v1/cases/{case_id}/documents", headers=_auth())
+        assert documents.status_code == 200
+        assert documents.json() == {"items": []}
+
+        preview = client.post(
+            f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/extractions",
+            headers=_auth(),
+        )
+        assert preview.status_code == 202, preview.text
+        job = preview.json()["job"]
+        assert job["status"] == preview_status
+        assert job["result"]["pages"][0]["spans"][0]["text"] == "candidate preview text"
+        assert "source_sha256" not in job["result"]
+        assert "canonical_text_sha256" not in job["result"]
+        assert len(observed) == 1
+        assert observed[0][1] == payload
+
+        confirmed = client.post(
+            f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/confirmed-document",
+            json={
+                "extraction_job_id": job["extraction_job_id"],
+                "filename": "invoice-confirmed.txt",
+                "content_text": "human-confirmed review text",
+            },
+            headers=_auth(),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+        # The review document remains text-only; binary provenance stays on
+        # the operational asset/extraction records rather than this public DTO.
+        assert "source_asset_id" not in confirmed.json()["record"]
+        documents = client.get(f"/api/v1/cases/{case_id}/documents", headers=_auth())
+        assert len(documents.json()["items"]) == 1
+
+
+def test_binary_asset_magic_mismatch_is_rejected_before_storage() -> None:
+    with _client() as client:
+        case = client.post("/api/v1/cases", json={"title": "Reject mismatch"}, headers=_auth())
+        assert case.status_code == 201
+        case_id = case.json()["case_id"]
+        response = client.post(
+            f"/api/v1/cases/{case_id}/document-assets",
+            params={"document_type": "CI", "filename": "wrong.pdf"},
+            content=_tiny_png(),
+            headers={**_auth(), "Content-Type": "application/pdf"},
+        )
+        assert response.status_code == 422
+        assert response.json()["code"] == "invalid_operation"
+        assets = client.get(f"/api/v1/cases/{case_id}/document-assets", headers=_auth())
+        assert assets.json() == {"items": []}
+
+
+@pytest.mark.parametrize("unsafe_filename", ["../invoice.png", "invoice\r\ncopy.png", "   "])
+def test_binary_asset_unsafe_filename_is_rejected_before_storage(unsafe_filename: str) -> None:
+    with _client() as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Unsafe asset name"}, headers=_auth()
+        ).json()["case_id"]
+        response = client.post(
+            f"/api/v1/cases/{case_id}/document-assets",
+            params={"document_type": "CI", "filename": unsafe_filename},
+            content=_tiny_png(),
+            headers={**_auth(), "Content-Type": "image/png"},
+        )
+        assert response.status_code == 422
+        assets = client.get(f"/api/v1/cases/{case_id}/document-assets", headers=_auth())
+        assert assets.json() == {"items": []}
+
+
+def test_binary_asset_content_type_and_size_limit_are_required_at_public_boundary() -> None:
+    with _client() as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Bounded asset"}, headers=_auth()
+        ).json()["case_id"]
+        path = f"/api/v1/cases/{case_id}/document-assets"
+        params = {"document_type": "CI", "filename": "invoice.png"}
+
+        missing_type = client.post(path, params=params, content=_tiny_png(), headers=_auth())
+        assert missing_type.status_code == 422
+        assert missing_type.json()["code"] == "request_validation_failed"
+
+        too_large = client.build_request(
+            "POST",
+            path,
+            params=params,
+            content=b"not-read",
+            headers={
+                **_auth(),
+                "Content-Type": "image/png",
+                "Content-Length": str(MAX_DOCUMENT_ASSET_BYTES + 1),
+            },
+        )
+        rejected = client.send(too_large)
+        assert rejected.status_code == 413
+        assert rejected.json()["code"] == "request_body_too_large"
+
+        specification = client.get("/openapi.json").json()
+        header = next(
+            value
+            for value in specification["paths"]["/api/v1/cases/{case_id}/document-assets"]["post"][
+                "parameters"
+            ]
+            if value["in"] == "header" and value["name"] == "content-type"
+        )
+        assert header["required"] is True
+
+
+def test_document_asset_upload_streams_the_persisted_source_hash() -> None:
+    """The public binary boundary hashes request chunks before service storage."""
+
+    observed_hashes: list[str] = []
+
+    def extraction_handler(request, content: bytes) -> dict[str, object]:
+        observed_hashes.append(request.source_sha256)
+        return {
+            "schema_version": "1.0",
+            "document_asset_id": request.document_asset_id,
+            "extraction_request_id": request.extraction_request_id,
+            "status": "unavailable",
+            "media_type": request.media_type,
+            "byte_size": len(content),
+            "source_sha256": request.source_sha256,
+            "canonical_text_sha256": None,
+            "extractor_revision": None,
+            "pages": [],
+            "warnings": [{"code": "preview_engine_unavailable"}],
+        }
+
+    with _client(extract_handler=extraction_handler) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Streamed source hash"}, headers=_auth()
+        ).json()["case_id"]
+        payload = _tiny_png()
+        uploaded = client.post(
+            f"/api/v1/cases/{case_id}/document-assets",
+            params={"document_type": "CI", "filename": "invoice.png"},
+            content=payload,
+            headers={**_auth(), "Content-Type": "image/png"},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+
+        # The public DTO intentionally hides the hash.  The extraction request
+        # is the controlled internal boundary that proves the persisted digest.
+        preview = client.post(
+            f"/api/v1/cases/{case_id}/document-assets/{uploaded.json()['asset_id']}/extractions",
+            headers=_auth(),
+        )
+        assert preview.status_code == 202, preview.text
+        assert observed_hashes == [hashlib.sha256(payload).hexdigest()]
+
+
+def test_document_asset_stream_hash_accumulates_chunked_request_body() -> None:
+    payload = _tiny_png()
+    chunks = [payload[:7], payload[7:19], payload[19:]]
+
+    async def receive() -> dict[str, object]:
+        if not chunks:
+            return {"type": "http.disconnect"}
+        return {
+            "type": "http.request",
+            "body": chunks.pop(0),
+            "more_body": bool(chunks),
+        }
+
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/document-assets", "headers": []},
+        receive,
+    )
+    upload = asyncio.run(_read_document_asset_body(request))
+
+    assert upload.content == payload
+    assert upload.source_sha256 == hashlib.sha256(payload).hexdigest()
 
 
 def test_temporal_context_is_persisted_and_forwarded_to_case_assistant() -> None:

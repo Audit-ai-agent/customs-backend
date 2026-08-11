@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 from pydantic import ValidationError
 
 from customs_backend.agent_contract import AgentContractPayloadError, validate_agent_v3_payload
+from customs_backend.binary_assets import inspect_binary_asset
 from customs_backend.case_input_boundary import (
     CASE_DOCUMENT_INPUT_RESPONSE,
     case_input_notice,
@@ -34,6 +35,7 @@ from customs_backend.domain import (
     AnswerScope,
     AgentKnowledgeAnswerRequest,
     AgentKnowledgeAnswerResponse,
+    AgentDocumentExtractionRequest,
     AgentDocumentInput,
     AgentAssistantAnswerRequest,
     AgentAssistantAnswerResponse,
@@ -45,6 +47,7 @@ from customs_backend.domain import (
     CaseCreate,
     CaseRecord,
     CaseStatus,
+    ConfirmedExtractedTextCreate,
     CitationKind,
     CompletionEligibility,
     ConversationCreate,
@@ -60,6 +63,10 @@ from customs_backend.domain import (
     CorrectionProposalRecord,
     CorrectionProposalStatus,
     DocumentRecord,
+    DocumentAssetRecord,
+    DocumentExtractionResult,
+    DocumentType,
+    ExtractionJobRecord,
     ExecutionStatus,
     FindingDecisionRecord,
     FindingDecisionRequest,
@@ -630,6 +637,14 @@ class DocumentView:
     content_text: str
 
 
+@dataclass(frozen=True)
+class DocumentAssetExtractionView:
+    """Operational preview state; it is deliberately outside review input."""
+
+    asset: DocumentAssetRecord
+    job: ExtractionJobRecord
+
+
 class _AssistantTurnLock:
     """Reference-counted keyed lock for one synchronous assistant exchange."""
 
@@ -719,7 +734,12 @@ class WorkbenchService:
         return records
 
     def add_document(
-        self, principal: Principal, case_id: str, request: TextDocumentCreate
+        self,
+        principal: Principal,
+        case_id: str,
+        request: TextDocumentCreate,
+        *,
+        source_asset_id: str | None = None,
     ) -> tuple[CaseRecord, DocumentRecord]:
         self._require_role(principal, Role.reviewer)
         case = self.get_case(principal, case_id)
@@ -742,6 +762,7 @@ class WorkbenchService:
             character_count=len(request.content_text),
             created_by=principal.subject,
             created_at=utc_now(),
+            source_asset_id=source_asset_id,
             replaces_document_id=request.replaces_document_id,
         )
         existing = self.repository.list_documents(principal.org_id, case_id)
@@ -783,6 +804,197 @@ class WorkbenchService:
                 new_manifest_digest=new_manifest_digest,
             ),
             record,
+        )
+
+    def add_document_asset(
+        self,
+        principal: Principal,
+        case_id: str,
+        *,
+        document_type: DocumentType,
+        filename: str,
+        declared_media_type: str,
+        content: bytes,
+        source_sha256: str | None = None,
+    ) -> DocumentAssetRecord:
+        """Store a verified binary source without adding it to text review."""
+
+        self._require_role(principal, Role.reviewer)
+        case = self.get_case(principal, case_id)
+        if case.status == CaseStatus.closed:
+            raise ConflictError("document assets cannot be added to a closed case")
+        inspection = inspect_binary_asset(
+            payload=content, declared_media_type=declared_media_type
+        )
+        asset_id = _id("asset")
+        # Public uploads calculate this digest while consuming the raw stream.
+        # Direct service callers retain the deterministic fallback.  The object
+        # store independently verifies the final bytes against this digest.
+        if source_sha256 is None:
+            digest = hashlib.sha256(content).hexdigest()
+        elif len(source_sha256) == 64 and all(
+            character in "0123456789abcdef" for character in source_sha256
+        ):
+            digest = source_sha256
+        else:
+            raise ValueError("document asset source hash is invalid")
+        record = DocumentAssetRecord(
+            asset_id=asset_id,
+            case_id=case_id,
+            org_id=principal.org_id,
+            document_type=document_type,
+            filename=filename,
+            media_type=inspection.media_type,
+            source_sha256=digest,
+            object_key=f"{principal.org_id}/{case_id}/assets/{asset_id}/{digest}",
+            byte_size=inspection.byte_size,
+            page_count=inspection.page_count,
+            pixel_count=inspection.pixel_count,
+            created_by=principal.subject,
+            created_at=utc_now(),
+        )
+        self.object_store.put_bytes(
+            key=record.object_key,
+            content=content,
+            content_sha256=record.source_sha256,
+            media_type=record.media_type,
+        )
+        return self.repository.add_document_asset(record)
+
+    def list_document_assets(
+        self, principal: Principal, case_id: str
+    ) -> list[DocumentAssetRecord]:
+        self.get_case(principal, case_id)
+        return self.repository.list_document_assets(principal.org_id, case_id)
+
+    def get_document_asset(
+        self, principal: Principal, case_id: str, asset_id: str
+    ) -> DocumentAssetRecord:
+        self.get_case(principal, case_id)
+        record = self.repository.get_document_asset(principal.org_id, case_id, asset_id)
+        if record is None:
+            raise NotFoundError("document asset not found")
+        return record
+
+    @staticmethod
+    def _validate_extraction_result(
+        *, asset: DocumentAssetRecord, request: AgentDocumentExtractionRequest, raw: dict[str, Any]
+    ) -> DocumentExtractionResult:
+        try:
+            validate_agent_v3_payload("document_extraction_result", raw)
+            result = DocumentExtractionResult.model_validate(raw)
+        except (AgentContractPayloadError, ValidationError) as exc:
+            raise AgentResponseRejectedError("Agent document extraction contract is invalid") from exc
+        if (
+            result.document_asset_id != asset.asset_id
+            or result.extraction_request_id != request.extraction_request_id
+            or result.media_type != asset.media_type
+            or result.byte_size != asset.byte_size
+            or result.source_sha256 != asset.source_sha256
+        ):
+            raise AgentResponseRejectedError("Agent document extraction provenance does not match")
+        page_numbers = [page.page_number for page in result.pages]
+        if len(page_numbers) != len(set(page_numbers)) or any(
+            number > asset.page_count for number in page_numbers
+        ):
+            raise AgentResponseRejectedError("Agent document extraction page provenance is invalid")
+        return result
+
+    def request_document_extraction(
+        self, principal: Principal, case_id: str, asset_id: str
+    ) -> DocumentAssetExtractionView:
+        """Run one isolated preview request; its result cannot affect a review."""
+
+        self._require_role(principal, Role.reviewer)
+        case = self.get_case(principal, case_id)
+        if case.status == CaseStatus.closed:
+            raise ConflictError("document extraction cannot be started for a closed case")
+        asset = self.get_document_asset(principal, case_id, asset_id)
+        now = utc_now()
+        job = ExtractionJobRecord(
+            extraction_job_id=_id("extract"),
+            asset_id=asset.asset_id,
+            case_id=case_id,
+            org_id=principal.org_id,
+            status="queued",
+            created_by=principal.subject,
+            created_at=now,
+            updated_at=now,
+        )
+        self.repository.create_extraction_job(job)
+        request = AgentDocumentExtractionRequest(
+            document_asset_id=asset.asset_id,
+            extraction_request_id=job.extraction_job_id,
+            media_type=asset.media_type,
+            source_sha256=asset.source_sha256,
+            byte_size=asset.byte_size,
+        )
+        try:
+            validate_agent_v3_payload("document_extraction_request", request.to_agent_wire())
+            content = self.object_store.get_bytes(
+                key=asset.object_key,
+                expected_sha256=asset.source_sha256,
+                maximum_bytes=asset.byte_size,
+            )
+            result = self._validate_extraction_result(
+                asset=asset,
+                request=request,
+                raw=self.agent.extract_document(request, content),
+            )
+            updated = job.model_copy(
+                update={"status": result.status, "result": result, "updated_at": utc_now()}
+            )
+        except AgentResponseRejectedError:
+            updated = job.model_copy(
+                update={"status": "failed", "error_code": "document_extraction_unavailable", "updated_at": utc_now()}
+            )
+        except (KeyError, ValueError):
+            updated = job.model_copy(
+                update={"status": "failed", "error_code": "document_asset_unavailable", "updated_at": utc_now()}
+            )
+        persisted = self.repository.update_extraction_job(updated)
+        return DocumentAssetExtractionView(asset=asset, job=persisted)
+
+    def get_document_extraction(
+        self, principal: Principal, case_id: str, asset_id: str, extraction_job_id: str
+    ) -> DocumentAssetExtractionView:
+        asset = self.get_document_asset(principal, case_id, asset_id)
+        job = self.repository.get_extraction_job(principal.org_id, case_id, extraction_job_id)
+        if job is None or job.asset_id != asset.asset_id:
+            raise NotFoundError("document extraction job not found")
+        return DocumentAssetExtractionView(asset=asset, job=job)
+
+    def confirm_extracted_text(
+        self,
+        principal: Principal,
+        case_id: str,
+        asset_id: str,
+        request: ConfirmedExtractedTextCreate,
+    ) -> tuple[CaseRecord, DocumentRecord]:
+        """Require a human supplied text value before it joins text-only review."""
+
+        asset = self.get_document_asset(principal, case_id, asset_id)
+        job = self.repository.get_extraction_job(
+            principal.org_id, case_id, request.extraction_job_id
+        )
+        if (
+            job is None
+            or job.asset_id != asset.asset_id
+            or job.status not in {"preview_ready", "needs_review"}
+        ):
+            raise ConflictError(
+                "an available extraction preview is required before text confirmation"
+            )
+        return self.add_document(
+            principal,
+            case_id,
+            TextDocumentCreate(
+                document_type=asset.document_type,
+                filename=request.filename,
+                content_text=request.content_text,
+                replaces_document_id=request.replaces_document_id,
+            ),
+            source_asset_id=asset.asset_id,
         )
 
     def list_document_records(self, principal: Principal, case_id: str) -> list[DocumentRecord]:

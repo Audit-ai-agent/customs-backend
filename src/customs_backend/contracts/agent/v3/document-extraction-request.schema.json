@@ -1,0 +1,31 @@
+{
+  "$id": "https://schemas.customs.local/agent/v3/document-extraction-request.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Metadata carried in required headers for one raw identity-encoded PDF/JPEG/PNG document-preview request. The HTTP body is binary and is intentionally outside this JSON metadata shape; it must never be base64 encoded or embedded in a review request.",
+  "properties": {
+    "document_asset_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "extraction_request_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "source_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "media_type": {
+      "type": "string",
+      "enum": ["application/pdf", "image/jpeg", "image/png"]
+    }
+  },
+  "required": ["document_asset_id", "extraction_request_id", "source_sha256", "media_type"],
+  "title": "Customs AI Agent document extraction binary request metadata",
+  "type": "object"
+}
