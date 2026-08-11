@@ -113,7 +113,7 @@ _REQUIRED_CHECKS = frozenset(
         "knowledge_official_provenance",
         "knowledge_default_boundary",
         "knowledge_v2_scope_coverage",
-        "knowledge_multiscope_clarification",
+        "knowledge_multiscope_checklist",
         "finding_decision",
         "correction_proposed",
         "approver_login",

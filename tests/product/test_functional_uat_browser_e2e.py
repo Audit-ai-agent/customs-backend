@@ -131,6 +131,23 @@ def test_receipt_rejects_raw_or_incomplete_values(tmp_path: Path, mutate) -> Non
         browser_e2e._load_receipt(path)
 
 
+def test_receipt_rejects_the_legacy_multiscope_clarification_check(tmp_path: Path) -> None:
+    payload = _receipt()
+    payload["checks"] = [
+        (
+            "knowledge_multiscope_clarification"
+            if value == "knowledge_multiscope_checklist"
+            else value
+        )
+        for value in payload["checks"]
+    ]
+    path = tmp_path / "receipt.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(browser_e2e.BrowserE2eError, match="receipt_invalid"):
+        browser_e2e._load_receipt(path)
+
+
 def test_child_environment_is_narrow_and_keeps_only_declared_credentials(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -420,7 +437,7 @@ def test_browser_receipt_requires_current_workbench_correctness_checks() -> None
         "knowledge_official_provenance",
         "knowledge_default_boundary",
         "knowledge_v2_scope_coverage",
-        "knowledge_multiscope_clarification",
+        "knowledge_multiscope_checklist",
         "export_document_registered",
         "export_partial_coverage",
         "export_human_review_required",
