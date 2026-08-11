@@ -21,6 +21,7 @@ from customs_backend.domain import (
     FindingDecisionHistoryEntry,
     FindingDecisionRecord,
     FindingDecisionStatus,
+    GuidanceRegistryVersion,
     JobRecord,
     KnowledgeConversationRecord,
     ReviewRunRecord,
@@ -463,6 +464,8 @@ class InMemoryWorkbenchRepository:
         assistant_message: ConversationMessageRecord,
         idempotency_key: str,
         idempotency_request_digest: str,
+        conversation_snapshot_id: str | None = None,
+        guidance_registry_version: GuidanceRegistryVersion | None = None,
     ) -> tuple[ConversationMessageExchange, bool]:
         with self._lock:
             conversation = self._conversations.get(user_message.conversation_id)
@@ -485,6 +488,20 @@ class InMemoryWorkbenchRepository:
                 return self._exchange(user_id, assistant_id), False
             if user_message.role.value != "user" or assistant_message.role.value != "assistant":
                 raise ConflictError("conversation exchange roles are invalid")
+            if guidance_registry_version is not None and conversation_snapshot_id is None:
+                raise ConflictError("conversation guidance snapshot binding is incomplete")
+            if (
+                conversation.snapshot_id is not None
+                and conversation_snapshot_id is not None
+                and conversation_snapshot_id != conversation.snapshot_id
+            ):
+                raise ConflictError("conversation cannot switch its resolved snapshot")
+            if (
+                conversation.guidance_registry_version is not None
+                and guidance_registry_version is not None
+                and guidance_registry_version != conversation.guidance_registry_version
+            ):
+                raise ConflictError("conversation cannot switch its guidance registry")
             self._messages[user_message.message_id] = self._copy(user_message)
             self._messages[assistant_message.message_id] = self._copy(assistant_message)
             self._chat_idempotency[key] = (
@@ -493,7 +510,15 @@ class InMemoryWorkbenchRepository:
                 assistant_message.message_id,
             )
             self._conversations[conversation.conversation_id] = self._copy(
-                conversation.model_copy(update={"updated_at": assistant_message.created_at})
+                conversation.model_copy(
+                    update={
+                        "snapshot_id": conversation.snapshot_id or conversation_snapshot_id,
+                        "guidance_registry_version": (
+                            conversation.guidance_registry_version or guidance_registry_version
+                        ),
+                        "updated_at": assistant_message.created_at,
+                    }
+                )
             )
             return self._exchange(user_message.message_id, assistant_message.message_id), True
 
@@ -604,6 +629,7 @@ class InMemoryWorkbenchRepository:
         knowledge_snapshot_id: str | None,
         idempotency_key: str,
         idempotency_request_digest: str,
+        guidance_registry_version: GuidanceRegistryVersion | None = None,
     ) -> tuple[ConversationMessageExchange, bool]:
         with self._lock:
             conversation = self._knowledge_conversations.get(user_message.conversation_id)
@@ -628,6 +654,8 @@ class InMemoryWorkbenchRepository:
                 return self._knowledge_exchange(user_id, assistant_id), False
             if user_message.role.value != "user" or assistant_message.role.value != "assistant":
                 raise ConflictError("knowledge conversation exchange roles are invalid")
+            if guidance_registry_version is not None and knowledge_snapshot_id is None:
+                raise ConflictError("knowledge guidance snapshot binding is incomplete")
             # A classified V2 no-coverage turn may have no Data snapshot at
             # all.  Preserve an existing conversation pin, while continuing
             # to reject a different non-null snapshot on a later covered
@@ -638,6 +666,12 @@ class InMemoryWorkbenchRepository:
                 and knowledge_snapshot_id != conversation.snapshot_id
             ):
                 raise ConflictError("knowledge conversation cannot switch its resolved snapshot")
+            if (
+                conversation.guidance_registry_version is not None
+                and guidance_registry_version is not None
+                and guidance_registry_version != conversation.guidance_registry_version
+            ):
+                raise ConflictError("knowledge conversation cannot switch its guidance registry")
             self._knowledge_messages[user_message.message_id] = self._copy(user_message)
             self._knowledge_messages[assistant_message.message_id] = self._copy(assistant_message)
             self._knowledge_chat_idempotency[key] = (
@@ -649,6 +683,9 @@ class InMemoryWorkbenchRepository:
                 conversation.model_copy(
                     update={
                         "snapshot_id": conversation.snapshot_id or knowledge_snapshot_id,
+                        "guidance_registry_version": (
+                            conversation.guidance_registry_version or guidance_registry_version
+                        ),
                         "updated_at": assistant_message.created_at,
                     }
                 )

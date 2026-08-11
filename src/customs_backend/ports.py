@@ -16,6 +16,7 @@ from customs_backend.domain import (
     DocumentRecord,
     FindingDecisionRecord,
     FindingDecisionStatus,
+    GuidanceRegistryVersion,
     JobRecord,
     KnowledgeConversationRecord,
     ReviewRunRecord,
@@ -119,6 +120,8 @@ class WorkbenchRepository(Protocol):
         assistant_message: ConversationMessageRecord,
         idempotency_key: str,
         idempotency_request_digest: str,
+        conversation_snapshot_id: str | None = None,
+        guidance_registry_version: GuidanceRegistryVersion | None = None,
     ) -> tuple[ConversationMessageExchange, bool]: ...
     def create_knowledge_conversation(
         self, record: KnowledgeConversationRecord
@@ -149,6 +152,7 @@ class WorkbenchRepository(Protocol):
         knowledge_snapshot_id: str | None,
         idempotency_key: str,
         idempotency_request_digest: str,
+        guidance_registry_version: GuidanceRegistryVersion | None = None,
     ) -> tuple[ConversationMessageExchange, bool]: ...
     def create_correction_proposal(
         self, record: CorrectionProposalRecord

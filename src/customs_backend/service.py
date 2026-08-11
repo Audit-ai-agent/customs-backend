@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import threading
 import uuid
 from dataclasses import dataclass
@@ -71,6 +72,7 @@ from customs_backend.domain import (
     FindingDecisionRecord,
     FindingDecisionRequest,
     GuidanceResolution,
+    GuidanceRegistryVersion,
     InputDocumentManifestEntry,
     KnowledgeConversationCreate,
     KnowledgeConversationRecord,
@@ -87,6 +89,7 @@ from customs_backend.domain import (
     ReviewRunRecord,
     Role,
     TemporalContext,
+    TemporalCoverage,
     TextDocumentCreate,
     canonical_digest,
     canonical_json_bytes,
@@ -128,6 +131,7 @@ _DECLARED_TYPE_MAP: dict[
 }
 _MAX_DOCUMENTS = 20
 _MAX_AGENT_REQUEST_BYTES = 2 * 1024 * 1024
+_V2_GUIDANCE_SNAPSHOT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{2,80}$")
 _OFFICIAL_GUIDANCE_HOSTS = frozenset(
     {
         "law.go.kr",
@@ -175,16 +179,16 @@ def _scoped_knowledge_conversation_idempotency_key(
     )
 
 
-def _citation_key(citation: MessageCitation) -> tuple[str, str]:
+def _citation_key(citation: MessageCitation) -> tuple[str, str, int | None]:
     """Use one stable identity for legacy Case and snapshot-source citations."""
 
     if citation.kind == CitationKind.guidance_evidence:
         if citation.source_id is None:  # guarded by the domain model
             raise ConflictError("guidance citation has no source identity")
-        return citation.kind.value, citation.source_id
+        return citation.kind.value, citation.source_id, citation.resolution_index
     if citation.reference_id is None:  # guarded by the domain model
         raise ConflictError("case citation has no reference identity")
-    return citation.kind.value, citation.reference_id
+    return citation.kind.value, citation.reference_id, None
 
 
 def _canonical_citation(citation: MessageCitation) -> bytes:
@@ -208,6 +212,10 @@ def _validate_answer_sections(
     second unvalidated source into storage or the Browser.
     """
 
+    if any(section.resolution_index is not None for section in sections):
+        raise ConflictError("single-scope answer sections cannot carry a resolution index")
+    if any(item.resolution_index is not None for item in citations):
+        raise ConflictError("single-scope citations cannot carry a resolution index")
     if len({section.kind for section in sections}) != len(sections):
         raise ConflictError("assistant response repeats an answer section kind")
     expected_order = {
@@ -356,6 +364,249 @@ def _validate_guidance_citations(
             raise ConflictError("guidance citation cannot claim unavailable coverage")
 
 
+def _validate_multi_scope_metadata(
+    *,
+    guidance_resolution: GuidanceResolution | None,
+    guidance_resolutions: list[GuidanceResolution] | None,
+    answer_format: str | None,
+    guidance_registry_sha256: str | None,
+    expected_as_of: date,
+) -> tuple[GuidanceResolution, GuidanceResolution] | None:
+    """Validate the fixed two-V2-scope envelope before any citation is used.
+
+    The singular field remains optional for legacy/no-coverage responses.  The
+    plural form is deliberately all-or-nothing so a client cannot mistake a
+    one-scope answer for a two-scope checklist.
+    """
+
+    if guidance_resolutions is None:
+        if answer_format is not None:
+            raise ConflictError("multi-scope format requires two guidance resolutions")
+        return None
+    if guidance_resolution is not None:
+        raise ConflictError("guidance resolution forms are mutually exclusive")
+    if answer_format != "multi_scope_checklist":
+        raise ConflictError("two guidance resolutions require the multi-scope format")
+    if len(guidance_resolutions) != 2:
+        raise ConflictError("multi-scope answer requires exactly two guidance resolutions")
+    first, second = guidance_resolutions
+    if first.registry_version != "2.0" or second.registry_version != "2.0":
+        raise ConflictError("multi-scope answer requires the V2 guidance registry")
+    if (first.topic, first.scope) == (second.topic, second.scope):
+        raise ConflictError("multi-scope answer requires independent guidance scopes")
+    if first.as_of != expected_as_of or second.as_of != expected_as_of:
+        raise ConflictError("multi-scope guidance resolution date is invalid")
+    try:
+        registries = [
+            validate_guidance_resolution(
+                registry_version=resolution.registry_version,
+                topic=resolution.topic,
+                scope=resolution.scope,
+                requested_direction=resolution.requested_direction,
+                applicable_directions=resolution.applicable_directions,
+                coverage=resolution.coverage,
+            )
+            for resolution in (first, second)
+        ]
+    except (AttributeError, GuidanceRegistryProjectionError) as exc:
+        raise ConflictError("multi-scope guidance provenance is outside the registry projection") from exc
+    if any(guidance_registry_sha256 != registry.registry_sha256 for registry in registries):
+        raise ConflictError("multi-scope guidance registry digest is invalid")
+    return first, second
+
+
+def _validate_multi_scope_guidance_citations(
+    citations: list[MessageCitation],
+    *,
+    resolutions: tuple[GuidanceResolution, GuidanceResolution],
+    expected_as_of: date,
+    functional_uat: bool,
+) -> None:
+    """Validate every official citation against its own resolution index."""
+
+    registries = [
+        validate_guidance_resolution(
+            registry_version=resolution.registry_version,
+            topic=resolution.topic,
+            scope=resolution.scope,
+            requested_direction=resolution.requested_direction,
+            applicable_directions=resolution.applicable_directions,
+            coverage=resolution.coverage,
+        )
+        for resolution in resolutions
+    ]
+    for citation in citations:
+        if citation.kind != CitationKind.guidance_evidence:
+            if citation.resolution_index is not None:
+                raise ConflictError("case citation cannot carry a resolution index")
+            continue
+        index = citation.resolution_index
+        if index not in {0, 1}:
+            raise ConflictError("multi-scope guidance citation has no resolution index")
+        resolution = resolutions[index]
+        registry = registries[index]
+        if (
+            citation.as_of != expected_as_of
+            or citation.as_of != resolution.as_of
+            or citation.snapshot_id != resolution.snapshot_id
+            or citation.coverage != resolution.coverage
+        ):
+            raise ConflictError("multi-scope guidance citation snapshot is inconsistent")
+        if citation.registry_source_id is None:
+            raise ConflictError("multi-scope V2 guidance citation has no registry source")
+        try:
+            validate_guidance_citation(
+                registry=registry,
+                registry_source_id=citation.registry_source_id,
+                source_kind=str(citation.source_kind),
+                source_title=str(citation.source_title),
+                source_uri=str(citation.source_uri),
+                topic=resolution.topic,
+                scope=resolution.scope,
+                requested_direction=resolution.requested_direction,
+                applicable_directions=resolution.applicable_directions,
+            )
+        except (AttributeError, GuidanceRegistryProjectionError) as exc:
+            raise ConflictError("multi-scope guidance citation is outside the registry projection") from exc
+        if functional_uat and citation.source_kind == "development_fixture":
+            raise ConflictError("functional UAT guidance requires an official snapshot source")
+        if citation.coverage != "covered":
+            raise ConflictError("multi-scope checklist citation must be covered")
+
+
+def _validate_multi_scope_section_citations(
+    sections: list[AnswerSection], *, citations: list[MessageCitation]
+) -> None:
+    """Require every displayed section citation to be an exact top-level item."""
+
+    known = {_canonical_citation(item) for item in citations}
+    for section in sections:
+        if not section.citations:
+            raise ConflictError("answer section requires at least one canonical citation")
+        section_keys = [_citation_key(item) for item in section.citations]
+        if len(section_keys) != len(set(section_keys)):
+            raise ConflictError("answer section repeats a citation")
+        if any(_canonical_citation(item) not in known for item in section.citations):
+            raise ConflictError("answer section citation differs from its canonical citation")
+
+
+def _validate_multi_scope_case_sections(
+    sections: list[AnswerSection], *, citations: list[MessageCitation]
+) -> None:
+    expected = (
+        (AnswerSectionKind.case_analysis, None),
+        (AnswerSectionKind.general_guidance, 0),
+        (AnswerSectionKind.general_guidance, 1),
+        (AnswerSectionKind.case_application, None),
+    )
+    actual = tuple((section.kind, section.resolution_index) for section in sections)
+    if actual != expected:
+        raise ConflictError("multi-scope checklist must use the fixed four-section order")
+    _validate_multi_scope_section_citations(sections, citations=citations)
+    case_section, first_guidance, second_guidance, application = sections
+    if any(item.kind == CitationKind.guidance_evidence for item in case_section.citations):
+        raise ConflictError("multi-scope case analysis requires only case citations")
+    for index, section in enumerate((first_guidance, second_guidance)):
+        if any(
+            item.kind != CitationKind.guidance_evidence or item.resolution_index != index
+            for item in section.citations
+        ):
+            raise ConflictError("multi-scope guidance section uses another resolution citation")
+    application_indexes = {
+        item.resolution_index
+        for item in application.citations
+        if item.kind == CitationKind.guidance_evidence
+    }
+    if (
+        not any(item.kind != CitationKind.guidance_evidence for item in application.citations)
+        or application_indexes != {0, 1}
+    ):
+        raise ConflictError("multi-scope application requires case and both guidance citations")
+
+
+def _validate_multi_scope_knowledge_sections(
+    sections: list[AnswerSection], *, citations: list[MessageCitation]
+) -> None:
+    expected = (
+        (AnswerSectionKind.general_guidance, 0),
+        (AnswerSectionKind.general_guidance, 1),
+    )
+    actual = tuple((section.kind, section.resolution_index) for section in sections)
+    if actual != expected:
+        raise ConflictError("multi-scope knowledge answer requires two indexed guidance sections")
+    _validate_multi_scope_section_citations(sections, citations=citations)
+    for index, section in enumerate(sections):
+        if any(
+            item.kind != CitationKind.guidance_evidence or item.resolution_index != index
+            for item in section.citations
+        ):
+            raise ConflictError("multi-scope knowledge section uses another resolution citation")
+
+
+def _multi_scope_is_complete(
+    resolutions: tuple[GuidanceResolution, GuidanceResolution],
+) -> tuple[bool, str | None]:
+    snapshots = {item.snapshot_id for item in resolutions}
+    if any(item.coverage != "covered" for item in resolutions):
+        return False, None
+    if len(snapshots) != 1:
+        return False, None
+    snapshot_id = next(iter(snapshots))
+    return snapshot_id is not None, snapshot_id
+
+
+def _guidance_snapshot_binding(
+    *,
+    guidance_resolution: GuidanceResolution | None,
+    guidance_resolutions: list[GuidanceResolution] | None,
+) -> tuple[str | None, GuidanceRegistryVersion | None]:
+    """Return a durable snapshot binding only when an answer selects one.
+
+    A partial two-scope result deliberately returns no binding: its visible
+    response does not represent one combined snapshot, so persisting one peer
+    would make later turns look more complete than the original answer.  V1
+    bindings remain persisted for history, but only the separate stored-V2
+    helper may send a pin back to Agent/Data.
+    """
+
+    if guidance_resolutions is not None:
+        if len(guidance_resolutions) != 2:
+            raise ConflictError("multi-scope answer requires exactly two guidance resolutions")
+        if any(item.registry_version != "2.0" for item in guidance_resolutions):
+            raise ConflictError("multi-scope answer requires the V2 guidance registry")
+        complete, snapshot_id = _multi_scope_is_complete(
+            (guidance_resolutions[0], guidance_resolutions[1])
+        )
+        if not complete:
+            return None, None
+        assert snapshot_id is not None
+        if _V2_GUIDANCE_SNAPSHOT_ID.fullmatch(snapshot_id) is None:
+            raise ConflictError("V2 guidance snapshot identifier is invalid")
+        return snapshot_id, "2.0"
+    if guidance_resolution is None or guidance_resolution.snapshot_id is None:
+        return None, None
+    if (
+        guidance_resolution.registry_version == "2.0"
+        and _V2_GUIDANCE_SNAPSHOT_ID.fullmatch(guidance_resolution.snapshot_id) is None
+    ):
+        raise ConflictError("V2 guidance snapshot identifier is invalid")
+    return guidance_resolution.snapshot_id, guidance_resolution.registry_version
+
+
+def _stored_v2_snapshot_pin(
+    *, snapshot_id: str | None, registry_version: GuidanceRegistryVersion | None
+) -> str | None:
+    """Return only a verified V2 pin; retain legacy V1 state without sending it."""
+
+    if registry_version is None:
+        return None
+    if registry_version != "2.0":
+        return None
+    if snapshot_id is None or _V2_GUIDANCE_SNAPSHOT_ID.fullmatch(snapshot_id) is None:
+        raise ConflictError("stored V2 guidance snapshot identifier is invalid")
+    return snapshot_id
+
+
 def _is_safe_official_guidance_uri(value: str | None) -> bool:
     """Accept only the versioned registry's public HTTPS source hosts."""
 
@@ -467,15 +718,17 @@ def _result_digest(
 def _agent_result_hash_payload(result: dict[str, Any]) -> dict[str, Any]:
     """Return the Agent-defined canonical payload for ``result_sha256``.
 
-    ``temporal_context`` is an additive field.  Its explicit ``null`` value
-    means that no temporal provenance was supplied, so the Agent deliberately
-    hashes it exactly like a historic result where the field was absent.  A
-    populated context remains part of the provider hash.
+    ``temporal_context`` and ``temporal_coverage`` are additive fields.  Their
+    explicit ``null`` values mean that no temporal provenance was supplied, so
+    the Agent deliberately hashes them exactly like a historic result where
+    the fields were absent.  Populated values remain part of the provider hash.
     """
 
     payload = {key: value for key, value in result.items() if key != "result_sha256"}
     if payload.get("temporal_context") is None:
         payload.pop("temporal_context", None)
+    if payload.get("temporal_coverage") is None:
+        payload.pop("temporal_coverage", None)
     return payload
 
 
@@ -516,6 +769,11 @@ def _agent_result_snapshot(run: ReviewRunRecord) -> dict[str, Any]:
     # historic result, while a populated context is hash-protected.
     result["temporal_context"] = (
         run.temporal_context.model_dump(mode="json") if run.temporal_context is not None else None
+    )
+    result["temporal_coverage"] = (
+        run.temporal_coverage.model_dump(mode="json")
+        if run.temporal_coverage is not None
+        else None
     )
     if canonical_digest(_agent_result_hash_payload(result)) != run.provider_result_sha256:
         raise ConflictError("persisted Agent result is not hash-consistent for assistant context")
@@ -1114,8 +1372,15 @@ class WorkbenchService:
                 if result.get("temporal_context") is not None
                 else None
             )
+            temporal_coverage = (
+                TemporalCoverage.model_validate(result["temporal_coverage"])
+                if result.get("temporal_coverage") is not None
+                else None
+            )
             if temporal_context is not None and temporal_context.law_as_of != review_as_of:
                 raise ValueError("temporal law_as_of must match review_as_of")
+            if temporal_coverage is not None and temporal_context is None:
+                raise ValueError("temporal coverage requires temporal context")
         except (AgentContractPayloadError, KeyError, TypeError, ValueError, ValidationError) as exc:
             raise ConflictError("Agent result does not satisfy the V3 review contract") from exc
         expected_provider_result_sha256 = canonical_digest(_agent_result_hash_payload(result))
@@ -1199,6 +1464,7 @@ class WorkbenchService:
             agent_jurisdiction=agent_jurisdiction,
             agent_requires_human_review=True,
             temporal_context=temporal_context,
+            temporal_coverage=temporal_coverage,
             review_disposition=ReviewDisposition.human_review_required,
             assurance_level=AssuranceLevel.diagnostic,
             completion_eligibility=eligibility,
@@ -1377,6 +1643,11 @@ class WorkbenchService:
             if existing is not None:
                 return existing
 
+            # Another turn may have completed while this idempotency key waited.
+            # Reload the immutable V2 pin before the Agent request so a later
+            # lookup cannot silently select the active snapshot again.
+            conversation, run = self._get_conversation(principal, conversation_id)
+
             input_notice = case_input_notice(request.content)
             if input_notice is not None:
                 # Preserve the authorised Case conversation record, but do
@@ -1426,6 +1697,10 @@ class WorkbenchService:
                     )
                     for item in history
                 ],
+                expected_snapshot_id=_stored_v2_snapshot_pin(
+                    snapshot_id=conversation.snapshot_id,
+                    registry_version=conversation.guidance_registry_version,
+                ),
             )
             answer_wire = answer_request.to_agent_wire()
             try:
@@ -1468,21 +1743,66 @@ class WorkbenchService:
                 for citation in answer.citations
             ):
                 raise ConflictError("Agent assistant response contains an unknown citation")
-            _validate_guidance_citations(
-                answer.citations,
-                expected_as_of=run.review_as_of,
-                functional_uat=functional_uat,
+            multi_resolutions = _validate_multi_scope_metadata(
                 guidance_resolution=answer.guidance_resolution,
+                guidance_resolutions=answer.guidance_resolutions,
+                answer_format=answer.answer_format,
                 guidance_registry_sha256=answer.guidance_registry_sha256,
+                expected_as_of=run.review_as_of,
             )
-            _validate_answer_sections(
-                answer.answer_sections, citations=answer.citations, global_only=False
-            )
+            if multi_resolutions is None:
+                _validate_guidance_citations(
+                    answer.citations,
+                    expected_as_of=run.review_as_of,
+                    functional_uat=functional_uat,
+                    guidance_resolution=answer.guidance_resolution,
+                    guidance_registry_sha256=answer.guidance_registry_sha256,
+                )
+                _validate_answer_sections(
+                    answer.answer_sections, citations=answer.citations, global_only=False
+                )
+            else:
+                if answer.correction_draft is not None:
+                    raise ConflictError("multi-scope checklist cannot contain a correction draft")
+                complete, _snapshot_id = _multi_scope_is_complete(multi_resolutions)
+                if answer.answer_scope == AnswerScope.insufficient_evidence:
+                    if answer.citations or answer.answer_sections:
+                        raise ConflictError(
+                            "incomplete multi-scope answer cannot expose citations or sections"
+                        )
+                else:
+                    if not complete:
+                        raise ConflictError("multi-scope checklist requires both scopes covered")
+                    if answer.answer_scope not in {
+                        AnswerScope.case_grounded,
+                        AnswerScope.evidence_grounded,
+                    }:
+                        raise ConflictError("multi-scope checklist requires a case-grounded answer")
+                    guidance_citations = [
+                        item
+                        for item in answer.citations
+                        if item.kind == CitationKind.guidance_evidence
+                    ]
+                    if {item.resolution_index for item in guidance_citations} != {0, 1}:
+                        raise ConflictError(
+                            "multi-scope guidance citations require both resolution indexes"
+                        )
+                    _validate_multi_scope_guidance_citations(
+                        answer.citations,
+                        resolutions=multi_resolutions,
+                        expected_as_of=run.review_as_of,
+                        functional_uat=functional_uat,
+                    )
+                    _validate_multi_scope_case_sections(
+                        answer.answer_sections, citations=answer.citations
+                    )
             if answer.case_input_notice is not None and (
                 answer.citations
                 or answer.answer_sections
                 or answer.correction_draft is not None
                 or answer.guidance_resolution is not None
+                or answer.guidance_resolutions is not None
+                or answer.answer_format is not None
                 or answer.guidance_registry_sha256 is not None
             ):
                 raise ConflictError("case input notice response cannot create review evidence")
@@ -1497,6 +1817,10 @@ class WorkbenchService:
                     item_id=answer.correction_draft.item_id,
                     finding_id=None,
                 )
+            conversation_snapshot_id, guidance_registry_version = _guidance_snapshot_binding(
+                guidance_resolution=answer.guidance_resolution,
+                guidance_resolutions=answer.guidance_resolutions,
+            )
             now = utc_now()
             exchange, _created = self.repository.append_message_exchange(
                 user_message=ConversationMessageRecord(
@@ -1518,12 +1842,16 @@ class WorkbenchService:
                     suggested_questions=answer.suggested_questions,
                     correction_draft=answer.correction_draft,
                     guidance_resolution=answer.guidance_resolution,
+                    guidance_resolutions=answer.guidance_resolutions,
+                    answer_format=answer.answer_format,
                     case_input_notice=answer.case_input_notice,
                     created_by="customs-ai-agent",
                     created_at=now + timedelta(microseconds=1),
                 ),
                 idempotency_key=scoped_key,
                 idempotency_request_digest=request_digest,
+                conversation_snapshot_id=conversation_snapshot_id,
+                guidance_registry_version=guidance_registry_version,
             )
             return exchange
         finally:
@@ -1649,6 +1977,7 @@ class WorkbenchService:
             # Re-read under the per-turn lock.  Historical user turns remain
             # fail-closed, and standalone knowledge never replays historical
             # prose to Agent, Data, Claude, or a transcript.
+            conversation = self._get_knowledge_conversation(principal, conversation_id)
             history = self.repository.list_knowledge_messages(
                 principal.org_id, principal.subject, conversation_id
             )
@@ -1662,6 +1991,10 @@ class WorkbenchService:
                 trade_type=conversation.trade_type,
                 as_of=conversation.as_of,
                 recent_turns=[],
+                expected_snapshot_id=_stored_v2_snapshot_pin(
+                    snapshot_id=conversation.snapshot_id,
+                    registry_version=conversation.guidance_registry_version,
+                ),
             )
             answer_wire = answer_request.to_agent_wire()
             try:
@@ -1694,71 +2027,123 @@ class WorkbenchService:
                 "out_of_scope",
             }:
                 raise ConflictError("knowledge answer has an invalid scope")
+            multi_resolutions = _validate_multi_scope_metadata(
+                guidance_resolution=answer.guidance_resolution,
+                guidance_resolutions=answer.guidance_resolutions,
+                answer_format=answer.answer_format,
+                guidance_registry_sha256=answer.guidance_registry_sha256,
+                expected_as_of=conversation.as_of,
+            )
             citation_keys = [_citation_key(item) for item in answer.citations]
             if len(citation_keys) != len(set(citation_keys)):
                 raise ConflictError("Agent knowledge answer repeats a citation")
             if any(item.kind != CitationKind.guidance_evidence for item in answer.citations):
                 raise ConflictError("knowledge answer contains a non-guidance citation")
-            if any(
-                item.as_of != answer.as_of
-                or item.snapshot_id != answer.snapshot_id
-                or item.coverage != answer.coverage
-                for item in answer.citations
-            ):
-                raise ConflictError(
-                    "knowledge answer citation does not match its resolved snapshot"
-                )
-            if answer.guidance_resolution is not None and (
-                answer.guidance_resolution.as_of != answer.as_of
-                or answer.guidance_resolution.snapshot_id != answer.snapshot_id
-                or answer.guidance_resolution.coverage != answer.coverage
-            ):
-                raise ConflictError("knowledge answer resolution does not match its snapshot")
-            _validate_guidance_citations(
-                answer.citations,
-                expected_as_of=conversation.as_of,
-                functional_uat=functional_uat,
-                guidance_resolution=answer.guidance_resolution,
-                guidance_registry_sha256=answer.guidance_registry_sha256,
-            )
-            if answer.answer_scope.value == "general_customs_guidance" and not citation_keys:
-                raise ConflictError("grounded knowledge answer requires an official citation")
-            if answer.answer_scope.value == "general_customs_guidance" and answer.coverage not in {
-                "covered",
-                "partial",
-            }:
-                raise ConflictError("grounded knowledge answer has no covered snapshot")
-            # A V2 no-coverage answer can be deliberately resolved before
-            # Data is called (for example, export-side customs value).  Its
-            # ``snapshot_id`` is therefore ``null``.  It cannot replace the
-            # immutable snapshot already pinned by an earlier covered answer,
-            # but it is not a snapshot switch either.  A *non-null* later
-            # snapshot still has to match exactly.
-            if (
-                conversation.snapshot_id is not None
-                and answer.snapshot_id is not None
-                and answer.snapshot_id != conversation.snapshot_id
-            ):
-                raise ConflictError("knowledge conversation cannot switch its resolved snapshot")
-            _validate_answer_sections(
-                answer.answer_sections, citations=answer.citations, global_only=True
-            )
-            if answer.answer_scope.value != "general_customs_guidance" and answer.answer_sections:
-                raise ConflictError(
-                    "non-guidance knowledge answer cannot contain a guidance section"
-                )
-            sections = answer.answer_sections
-            if answer.answer_scope.value == "general_customs_guidance" and not sections:
-                sections = [
-                    AnswerSection(
-                        kind=AnswerSectionKind.general_guidance,
-                        title="공식 통관 안내",
-                        content=answer.direct_answer,
-                        citations=answer.citations,
+            if multi_resolutions is None:
+                if any(
+                    item.as_of != answer.as_of
+                    or item.snapshot_id != answer.snapshot_id
+                    or item.coverage != answer.coverage
+                    for item in answer.citations
+                ):
+                    raise ConflictError(
+                        "knowledge answer citation does not match its resolved snapshot"
                     )
-                ]
+                if answer.guidance_resolution is not None and (
+                    answer.guidance_resolution.as_of != answer.as_of
+                    or answer.guidance_resolution.snapshot_id != answer.snapshot_id
+                    or answer.guidance_resolution.coverage != answer.coverage
+                ):
+                    raise ConflictError("knowledge answer resolution does not match its snapshot")
+                _validate_guidance_citations(
+                    answer.citations,
+                    expected_as_of=conversation.as_of,
+                    functional_uat=functional_uat,
+                    guidance_resolution=answer.guidance_resolution,
+                    guidance_registry_sha256=answer.guidance_registry_sha256,
+                )
+                if answer.answer_scope.value == "general_customs_guidance" and not citation_keys:
+                    raise ConflictError("grounded knowledge answer requires an official citation")
+                if answer.answer_scope.value == "general_customs_guidance" and answer.coverage not in {
+                    "covered",
+                    "partial",
+                }:
+                    raise ConflictError("grounded knowledge answer has no covered snapshot")
+                # A V2 no-coverage answer can be deliberately resolved before
+                # Data is called (for example, export-side customs value).  Its
+                # ``snapshot_id`` is therefore ``null``.  It cannot replace the
+                # immutable snapshot already pinned by an earlier covered answer,
+                # but it is not a snapshot switch either.  A *non-null* later
+                # snapshot still has to match exactly.
+                if (
+                    conversation.snapshot_id is not None
+                    and answer.snapshot_id is not None
+                    and answer.snapshot_id != conversation.snapshot_id
+                ):
+                    raise ConflictError("knowledge conversation cannot switch its resolved snapshot")
+                _validate_answer_sections(
+                    answer.answer_sections, citations=answer.citations, global_only=True
+                )
+                if answer.answer_scope.value != "general_customs_guidance" and answer.answer_sections:
+                    raise ConflictError(
+                        "non-guidance knowledge answer cannot contain a guidance section"
+                    )
+                sections = answer.answer_sections
+                if answer.answer_scope.value == "general_customs_guidance" and not sections:
+                    sections = [
+                        AnswerSection(
+                            kind=AnswerSectionKind.general_guidance,
+                            title="공식 통관 안내",
+                            content=answer.direct_answer,
+                            citations=answer.citations,
+                        )
+                    ]
+                knowledge_snapshot_id = answer.snapshot_id
+            else:
+                complete, common_snapshot_id = _multi_scope_is_complete(multi_resolutions)
+                if answer.answer_scope == AnswerScope.insufficient_evidence:
+                    if answer.citations or answer.answer_sections:
+                        raise ConflictError(
+                            "incomplete multi-scope answer cannot expose citations or sections"
+                        )
+                else:
+                    if not complete or common_snapshot_id is None:
+                        raise ConflictError("multi-scope knowledge answer requires both scopes covered")
+                    if answer.answer_scope != AnswerScope.general_customs_guidance:
+                        raise ConflictError(
+                            "multi-scope knowledge answer requires official guidance scope"
+                        )
+                    if answer.coverage != "covered" or answer.snapshot_id != common_snapshot_id:
+                        raise ConflictError(
+                            "multi-scope knowledge answer does not match its common snapshot"
+                        )
+                    if {item.resolution_index for item in answer.citations} != {0, 1}:
+                        raise ConflictError(
+                            "multi-scope guidance citations require both resolution indexes"
+                        )
+                    _validate_multi_scope_guidance_citations(
+                        answer.citations,
+                        resolutions=multi_resolutions,
+                        expected_as_of=conversation.as_of,
+                        functional_uat=functional_uat,
+                    )
+                    _validate_multi_scope_knowledge_sections(
+                        answer.answer_sections, citations=answer.citations
+                    )
+                sections = answer.answer_sections
             if any(not item.strip() for item in answer.suggested_questions):
                 raise ConflictError("Agent knowledge answer contains an empty suggested question")
+            _binding_snapshot_id, guidance_registry_version = _guidance_snapshot_binding(
+                guidance_resolution=answer.guidance_resolution,
+                guidance_resolutions=answer.guidance_resolutions,
+            )
+            if multi_resolutions is None:
+                # Preserve pre-V2 snapshot persistence for legacy responses
+                # that predate an explicit registry resolution, while only a
+                # verified V2 registry version is ever sent back as a selector.
+                knowledge_snapshot_id = answer.snapshot_id
+            else:
+                knowledge_snapshot_id = _binding_snapshot_id
             now = utc_now()
             exchange, _created = self.repository.append_knowledge_message_exchange(
                 user_message=ConversationMessageRecord(
@@ -1782,12 +2167,15 @@ class WorkbenchService:
                     knowledge_snapshot_id=answer.snapshot_id,
                     knowledge_as_of=answer.as_of,
                     guidance_resolution=answer.guidance_resolution,
+                    guidance_resolutions=answer.guidance_resolutions,
+                    answer_format=answer.answer_format,
                     created_by="customs-ai-agent",
                     created_at=now + timedelta(microseconds=1),
                 ),
-                knowledge_snapshot_id=answer.snapshot_id,
+                knowledge_snapshot_id=knowledge_snapshot_id,
                 idempotency_key=scoped_key,
                 idempotency_request_digest=request_digest,
+                guidance_registry_version=guidance_registry_version,
             )
             return exchange
         finally:
