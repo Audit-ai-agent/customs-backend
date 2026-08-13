@@ -2467,6 +2467,13 @@ class WorkbenchService:
             decided_by=principal.subject,
         )
 
+    def delete_case(self, principal: Principal, case_id: str) -> None:
+        """Local admin removal of a whole case; reviewer-only, irreversible."""
+
+        self._require_role(principal, Role.reviewer)
+        self.get_case(principal, case_id)
+        self.repository.delete_case(org_id=principal.org_id, case_id=case_id)
+
     def close_case(
         self, principal: Principal, case_id: str, request: CaseClosureRequest
     ) -> CaseRecord:

@@ -101,6 +101,53 @@ class InMemoryWorkbenchRepository:
             self._cases[case_id] = self._copy(updated)
             return self._copy(updated)
 
+    def delete_case(self, *, org_id: str, case_id: str) -> None:
+        """Remove a case and every record attached to it (local admin path).
+
+        Object-store blobs are left behind; both local modes tolerate orphans.
+        """
+
+        with self._lock:
+            record = self._cases.get(case_id)
+            if record is None or record.org_id != org_id:
+                raise ConflictError("case does not exist")
+            removed_runs = {
+                k for k, v in self._runs.items() if v.case_id == case_id
+            }
+            removed_jobs = {k for k, v in self._jobs.items() if v.case_id == case_id}
+            removed_convs = {
+                k for k, v in self._conversations.items() if v.review_run_id in removed_runs
+            }
+            self._cases.pop(case_id, None)
+            self._documents = {
+                k: v for k, v in self._documents.items() if v.case_id != case_id
+            }
+            self._document_assets = {
+                k: v for k, v in self._document_assets.items() if v.case_id != case_id
+            }
+            self._extraction_jobs = {
+                k: v for k, v in self._extraction_jobs.items() if v.case_id != case_id
+            }
+            self._jobs = {k: v for k, v in self._jobs.items() if k not in removed_jobs}
+            self._runs = {k: v for k, v in self._runs.items() if k not in removed_runs}
+            self._conversations = {
+                k: v for k, v in self._conversations.items() if k not in removed_convs
+            }
+            self._messages = {
+                k: v for k, v in self._messages.items() if v.conversation_id not in removed_convs
+            }
+            self._correction_proposals = {
+                k: v
+                for k, v in self._correction_proposals.items()
+                if v.review_run_id not in removed_runs
+            }
+            self._idempotency = {
+                k: v for k, v in self._idempotency.items() if v not in removed_jobs
+            }
+            self._chat_idempotency = {
+                k: v for k, v in self._chat_idempotency.items() if k[1] not in removed_convs
+            }
+
     def add_document(
         self,
         record: DocumentRecord,

@@ -964,6 +964,22 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
     ) -> CaseRecord:
         return service.get_case(principal, case_id)
 
+    @app.delete("/api/v1/cases/{case_id}", status_code=204)
+    def delete_case_endpoint(
+        case_id: str,
+        principal: Principal = Depends(writers),
+        service: WorkbenchService = Depends(_service),
+    ) -> None:
+        service.delete_case(principal, case_id)
+        record_public_exchange(
+            case_id=case_id,
+            method="DELETE",
+            path=f"/api/v1/cases/{case_id}",
+            request_body={},
+            response_status=204,
+            response_body={},
+        )
+
     @app.post("/api/v1/cases/{case_id}/closure", response_model=CaseRecord)
     def close_case_endpoint(
         case_id: str,

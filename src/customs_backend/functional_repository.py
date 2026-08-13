@@ -336,6 +336,10 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
         self._persist()
         return value
 
+    def delete_case(self, *, org_id: str, case_id: str) -> None:
+        super().delete_case(org_id=org_id, case_id=case_id)
+        self._persist()
+
     def close_case(
         self, *, org_id: str, case_id: str, closure: CaseClosureRecord
     ) -> CaseRecord:
