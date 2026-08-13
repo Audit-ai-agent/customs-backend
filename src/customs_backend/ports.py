@@ -17,6 +17,7 @@ from customs_backend.domain import (
     FindingDecisionRecord,
     FindingDecisionStatus,
     GuidanceRegistryVersion,
+    HsSelectionRecord,
     JobRecord,
     KnowledgeConversationRecord,
     ReviewRunRecord,
@@ -99,6 +100,15 @@ class WorkbenchRepository(Protocol):
         reason: str,
         decided_by: str,
     ) -> FindingDecisionRecord: ...
+    def record_hs_selection(
+        self,
+        *,
+        org_id: str,
+        review_run_id: str,
+        code: str,
+        reason: str,
+        selected_by: str,
+    ) -> HsSelectionRecord: ...
     def create_conversation(self, record: ConversationRecord) -> ConversationRecord: ...
     def get_conversation(self, org_id: str, conversation_id: str) -> ConversationRecord | None: ...
     def list_conversations(self, org_id: str, review_run_id: str) -> list[ConversationRecord]: ...

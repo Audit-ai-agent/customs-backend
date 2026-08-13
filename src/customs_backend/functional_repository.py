@@ -18,6 +18,7 @@ from customs_backend.domain import (
     FindingDecisionRecord,
     FindingDecisionStatus,
     GuidanceRegistryVersion,
+    HsSelectionRecord,
     JobRecord,
     KnowledgeConversationRecord,
     ReviewRunRecord,
@@ -330,6 +331,25 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
             status=status,
             reason=reason,
             decided_by=decided_by,
+        )
+        self._persist()
+        return value
+
+    def record_hs_selection(
+        self,
+        *,
+        org_id: str,
+        review_run_id: str,
+        code: str,
+        reason: str,
+        selected_by: str,
+    ) -> HsSelectionRecord:
+        value = super().record_hs_selection(
+            org_id=org_id,
+            review_run_id=review_run_id,
+            code=code,
+            reason=reason,
+            selected_by=selected_by,
         )
         self._persist()
         return value

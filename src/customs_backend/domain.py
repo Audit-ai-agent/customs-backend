@@ -503,6 +503,43 @@ class FindingDecisionRecord(BaseModel):
     history: list[FindingDecisionHistoryEntry] = Field(min_length=1, max_length=100)
 
 
+class HsSelectionRequest(BaseModel):
+    """A reviewer-owned HS code confirmation which never changes the Agent result."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: str = Field(pattern=r"^[0-9]{10}$")
+    reason: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("reason")
+    @classmethod
+    def non_blank_reason(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("an HS selection reason is required")
+        return value
+
+
+class HsSelectionHistoryEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    code: str = Field(pattern=r"^[0-9]{10}$")
+    reason: str = Field(min_length=1, max_length=4000)
+    selected_by: str = Field(min_length=1, max_length=256)
+    selected_at: datetime
+
+
+class HsSelectionRecord(BaseModel):
+    """Current reviewer HS code selection plus every prior selection."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: str = Field(pattern=r"^[0-9]{10}$")
+    reason: str = Field(min_length=1, max_length=4000)
+    selected_by: str = Field(min_length=1, max_length=256)
+    selected_at: datetime
+    history: list[HsSelectionHistoryEntry] = Field(min_length=1, max_length=100)
+
+
 class ConversationCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1151,6 +1188,11 @@ class ReviewRunRecord(BaseModel):
     document_analyses: list[dict[str, Any]] = Field(default_factory=list)
     comparisons: list[dict[str, Any]] = Field(default_factory=list)
     reviewer_decisions: list[FindingDecisionRecord] = Field(default_factory=list)
+    # Reviewer-owned HS code confirmation.  Like reviewer decisions it is
+    # Backend state layered next to the Agent result, never inside it, so it
+    # must stay out of the provider hash reconstruction.  Historic runs load
+    # with no selection.
+    hs_selection: HsSelectionRecord | None = None
     # Existing Browser key; it is display-only and never controls completion.
     release_identity: dict[str, Any] = Field(default_factory=dict)
     created_by: str

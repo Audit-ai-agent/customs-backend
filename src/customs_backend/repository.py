@@ -22,6 +22,8 @@ from customs_backend.domain import (
     FindingDecisionRecord,
     FindingDecisionStatus,
     GuidanceRegistryVersion,
+    HsSelectionHistoryEntry,
+    HsSelectionRecord,
     JobRecord,
     KnowledgeConversationRecord,
     ReviewRunRecord,
@@ -384,6 +386,45 @@ class InMemoryWorkbenchRepository:
                 run.model_copy(update={"reviewer_decisions": decisions})
             )
             return self._copy(decision)
+
+    def record_hs_selection(
+        self,
+        *,
+        org_id: str,
+        review_run_id: str,
+        code: str,
+        reason: str,
+        selected_by: str,
+    ) -> HsSelectionRecord:
+        """Atomically replace the run's reviewer HS code selection.
+
+        Agent output is immutable.  This only appends reviewer-owned history
+        and deliberately does not recompute the Agent result digest.
+        """
+
+        with self._lock:
+            run = self._runs.get(review_run_id)
+            if run is None or run.org_id != org_id:
+                raise ConflictError("review run does not exist")
+            now = utc_now()
+            entry = HsSelectionHistoryEntry(
+                code=code,
+                reason=reason,
+                selected_by=selected_by,
+                selected_at=now,
+            )
+            history = [*run.hs_selection.history, entry] if run.hs_selection else [entry]
+            selection = HsSelectionRecord(
+                code=code,
+                reason=reason,
+                selected_by=selected_by,
+                selected_at=now,
+                history=history,
+            )
+            self._runs[review_run_id] = self._copy(
+                run.model_copy(update={"hs_selection": selection})
+            )
+            return self._copy(selection)
 
     def create_conversation(self, record: ConversationRecord) -> ConversationRecord:
         with self._lock:

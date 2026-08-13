@@ -22,6 +22,7 @@ from customs_backend.case_input_boundary import (
 )
 from customs_backend.guidance_registry import (
     GuidanceRegistryProjectionError,
+    validate_development_fixture_citation,
     validate_guidance_citation,
     validate_guidance_resolution,
 )
@@ -73,6 +74,8 @@ from customs_backend.domain import (
     FindingDecisionRequest,
     GuidanceResolution,
     GuidanceRegistryVersion,
+    HsSelectionRecord,
+    HsSelectionRequest,
     InputDocumentManifestEntry,
     KnowledgeConversationCreate,
     KnowledgeConversationRecord,
@@ -104,6 +107,15 @@ from customs_backend.ports import (
     NotFoundError,
     ObjectStore,
     WorkbenchRepository,
+)
+from customs_backend.trade_features import (
+    DutyAssessmentView,
+    HsClassificationView,
+    OriginVerificationView,
+    build_duty_assessment,
+    build_hs_classification,
+    build_origin_verification,
+    validate_hs_selection_code,
 )
 
 
@@ -309,6 +321,22 @@ def _validate_guidance_citations(
                     # identity.  They remain valid but cannot be upgraded or
                     # made to claim V2 provenance retroactively.
                     continue
+                if not functional_uat and citation.source_kind == "development_fixture":
+                    # The Agent's deterministic local fixture binds a real
+                    # registry source but a clearly synthetic fixed URI, so
+                    # the official title/URI equality below can never hold.
+                    # Its registry binding is still validated, and the
+                    # Functional-UAT check later rejects this kind outright.
+                    validate_development_fixture_citation(
+                        registry=registry,
+                        registry_source_id=citation.registry_source_id,
+                        source_uri=str(citation.source_uri),
+                        topic=resolution.topic,
+                        scope=resolution.scope,
+                        requested_direction=resolution.requested_direction,
+                        applicable_directions=resolution.applicable_directions,
+                    )
+                    continue
                 validate_guidance_citation(
                     registry=registry,
                     registry_source_id=citation.registry_source_id,
@@ -455,17 +483,31 @@ def _validate_multi_scope_guidance_citations(
         if citation.registry_source_id is None:
             raise ConflictError("multi-scope V2 guidance citation has no registry source")
         try:
-            validate_guidance_citation(
-                registry=registry,
-                registry_source_id=citation.registry_source_id,
-                source_kind=str(citation.source_kind),
-                source_title=str(citation.source_title),
-                source_uri=str(citation.source_uri),
-                topic=resolution.topic,
-                scope=resolution.scope,
-                requested_direction=resolution.requested_direction,
-                applicable_directions=resolution.applicable_directions,
-            )
+            if not functional_uat and citation.source_kind == "development_fixture":
+                # Same deterministic-fixture boundary as the single-scope
+                # validation: keep the registry binding, replace the official
+                # title/URI equality with the exact fixed fixture URI.
+                validate_development_fixture_citation(
+                    registry=registry,
+                    registry_source_id=citation.registry_source_id,
+                    source_uri=str(citation.source_uri),
+                    topic=resolution.topic,
+                    scope=resolution.scope,
+                    requested_direction=resolution.requested_direction,
+                    applicable_directions=resolution.applicable_directions,
+                )
+            else:
+                validate_guidance_citation(
+                    registry=registry,
+                    registry_source_id=citation.registry_source_id,
+                    source_kind=str(citation.source_kind),
+                    source_title=str(citation.source_title),
+                    source_uri=str(citation.source_uri),
+                    topic=resolution.topic,
+                    scope=resolution.scope,
+                    requested_direction=resolution.requested_direction,
+                    applicable_directions=resolution.applicable_directions,
+                )
         except (AttributeError, GuidanceRegistryProjectionError) as exc:
             raise ConflictError("multi-scope guidance citation is outside the registry projection") from exc
         if functional_uat and citation.source_kind == "development_fixture":
@@ -2422,3 +2464,39 @@ class WorkbenchService:
             reason=request.reason.strip(),
             decided_by=principal.subject,
         )
+
+    def hs_classification(
+        self, principal: Principal, review_run_id: str
+    ) -> HsClassificationView:
+        run = self.get_run(principal, review_run_id)
+        return build_hs_classification(run)
+
+    def record_hs_selection(
+        self,
+        principal: Principal,
+        review_run_id: str,
+        request: HsSelectionRequest,
+    ) -> HsSelectionRecord:
+        self._require_role(principal, Role.reviewer)
+        run = self.get_run(principal, review_run_id)
+        try:
+            validate_hs_selection_code(request.code)
+        except ValueError as exc:
+            raise ConflictError(str(exc)) from exc
+        return self.repository.record_hs_selection(
+            org_id=principal.org_id,
+            review_run_id=run.review_run_id,
+            code=request.code,
+            reason=request.reason.strip(),
+            selected_by=principal.subject,
+        )
+
+    def origin_verification(
+        self, principal: Principal, review_run_id: str
+    ) -> OriginVerificationView:
+        run = self.get_run(principal, review_run_id)
+        return build_origin_verification(run)
+
+    def duty_assessment(self, principal: Principal, review_run_id: str) -> DutyAssessmentView:
+        run = self.get_run(principal, review_run_id)
+        return build_duty_assessment(run)

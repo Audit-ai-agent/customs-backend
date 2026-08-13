@@ -41,6 +41,8 @@ from customs_backend.domain import (
     ExtractionJobRecord,
     FindingDecisionRecord,
     FindingDecisionRequest,
+    HsSelectionRecord,
+    HsSelectionRequest,
     JobStatus,
     KnowledgeConversationCreate,
     KnowledgeConversationRecord,
@@ -61,6 +63,11 @@ from customs_backend.ports import (
     ObjectStore,
     TokenVerifier,
     WorkbenchRepository,
+)
+from customs_backend.trade_features import (
+    DutyAssessmentView,
+    HsClassificationView,
+    OriginVerificationView,
 )
 from customs_backend.repository import InMemoryWorkbenchRepository
 from customs_backend.scenario_transcript import (
@@ -1269,6 +1276,66 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
                 },
             )
         return result
+
+    @app.get(
+        "/api/v1/review-runs/{review_run_id}/hs-classification",
+        response_model=HsClassificationView,
+        response_model_exclude_none=True,
+    )
+    def get_hs_classification_endpoint(
+        review_run_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> HsClassificationView:
+        return service.hs_classification(principal, review_run_id)
+
+    @app.post(
+        "/api/v1/review-runs/{review_run_id}/hs-classification",
+        response_model=HsSelectionRecord,
+        status_code=200,
+    )
+    def record_hs_selection_endpoint(
+        review_run_id: str,
+        body: HsSelectionRequest,
+        principal: Principal = Depends(writers),
+        service: WorkbenchService = Depends(_service),
+    ) -> HsSelectionRecord:
+        result = service.record_hs_selection(principal, review_run_id, body)
+        run = service.get_run(principal, review_run_id)
+        record_public_exchange(
+            case_id=run.case_id,
+            method="POST",
+            path=f"/api/v1/review-runs/{review_run_id}/hs-classification",
+            request_body=body.model_dump(mode="json"),
+            response_status=200,
+            response_body=result.model_dump(mode="json"),
+            review_run_id=review_run_id,
+        )
+        return result
+
+    @app.get(
+        "/api/v1/review-runs/{review_run_id}/origin-verification",
+        response_model=OriginVerificationView,
+        response_model_exclude_none=True,
+    )
+    def get_origin_verification_endpoint(
+        review_run_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> OriginVerificationView:
+        return service.origin_verification(principal, review_run_id)
+
+    @app.get(
+        "/api/v1/review-runs/{review_run_id}/duty-assessment",
+        response_model=DutyAssessmentView,
+        response_model_exclude_none=True,
+    )
+    def get_duty_assessment_endpoint(
+        review_run_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> DutyAssessmentView:
+        return service.duty_assessment(principal, review_run_id)
 
     @app.put(
         "/api/v1/review-runs/{review_run_id}/findings/{finding_id}/decision",
