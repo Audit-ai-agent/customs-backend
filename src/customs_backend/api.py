@@ -22,6 +22,7 @@ from customs_backend.agent_contract import BackendConfigurationError, validate_a
 from customs_backend.auth import StaticTokenVerifier, principal_dependency, require_roles
 from customs_backend.case_input_boundary import case_input_notice, safe_case_transcript_content
 from customs_backend.domain import (
+    CaseClosureRequest,
     CaseCreate,
     CaseRecord,
     ConfirmedExtractedTextCreate,
@@ -949,6 +950,24 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         service: WorkbenchService = Depends(_service),
     ) -> CaseRecord:
         return service.get_case(principal, case_id)
+
+    @app.post("/api/v1/cases/{case_id}/closure", response_model=CaseRecord)
+    def close_case_endpoint(
+        case_id: str,
+        body: CaseClosureRequest,
+        principal: Principal = Depends(writers),
+        service: WorkbenchService = Depends(_service),
+    ) -> CaseRecord:
+        result = service.close_case(principal, case_id, body)
+        record_public_exchange(
+            case_id=case_id,
+            method="POST",
+            path=f"/api/v1/cases/{case_id}/closure",
+            request_body=body.model_dump(mode="json"),
+            response_status=200,
+            response_body=result.model_dump(mode="json"),
+        )
+        return result
 
     @app.post(
         "/api/v1/cases/{case_id}/documents", response_model=DocumentViewResponse, status_code=201

@@ -6,6 +6,7 @@ from threading import RLock
 from typing import Any
 
 from customs_backend.domain import (
+    CaseClosureRecord,
     CaseRecord,
     ConversationMessageExchange,
     ConversationMessageRecord,
@@ -80,6 +81,25 @@ class InMemoryWorkbenchRepository:
         with self._lock:
             records = [record for record in self._cases.values() if record.org_id == org_id]
             return self._copy(sorted(records, key=lambda record: record.created_at, reverse=True))
+
+    def close_case(
+        self, *, org_id: str, case_id: str, closure: CaseClosureRecord
+    ) -> CaseRecord:
+        with self._lock:
+            record = self._cases.get(case_id)
+            if record is None or record.org_id != org_id:
+                raise ConflictError("case does not exist")
+            if record.status == CaseStatus.closed:
+                raise ConflictError("the case is already closed")
+            updated = record.model_copy(
+                update={
+                    "status": CaseStatus.closed,
+                    "closure": closure,
+                    "updated_at": utc_now(),
+                }
+            )
+            self._cases[case_id] = self._copy(updated)
+            return self._copy(updated)
 
     def add_document(
         self,

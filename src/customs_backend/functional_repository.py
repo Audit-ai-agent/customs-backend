@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from customs_backend.domain import (
+    CaseClosureRecord,
     CaseRecord,
     ConversationMessageExchange,
     ConversationMessageRecord,
@@ -332,6 +333,13 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
             reason=reason,
             decided_by=decided_by,
         )
+        self._persist()
+        return value
+
+    def close_case(
+        self, *, org_id: str, case_id: str, closure: CaseClosureRecord
+    ) -> CaseRecord:
+        value = super().close_case(org_id=org_id, case_id=case_id, closure=closure)
         self._persist()
         return value
 

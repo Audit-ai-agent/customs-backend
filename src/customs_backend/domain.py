@@ -132,6 +132,32 @@ class CaseCreate(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class CaseClosureRequest(BaseModel):
+    """A reviewer-owned closure decision; it never sends anything anywhere."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    disposition: Literal["cleared", "returned"]
+    reason: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("reason")
+    @classmethod
+    def non_blank_reason(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("a closure reason is required")
+        return value
+
+
+class CaseClosureRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    disposition: Literal["cleared", "returned"]
+    reason: str = Field(min_length=1, max_length=4000)
+    review_run_id: str = Field(min_length=1, max_length=128)
+    closed_by: str = Field(min_length=1, max_length=256)
+    closed_at: datetime
+
+
 class CaseRecord(BaseModel):
     case_id: str
     org_id: str
@@ -141,6 +167,9 @@ class CaseRecord(BaseModel):
     revision: int = Field(default=0, ge=0)
     document_manifest_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # The reviewer's final internal disposition. Historic cases stay readable
+    # with no closure; a closed case never carries an external transmission.
+    closure: CaseClosureRecord | None = None
     created_by: str
     created_at: datetime
     updated_at: datetime

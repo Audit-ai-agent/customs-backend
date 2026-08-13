@@ -145,6 +145,77 @@
         "title": "AuthConfigResponse",
         "type": "object"
       },
+      "CaseClosureRecord": {
+        "additionalProperties": false,
+        "properties": {
+          "closed_at": {
+            "format": "date-time",
+            "title": "Closed At",
+            "type": "string"
+          },
+          "closed_by": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Closed By",
+            "type": "string"
+          },
+          "disposition": {
+            "enum": [
+              "cleared",
+              "returned"
+            ],
+            "title": "Disposition",
+            "type": "string"
+          },
+          "reason": {
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          },
+          "review_run_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Review Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "disposition",
+          "reason",
+          "review_run_id",
+          "closed_by",
+          "closed_at"
+        ],
+        "title": "CaseClosureRecord",
+        "type": "object"
+      },
+      "CaseClosureRequest": {
+        "additionalProperties": false,
+        "description": "A reviewer-owned closure decision; it never sends anything anywhere.",
+        "properties": {
+          "disposition": {
+            "enum": [
+              "cleared",
+              "returned"
+            ],
+            "title": "Disposition",
+            "type": "string"
+          },
+          "reason": {
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "disposition",
+          "reason"
+        ],
+        "title": "CaseClosureRequest",
+        "type": "object"
+      },
       "CaseCreate": {
         "additionalProperties": false,
         "properties": {
@@ -199,6 +270,16 @@
           "case_id": {
             "title": "Case Id",
             "type": "string"
+          },
+          "closure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CaseClosureRecord"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "created_at": {
             "format": "date-time",
@@ -4380,6 +4461,130 @@
           }
         ],
         "summary": "Get Case Endpoint"
+      }
+    },
+    "/api/v1/cases/{case_id}/closure": {
+      "post": {
+        "operationId": "close_case_endpoint_api_v1_cases__case_id__closure_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "title": "Case Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CaseClosureRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CaseRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Close Case Endpoint"
       }
     },
     "/api/v1/cases/{case_id}/document-assets": {

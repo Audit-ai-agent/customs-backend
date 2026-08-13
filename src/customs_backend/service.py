@@ -46,6 +46,8 @@ from customs_backend.domain import (
     AgentReviewRequest,
     Assessment,
     AssuranceLevel,
+    CaseClosureRecord,
+    CaseClosureRequest,
     CaseCreate,
     CaseRecord,
     CaseStatus,
@@ -2463,6 +2465,47 @@ class WorkbenchService:
             status=request.status,
             reason=request.reason.strip(),
             decided_by=principal.subject,
+        )
+
+    def close_case(
+        self, principal: Principal, case_id: str, request: CaseClosureRequest
+    ) -> CaseRecord:
+        """Record the reviewer's final internal disposition and close the case.
+
+        Closing requires a completed review run whose findings all carry a
+        reviewer decision - a case is never closed over undecided findings.
+        Nothing is transmitted anywhere; this is an internal state change.
+        """
+
+        self._require_role(principal, Role.reviewer)
+        case = self.get_case(principal, case_id)
+        if case.status == CaseStatus.closed:
+            raise ConflictError("the case is already closed")
+        runs = self.repository.list_runs(principal.org_id, case_id)
+        latest = max(runs, key=lambda run: run.created_at, default=None)
+        if latest is None:
+            raise ConflictError("a case needs a completed review before it can be closed")
+        decided = {decision.finding_id for decision in latest.reviewer_decisions}
+        undecided = [
+            str(item.get("finding_id"))
+            for item in latest.findings
+            if isinstance(item, dict)
+            and isinstance(item.get("finding_id"), str)
+            and item["finding_id"] not in decided
+        ]
+        if undecided:
+            raise ConflictError(
+                "every finding needs a reviewer decision before the case can be closed"
+            )
+        closure = CaseClosureRecord(
+            disposition=request.disposition,
+            reason=request.reason.strip(),
+            review_run_id=latest.review_run_id,
+            closed_by=principal.subject,
+            closed_at=utc_now(),
+        )
+        return self.repository.close_case(
+            org_id=principal.org_id, case_id=case_id, closure=closure
         )
 
     def hs_classification(

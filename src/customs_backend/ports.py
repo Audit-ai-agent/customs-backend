@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Protocol
 
 from customs_backend.domain import (
+    CaseClosureRecord,
     CaseRecord,
     ConversationMessageExchange,
     ConversationMessageRecord,
@@ -100,6 +101,9 @@ class WorkbenchRepository(Protocol):
         reason: str,
         decided_by: str,
     ) -> FindingDecisionRecord: ...
+    def close_case(
+        self, *, org_id: str, case_id: str, closure: CaseClosureRecord
+    ) -> CaseRecord: ...
     def record_hs_selection(
         self,
         *,
