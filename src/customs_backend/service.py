@@ -2508,6 +2508,36 @@ class WorkbenchService:
             org_id=principal.org_id, case_id=case_id, closure=closure
         )
 
+    def review_progress(self, principal: Principal, case_id: str) -> dict[str, Any]:
+        """Display-only live progress of the newest in-flight review, if any.
+
+        The Agent keeps this in memory during the synchronous review call; a
+        missing or stale snapshot degrades to "running with no stages" or
+        "idle" rather than an error.
+        """
+
+        self.get_case(principal, case_id)
+        job = self.repository.latest_review_job(principal.org_id, case_id)
+        if job is None or job.status not in {JobStatus.queued, JobStatus.running}:
+            return {"status": "idle", "stages": []}
+        snapshot = self.agent.get_review_progress(job.review_run_id)
+        if not isinstance(snapshot, dict):
+            return {
+                "status": "running",
+                "review_run_id": job.review_run_id,
+                "stages": [],
+            }
+        stages = [
+            {"stage": str(item.get("stage", "")), "status": str(item.get("status", ""))}
+            for item in snapshot.get("stages", [])
+            if isinstance(item, dict)
+        ]
+        return {
+            "status": "running",
+            "review_run_id": job.review_run_id,
+            "stages": stages,
+        }
+
     def hs_classification(
         self, principal: Principal, review_run_id: str
     ) -> HsClassificationView:

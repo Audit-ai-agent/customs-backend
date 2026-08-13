@@ -155,6 +155,19 @@ class CaseListResponse(BaseModel):
     items: list[CaseRecord]
 
 
+class ReviewProgressStageView(BaseModel):
+    stage: str
+    status: str
+
+
+class ReviewProgressView(BaseModel):
+    """Display-only live progress; never part of the immutable review result."""
+
+    status: Literal["idle", "running"]
+    review_run_id: str | None = None
+    stages: list[ReviewProgressStageView] = []
+
+
 class DocumentListResponse(BaseModel):
     items: list[DocumentViewResponse]
 
@@ -968,6 +981,18 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             response_body=result.model_dump(mode="json"),
         )
         return result
+
+    @app.get(
+        "/api/v1/cases/{case_id}/review-progress",
+        response_model=ReviewProgressView,
+        response_model_exclude_none=True,
+    )
+    def review_progress_endpoint(
+        case_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> ReviewProgressView:
+        return ReviewProgressView.model_validate(service.review_progress(principal, case_id))
 
     @app.post(
         "/api/v1/cases/{case_id}/documents", response_model=DocumentViewResponse, status_code=201

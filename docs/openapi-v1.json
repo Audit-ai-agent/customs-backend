@@ -3219,6 +3219,61 @@
         "title": "ReviewEnqueueRequest",
         "type": "object"
       },
+      "ReviewProgressStageView": {
+        "properties": {
+          "stage": {
+            "title": "Stage",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "stage",
+          "status"
+        ],
+        "title": "ReviewProgressStageView",
+        "type": "object"
+      },
+      "ReviewProgressView": {
+        "description": "Display-only live progress; never part of the immutable review result.",
+        "properties": {
+          "review_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Review Run Id"
+          },
+          "stages": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ReviewProgressStageView"
+            },
+            "title": "Stages",
+            "type": "array"
+          },
+          "status": {
+            "enum": [
+              "idle",
+              "running"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "ReviewProgressView",
+        "type": "object"
+      },
       "ReviewRunListResponse": {
         "properties": {
           "items": {
@@ -5620,6 +5675,120 @@
           }
         ],
         "summary": "Get Document Content Endpoint"
+      }
+    },
+    "/api/v1/cases/{case_id}/review-progress": {
+      "get": {
+        "operationId": "review_progress_endpoint_api_v1_cases__case_id__review_progress_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "title": "Case Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewProgressView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Review Progress Endpoint"
       }
     },
     "/api/v1/cases/{case_id}/review-runs": {

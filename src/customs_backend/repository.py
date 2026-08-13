@@ -824,6 +824,17 @@ class InMemoryWorkbenchRepository:
             self._correction_proposals[correction_proposal_id] = self._copy(updated)
             return self._copy(updated)
 
+    def latest_review_job(self, org_id: str, case_id: str) -> JobRecord | None:
+        with self._lock:
+            jobs = [
+                job
+                for job in self._jobs.values()
+                if job.org_id == org_id and job.case_id == case_id
+            ]
+            if not jobs:
+                return None
+            return self._copy(max(jobs, key=lambda job: job.created_at))
+
     def get_job(self, org_id: str, job_id: str) -> JobRecord | None:
         with self._lock:
             job = self._jobs.get(job_id)

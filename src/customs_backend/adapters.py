@@ -263,6 +263,26 @@ class HttpAgentClient:
         )
         return result
 
+    def get_review_progress(self, review_run_id: str) -> dict[str, Any] | None:
+        """Display-only live progress; any failure degrades to None."""
+
+        try:
+            response = self._client.get(
+                f"/internal/agent/v3/reviews/{review_run_id}/progress",
+                timeout=httpx.Timeout(3.0, connect=2.0),
+            )
+            if response.status_code != 200:
+                return None
+            self._require_service_mode(response)
+            value = self._decode_object(
+                response, maximum_bytes=64 * 1024, label="review progress"
+            )
+            return value
+        except AgentResponseRejectedError:
+            return None
+        except httpx.HTTPError:
+            return None
+
     def extract_document(
         self, request: AgentDocumentExtractionRequest, content: bytes
     ) -> dict[str, Any]:
@@ -444,6 +464,9 @@ class CallableAgentClient:
             "pages": [],
             "warnings": [{"code": "preview_engine_unavailable"}],
         }
+
+    def get_review_progress(self, review_run_id: str) -> dict[str, Any] | None:
+        return None
 
     def answer(self, request: AgentAssistantAnswerRequest) -> dict[str, Any]:
         if self._answer is not None:
