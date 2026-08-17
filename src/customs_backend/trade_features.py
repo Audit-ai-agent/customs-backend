@@ -119,6 +119,27 @@ class HsReferenceEntryView(BaseModel):
     reference: HsReferenceInfo
 
 
+class HsReferenceSearchResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    code: str = Field(pattern=r"^[0-9]{10}$")
+    name_ko: str | None = None
+    name_en: str | None = None
+    ancestors: list[HsAncestor] = Field(default_factory=list)
+
+
+class HsReferenceSearchView(BaseModel):
+    """Packaged HSK reference rows matching a code prefix or an item name."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str
+    mode: Literal["code_prefix", "name"]
+    results: list[HsReferenceSearchResult]
+    truncated: bool
+    reference: HsReferenceInfo
+
+
 class OriginCheck(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -821,15 +842,85 @@ def lookup_hs_reference(code: str) -> HsReferenceEntryView:
     )
 
 
+_SEARCH_RESULT_LIMIT = 12
+_SEARCH_CODE_PATTERN = re.compile(r"[0-9]{1,10}")
+
+
+@lru_cache(maxsize=1)
+def _name_search_index() -> tuple[tuple[str, str, str], ...]:
+    """(code, lowered leaf text, lowered leaf+ancestor text) per leaf code."""
+
+    entries: list[tuple[str, str, str]] = []
+    for code in sorted(hsk_names().get("levels", {}).get("10", {})):
+        name_ko, name_en = _leaf_names(code)
+        leaf_text = " ".join(part for part in (name_ko, name_en) if part).lower()
+        ancestor_text = " ".join(item.name_ko for item in _ancestors_for(code)).lower()
+        entries.append((code, leaf_text, f"{leaf_text} {ancestor_text}"))
+    return tuple(entries)
+
+
+def _search_result(code: str) -> HsReferenceSearchResult:
+    name_ko, name_en = _leaf_names(code)
+    return HsReferenceSearchResult(
+        code=code,
+        name_ko=name_ko,
+        name_en=name_en,
+        ancestors=_ancestors_for(code),
+    )
+
+
+def search_hs_reference(query: str) -> HsReferenceSearchView:
+    """Match packaged HSK leaf rows by code prefix or by item name.
+
+    A digits-only query is a code-prefix search; anything else matches every
+    query token as a substring of the row's Korean/English names (leaf plus
+    ancestors).  Both modes are deterministic lookups over the packaged
+    table — no scoring model, no external calls.
+    """
+
+    reference = hsk_names()
+    cleaned = query.strip()
+    compact = cleaned.replace(" ", "")
+    matched: list[str]
+    if _SEARCH_CODE_PATTERN.fullmatch(compact):
+        mode: Literal["code_prefix", "name"] = "code_prefix"
+        matched = [
+            code for code, _, _ in _name_search_index() if code.startswith(compact)
+        ]
+    else:
+        mode = "name"
+        tokens = [token for token in cleaned.lower().split() if token]
+        scored: list[tuple[int, str]] = []
+        for code, leaf_text, full_text in _name_search_index():
+            if tokens and all(token in full_text for token in tokens):
+                leaf_hits = sum(1 for token in tokens if token in leaf_text)
+                scored.append((leaf_hits, code))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        matched = [code for _, code in scored]
+
+    return HsReferenceSearchView(
+        query=cleaned,
+        mode=mode,
+        results=[_search_result(code) for code in matched[:_SEARCH_RESULT_LIMIT]],
+        truncated=len(matched) > _SEARCH_RESULT_LIMIT,
+        reference=HsReferenceInfo(
+            as_of=str(reference.get("as_of", "")),
+            source=str(reference.get("source", "")),
+        ),
+    )
+
+
 __all__ = [
     "DutyAssessmentView",
     "HsClassificationView",
     "HsReferenceEntryView",
+    "HsReferenceSearchView",
     "OriginVerificationView",
     "build_duty_assessment",
     "build_hs_classification",
     "build_origin_verification",
     "hs_reference_has",
     "lookup_hs_reference",
+    "search_hs_reference",
     "validate_hs_selection_code",
 ]

@@ -21,6 +21,7 @@ from customs_backend.trade_features import (
     build_hs_classification,
     build_origin_verification,
     hs_reference_has,
+    search_hs_reference,
 )
 
 from tests.product.test_workbench_api import _auth, _client
@@ -445,6 +446,57 @@ def test_hsk_reference_lookup_round_trip() -> None:
 
         malformed = client.get("/api/v1/hsk-reference/6109", headers=_auth())
         assert malformed.status_code == 404
+
+
+def test_hsk_reference_search_by_code_prefix() -> None:
+    view = search_hs_reference("610910")
+    assert view.mode == "code_prefix"
+    assert view.results
+    assert all(result.code.startswith("610910") for result in view.results)
+    assert [result.code for result in view.results] == sorted(
+        result.code for result in view.results
+    )
+    exact = search_hs_reference("6109101000")
+    assert [result.code for result in exact.results] == ["6109101000"]
+    assert not exact.truncated
+
+
+def test_hsk_reference_search_by_name() -> None:
+    korean = search_hs_reference("티셔츠")
+    assert korean.mode == "name"
+    assert any(result.code == "6109101000" for result in korean.results)
+
+    english = search_hs_reference("t-shirts")
+    assert any(result.code.startswith("6109") for result in english.results)
+
+    nothing = search_hs_reference("존재하지않는품명")
+    assert nothing.results == []
+    assert not nothing.truncated
+
+
+def test_hsk_reference_search_truncates_wide_prefix() -> None:
+    view = search_hs_reference("0")
+    assert view.mode == "code_prefix"
+    assert len(view.results) == 12
+    assert view.truncated
+
+
+def test_hsk_reference_search_endpoint_round_trip() -> None:
+    with _client(review_handler=_review_result_with_facts) as client:
+        by_code = client.get("/api/v1/hsk-reference", params={"q": "610910"}, headers=_auth())
+        assert by_code.status_code == 200
+        body = by_code.json()
+        assert body["mode"] == "code_prefix"
+        assert any(item["code"] == "6109101000" for item in body["results"])
+        assert body["reference"]["as_of"]
+
+        by_name = client.get("/api/v1/hsk-reference", params={"q": "티셔츠"}, headers=_auth())
+        assert by_name.status_code == 200
+        assert by_name.json()["mode"] == "name"
+        assert any(item["code"] == "6109101000" for item in by_name.json()["results"])
+
+        empty = client.get("/api/v1/hsk-reference", params={"q": ""}, headers=_auth())
+        assert empty.status_code == 422
 
 
 def test_hs_selection_requires_reviewer_role() -> None:

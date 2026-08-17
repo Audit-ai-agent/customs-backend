@@ -2392,6 +2392,91 @@
         "title": "HsReferenceInfo",
         "type": "object"
       },
+      "HsReferenceSearchResult": {
+        "additionalProperties": false,
+        "properties": {
+          "ancestors": {
+            "items": {
+              "$ref": "#/components/schemas/HsAncestor"
+            },
+            "title": "Ancestors",
+            "type": "array"
+          },
+          "code": {
+            "pattern": "^[0-9]{10}$",
+            "title": "Code",
+            "type": "string"
+          },
+          "name_en": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name En"
+          },
+          "name_ko": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name Ko"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "HsReferenceSearchResult",
+        "type": "object"
+      },
+      "HsReferenceSearchView": {
+        "additionalProperties": false,
+        "description": "Packaged HSK reference rows matching a code prefix or an item name.",
+        "properties": {
+          "mode": {
+            "enum": [
+              "code_prefix",
+              "name"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "query": {
+            "title": "Query",
+            "type": "string"
+          },
+          "reference": {
+            "$ref": "#/components/schemas/HsReferenceInfo"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/HsReferenceSearchResult"
+            },
+            "title": "Results",
+            "type": "array"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "query",
+          "mode",
+          "results",
+          "truncated",
+          "reference"
+        ],
+        "title": "HsReferenceSearchView",
+        "type": "object"
+      },
       "HsSelectionHistoryEntry": {
         "additionalProperties": false,
         "properties": {
@@ -6446,6 +6531,122 @@
           }
         },
         "summary": "Create Development Session"
+      }
+    },
+    "/api/v1/hsk-reference": {
+      "get": {
+        "operationId": "search_hsk_reference_endpoint_api_v1_hsk_reference_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "maxLength": 100,
+              "minLength": 1,
+              "title": "Q",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HsReferenceSearchView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Search Hsk Reference Endpoint"
       }
     },
     "/api/v1/hsk-reference/{code}": {
