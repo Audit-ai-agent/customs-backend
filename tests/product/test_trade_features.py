@@ -464,14 +464,51 @@ def test_hsk_reference_search_by_code_prefix() -> None:
 def test_hsk_reference_search_by_name() -> None:
     korean = search_hs_reference("티셔츠")
     assert korean.mode == "name"
+    assert not korean.partial
     assert any(result.code == "6109101000" for result in korean.results)
 
     english = search_hs_reference("t-shirts")
     assert any(result.code.startswith("6109") for result in english.results)
 
-    nothing = search_hs_reference("존재하지않는품명")
+    nothing = search_hs_reference("zzqqxxyy")
     assert nothing.results == []
     assert not nothing.truncated
+    assert not nothing.partial
+
+
+def test_hsk_reference_search_matches_english_ancestor_names() -> None:
+    # "frozen" only exists in the heading's English name; both words match.
+    view = search_hs_reference("frozen mackerel")
+    assert not view.partial
+    assert any(result.code == "0303540000" for result in view.results)
+
+
+def test_hsk_reference_search_falls_back_to_partial_word_matches() -> None:
+    # No row carries both words, so rows matching either word are ranked
+    # by how many words they match and the view says so.
+    view = search_hs_reference("스테인리스 볼트")
+    assert view.partial
+    assert view.results
+    assert any(result.code.startswith("7318") for result in view.results)
+
+
+def test_hsk_reference_search_splits_korean_compound_words() -> None:
+    # No row spells "와이어로프"; the compound halves still surface rope and
+    # wire rows instead of an empty list.
+    view = search_hs_reference("와이어로프")
+    assert view.partial
+    assert view.results
+    texts = " ".join(f"{r.name_ko or ''} {r.name_en or ''}".lower() for r in view.results)
+    assert "로프" in texts or "와이어" in texts
+
+    refined = search_hs_reference("철강 로프")
+    assert not refined.partial
+    assert any(result.code.startswith("7312") for result in refined.results)
+
+
+def test_hsk_reference_search_applies_query_synonyms() -> None:
+    view = search_hs_reference("전구")
+    assert any(result.code.startswith("8539") for result in view.results)
 
 
 def test_hsk_reference_search_truncates_wide_prefix() -> None:

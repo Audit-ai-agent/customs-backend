@@ -2448,6 +2448,11 @@
             "title": "Mode",
             "type": "string"
           },
+          "partial": {
+            "default": false,
+            "title": "Partial",
+            "type": "boolean"
+          },
           "query": {
             "title": "Query",
             "type": "string"

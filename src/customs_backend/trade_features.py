@@ -137,6 +137,9 @@ class HsReferenceSearchView(BaseModel):
     mode: Literal["code_prefix", "name"]
     results: list[HsReferenceSearchResult]
     truncated: bool
+    # True when no row matched every query word, so the results are ranked
+    # by how many words they do match instead of being exact matches.
+    partial: bool = False
     reference: HsReferenceInfo
 
 
@@ -845,18 +848,126 @@ def lookup_hs_reference(code: str) -> HsReferenceEntryView:
 _SEARCH_RESULT_LIMIT = 12
 _SEARCH_CODE_PATTERN = re.compile(r"[0-9]{1,10}")
 
+# Retrieval aid only: common trade terms mapped to the reference table's own
+# vocabulary.  Every result still comes solely from the packaged table and
+# goes through the reviewer's pick-reason-confirm flow, so a mapping here can
+# widen what a query finds but can never introduce a code.
+_QUERY_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "전구": ("램프",),
+    "형광등": ("램프",),
+    "백열전구": ("백열램프",),
+    "휴대폰": ("스마트폰", "전화기"),
+    "핸드폰": ("스마트폰", "전화기"),
+    "bulb": ("램프", "lamp"),
+    "bulbs": ("램프", "lamp"),
+}
+
 
 @lru_cache(maxsize=1)
-def _name_search_index() -> tuple[tuple[str, str, str], ...]:
-    """(code, lowered leaf text, lowered leaf+ancestor text) per leaf code."""
+def _name_search_index() -> tuple[tuple[str, str, str, str], ...]:
+    """(code, leaf text, leaf+heading text, leaf+all-ancestor text), lowered.
 
-    entries: list[tuple[str, str, str]] = []
-    for code in sorted(hsk_names().get("levels", {}).get("10", {})):
+    Ancestor names contribute both Korean and English so English modifiers
+    ("frozen", "stainless") have text to match; the HS6 sheet's 5-digit stem
+    fallback mirrors _ancestors_for.  The heading text excludes the 2-digit
+    chapter title, whose broad wording would otherwise let a chapter-level
+    word ("…로프…") rank whole unrelated chapters ahead of the heading that
+    actually names the item.
+    """
+
+    levels = hsk_names().get("levels", {})
+    entries: list[tuple[str, str, str, str]] = []
+    for code in sorted(levels.get("10", {})):
         name_ko, name_en = _leaf_names(code)
         leaf_text = " ".join(part for part in (name_ko, name_en) if part).lower()
-        ancestor_text = " ".join(item.name_ko for item in _ancestors_for(code)).lower()
-        entries.append((code, leaf_text, f"{leaf_text} {ancestor_text}"))
+        heading_parts: list[str] = []
+        chapter_parts: list[str] = []
+        for level, lengths in ((2, (2,)), (4, (4,)), (6, (6, 5))):
+            table = levels.get(str(level), {})
+            for length in lengths:
+                entry = table.get(code[:length])
+                if isinstance(entry, list):
+                    bucket = chapter_parts if level == 2 else heading_parts
+                    bucket.extend(name for name in entry if isinstance(name, str))
+                    break
+        heading_text = f"{leaf_text} {' '.join(heading_parts).lower()}"
+        full_text = f"{heading_text} {' '.join(chapter_parts).lower()}"
+        entries.append((code, leaf_text, heading_text, full_text))
     return tuple(entries)
+
+
+_LATIN_CHARS = re.compile(r"[a-z0-9]")
+_HANGUL_COMPOUND = re.compile(r"[가-힣]{4,}")
+
+
+def _token_variants(token: str) -> tuple[str, ...]:
+    """Deterministic spelling variants: hyphen/apostrophe joins and plural -s."""
+
+    variants = [token]
+    compact = token.replace("-", "").replace("'", "")
+    if compact != token and len(compact) >= 2:
+        variants.append(compact)
+    spaced = token.replace("-", " ")
+    if spaced != token:
+        variants.append(spaced)
+    for base in (token, compact):
+        if len(base) > 3 and base.endswith("s") and not base.endswith("ss"):
+            variants.append(base[:-1])
+        if _LATIN_CHARS.search(base) and not base.endswith("s"):
+            variants.append(f"{base}s")
+    return tuple(dict.fromkeys(variants))
+
+
+@lru_cache(maxsize=512)
+def _bounded_pattern(fragment: str) -> re.Pattern[str]:
+    """The fragment must not sit inside a longer Korean word ("네프로프스")."""
+
+    return re.compile(rf"(?<![가-힣]){re.escape(fragment)}(?![가-힣])")
+
+
+@lru_cache(maxsize=512)
+def _latin_bounded_pattern(fragment: str) -> re.Pattern[str]:
+    """The fragment must not sit inside a longer Latin word ("nightshirts")."""
+
+    return re.compile(rf"(?<![a-z0-9]){re.escape(fragment)}(?![a-z0-9])")
+
+
+def _fragment_in(fragment: str, text: str) -> bool:
+    # Latin fragments match whole words only.  Korean fragments stay plain
+    # substrings because the nomenclature agglutinates suffixes ("전구용",
+    # "백열램프") that a boundary rule would wrongly reject.
+    if _LATIN_CHARS.search(fragment):
+        return _latin_bounded_pattern(fragment).search(text) is not None
+    return fragment in text
+
+
+def _token_hit(variants: tuple[str, ...], synonyms: tuple[str, ...], text: str) -> int:
+    """2 = the word (or a variant/synonym) appears; 1 = half of a compound does."""
+
+    for variant in variants:
+        if _fragment_in(variant, text):
+            return 2
+    for synonym in synonyms:
+        for synonym_variant in _token_variants(synonym):
+            if _fragment_in(synonym_variant, text):
+                return 2
+    token = variants[0]
+    if _HANGUL_COMPOUND.fullmatch(token):
+        # Korean compounds are written without spaces ("와이어로프"); credit a
+        # split whose halves both appear, or half-credit a single half.  A
+        # half only counts at a word boundary so it cannot match inside a
+        # longer transliterated word.
+        best = 0
+        for split in range(2, len(token) - 1):
+            left, right = token[:split], token[split:]
+            left_in = _bounded_pattern(left).search(text) is not None
+            right_in = _bounded_pattern(right).search(text) is not None
+            if left_in and right_in:
+                return 2
+            if left_in or right_in:
+                best = 1
+        return best
+    return 0
 
 
 def _search_result(code: str) -> HsReferenceSearchResult:
@@ -872,37 +983,61 @@ def _search_result(code: str) -> HsReferenceSearchResult:
 def search_hs_reference(query: str) -> HsReferenceSearchView:
     """Match packaged HSK leaf rows by code prefix or by item name.
 
-    A digits-only query is a code-prefix search; anything else matches every
-    query token as a substring of the row's Korean/English names (leaf plus
-    ancestors).  Both modes are deterministic lookups over the packaged
-    table — no scoring model, no external calls.
+    A digits-only query is a code-prefix search.  Anything else matches query
+    words against the row's Korean/English names (leaf plus ancestors): rows
+    matching every word rank first; when no row matches every word, rows are
+    ranked by how many words they match and the view is flagged ``partial``.
+    Both modes are deterministic lookups over the packaged table — no scoring
+    model, no external calls.
     """
 
     reference = hsk_names()
     cleaned = query.strip()
     compact = cleaned.replace(" ", "")
     matched: list[str]
+    partial = False
     if _SEARCH_CODE_PATTERN.fullmatch(compact):
         mode: Literal["code_prefix", "name"] = "code_prefix"
         matched = [
-            code for code, _, _ in _name_search_index() if code.startswith(compact)
+            code for code, _, _, _ in _name_search_index() if code.startswith(compact)
         ]
     else:
         mode = "name"
-        tokens = [token for token in cleaned.lower().split() if token]
-        scored: list[tuple[int, str]] = []
-        for code, leaf_text, full_text in _name_search_index():
-            if tokens and all(token in full_text for token in tokens):
-                leaf_hits = sum(1 for token in tokens if token in leaf_text)
-                scored.append((leaf_hits, code))
-        scored.sort(key=lambda item: (-item[0], item[1]))
-        matched = [code for _, code in scored]
+        prepared = [
+            (_token_variants(token), _QUERY_SYNONYMS.get(token, ()))
+            for token in cleaned.lower().split()
+            if token
+        ]
+        scored: list[tuple[bool, int, int, int, str]] = []
+        for code, leaf_text, heading_text, full_text in _name_search_index():
+            hits = [_token_hit(variants, synonyms, full_text) for variants, synonyms in prepared]
+            # Korean and English noun phrases are head-final ("스테인리스
+            # 볼트", "stainless steel bolts"), so the last word counts twice:
+            # rows matching the head noun outrank rows matching a modifier.
+            score = sum(hits) + (hits[-1] if hits else 0)
+            if score == 0:
+                continue
+            all_words = bool(hits) and all(hit == 2 for hit in hits)
+            leaf_score = sum(
+                _token_hit(variants, synonyms, leaf_text) for variants, synonyms in prepared
+            )
+            heading_score = sum(
+                _token_hit(variants, synonyms, heading_text) for variants, synonyms in prepared
+            )
+            scored.append((all_words, score, leaf_score, heading_score, code))
+        if any(item[0] for item in scored):
+            scored = [item for item in scored if item[0]]
+        else:
+            partial = bool(scored)
+        scored.sort(key=lambda item: (-item[1], -item[2], -item[3], item[4]))
+        matched = [code for _, _, _, _, code in scored]
 
     return HsReferenceSearchView(
         query=cleaned,
         mode=mode,
         results=[_search_result(code) for code in matched[:_SEARCH_RESULT_LIMIT]],
         truncated=len(matched) > _SEARCH_RESULT_LIMIT,
+        partial=partial,
         reference=HsReferenceInfo(
             as_of=str(reference.get("as_of", "")),
             source=str(reference.get("source", "")),
