@@ -935,10 +935,14 @@ def _latin_bounded_pattern(fragment: str) -> re.Pattern[str]:
 def _fragment_in(fragment: str, text: str) -> bool:
     # Latin fragments match whole words only.  Korean fragments stay plain
     # substrings because the nomenclature agglutinates suffixes ("전구용",
-    # "백열램프") that a boundary rule would wrongly reject.
+    # "백열램프") that a boundary rule would wrongly reject.  The plain
+    # substring test runs first because it is far cheaper than the regex
+    # and rules out almost every row.
+    if fragment not in text:
+        return False
     if _LATIN_CHARS.search(fragment):
         return _latin_bounded_pattern(fragment).search(text) is not None
-    return fragment in text
+    return True
 
 
 def _token_hit(variants: tuple[str, ...], synonyms: tuple[str, ...], text: str) -> int:
@@ -960,8 +964,8 @@ def _token_hit(variants: tuple[str, ...], synonyms: tuple[str, ...], text: str) 
         best = 0
         for split in range(2, len(token) - 1):
             left, right = token[:split], token[split:]
-            left_in = _bounded_pattern(left).search(text) is not None
-            right_in = _bounded_pattern(right).search(text) is not None
+            left_in = left in text and _bounded_pattern(left).search(text) is not None
+            right_in = right in text and _bounded_pattern(right).search(text) is not None
             if left_in and right_in:
                 return 2
             if left_in or right_in:
