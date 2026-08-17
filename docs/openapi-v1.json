@@ -2226,6 +2226,15 @@
             ],
             "title": "Name Ko"
           },
+          "origin": {
+            "default": "document_code",
+            "enum": [
+              "document_code",
+              "description_match"
+            ],
+            "title": "Origin",
+            "type": "string"
+          },
           "recommended": {
             "title": "Recommended",
             "type": "boolean"

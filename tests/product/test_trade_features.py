@@ -164,6 +164,49 @@ def test_hs_classification_unknown_code_capped_and_not_recommended() -> None:
     assert view.candidates[0].confidence <= 0.5
 
 
+def test_hs_classification_description_candidates_when_no_codes() -> None:
+    no_code = _analysis(
+        "doc_ci",
+        "invoice",
+        [
+            _fact("f_desc", "description", "MEN'S COTTON T-SHIRTS", "doc_ci"),
+            _fact("f_origin", "origin_country", "KR", "doc_ci"),
+        ],
+    )
+    view = build_hs_classification(_run([no_code]))
+    assert view.candidates
+    assert len(view.candidates) <= 5
+    assert "6109101000" in {candidate.code for candidate in view.candidates}
+    for candidate in view.candidates:
+        assert candidate.origin == "description_match"
+        assert candidate.in_reference
+        assert not candidate.recommended
+        assert candidate.confidence <= 0.4
+        assert candidate.basis and candidate.basis[0].fact_name == "description"
+
+
+def test_hs_classification_description_candidates_yield_to_cited_codes() -> None:
+    cited = _analysis(
+        "doc_ci",
+        "invoice",
+        [
+            _fact("f_hs", "hs_code", "0303540000", "doc_ci"),
+            _fact("f_desc", "description", "MEN'S COTTON T-SHIRTS", "doc_ci"),
+        ],
+    )
+    view = build_hs_classification(_run([cited]))
+    assert [candidate.code for candidate in view.candidates] == ["0303540000"]
+    assert view.candidates[0].origin == "document_code"
+
+
+def test_hs_classification_no_candidates_without_codes_or_descriptions() -> None:
+    bare = _analysis(
+        "doc_ci", "invoice", [_fact("f_origin", "origin_country", "KR", "doc_ci")]
+    )
+    view = build_hs_classification(_run([bare]))
+    assert view.candidates == []
+
+
 def test_origin_verification_verified() -> None:
     view = build_origin_verification(_run([_CI, _CO_MATCH]))
     assert view.status == "verified"

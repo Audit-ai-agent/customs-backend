@@ -26,6 +26,7 @@ from customs_backend.domain import HsSelectionRecord, ReviewRunRecord
 _HS_FACT_NAMES = frozenset({"hs_code", "hs_codes"})
 _ORIGIN_FACT_NAMES = frozenset({"origin_country", "country_of_origin"})
 _AMOUNT_FACT_NAMES = ("total_amount", "amount")
+_DESCRIPTION_FACT_NAMES = frozenset({"description", "goods_description"})
 _HS_CODE_PATTERN = re.compile(r"\b([0-9]{10})\b")
 _MONEY_PATTERN = re.compile(r"(?:([A-Z]{3})\s*)?([0-9][0-9,]*(?:\.[0-9]+)?)")
 _COUNTRY_PATTERN = re.compile(r"^[A-Z]{2}$")
@@ -78,10 +79,13 @@ class HsCandidate(BaseModel):
     name_en: str | None = None
     ancestors: list[HsAncestor] = Field(default_factory=list)
     # Share of HS-bearing documents in this run that cite the code (0..1).
-    # It is a document-agreement ratio, not a model probability.
+    # It is a document-agreement ratio, not a model probability.  A
+    # description-match candidate instead carries its capped lexical
+    # overlap share, so it always ranks below any document-cited code.
     confidence: float = Field(ge=0.0, le=1.0)
     in_reference: bool
     recommended: bool
+    origin: Literal["document_code", "description_match"] = "document_code"
     basis: list[HsCandidateBasis] = Field(default_factory=list)
 
 
@@ -298,6 +302,118 @@ def hs_reference_has(code: str) -> bool:
     return code in hsk_names().get("levels", {}).get("10", {})
 
 
+# ── Description-based HSK candidates ─────────────────────────────
+#
+# When no document carries a 10-digit HS code, the reviewer still needs a
+# starting point.  These candidates come from a deterministic lexical match
+# of the documents' goods descriptions against the packaged HSK name table
+# (leaf plus ancestor names, Korean and English).  They are reference-backed
+# suggestions only: confidence is capped, ``recommended`` is never set, and
+# the reviewer confirms through the same selection flow as cited codes.
+
+_DESCRIPTION_TOKEN_PATTERN = re.compile(r"[0-9a-z가-힣]+")
+_DESCRIPTION_STOPWORDS = frozenset(
+    {
+        "and", "for", "from", "its", "not", "of", "or", "other", "than",
+        "the", "with", "made", "kind", "kinds", "part", "parts",
+        "기타", "그", "밖의", "이나", "및", "것", "한정한다", "제외한다", "포함한다",
+    }
+)
+_DESCRIPTION_CANDIDATE_LIMIT = 5
+_DESCRIPTION_CONFIDENCE_CAP = 0.4
+
+
+def _description_stems(text: str) -> frozenset[str]:
+    lowered = text.lower().replace("'", "")
+    stems: set[str] = set()
+    for compact in (lowered, lowered.replace("-", "")):
+        for token in _DESCRIPTION_TOKEN_PATTERN.findall(compact):
+            if len(token) < 2 or token in _DESCRIPTION_STOPWORDS or token.isdigit():
+                continue
+            stems.add(token)
+            if len(token) > 3 and token.endswith("s"):
+                stems.add(token[:-1])
+    return frozenset(stems)
+
+
+@lru_cache(maxsize=1)
+def _description_index() -> tuple[tuple[str, frozenset[str]], ...]:
+    levels = hsk_names().get("levels", {})
+    ancestor_tables = {length: levels.get(str(level), {}) for level, length in ((2, 2), (4, 4), (6, 6))}
+    entries: list[tuple[str, frozenset[str]]] = []
+    for code, names in levels.get("10", {}).items():
+        parts = [name for name in names if isinstance(name, str)]
+        for length, table in ancestor_tables.items():
+            # The HS6 sheet mixes 5-digit stems with 6-digit codes (see
+            # _ancestors_for), so the subheading lookup falls back one digit.
+            for prefix_length in (length, length - 1) if length == 6 else (length,):
+                entry = table.get(code[:prefix_length])
+                if isinstance(entry, list):
+                    parts.extend(name for name in entry if isinstance(name, str))
+                    break
+        stems = _description_stems(" ".join(parts))
+        if stems:
+            entries.append((code, stems))
+    return tuple(entries)
+
+
+def _description_facts(analyses: list[dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
+    facts: list[tuple[str, dict[str, Any]]] = []
+    for analysis in analyses:
+        if not isinstance(analysis, dict):
+            continue
+        document_id = str(analysis.get("document_id", ""))
+        for fact in _iter_facts(analysis):
+            name = fact.get("name")
+            if isinstance(name, str) and name in _DESCRIPTION_FACT_NAMES and _fact_value(fact):
+                facts.append((document_id, fact))
+    return facts
+
+
+def _description_candidates(analyses: list[dict[str, Any]]) -> list[HsCandidate]:
+    facts = _description_facts(analyses)
+    stems: set[str] = set()
+    for _, fact in facts:
+        stems |= _description_stems(_fact_value(fact))
+    if not stems:
+        return []
+
+    scored: list[tuple[int, float, str]] = []
+    for code, entry_stems in _description_index():
+        matched = len(stems & entry_stems)
+        if matched == 0:
+            continue
+        scored.append((matched, matched / len(stems), code))
+    scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
+
+    basis = [
+        HsCandidateBasis(
+            document_id=document_id,
+            fact_id=str(fact.get("fact_id", "")),
+            fact_name=str(fact.get("name", "")),
+            raw_value=str(fact.get("raw_value", ""))[:200],
+        )
+        for document_id, fact in facts[:20]
+    ]
+    candidates: list[HsCandidate] = []
+    for matched, share, code in scored[:_DESCRIPTION_CANDIDATE_LIMIT]:
+        name_ko, name_en = _leaf_names(code)
+        candidates.append(
+            HsCandidate(
+                code=code,
+                name_ko=name_ko,
+                name_en=name_en,
+                ancestors=_ancestors_for(code),
+                confidence=round(min(_DESCRIPTION_CONFIDENCE_CAP, share), 4),
+                in_reference=True,
+                recommended=False,
+                origin="description_match",
+                basis=basis,
+            )
+        )
+    return candidates
+
+
 def build_hs_classification(run: ReviewRunRecord) -> HsClassificationView:
     reference = hsk_names()
     code_basis: dict[str, list[HsCandidateBasis]] = {}
@@ -350,6 +466,11 @@ def build_hs_classification(run: ReviewRunRecord) -> HsClassificationView:
                 and sum(1 for docs in code_documents.values() if len(docs) / total_documents == best_share) == 1,
                 basis=code_basis[code][:20],
             )
+        )
+
+    if not candidates:
+        candidates = _description_candidates(
+            [analysis for analysis in run.document_analyses if isinstance(analysis, dict)]
         )
 
     return HsClassificationView(
