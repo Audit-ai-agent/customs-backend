@@ -428,6 +428,25 @@ def test_hs_selection_rejects_codes_outside_reference() -> None:
         assert response.status_code == 409
 
 
+def test_hsk_reference_lookup_round_trip() -> None:
+    with _client(review_handler=_review_result_with_facts) as client:
+        known = client.get("/api/v1/hsk-reference/6109101000", headers=_auth())
+        assert known.status_code == 200
+        body = known.json()
+        assert body["in_reference"] is True
+        assert body["name_ko"] == "티셔츠"
+        assert [item["level"] for item in body["ancestors"]] == [2, 4, 6]
+        assert body["reference"]["as_of"]
+
+        unknown = client.get("/api/v1/hsk-reference/9999999999", headers=_auth())
+        assert unknown.status_code == 200
+        assert unknown.json()["in_reference"] is False
+        assert "name_ko" not in unknown.json()
+
+        malformed = client.get("/api/v1/hsk-reference/6109", headers=_auth())
+        assert malformed.status_code == 404
+
+
 def test_hs_selection_requires_reviewer_role() -> None:
     with _client(review_handler=_review_result_with_facts) as client:
         run_id = _completed_run(client)

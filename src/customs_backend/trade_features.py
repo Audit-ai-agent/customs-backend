@@ -106,6 +106,19 @@ class HsClassificationView(BaseModel):
     selection: HsSelectionRecord | None = None
 
 
+class HsReferenceEntryView(BaseModel):
+    """One packaged HSK reference row for a manually typed 10-digit code."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: str = Field(pattern=r"^[0-9]{10}$")
+    in_reference: bool
+    name_ko: str | None = None
+    name_en: str | None = None
+    ancestors: list[HsAncestor] = Field(default_factory=list)
+    reference: HsReferenceInfo
+
+
 class OriginCheck(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -785,13 +798,38 @@ def validate_hs_selection_code(code: str) -> None:
         raise ValueError("the HS code is not present in the packaged HSK reference table")
 
 
+def lookup_hs_reference(code: str) -> HsReferenceEntryView:
+    """Describe one well-formed 10-digit code from the packaged reference.
+
+    An unknown code is a normal answer (``in_reference`` false), not an
+    error; a malformed code is rejected by the caller before this lookup.
+    """
+
+    reference = hsk_names()
+    in_reference = hs_reference_has(code)
+    name_ko, name_en = _leaf_names(code) if in_reference else (None, None)
+    return HsReferenceEntryView(
+        code=code,
+        in_reference=in_reference,
+        name_ko=name_ko,
+        name_en=name_en,
+        ancestors=_ancestors_for(code) if in_reference else [],
+        reference=HsReferenceInfo(
+            as_of=str(reference.get("as_of", "")),
+            source=str(reference.get("source", "")),
+        ),
+    )
+
+
 __all__ = [
     "DutyAssessmentView",
     "HsClassificationView",
+    "HsReferenceEntryView",
     "OriginVerificationView",
     "build_duty_assessment",
     "build_hs_classification",
     "build_origin_verification",
     "hs_reference_has",
+    "lookup_hs_reference",
     "validate_hs_selection_code",
 ]

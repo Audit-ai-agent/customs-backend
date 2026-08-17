@@ -2319,6 +2319,60 @@
         "title": "HsClassificationView",
         "type": "object"
       },
+      "HsReferenceEntryView": {
+        "additionalProperties": false,
+        "description": "One packaged HSK reference row for a manually typed 10-digit code.",
+        "properties": {
+          "ancestors": {
+            "items": {
+              "$ref": "#/components/schemas/HsAncestor"
+            },
+            "title": "Ancestors",
+            "type": "array"
+          },
+          "code": {
+            "pattern": "^[0-9]{10}$",
+            "title": "Code",
+            "type": "string"
+          },
+          "in_reference": {
+            "title": "In Reference",
+            "type": "boolean"
+          },
+          "name_en": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name En"
+          },
+          "name_ko": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name Ko"
+          },
+          "reference": {
+            "$ref": "#/components/schemas/HsReferenceInfo"
+          }
+        },
+        "required": [
+          "code",
+          "in_reference",
+          "reference"
+        ],
+        "title": "HsReferenceEntryView",
+        "type": "object"
+      },
       "HsReferenceInfo": {
         "additionalProperties": false,
         "properties": {
@@ -6392,6 +6446,120 @@
           }
         },
         "summary": "Create Development Session"
+      }
+    },
+    "/api/v1/hsk-reference/{code}": {
+      "get": {
+        "operationId": "get_hsk_reference_entry_endpoint_api_v1_hsk_reference__code__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "code",
+            "required": true,
+            "schema": {
+              "title": "Code",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HsReferenceEntryView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Hsk Reference Entry Endpoint"
       }
     },
     "/api/v1/jobs/{job_id}": {

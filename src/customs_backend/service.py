@@ -114,10 +114,12 @@ from customs_backend.ports import (
 from customs_backend.trade_features import (
     DutyAssessmentView,
     HsClassificationView,
+    HsReferenceEntryView,
     OriginVerificationView,
     build_duty_assessment,
     build_hs_classification,
     build_origin_verification,
+    lookup_hs_reference,
     validate_hs_selection_code,
 )
 
@@ -2577,6 +2579,12 @@ class WorkbenchService:
     ) -> HsClassificationView:
         run = self.get_run(principal, review_run_id)
         return build_hs_classification(run)
+
+    def hs_reference_entry(self, principal: Principal, code: str) -> HsReferenceEntryView:
+        del principal  # the packaged reference table has no org scope
+        if re.fullmatch(r"[0-9]{10}", code) is None:
+            raise NotFoundError("an HSK reference lookup takes a 10-digit code")
+        return lookup_hs_reference(code)
 
     def record_hs_selection(
         self,

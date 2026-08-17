@@ -68,6 +68,7 @@ from customs_backend.ports import (
 from customs_backend.trade_features import (
     DutyAssessmentView,
     HsClassificationView,
+    HsReferenceEntryView,
     OriginVerificationView,
 )
 from customs_backend.repository import InMemoryWorkbenchRepository
@@ -1336,6 +1337,18 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
                 },
             )
         return result
+
+    @app.get(
+        "/api/v1/hsk-reference/{code}",
+        response_model=HsReferenceEntryView,
+        response_model_exclude_none=True,
+    )
+    def get_hsk_reference_entry_endpoint(
+        code: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> HsReferenceEntryView:
+        return service.hs_reference_entry(principal, code)
 
     @app.get(
         "/api/v1/review-runs/{review_run_id}/hs-classification",
