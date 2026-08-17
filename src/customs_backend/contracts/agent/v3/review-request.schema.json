@@ -30,6 +30,16 @@
       },
       "required": ["correction_proposal_id", "document_id", "field_name", "new_value", "reason", "source_kind"],
       "type": "object"
+    },
+    "ReviewerHsSelection": {
+      "additionalProperties": false,
+      "description": "Reviewer-confirmed HSK code, labelled human-provided context. It never overrides a document-cited HS code; the Agent may use it only as the retrieval commodity when no input document cites a code.",
+      "properties": {
+        "code": {"type": "string", "pattern": "^[0-9]{10}$"},
+        "source_kind": {"const": "human_provided", "type": "string"}
+      },
+      "required": ["code", "source_kind"],
+      "type": "object"
     }
   },
   "properties": {
@@ -41,7 +51,8 @@
     "trade_type": {"enum": ["import", "export"], "type": "string"},
     "parent_review_run_id": {"type": ["string", "null"], "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"},
     "applied_correction_proposal_ids": {"type": "array", "maxItems": 50, "items": {"type": "string", "minLength": 1, "maxLength": 128}},
-    "human_corrections": {"type": "array", "maxItems": 50, "items": {"$ref": "#/$defs/HumanCorrection"}}
+    "human_corrections": {"type": "array", "maxItems": 50, "items": {"$ref": "#/$defs/HumanCorrection"}},
+    "reviewer_hs_selection": {"anyOf": [{"$ref": "#/$defs/ReviewerHsSelection"}, {"type": "null"}]}
   },
   "required": ["case_id", "review_run_id", "review_as_of", "trade_type", "jurisdiction", "documents"],
   "title": "Customs AI Agent functional review request",

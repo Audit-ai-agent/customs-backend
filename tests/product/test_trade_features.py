@@ -386,6 +386,37 @@ def test_trade_feature_endpoints_round_trip() -> None:
         assert duty_body["applied"]["rate_kind"] == "basic"
 
 
+def test_re_review_carries_reviewer_hs_selection_to_agent() -> None:
+    wires: list[dict[str, Any]] = []
+
+    def handler(request: Any) -> dict[str, Any]:
+        wires.append(request.to_agent_wire())
+        return _review_result_with_facts(request)
+
+    with _client(review_handler=handler) as client:
+        run_id = _completed_run(client)
+        assert "reviewer_hs_selection" not in wires[0]
+
+        selection = client.post(
+            f"/api/v1/review-runs/{run_id}/hs-classification",
+            json={"code": "0303540000", "reason": "문서 근거와 일치"},
+            headers=_auth(),
+        )
+        assert selection.status_code == 200
+        case_id = client.get(f"/api/v1/review-runs/{run_id}", headers=_auth()).json()["case_id"]
+
+        second = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={},
+            headers={**_auth(), "Idempotency-Key": "trade-features-2"},
+        )
+        assert second.status_code == 202
+        assert wires[1]["reviewer_hs_selection"] == {
+            "code": "0303540000",
+            "source_kind": "human_provided",
+        }
+
+
 def test_hs_selection_rejects_codes_outside_reference() -> None:
     with _client(review_handler=_review_result_with_facts) as client:
         run_id = _completed_run(client)

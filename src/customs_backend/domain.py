@@ -1266,6 +1266,19 @@ class AgentHumanCorrection(BaseModel):
     source_kind: Literal["human_provided"] = "human_provided"
 
 
+class AgentReviewerHsSelection(BaseModel):
+    """Reviewer-confirmed HSK code carried as labelled human-provided context.
+
+    It never overrides a document-cited HS code; the Agent may use it only
+    as the retrieval commodity when no input document cites a code itself.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    code: str = Field(pattern=r"^[0-9]{10}$")
+    source_kind: Literal["human_provided"] = "human_provided"
+
+
 class AgentReviewRequest(BaseModel):
     """The exact compact input sent to the Agent V3.2 endpoint."""
 
@@ -1282,6 +1295,7 @@ class AgentReviewRequest(BaseModel):
     parent_review_run_id: str | None = Field(default=None, max_length=128)
     applied_correction_proposal_ids: list[str] = Field(default_factory=list, max_length=50)
     human_corrections: list[AgentHumanCorrection] = Field(default_factory=list, max_length=50)
+    reviewer_hs_selection: AgentReviewerHsSelection | None = None
 
     @model_validator(mode="after")
     def correction_context_is_bound(self) -> "AgentReviewRequest":
@@ -1327,6 +1341,8 @@ class AgentReviewRequest(BaseModel):
                     ],
                 }
             )
+        if self.reviewer_hs_selection is not None:
+            wire["reviewer_hs_selection"] = self.reviewer_hs_selection.model_dump(mode="json")
         return wire
 
     @property

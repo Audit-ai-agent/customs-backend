@@ -43,6 +43,7 @@ from customs_backend.domain import (
     AgentAssistantAnswerResponse,
     AgentConversationTurn,
     AgentHumanCorrection,
+    AgentReviewerHsSelection,
     AgentReviewRequest,
     Assessment,
     AssuranceLevel,
@@ -909,6 +910,11 @@ def _agent_request_from_snapshot(
             AgentHumanCorrection.model_validate(value)
             for value in list(snapshot.get("human_corrections", []))
         ]
+        reviewer_hs_selection = (
+            AgentReviewerHsSelection.model_validate(snapshot["reviewer_hs_selection"])
+            if snapshot.get("reviewer_hs_selection") is not None
+            else None
+        )
     except (KeyError, TypeError, ValueError, ValidationError) as exc:
         raise ConflictError("review job has an invalid immutable input snapshot") from exc
     return AgentReviewRequest(
@@ -930,6 +936,7 @@ def _agent_request_from_snapshot(
         parent_review_run_id=parent_review_run_id,
         applied_correction_proposal_ids=applied_correction_proposal_ids,
         human_corrections=human_corrections,
+        reviewer_hs_selection=reviewer_hs_selection,
     )
 
 
@@ -1323,6 +1330,14 @@ class WorkbenchService:
             ),
         )
 
+    def _latest_hs_selection_code(self, principal: Principal, case_id: str) -> str | None:
+        """Return the case's most recent reviewer-confirmed HSK code, if any."""
+
+        for run in self.repository.list_runs(principal.org_id, case_id):
+            if run.hs_selection is not None:
+                return run.hs_selection.code
+        return None
+
     def review(
         self,
         principal: Principal,
@@ -1352,6 +1367,12 @@ class WorkbenchService:
             "input_document_manifest": [item.model_dump(mode="json") for item in manifest],
             "input_manifest_digest": input_manifest_digest,
         }
+        reviewer_hs_code = self._latest_hs_selection_code(principal, case_id)
+        if reviewer_hs_code is not None:
+            snapshot["reviewer_hs_selection"] = {
+                "code": reviewer_hs_code,
+                "source_kind": "human_provided",
+            }
         supplied_digest = canonical_digest(
             {"case_id": case_id, "request": request.model_dump(mode="json")}
         )
@@ -2412,6 +2433,12 @@ class WorkbenchService:
             "applied_correction_proposal_ids": list(request.proposal_ids),
             "human_corrections": correction_context,
         }
+        revision_hs_code = self._latest_hs_selection_code(principal, case.case_id)
+        if revision_hs_code is not None:
+            snapshot["reviewer_hs_selection"] = {
+                "code": revision_hs_code,
+                "source_kind": "human_provided",
+            }
         now = utc_now()
         job = JobRecord(
             job_id=_id("job"),
