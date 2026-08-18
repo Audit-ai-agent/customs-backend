@@ -356,6 +356,39 @@
         "title": "CaseStatus",
         "type": "string"
       },
+      "CaseStatusMetrics": {
+        "additionalProperties": false,
+        "properties": {
+          "closed": {
+            "minimum": 0.0,
+            "title": "Closed",
+            "type": "integer"
+          },
+          "in_review": {
+            "minimum": 0.0,
+            "title": "In Review",
+            "type": "integer"
+          },
+          "open": {
+            "minimum": 0.0,
+            "title": "Open",
+            "type": "integer"
+          },
+          "total": {
+            "minimum": 0.0,
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "open",
+          "in_review",
+          "closed"
+        ],
+        "title": "CaseStatusMetrics",
+        "type": "object"
+      },
       "CitationKind": {
         "enum": [
           "fact",
@@ -365,6 +398,27 @@
         ],
         "title": "CitationKind",
         "type": "string"
+      },
+      "ClosureMetrics": {
+        "additionalProperties": false,
+        "properties": {
+          "cleared": {
+            "minimum": 0.0,
+            "title": "Cleared",
+            "type": "integer"
+          },
+          "returned": {
+            "minimum": 0.0,
+            "title": "Returned",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cleared",
+          "returned"
+        ],
+        "title": "ClosureMetrics",
+        "type": "object"
       },
       "CompletionEligibility": {
         "additionalProperties": false,
@@ -1188,6 +1242,27 @@
           "history"
         ],
         "title": "CorrectionProposalView",
+        "type": "object"
+      },
+      "DailyReviewCount": {
+        "additionalProperties": false,
+        "properties": {
+          "count": {
+            "minimum": 0.0,
+            "title": "Count",
+            "type": "integer"
+          },
+          "date": {
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "title": "Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "date",
+          "count"
+        ],
+        "title": "DailyReviewCount",
         "type": "object"
       },
       "DevelopmentSessionRequest": {
@@ -2058,6 +2133,33 @@
         ],
         "title": "FindingDecisionStatus",
         "type": "string"
+      },
+      "FindingMetrics": {
+        "additionalProperties": false,
+        "properties": {
+          "decided": {
+            "minimum": 0.0,
+            "title": "Decided",
+            "type": "integer"
+          },
+          "open": {
+            "minimum": 0.0,
+            "title": "Open",
+            "type": "integer"
+          },
+          "total": {
+            "minimum": 0.0,
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "decided",
+          "open"
+        ],
+        "title": "FindingMetrics",
+        "type": "object"
       },
       "GuidanceResolution": {
         "additionalProperties": false,
@@ -2986,6 +3088,44 @@
         "title": "MessageCitation",
         "type": "object"
       },
+      "OperationsMetricsView": {
+        "additionalProperties": false,
+        "properties": {
+          "cases": {
+            "$ref": "#/components/schemas/CaseStatusMetrics"
+          },
+          "closures": {
+            "$ref": "#/components/schemas/ClosureMetrics"
+          },
+          "daily_reviews": {
+            "items": {
+              "$ref": "#/components/schemas/DailyReviewCount"
+            },
+            "title": "Daily Reviews",
+            "type": "array"
+          },
+          "findings": {
+            "$ref": "#/components/schemas/FindingMetrics"
+          },
+          "generated_at": {
+            "title": "Generated At",
+            "type": "string"
+          },
+          "reviews": {
+            "$ref": "#/components/schemas/ReviewMetrics"
+          }
+        },
+        "required": [
+          "generated_at",
+          "cases",
+          "reviews",
+          "findings",
+          "closures",
+          "daily_reviews"
+        ],
+        "title": "OperationsMetricsView",
+        "type": "object"
+      },
       "OriginCertificateInfo": {
         "additionalProperties": false,
         "properties": {
@@ -3370,6 +3510,63 @@
           }
         },
         "title": "ReviewEnqueueRequest",
+        "type": "object"
+      },
+      "ReviewMetrics": {
+        "additionalProperties": false,
+        "properties": {
+          "failed": {
+            "minimum": 0.0,
+            "title": "Failed",
+            "type": "integer"
+          },
+          "indeterminate": {
+            "minimum": 0.0,
+            "title": "Indeterminate",
+            "type": "integer"
+          },
+          "issues_detected": {
+            "minimum": 0.0,
+            "title": "Issues Detected",
+            "type": "integer"
+          },
+          "no_issue_detected": {
+            "minimum": 0.0,
+            "title": "No Issue Detected",
+            "type": "integer"
+          },
+          "partial": {
+            "minimum": 0.0,
+            "title": "Partial",
+            "type": "integer"
+          },
+          "revisions": {
+            "minimum": 0.0,
+            "title": "Revisions",
+            "type": "integer"
+          },
+          "succeeded": {
+            "minimum": 0.0,
+            "title": "Succeeded",
+            "type": "integer"
+          },
+          "total": {
+            "minimum": 0.0,
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "revisions",
+          "no_issue_detected",
+          "issues_detected",
+          "indeterminate",
+          "succeeded",
+          "partial",
+          "failed"
+        ],
+        "title": "ReviewMetrics",
         "type": "object"
       },
       "ReviewProgressStageView": {
@@ -7342,6 +7539,109 @@
           }
         ],
         "summary": "Send Knowledge Conversation Message Endpoint"
+      }
+    },
+    "/api/v1/operations-metrics": {
+      "get": {
+        "operationId": "get_operations_metrics_endpoint_api_v1_operations_metrics_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationsMetricsView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Operations Metrics Endpoint"
       }
     },
     "/api/v1/review-runs/{review_run_id}": {

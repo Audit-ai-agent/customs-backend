@@ -65,6 +65,7 @@ from customs_backend.ports import (
     TokenVerifier,
     WorkbenchRepository,
 )
+from customs_backend.operations_metrics import OperationsMetricsView
 from customs_backend.trade_features import (
     DutyAssessmentView,
     HsClassificationView,
@@ -1338,6 +1339,17 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
                 },
             )
         return result
+
+    @app.get(
+        "/api/v1/operations-metrics",
+        response_model=OperationsMetricsView,
+        response_model_exclude_none=True,
+    )
+    def get_operations_metrics_endpoint(
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> OperationsMetricsView:
+        return service.operations_metrics(principal)
 
     @app.get(
         "/api/v1/hsk-reference",

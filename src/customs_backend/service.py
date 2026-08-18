@@ -7,7 +7,7 @@ import re
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 
@@ -110,6 +110,10 @@ from customs_backend.ports import (
     NotFoundError,
     ObjectStore,
     WorkbenchRepository,
+)
+from customs_backend.operations_metrics import (
+    OperationsMetricsView,
+    build_operations_metrics,
 )
 from customs_backend.trade_features import (
     DutyAssessmentView,
@@ -2591,6 +2595,16 @@ class WorkbenchService:
     def hs_reference_search(self, principal: Principal, query: str) -> HsReferenceSearchView:
         del principal  # the packaged reference table has no org scope
         return search_hs_reference(query)
+
+    def operations_metrics(self, principal: Principal) -> OperationsMetricsView:
+        cases = self.repository.list_cases(principal.org_id)
+        runs_by_case = {
+            case.case_id: self.repository.list_runs(principal.org_id, case.case_id)
+            for case in cases
+        }
+        return build_operations_metrics(
+            cases, runs_by_case, now=datetime.now(timezone.utc)
+        )
 
     def record_hs_selection(
         self,
