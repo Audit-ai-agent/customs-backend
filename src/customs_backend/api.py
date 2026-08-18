@@ -65,6 +65,7 @@ from customs_backend.ports import (
     TokenVerifier,
     WorkbenchRepository,
 )
+from customs_backend.law_reference import LawCatalogView, LawSearchView
 from customs_backend.operations_metrics import OperationsMetricsView
 from customs_backend.trade_features import (
     DutyAssessmentView,
@@ -1339,6 +1340,30 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
                 },
             )
         return result
+
+    @app.get(
+        "/api/v1/law-search",
+        response_model=LawSearchView,
+        response_model_exclude_none=True,
+    )
+    def law_search_endpoint(
+        q: str = Query(min_length=1, max_length=200),
+        top_k: int | None = Query(default=None, ge=1, le=20),
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> LawSearchView:
+        return service.law_search(principal, q, top_k)
+
+    @app.get(
+        "/api/v1/laws",
+        response_model=LawCatalogView,
+        response_model_exclude_none=True,
+    )
+    def law_catalog_endpoint(
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> LawCatalogView:
+        return service.law_catalog(principal)
 
     @app.get(
         "/api/v1/operations-metrics",

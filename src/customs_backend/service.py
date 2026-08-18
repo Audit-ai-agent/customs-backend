@@ -111,6 +111,15 @@ from customs_backend.ports import (
     ObjectStore,
     WorkbenchRepository,
 )
+from customs_backend.law_reference import (
+    LawCatalogView,
+    LawReferenceError,
+    LawSearchView,
+    build_law_catalog_request,
+    build_law_search_request,
+    law_catalog_view,
+    law_search_view,
+)
 from customs_backend.operations_metrics import (
     OperationsMetricsView,
     build_operations_metrics,
@@ -2595,6 +2604,27 @@ class WorkbenchService:
     def hs_reference_search(self, principal: Principal, query: str) -> HsReferenceSearchView:
         del principal  # the packaged reference table has no org scope
         return search_hs_reference(query)
+
+    def law_search(self, principal: Principal, query: str, top_k: int | None) -> LawSearchView:
+        """Reviewer-facing statute search over the loaded Data law store."""
+
+        del principal  # the statute store is a shared read-only reference
+        as_of = datetime.now(timezone.utc).date()
+        try:
+            request = build_law_search_request(query, top_k, as_of)
+            return law_search_view(query, self.agent.law_search(request))
+        except LawReferenceError as exc:
+            raise KnowledgeInputRejectedError() from exc
+
+    def law_catalog(self, principal: Principal) -> LawCatalogView:
+        """The statutes the loaded Data law store can search."""
+
+        del principal  # the statute store is a shared read-only reference
+        as_of = datetime.now(timezone.utc).date()
+        try:
+            return law_catalog_view(self.agent.law_catalog(build_law_catalog_request(as_of)))
+        except LawReferenceError as exc:
+            raise KnowledgeInputRejectedError() from exc
 
     def operations_metrics(self, principal: Principal) -> OperationsMetricsView:
         cases = self.repository.list_cases(principal.org_id)

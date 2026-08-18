@@ -263,6 +263,36 @@ class HttpAgentClient:
         )
         return result
 
+    def law_search(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Reviewer-facing statute search proxied through the Agent to Data."""
+
+        response = self._client.post(
+            "/internal/agent/v3/law-search",
+            json=request,
+            timeout=httpx.Timeout(60.0, connect=10.0),
+        )
+        if response.status_code != 200:
+            raise AgentResponseRejectedError(
+                f"Agent law search returned HTTP {response.status_code}"
+            )
+        self._require_service_mode(response)
+        return self._decode_object(response, maximum_bytes=1024 * 1024, label="law search")
+
+    def law_catalog(self, request: dict[str, Any]) -> dict[str, Any]:
+        """The searchable-statute catalog proxied through the Agent to Data."""
+
+        response = self._client.post(
+            "/internal/agent/v3/law-catalog",
+            json=request,
+            timeout=httpx.Timeout(30.0, connect=10.0),
+        )
+        if response.status_code != 200:
+            raise AgentResponseRejectedError(
+                f"Agent law catalog returned HTTP {response.status_code}"
+            )
+        self._require_service_mode(response)
+        return self._decode_object(response, maximum_bytes=512 * 1024, label="law catalog")
+
     def get_review_progress(self, review_run_id: str) -> dict[str, Any] | None:
         """Display-only live progress; any failure degrades to None."""
 
@@ -467,6 +497,43 @@ class CallableAgentClient:
 
     def get_review_progress(self, review_run_id: str) -> dict[str, Any] | None:
         return None
+
+    def law_search(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Deterministic fixture: one 관세법 article echoing the request identity."""
+
+        return {
+            "schema_version": "3.0",
+            "request_id": request.get("request_id", "law-search-fixture"),
+            "status": "ok",
+            "as_of": request.get("as_of", "2026-08-05"),
+            "results": [
+                {
+                    "law_id": "LAW-226",
+                    "law_name": "관세법",
+                    "article_no": "제226조",
+                    "title": "관세법 제226조(허가ㆍ승인 등의 증명 및 확인)",
+                    "text": "수출입을 할 때 허가ㆍ승인 등의 조건을 갖출 필요가 있는 물품은 이를 증명하여야 한다.",
+                    "source_uri": "https://www.law.go.kr/%EB%B2%95%EB%A0%B9/%EA%B4%80%EC%84%B8%EB%B2%95/%EC%A0%9C226%EC%A1%B0",
+                    "valid_from": "2024-01-01",
+                    "valid_to": None,
+                    "score": 0.9,
+                }
+            ],
+        }
+
+    def law_catalog(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Deterministic fixture catalog for the local development profile."""
+
+        return {
+            "schema_version": "3.0",
+            "request_id": request.get("request_id", "law-catalog-fixture"),
+            "status": "ok",
+            "as_of": request.get("as_of", "2026-08-05"),
+            "laws": [
+                {"law_id": "LAW-226", "law_name": "관세법", "hierarchy": "법률", "article_count": 280},
+                {"law_id": "LAW-DEC", "law_name": "관세법 시행령", "hierarchy": "대통령령", "article_count": 190},
+            ],
+        }
 
     def answer(self, request: AgentAssistantAnswerRequest) -> dict[str, Any]:
         if self._answer is not None:
