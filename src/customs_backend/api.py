@@ -5,13 +5,14 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from contextlib import asynccontextmanager
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Path as ApiPath, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 from starlette.responses import JSONResponse
@@ -39,12 +40,15 @@ from customs_backend.domain import (
     DocumentAssetRecord,
     DocumentType,
     ExtractionJobRecord,
+    RasterExtractionJobRecord,
+    RasterTextExtractionJobRecord,
     FindingDecisionRecord,
     FindingDecisionRequest,
     JobStatus,
     KnowledgeConversationCreate,
     KnowledgeConversationRecord,
     MAX_DOCUMENT_ASSET_BYTES,
+    MAX_TEXT_DOCUMENT_CHARACTERS,
     Principal,
     RevisionCreate,
     ReviewEnqueueRequest,
@@ -68,7 +72,13 @@ from customs_backend.scenario_transcript import (
     ScenarioTranscriptRoot,
     workspace_transcript_root,
 )
-from customs_backend.service import WorkbenchService
+from customs_backend.service import (
+    RasterDocumentPageUnavailable,
+    RasterDocumentPreviewUnavailable,
+    RasterDocumentProfileSuperseded,
+    RasterExtractionWorker,
+    WorkbenchService,
+)
 from customs_backend.settings import Settings, get_settings
 
 
@@ -263,6 +273,270 @@ class ExtractionJobView(BaseModel):
 class ExtractionJobResponse(BaseModel):
     asset: DocumentAssetView
     job: ExtractionJobView
+
+
+class RasterExtractionPolygonView(BaseModel):
+    points: list[dict[str, float]]
+
+
+class RasterExtractionSpanView(BaseModel):
+    span_id: str
+    ordinal: int = Field(ge=1)
+    text: str
+    bbox: dict[str, float] | None = None
+    polygon: RasterExtractionPolygonView | None = None
+    confidence: float = Field(ge=0, le=1)
+    reading_order: int = Field(ge=1)
+
+
+class RasterExtractionPageView(BaseModel):
+    page_number: int = Field(ge=1)
+    width: int = Field(ge=1)
+    height: int = Field(ge=1)
+    coordinate_unit: Literal["pixels"]
+    spans: list[RasterExtractionSpanView]
+
+
+class RasterFieldCandidateView(BaseModel):
+    field_id: str
+    value: str
+    confidence: float = Field(ge=0, le=1)
+    evidence_span_ids: list[str]
+    bbox: dict[str, float] | None = None
+
+
+class RasterTableCellView(BaseModel):
+    cell_id: str
+    row_index: int = Field(ge=0)
+    column_index: int = Field(ge=0)
+    text: str
+    bbox: dict[str, float] | None = None
+    confidence: float = Field(ge=0, le=1)
+    evidence_span_ids: list[str]
+
+
+class RasterTableRowView(BaseModel):
+    row_index: int = Field(ge=0)
+    cells: list[RasterTableCellView]
+
+
+class RasterTableView(BaseModel):
+    table_id: str
+    page_number: int = Field(ge=1)
+    bbox: dict[str, float] | None = None
+    rows: list[RasterTableRowView]
+
+
+class RasterExtractionPreviewView(BaseModel):
+    """Safe reviewer projection; provenance digests stay Backend-internal."""
+
+    status: Literal["preview_ready", "needs_review", "unavailable"]
+    document_type: Literal["bill_of_lading", "commercial_invoice", "packing_list"] | None
+    classification_confidence: float | None = Field(default=None, ge=0, le=1)
+    pages: list[RasterExtractionPageView]
+    field_candidates: list[RasterFieldCandidateView]
+    tables: list[RasterTableView]
+    warnings: list[str]
+    needs_review_reasons: list[str]
+
+
+class RasterExtractionJobView(BaseModel):
+    raster_extraction_job_id: str
+    asset_id: str
+    case_id: str
+    profile_revision: str
+    status: Literal["queued", "running", "preview_ready", "needs_review", "unavailable", "failed"]
+    attempt_count: int = Field(ge=0, le=3)
+    result: RasterExtractionPreviewView | None = None
+    error_code: str | None = None
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_record(cls, record: RasterExtractionJobRecord) -> "RasterExtractionJobView":
+        preview = None
+        if record.result is not None:
+            preview = RasterExtractionPreviewView(
+                status=record.result.status,
+                document_type=(
+                    None if record.result.document_type == "unknown" else record.result.document_type
+                ),
+                classification_confidence=record.result.classification_confidence,
+                pages=[
+                    RasterExtractionPageView(
+                        page_number=page.page_number,
+                        width=page.width,
+                        height=page.height,
+                        coordinate_unit=page.coordinate_unit,
+                        spans=[
+                            RasterExtractionSpanView(
+                                span_id=span.span_id,
+                                ordinal=span.ordinal,
+                                text=span.text,
+                                bbox=span.bbox.model_dump() if span.bbox is not None else None,
+                                polygon=(
+                                    RasterExtractionPolygonView(
+                                        points=[point.model_dump() for point in span.polygon.points]
+                                    )
+                                    if span.polygon is not None
+                                    else None
+                                ),
+                                confidence=span.confidence,
+                                reading_order=span.reading_order,
+                            )
+                            for span in page.spans
+                        ],
+                    )
+                    for page in record.result.pages
+                ],
+                field_candidates=[
+                    RasterFieldCandidateView(
+                        field_id=candidate.field_id,
+                        value=candidate.value,
+                        confidence=candidate.confidence,
+                        evidence_span_ids=candidate.evidence_span_ids,
+                        bbox=(
+                            candidate.bbox.model_dump() if candidate.bbox is not None else None
+                        ),
+                    )
+                    for candidate in record.result.field_candidates
+                ],
+                tables=[
+                    RasterTableView(
+                        table_id=table.table_id,
+                        page_number=table.page_number,
+                        bbox=table.bbox.model_dump() if table.bbox is not None else None,
+                        rows=[
+                            RasterTableRowView(
+                                row_index=row.row_index,
+                                cells=[
+                                    RasterTableCellView(
+                                        cell_id=cell.cell_id,
+                                        row_index=cell.row_index,
+                                        column_index=cell.column_index,
+                                        text=cell.text,
+                                        bbox=(
+                                            cell.bbox.model_dump()
+                                            if cell.bbox is not None
+                                            else None
+                                        ),
+                                        confidence=cell.confidence,
+                                        evidence_span_ids=cell.evidence_span_ids,
+                                    )
+                                    for cell in row.cells
+                                ],
+                            )
+                            for row in table.rows
+                        ],
+                    )
+                    for table in record.result.tables
+                ],
+                warnings=[warning.code for warning in record.result.warnings],
+                needs_review_reasons=[
+                    reason.code for reason in record.result.needs_review_reasons
+                ],
+            )
+        return cls(
+            raster_extraction_job_id=record.raster_extraction_job_id,
+            asset_id=record.asset_id,
+            case_id=record.case_id,
+            profile_revision=record.profile_revision,
+            status=record.status,
+            attempt_count=record.attempt_count,
+            result=preview,
+            error_code=record.error_code,
+            created_by=record.created_by,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+        )
+
+
+class RasterExtractionJobResponse(BaseModel):
+    asset: DocumentAssetView
+    job: RasterExtractionJobView
+    idempotency_reused: bool
+    # This is a safe comparison aid only; it is never a model/pointer receipt.
+    # ``None`` means Agent currently has no active profile, not a fallback.
+    current_profile_revision: str | None
+    profile_superseded: bool
+
+
+class RasterTextExtractionPageView(BaseModel):
+    page_number: int = Field(ge=1)
+    text: str
+    # The key is always emitted; ``null`` means the provider did not make a
+    # confidence claim.  Keeping it required prevents the OpenAPI contract
+    # from diverging from the strict Frontend decoder.
+    confidence: float | None = Field(..., ge=0, le=1)
+
+
+class RasterTextExtractionPreviewView(BaseModel):
+    """Reviewer-editable text draft; no layout/table/field projection exists."""
+
+    status: Literal["preview_ready", "needs_review", "unavailable"]
+    # Same distinction as page confidence: absent is a contract error;
+    # explicit ``null`` is the valid no-draft representation.
+    canonical_text: str | None = Field(..., max_length=MAX_TEXT_DOCUMENT_CHARACTERS)
+    pages: list[RasterTextExtractionPageView]
+    warnings: list[str]
+    needs_review_reasons: list[str]
+
+
+class RasterTextExtractionJobView(BaseModel):
+    raster_text_extraction_job_id: str
+    asset_id: str
+    case_id: str
+    profile_revision: str
+    status: Literal["queued", "running", "preview_ready", "needs_review", "unavailable", "failed"]
+    attempt_count: int = Field(ge=0, le=3)
+    result: RasterTextExtractionPreviewView | None = None
+    error_code: str | None = None
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_record(cls, record: RasterTextExtractionJobRecord) -> "RasterTextExtractionJobView":
+        preview = None
+        if record.result is not None:
+            preview = RasterTextExtractionPreviewView(
+                status=record.result.status,
+                canonical_text=record.result.canonical_text,
+                pages=[
+                    RasterTextExtractionPageView(
+                        page_number=page.page_number,
+                        text=page.text,
+                        confidence=page.confidence,
+                    )
+                    for page in record.result.pages
+                ],
+                warnings=[warning.code for warning in record.result.warnings],
+                needs_review_reasons=[
+                    reason.code for reason in record.result.needs_review_reasons
+                ],
+            )
+        return cls(
+            raster_text_extraction_job_id=record.raster_text_extraction_job_id,
+            asset_id=record.asset_id,
+            case_id=record.case_id,
+            profile_revision=record.profile_revision,
+            status=record.status,
+            attempt_count=record.attempt_count,
+            result=preview,
+            error_code=record.error_code,
+            created_by=record.created_by,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+        )
+
+
+class RasterTextExtractionJobResponse(BaseModel):
+    asset: DocumentAssetView
+    job: RasterTextExtractionJobView
+    idempotency_reused: bool
+    current_profile_revision: str | None
+    profile_superseded: bool
 
 
 class ConversationView(BaseModel):
@@ -698,6 +972,49 @@ def _safe_case_transcript_response(value: Mapping[str, Any]) -> dict[str, Any]:
     return redacted
 
 
+def _safe_confirmed_document_transcript_request(
+    body: ConfirmedExtractedTextCreate,
+) -> dict[str, Any]:
+    """Keep OCR-derived confirmation text out of the public transcript.
+
+    The Browser pre-fills this value from an OCR preview, so even a reviewer
+    confirmation may still contain provider-derived text verbatim.  Preserve
+    only the operation binding needed for Functional-UAT reconstruction; the
+    actual text remains in the protected document store and normal API reply.
+    """
+
+    return {
+        "extraction_job_id": body.extraction_job_id,
+        "raster_extraction_job_id": body.raster_extraction_job_id,
+        "raster_text_extraction_job_id": body.raster_text_extraction_job_id,
+        "filename": body.filename,
+        "replaces_document_id": body.replaces_document_id,
+        "document_body_redacted": True,
+    }
+
+
+def _safe_confirmed_document_transcript_response(
+    value: DocumentViewResponse,
+) -> dict[str, Any]:
+    """Record only metadata for a confirmed text-document response."""
+
+    record = value.record
+    return {
+        "record": {
+            "document_id": record.document_id,
+            "case_id": record.case_id,
+            "document_type": record.document_type,
+            "filename": record.filename,
+            "media_type": record.media_type,
+            "byte_size": record.byte_size,
+            "character_count": record.character_count,
+            "created_at": record.created_at.isoformat(),
+            "replaces_document_id": record.replaces_document_id,
+        },
+        "document_body_redacted": True,
+    }
+
+
 def _verifier_ready(verifier: TokenVerifier) -> bool:
     health = getattr(verifier, "health", None)
     if health is None:
@@ -719,6 +1036,21 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         if actual_container.settings.environment == "functional-uat"
         else None
     )
+    raster_worker = (
+        RasterExtractionWorker(actual_container.service)
+        if actual_container.settings.environment in {"local-development", "functional-uat"}
+        else None
+    )
+
+    @asynccontextmanager
+    async def application_lifespan(_app: FastAPI):
+        if raster_worker is not None:
+            raster_worker.start()
+        try:
+            yield
+        finally:
+            if raster_worker is not None:
+                raster_worker.stop()
 
     def record_public_exchange(
         *,
@@ -749,6 +1081,7 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             code: {"model": ProblemDetailsV1, "description": "Fail-closed problem response."}
             for code in (400, 401, 403, 404, 409, 413, 422, 503)
         },
+        lifespan=application_lifespan,
     )
     app.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_PUBLIC_REQUEST_BODY_BYTES)
     app.state.container = actual_container
@@ -770,6 +1103,18 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
     @app.exception_handler(ConflictError)
     async def conflict_handler(request: Request, _exc: ConflictError):
         return _error_response(409, "stale_or_conflicting_state", instance=request.url.path)
+
+    @app.exception_handler(RasterDocumentPreviewUnavailable)
+    async def raster_preview_unavailable_handler(
+        request: Request, _exc: RasterDocumentPreviewUnavailable
+    ):
+        return _error_response(503, "raster_ocr_unavailable", instance=request.url.path)
+
+    @app.exception_handler(RasterDocumentProfileSuperseded)
+    async def raster_profile_superseded_handler(
+        request: Request, _exc: RasterDocumentProfileSuperseded
+    ):
+        return _error_response(409, "raster_profile_superseded", instance=request.url.path)
 
     @app.exception_handler(AuthorizationError)
     async def authorization_handler(request: Request, _exc: AuthorizationError):
@@ -1122,6 +1467,193 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         )
 
     @app.post(
+        "/api/v1/cases/{case_id}/document-assets/{asset_id}/raster-extractions",
+        response_model=RasterExtractionJobResponse,
+        status_code=202,
+    )
+    def request_raster_document_extraction_endpoint(
+        case_id: str,
+        asset_id: str,
+        principal: Principal = Depends(writers),
+        service: WorkbenchService = Depends(_service),
+    ) -> RasterExtractionJobResponse:
+        value = service.request_raster_document_extraction(principal, case_id, asset_id)
+        result = RasterExtractionJobResponse(
+            asset=DocumentAssetView.from_record(value.asset),
+            job=RasterExtractionJobView.from_record(value.job),
+            idempotency_reused=not value.created,
+            current_profile_revision=value.current_profile_revision,
+            profile_superseded=value.profile_superseded,
+        )
+        # The transcript has operational state only: no source bytes, OCR
+        # text, field values, geometry, provider diagnostics, or hash.
+        record_public_exchange(
+            case_id=case_id,
+            method="POST",
+            path=f"/api/v1/cases/{case_id}/document-assets/{asset_id}/raster-extractions",
+            request_body={"asset_id": asset_id, "profile_revision": value.job.profile_revision},
+            response_status=202,
+            response_body={
+                "asset_id": value.asset.asset_id,
+                "raster_extraction_job_id": value.job.raster_extraction_job_id,
+                "status": value.job.status,
+                "idempotency_reused": not value.created,
+            },
+        )
+        return result
+
+    @app.get(
+        "/api/v1/cases/{case_id}/document-assets/{asset_id}/raster-extractions/{raster_extraction_job_id}",
+        response_model=RasterExtractionJobResponse,
+    )
+    def get_raster_document_extraction_endpoint(
+        case_id: str,
+        asset_id: str,
+        raster_extraction_job_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> RasterExtractionJobResponse:
+        value = service.get_raster_document_extraction(
+            principal, case_id, asset_id, raster_extraction_job_id
+        )
+        return RasterExtractionJobResponse(
+            asset=DocumentAssetView.from_record(value.asset),
+            job=RasterExtractionJobView.from_record(value.job),
+            idempotency_reused=False,
+            current_profile_revision=value.current_profile_revision,
+            profile_superseded=value.profile_superseded,
+        )
+
+    @app.post(
+        "/api/v1/cases/{case_id}/document-assets/{asset_id}/raster-text-extractions",
+        response_model=RasterTextExtractionJobResponse,
+        status_code=202,
+    )
+    def request_raster_text_document_extraction_endpoint(
+        case_id: str,
+        asset_id: str,
+        principal: Principal = Depends(writers),
+        service: WorkbenchService = Depends(_service),
+    ) -> RasterTextExtractionJobResponse:
+        value = service.request_raster_text_document_extraction(principal, case_id, asset_id)
+        result = RasterTextExtractionJobResponse(
+            asset=DocumentAssetView.from_record(value.asset),
+            job=RasterTextExtractionJobView.from_record(value.job),
+            idempotency_reused=not value.created,
+            current_profile_revision=value.current_profile_revision,
+            profile_superseded=value.profile_superseded,
+        )
+        # Keep Functional-UAT/public transcripts operational-only.  In
+        # particular, neither OCR text nor source bytes are recorded here.
+        record_public_exchange(
+            case_id=case_id,
+            method="POST",
+            path=(
+                f"/api/v1/cases/{case_id}/document-assets/{asset_id}/"
+                "raster-text-extractions"
+            ),
+            request_body={"asset_id": asset_id, "profile_revision": value.job.profile_revision},
+            response_status=202,
+            response_body={
+                "asset_id": value.asset.asset_id,
+                "raster_text_extraction_job_id": value.job.raster_text_extraction_job_id,
+                "status": value.job.status,
+                "idempotency_reused": not value.created,
+            },
+        )
+        return result
+
+    @app.get(
+        "/api/v1/cases/{case_id}/document-assets/{asset_id}/raster-text-extractions/"
+        "{raster_text_extraction_job_id}",
+        response_model=RasterTextExtractionJobResponse,
+    )
+    def get_raster_text_document_extraction_endpoint(
+        case_id: str,
+        asset_id: str,
+        raster_text_extraction_job_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> RasterTextExtractionJobResponse:
+        value = service.get_raster_text_document_extraction(
+            principal, case_id, asset_id, raster_text_extraction_job_id
+        )
+        return RasterTextExtractionJobResponse(
+            asset=DocumentAssetView.from_record(value.asset),
+            job=RasterTextExtractionJobView.from_record(value.job),
+            idempotency_reused=False,
+            current_profile_revision=value.current_profile_revision,
+            profile_superseded=value.profile_superseded,
+        )
+
+    @app.get(
+        "/api/v1/cases/{case_id}/document-assets/{asset_id}/raster-extractions/"
+        "{raster_extraction_job_id}/pages/{page_number}",
+        response_class=Response,
+        responses={
+            200: {"content": {"image/png": {"schema": {"type": "string", "format": "binary"}}}},
+            403: {"model": ProblemDetailsV1},
+            404: {"model": ProblemDetailsV1},
+            409: {"model": ProblemDetailsV1},
+            503: {"model": ProblemDetailsV1},
+        },
+    )
+    def get_raster_document_page_endpoint(
+        case_id: str,
+        asset_id: str,
+        raster_extraction_job_id: str,
+        page_number: int = ApiPath(ge=1, le=20),
+        principal: Principal = Depends(writers),
+        service: WorkbenchService = Depends(_service),
+    ) -> Response:
+        """Return one provenance-checked PDFium PNG only for the reviewer overlay."""
+
+        try:
+            rendered = service.get_raster_document_page(
+                principal,
+                case_id,
+                asset_id,
+                raster_extraction_job_id,
+                page_number,
+            )
+        except RasterDocumentPageUnavailable:
+            # Provider/PDFium details are neither a Browser contract nor a
+            # transcript record.  The Browser can keep the text candidate
+            # list visible and ask the reviewer to retry later.
+            raise HTTPException(status_code=503, detail="raster page renderer unavailable") from None
+        return Response(
+            content=rendered.content,
+            media_type="image/png",
+            headers={
+                "Cache-Control": "no-store",
+                "Pragma": "no-cache",
+                "Content-Disposition": "inline",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": "sandbox",
+            },
+        )
+
+    @app.get("/api/v1/cases/{case_id}/document-assets/{asset_id}/source")
+    def get_document_asset_source_endpoint(
+        case_id: str,
+        asset_id: str,
+        principal: Principal = Depends(writers),
+        service: WorkbenchService = Depends(_service),
+    ) -> Response:
+        value = service.get_document_asset_source(principal, case_id, asset_id)
+        return Response(
+            content=value.content,
+            media_type=value.asset.media_type,
+            headers={
+                "Cache-Control": "no-store",
+                "Pragma": "no-cache",
+                "Content-Disposition": "inline",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": "sandbox",
+            },
+        )
+
+    @app.post(
         "/api/v1/cases/{case_id}/document-assets/{asset_id}/confirmed-document",
         response_model=DocumentViewResponse,
         status_code=201,
@@ -1144,9 +1676,9 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
             case_id=case_id,
             method="POST",
             path=f"/api/v1/cases/{case_id}/document-assets/{asset_id}/confirmed-document",
-            request_body=body.model_dump(mode="json"),
+            request_body=_safe_confirmed_document_transcript_request(body),
             response_status=201,
-            response_body=result.model_dump(mode="json"),
+            response_body=_safe_confirmed_document_transcript_response(result),
         )
         return result
 

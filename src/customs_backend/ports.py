@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Protocol
 
 from customs_backend.domain import (
@@ -13,6 +14,13 @@ from customs_backend.domain import (
     CorrectionProposalRecord,
     DocumentAssetRecord,
     ExtractionJobRecord,
+    RasterDocumentExtractionResult,
+    RasterDocumentPreviewStatus,
+    RasterDocumentPageRender,
+    RasterExtractionJobRecord,
+    RasterTextDocumentExtractionResult,
+    RasterTextDocumentPreviewStatus,
+    RasterTextExtractionJobRecord,
     DocumentRecord,
     FindingDecisionRecord,
     FindingDecisionStatus,
@@ -73,6 +81,76 @@ class WorkbenchRepository(Protocol):
     def get_extraction_job(
         self, org_id: str, case_id: str, extraction_job_id: str
     ) -> ExtractionJobRecord | None: ...
+    def create_raster_extraction_job(
+        self, job: RasterExtractionJobRecord
+    ) -> tuple[RasterExtractionJobRecord, bool]: ...
+    def get_raster_extraction_job(
+        self, org_id: str, case_id: str, raster_extraction_job_id: str
+    ) -> RasterExtractionJobRecord | None: ...
+    def claim_next_raster_extraction_job(
+        self, *, now: datetime, lease_expires_at: datetime
+    ) -> RasterExtractionJobRecord | None: ...
+    def complete_raster_extraction_job(
+        self,
+        *,
+        raster_extraction_job_id: str,
+        lease_token: str,
+        result: RasterDocumentExtractionResult,
+        completed_at: datetime,
+    ) -> RasterExtractionJobRecord | None: ...
+    def mark_raster_extraction_job_unavailable(
+        self,
+        *,
+        raster_extraction_job_id: str,
+        expected_profile_revision: str,
+        result: RasterDocumentExtractionResult,
+        error_code: str,
+        completed_at: datetime,
+    ) -> RasterExtractionJobRecord | None: ...
+    def fail_raster_extraction_job(
+        self,
+        *,
+        raster_extraction_job_id: str,
+        lease_token: str,
+        error_code: str,
+        retryable: bool,
+        completed_at: datetime,
+    ) -> RasterExtractionJobRecord | None: ...
+    def create_raster_text_extraction_job(
+        self, job: RasterTextExtractionJobRecord
+    ) -> tuple[RasterTextExtractionJobRecord, bool]: ...
+    def get_raster_text_extraction_job(
+        self, org_id: str, case_id: str, raster_text_extraction_job_id: str
+    ) -> RasterTextExtractionJobRecord | None: ...
+    def claim_next_raster_text_extraction_job(
+        self, *, now: datetime, lease_expires_at: datetime
+    ) -> RasterTextExtractionJobRecord | None: ...
+    def complete_raster_text_extraction_job(
+        self,
+        *,
+        raster_text_extraction_job_id: str,
+        lease_token: str,
+        result: RasterTextDocumentExtractionResult,
+        completed_at: datetime,
+    ) -> RasterTextExtractionJobRecord | None: ...
+    def mark_raster_text_extraction_job_unavailable(
+        self,
+        *,
+        raster_text_extraction_job_id: str,
+        expected_profile_revision: str,
+        result: RasterTextDocumentExtractionResult,
+        error_code: str,
+        completed_at: datetime,
+    ) -> RasterTextExtractionJobRecord | None: ...
+    def fail_raster_text_extraction_job(
+        self,
+        *,
+        raster_text_extraction_job_id: str,
+        lease_token: str,
+        error_code: str,
+        retryable: bool,
+        completed_at: datetime,
+    ) -> RasterTextExtractionJobRecord | None: ...
     def create_review_job(
         self, job: JobRecord, *, expected_case_revision: int
     ) -> tuple[JobRecord, bool]: ...
@@ -190,6 +268,13 @@ class ObjectStore(Protocol):
 class AgentClient(Protocol):
     def review(self, request: Any) -> dict[str, Any]: ...
     def extract_document(self, request: Any, content: bytes) -> dict[str, Any]: ...
+    def extract_raster_document(self, request: Any, content: bytes) -> dict[str, Any]: ...
+    def raster_document_preview_status(self) -> RasterDocumentPreviewStatus: ...
+    def extract_raster_text_document(self, request: Any, content: bytes) -> dict[str, Any]: ...
+    def raster_text_document_preview_status(self) -> RasterTextDocumentPreviewStatus: ...
+    def render_raster_document_page(
+        self, request: Any, content: bytes, page_number: int
+    ) -> RasterDocumentPageRender: ...
     def answer(self, request: Any) -> dict[str, Any]: ...
     def answer_knowledge(self, request: Any) -> dict[str, Any]: ...
     def metadata(self) -> dict[str, Any]: ...

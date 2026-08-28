@@ -16,7 +16,20 @@ if ($MyInvocation.InvocationName -ne '.') {
     throw 'Dot-source this script so the validated local values remain in the current process.'
 }
 
-$workspace = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+# A normal checkout lives directly below the shared workspace.  A task
+# worktree lives below <workspace>\_worktrees instead, but must still use the
+# one shared ignored profile.  Only accept that alternate layout when the
+# canonical Backend checkout is present; otherwise retain the normal path and
+# fail through the existing missing-profile boundary.
+$repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$workspace = (Resolve-Path (Join-Path $repositoryRoot '..')).Path
+if ((Split-Path -Leaf $workspace) -ceq '_worktrees') {
+    $sharedWorkspace = (Resolve-Path (Join-Path $workspace '..')).Path
+    $canonicalLoader = Join-Path $sharedWorkspace 'customs-backend\tools\Import-LocalProfile.ps1'
+    if (Test-Path -LiteralPath $canonicalLoader -PathType Leaf) {
+        $workspace = $sharedWorkspace
+    }
+}
 $profileFile = Join-Path $workspace "_local\profiles\$Profile\backend.env"
 if (-not (Test-Path -LiteralPath $profileFile -PathType Leaf)) {
     throw "Local profile is missing: _local/profiles/$Profile/backend.env"

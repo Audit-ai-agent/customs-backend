@@ -24,6 +24,12 @@ def _repository(tmp_path: Path) -> tuple[Path, bytes]:
         "src/customs_backend/contracts/agent/v3/knowledge-answer-response.schema.json": b"{}\n",
         "src/customs_backend/contracts/agent/v3/document-extraction-request.schema.json": b"{}\n",
         "src/customs_backend/contracts/agent/v3/document-extraction-result.schema.json": b"{}\n",
+        "src/customs_backend/contracts/agent/v3/raster-document-extraction-request.schema.json": b"{}\n",
+        "src/customs_backend/contracts/agent/v3/raster-document-extraction-result.schema.json": b"{}\n",
+        "src/customs_backend/contracts/agent/v3/raster-document-preview-status.schema.json": b"{}\n",
+        "src/customs_backend/contracts/agent/v3/raster-text-extraction-request.schema.json": b"{}\n",
+        "src/customs_backend/contracts/agent/v3/raster-text-extraction-result.schema.json": b"{}\n",
+        "src/customs_backend/contracts/agent/v3/raster-text-preview-status.schema.json": b"{}\n",
         "src/customs_backend/contracts/evidence/v3/guidance_registry_v1.manifest.json": b"{}\n",
         "src/customs_backend/contracts/evidence/v3/guidance_registry_v2.manifest.json": b"{}\n",
     }

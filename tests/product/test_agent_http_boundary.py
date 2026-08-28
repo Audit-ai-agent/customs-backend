@@ -3,21 +3,41 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import date
+from io import BytesIO
 
 import httpx
 import pytest
+from PIL import Image
 
 from customs_backend.adapters import HttpAgentClient
 from customs_backend.agent_contract import AgentContractPayloadError, validate_agent_v3_payload
 from customs_backend.domain import (
     AgentAssistantAnswerRequest,
     AgentDocumentExtractionRequest,
+    AgentRasterDocumentExtractionRequest,
+    AgentRasterTextDocumentExtractionRequest,
     AgentDocumentInput,
     AgentKnowledgeAnswerRequest,
     AgentReviewRequest,
 )
 from customs_backend.ports import AgentResponseRejectedError, KnowledgeInputRejectedError
+from customs_backend.raster_limits import (
+    RASTER_AGENT_EXECUTION_TIMEOUT_SECONDS,
+    RASTER_PAGE_RENDER_TIMEOUT_SECONDS,
+    RASTER_PROFILE_STATUS_TIMEOUT_SECONDS,
+    RASTER_WORKER_LEASE_GRACE_SECONDS,
+    RASTER_WORKER_LEASE_SECONDS,
+)
 from tests.product.agent_v3_fixture import build_agent_v3_result
+
+
+_V15_TEXT_PROFILE_REVISION = "synthetic-raster-text-v1:12f95aa0bd932311dd7e40fc"
+
+
+def _tiny_png() -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (1, 1), color=(0, 0, 0)).save(output, format="PNG")
+    return output.getvalue()
 
 
 def _request() -> AgentReviewRequest:
@@ -78,6 +98,96 @@ def test_packaged_document_extraction_schemas_accept_only_header_metadata_and_pr
                 }
             ],
             "warnings": [{"code": "human_confirmation_required"}],
+        },
+    )
+
+
+def test_packaged_raster_extraction_schemas_accept_only_header_metadata_and_preview() -> None:
+    source_sha256 = "a" * 64
+    metadata = {
+        "document_asset_id": "asset-boundary",
+        "extraction_request_id": "raster-extract-boundary",
+        "source_sha256": source_sha256,
+        "media_type": "image/png",
+        "raster_profile_revision": "synthetic-raster-v1",
+    }
+    validate_agent_v3_payload("raster_document_extraction_request", metadata)
+    validate_agent_v3_payload(
+        "raster_document_extraction_result",
+        {
+            "schema_version": "2.0",
+            **metadata,
+            "status": "unavailable",
+            "byte_size": 32,
+            "canonical_text_sha256": None,
+            "extractor_revision": None,
+            "document_type": "unknown",
+            "classification_confidence": None,
+            "pages": [],
+            "field_candidates": [],
+            "tables": [],
+            "warnings": [{"code": "raster_engine_unavailable"}],
+            "needs_review_reasons": [{"code": "raster_engine_unavailable"}],
+        },
+    )
+
+
+def test_packaged_raster_preview_status_schema_has_no_activation_receipt_fields() -> None:
+    validate_agent_v3_payload(
+        "raster_document_preview_status",
+        {
+            "schema_version": "1.0",
+            "availability": "available",
+            "raster_profile_revision": "synthetic-raster-v1-fingerprint",
+        },
+    )
+    with pytest.raises(AgentContractPayloadError):
+        validate_agent_v3_payload(
+            "raster_document_preview_status",
+            {
+                "schema_version": "1.0",
+                "availability": "available",
+                "raster_profile_revision": "synthetic-raster-v1-fingerprint",
+                "pointer_sha256": "a" * 64,
+            },
+        )
+
+
+def test_packaged_raster_text_schemas_reject_layout_and_bind_visible_text() -> None:
+    source_sha256 = "a" * 64
+    text = "Invoice No. INV-TEXT-001"
+    metadata = {
+        "document_asset_id": "asset-boundary",
+        "extraction_request_id": "raster-text-extract-boundary",
+        "source_sha256": source_sha256,
+        "media_type": "image/png",
+        "raster_text_profile_revision": _V15_TEXT_PROFILE_REVISION,
+    }
+    validate_agent_v3_payload("raster_text_extraction_request", metadata)
+    valid = {
+        "schema_version": "1.0",
+        **metadata,
+        "status": "needs_review",
+        "byte_size": 32,
+        "canonical_text": text,
+        "canonical_text_sha256": hashlib.sha256(text.encode()).hexdigest(),
+        "extractor_revision": "fixture-raster-text-r1",
+        "pages": [{"page_number": 1, "text": text, "confidence": 0.91}],
+        "warnings": [],
+        "needs_review_reasons": [{"code": "human_confirmation_required"}],
+    }
+    validate_agent_v3_payload("raster_text_extraction_result", valid)
+    with pytest.raises(AgentContractPayloadError):
+        validate_agent_v3_payload(
+            "raster_text_extraction_result",
+            {**valid, "tables": []},
+        )
+    validate_agent_v3_payload(
+        "raster_text_preview_status",
+        {
+            "schema_version": "1.0",
+            "availability": "available",
+            "raster_text_profile_revision": _V15_TEXT_PROFILE_REVISION,
         },
     )
 
@@ -454,6 +564,358 @@ def test_document_extraction_uses_raw_body_without_review_trace_or_filename() ->
         client.close()
 
     assert events == []
+
+
+def test_raster_document_extraction_uses_raw_body_and_profile_header_without_trace() -> None:
+    source = b"\x89PNG\r\n\x1a\nsynthetic-raster-source"
+    request = AgentRasterDocumentExtractionRequest(
+        document_asset_id="asset-boundary",
+        extraction_request_id="raster-extract-boundary",
+        media_type="image/png",
+        source_sha256=hashlib.sha256(source).hexdigest(),
+        byte_size=len(source),
+        raster_profile_revision="synthetic-raster-v1",
+    )
+    events: list[tuple[str, str, dict[str, object]]] = []
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        assert http_request.method == "POST"
+        assert http_request.url.path == "/internal/agent/v3/raster-document-extractions"
+        assert http_request.content == source
+        assert http_request.headers["Authorization"] == "Bearer test-token"
+        assert http_request.headers["X-Customs-Service-Mode"] == "local-development"
+        assert http_request.headers["Content-Type"] == "image/png"
+        assert http_request.headers["X-Document-Asset-ID"] == request.document_asset_id
+        assert http_request.headers["X-Extraction-Request-ID"] == request.extraction_request_id
+        assert http_request.headers["X-Document-SHA256"] == request.source_sha256
+        assert http_request.headers["X-Raster-Profile-Revision"] == request.raster_profile_revision
+        assert "filename" not in http_request.headers
+        assert http_request.extensions["timeout"] == {
+            "connect": RASTER_AGENT_EXECUTION_TIMEOUT_SECONDS,
+            "read": RASTER_AGENT_EXECUTION_TIMEOUT_SECONDS,
+            "write": RASTER_AGENT_EXECUTION_TIMEOUT_SECONDS,
+            "pool": RASTER_AGENT_EXECUTION_TIMEOUT_SECONDS,
+        }
+        return httpx.Response(
+            200,
+            json={
+                "schema_version": "2.0",
+                "document_asset_id": request.document_asset_id,
+                "extraction_request_id": request.extraction_request_id,
+                "media_type": request.media_type,
+                "byte_size": request.byte_size,
+                "source_sha256": request.source_sha256,
+                "raster_profile_revision": request.raster_profile_revision,
+                "status": "unavailable",
+                "canonical_text_sha256": None,
+                "extractor_revision": None,
+                "document_type": "unknown",
+                "classification_confidence": None,
+                "pages": [],
+                "field_candidates": [],
+                "tables": [],
+                "warnings": [{"code": "raster_engine_unavailable"}],
+                "needs_review_reasons": [{"code": "raster_engine_unavailable"}],
+            },
+            headers={"X-Customs-Service-Mode": "local-development"},
+            request=http_request,
+        )
+
+    client = HttpAgentClient(
+        base_url="http://127.0.0.1:8090",
+        service_token="test-token",
+        service_mode="local-development",
+        review_trace=lambda run_id, event, payload: events.append((run_id, event, payload)),
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        assert client.extract_raster_document(request, source)["status"] == "unavailable"
+    finally:
+        client.close()
+
+    assert events == []
+
+
+def test_raster_text_document_extraction_uses_a_distinct_raw_boundary_without_trace() -> None:
+    source = b"\x89PNG\r\n\x1a\nsynthetic-raster-text-source"
+    request = AgentRasterTextDocumentExtractionRequest(
+        document_asset_id="asset-boundary",
+        extraction_request_id="raster-text-extract-boundary",
+        media_type="image/png",
+        source_sha256=hashlib.sha256(source).hexdigest(),
+        byte_size=len(source),
+        raster_text_profile_revision=_V15_TEXT_PROFILE_REVISION,
+    )
+    events: list[tuple[str, str, dict[str, object]]] = []
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        assert http_request.method == "POST"
+        assert http_request.url.path == "/internal/agent/v3/raster-text-extractions"
+        assert http_request.content == source
+        assert http_request.headers["Authorization"] == "Bearer test-token"
+        assert http_request.headers["X-Customs-Service-Mode"] == "local-development"
+        assert http_request.headers["Content-Type"] == "image/png"
+        assert http_request.headers["X-Document-Asset-ID"] == request.document_asset_id
+        assert http_request.headers["X-Extraction-Request-ID"] == request.extraction_request_id
+        assert http_request.headers["X-Document-SHA256"] == request.source_sha256
+        assert (
+            http_request.headers["X-Raster-Text-Profile-Revision"]
+            == request.raster_text_profile_revision
+        )
+        assert "filename" not in http_request.headers
+        assert http_request.extensions["timeout"] == {
+            "connect": RASTER_AGENT_EXECUTION_TIMEOUT_SECONDS,
+            "read": RASTER_AGENT_EXECUTION_TIMEOUT_SECONDS,
+            "write": RASTER_AGENT_EXECUTION_TIMEOUT_SECONDS,
+            "pool": RASTER_AGENT_EXECUTION_TIMEOUT_SECONDS,
+        }
+        return httpx.Response(
+            200,
+            json={
+                "schema_version": "1.0",
+                "document_asset_id": request.document_asset_id,
+                "extraction_request_id": request.extraction_request_id,
+                "media_type": request.media_type,
+                "byte_size": request.byte_size,
+                "source_sha256": request.source_sha256,
+                "raster_text_profile_revision": request.raster_text_profile_revision,
+                "status": "unavailable",
+                "canonical_text": None,
+                "canonical_text_sha256": None,
+                "extractor_revision": None,
+                "pages": [],
+                "warnings": [{"code": "raster_text_engine_unavailable"}],
+                "needs_review_reasons": [{"code": "raster_text_engine_unavailable"}],
+            },
+            headers={"X-Customs-Service-Mode": "local-development"},
+            request=http_request,
+        )
+
+    client = HttpAgentClient(
+        base_url="http://127.0.0.1:8090",
+        service_token="test-token",
+        service_mode="local-development",
+        review_trace=lambda run_id, event, payload: events.append((run_id, event, payload)),
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        assert client.extract_raster_text_document(request, source)["status"] == "unavailable"
+    finally:
+        client.close()
+
+    assert events == []
+
+
+def test_raster_preview_status_uses_the_authenticated_no_body_agent_boundary() -> None:
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        assert http_request.method == "GET"
+        assert http_request.url.path == "/internal/agent/v3/raster-document-preview-status"
+        assert http_request.content == b""
+        assert http_request.headers["Authorization"] == "Bearer test-token"
+        assert http_request.headers["X-Customs-Service-Mode"] == "local-development"
+        assert http_request.extensions["timeout"] == {
+            "connect": RASTER_PROFILE_STATUS_TIMEOUT_SECONDS,
+            "read": RASTER_PROFILE_STATUS_TIMEOUT_SECONDS,
+            "write": RASTER_PROFILE_STATUS_TIMEOUT_SECONDS,
+            "pool": RASTER_PROFILE_STATUS_TIMEOUT_SECONDS,
+        }
+        return httpx.Response(
+            200,
+            json={
+                "schema_version": "1.0",
+                "availability": "available",
+                "raster_profile_revision": "synthetic-raster-v1-fingerprint",
+            },
+            headers={"X-Customs-Service-Mode": "local-development"},
+            request=http_request,
+        )
+
+    client = HttpAgentClient(
+        base_url="http://127.0.0.1:8090",
+        service_token="test-token",
+        service_mode="local-development",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        status = client.raster_document_preview_status()
+    finally:
+        client.close()
+
+    assert status.availability == "available"
+    assert status.raster_profile_revision == "synthetic-raster-v1-fingerprint"
+
+
+def test_raster_preview_status_rejects_an_incoherent_or_unexpected_agent_payload() -> None:
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "schema_version": "1.0",
+                "availability": "available",
+                "raster_profile_revision": None,
+            },
+            headers={"X-Customs-Service-Mode": "local-development"},
+            request=http_request,
+        )
+
+    client = HttpAgentClient(
+        base_url="http://127.0.0.1:8090",
+        service_token="test-token",
+        service_mode="local-development",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(AgentResponseRejectedError):
+            client.raster_document_preview_status()
+    finally:
+        client.close()
+
+
+def test_raster_pdf_page_uses_raw_pdf_and_verifies_every_renderer_binding() -> None:
+    source = b"%PDF-1.7\nsynthetic-source\n%%EOF\n"
+    page = _tiny_png()
+    request = AgentRasterDocumentExtractionRequest(
+        document_asset_id="asset-boundary",
+        extraction_request_id="raster-page-boundary",
+        media_type="application/pdf",
+        source_sha256=hashlib.sha256(source).hexdigest(),
+        byte_size=len(source),
+        raster_profile_revision="synthetic-raster-v1",
+    )
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        assert http_request.method == "POST"
+        assert http_request.url.path == "/internal/agent/v3/raster-document-pages/1"
+        assert http_request.content == source
+        assert http_request.headers["Authorization"] == "Bearer test-token"
+        assert http_request.headers["X-Customs-Service-Mode"] == "local-development"
+        assert http_request.headers["Content-Type"] == "application/pdf"
+        assert http_request.headers["X-Document-Asset-ID"] == request.document_asset_id
+        assert http_request.headers["X-Extraction-Request-ID"] == request.extraction_request_id
+        assert http_request.headers["X-Document-SHA256"] == request.source_sha256
+        assert http_request.headers["X-Raster-Profile-Revision"] == request.raster_profile_revision
+        assert http_request.extensions["timeout"] == {
+            "connect": RASTER_PAGE_RENDER_TIMEOUT_SECONDS,
+            "read": RASTER_PAGE_RENDER_TIMEOUT_SECONDS,
+            "write": RASTER_PAGE_RENDER_TIMEOUT_SECONDS,
+            "pool": RASTER_PAGE_RENDER_TIMEOUT_SECONDS,
+        }
+        return httpx.Response(
+            200,
+            content=page,
+            headers={
+                "Content-Type": "image/png",
+                "X-Customs-Service-Mode": "local-development",
+                "X-Document-SHA256": request.source_sha256,
+                "X-Raster-Profile-Revision": request.raster_profile_revision,
+                "X-Raster-Page-Number": "1",
+                "X-Raster-Page-Width": "1",
+                "X-Raster-Page-Height": "1",
+                "X-Raster-Page-SHA256": hashlib.sha256(page).hexdigest(),
+                "X-Raster-Renderer-Revision": "pdfium-fixture-dpi-216",
+            },
+            request=http_request,
+        )
+
+    client = HttpAgentClient(
+        base_url="http://127.0.0.1:8090",
+        service_token="test-token",
+        service_mode="local-development",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        rendered = client.render_raster_document_page(request, source, 1)
+    finally:
+        client.close()
+
+    assert rendered.content == page
+    assert rendered.width == 1
+    assert rendered.height == 1
+    assert rendered.renderer_revision == "pdfium-fixture-dpi-216"
+
+
+def test_raster_timeout_and_lease_contract_stays_within_the_one_minute_ocr_budget() -> None:
+    """Prevent the OCR transport and durable queue lease from drifting apart."""
+
+    assert RASTER_AGENT_EXECUTION_TIMEOUT_SECONDS == 60.0
+    assert RASTER_PAGE_RENDER_TIMEOUT_SECONDS < RASTER_AGENT_EXECUTION_TIMEOUT_SECONDS
+    assert RASTER_PROFILE_STATUS_TIMEOUT_SECONDS < RASTER_PAGE_RENDER_TIMEOUT_SECONDS
+    assert RASTER_WORKER_LEASE_SECONDS == (
+        RASTER_AGENT_EXECUTION_TIMEOUT_SECONDS + RASTER_WORKER_LEASE_GRACE_SECONDS
+    )
+    assert RASTER_WORKER_LEASE_SECONDS > RASTER_AGENT_EXECUTION_TIMEOUT_SECONDS
+
+
+@pytest.mark.parametrize(
+    ("page", "declared_width", "declared_height"),
+    [
+        (b"\x00" + _tiny_png()[1:], "1", "1"),
+        (
+            b"\x89PNG\r\n\x1a\n"
+            + (12).to_bytes(4, byteorder="big")
+            + b"IHDR"
+            + (1).to_bytes(4, byteorder="big")
+            + (1).to_bytes(4, byteorder="big")
+            + b"\x08\x02\x00\x00\x00\x00\x00\x00\x00",
+            "1",
+            "1",
+        ),
+        (
+            b"\x89PNG\r\n\x1a\n"
+            + (13).to_bytes(4, byteorder="big")
+            + b"JHDR"
+            + (1).to_bytes(4, byteorder="big")
+            + (1).to_bytes(4, byteorder="big")
+            + b"\x08\x02\x00\x00\x00\x00\x00\x00\x00",
+            "1",
+            "1",
+        ),
+        (_tiny_png(), "2", "1"),
+    ],
+    ids=["signature", "ihdr-length", "ihdr-type", "header-dimensions"],
+)
+def test_raster_pdf_page_rejects_invalid_png_ihdr_or_header_dimensions(
+    page: bytes, declared_width: str, declared_height: str
+) -> None:
+    source = b"%PDF-1.7\nsynthetic-source\n%%EOF\n"
+    request = AgentRasterDocumentExtractionRequest(
+        document_asset_id="asset-boundary",
+        extraction_request_id="raster-page-boundary",
+        media_type="application/pdf",
+        source_sha256=hashlib.sha256(source).hexdigest(),
+        byte_size=len(source),
+        raster_profile_revision="synthetic-raster-v1",
+    )
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=page,
+            headers={
+                "Content-Type": "image/png",
+                "X-Customs-Service-Mode": "local-development",
+                "X-Document-SHA256": request.source_sha256,
+                "X-Raster-Profile-Revision": request.raster_profile_revision,
+                "X-Raster-Page-Number": "1",
+                "X-Raster-Page-Width": declared_width,
+                "X-Raster-Page-Height": declared_height,
+                "X-Raster-Page-SHA256": hashlib.sha256(page).hexdigest(),
+                "X-Raster-Renderer-Revision": "pdfium-fixture-dpi-216",
+            },
+            request=http_request,
+        )
+
+    client = HttpAgentClient(
+        base_url="http://127.0.0.1:8090",
+        service_token="test-token",
+        service_mode="local-development",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(AgentResponseRejectedError):
+            client.render_raster_document_page(request, source, 1)
+    finally:
+        client.close()
 
 
 def test_assistant_uses_the_same_bearer_and_mode_bound_http_endpoint() -> None:

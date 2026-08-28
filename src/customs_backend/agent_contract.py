@@ -30,6 +30,12 @@ AgentContractKind = Literal[
     "knowledge_answer_response",
     "document_extraction_request",
     "document_extraction_result",
+    "raster_document_extraction_request",
+    "raster_document_extraction_result",
+    "raster_document_preview_status",
+    "raster_text_extraction_request",
+    "raster_text_extraction_result",
+    "raster_text_preview_status",
 ]
 _SCHEMA_PATHS: dict[AgentContractKind, tuple[str, ...]] = {
     "review_request": ("contracts", "agent", "v3", "review-request.schema.json"),
@@ -69,6 +75,42 @@ _SCHEMA_PATHS: dict[AgentContractKind, tuple[str, ...]] = {
         "agent",
         "v3",
         "document-extraction-result.schema.json",
+    ),
+    "raster_document_extraction_request": (
+        "contracts",
+        "agent",
+        "v3",
+        "raster-document-extraction-request.schema.json",
+    ),
+    "raster_document_extraction_result": (
+        "contracts",
+        "agent",
+        "v3",
+        "raster-document-extraction-result.schema.json",
+    ),
+    "raster_document_preview_status": (
+        "contracts",
+        "agent",
+        "v3",
+        "raster-document-preview-status.schema.json",
+    ),
+    "raster_text_extraction_request": (
+        "contracts",
+        "agent",
+        "v3",
+        "raster-text-extraction-request.schema.json",
+    ),
+    "raster_text_extraction_result": (
+        "contracts",
+        "agent",
+        "v3",
+        "raster-text-extraction-result.schema.json",
+    ),
+    "raster_text_preview_status": (
+        "contracts",
+        "agent",
+        "v3",
+        "raster-text-preview-status.schema.json",
     ),
 }
 
@@ -123,9 +165,15 @@ def validate_agent_contract_bundle() -> None:
     load_agent_contract_schema("knowledge_answer_response")
     load_agent_contract_schema("document_extraction_request")
     load_agent_contract_schema("document_extraction_result")
+    load_agent_contract_schema("raster_document_extraction_request")
+    load_agent_contract_schema("raster_document_extraction_result")
+    load_agent_contract_schema("raster_document_preview_status")
+    load_agent_contract_schema("raster_text_extraction_request")
+    load_agent_contract_schema("raster_text_extraction_result")
+    load_agent_contract_schema("raster_text_preview_status")
 
 
-@lru_cache(maxsize=10)
+@lru_cache(maxsize=12)
 def _agent_contract_validator(kind: AgentContractKind) -> Draft202012Validator:
     """Build a local-only registry for the assistant request's relative ref."""
 

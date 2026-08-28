@@ -40,6 +40,42 @@ MAX_TEXT_DOCUMENT_UTF8_BYTES = MAX_TEXT_DOCUMENT_CHARACTERS * 4
 MAX_DOCUMENT_ASSET_BYTES = 16 * 1024 * 1024
 MAX_DOCUMENT_ASSET_PAGES = 20
 MAX_DOCUMENT_ASSET_PIXELS = 40_000_000
+# A reviewer page is encoded from an already-admitted PDF page at the
+# approval-pinned DPI.  It is never persisted or returned in a JSON payload,
+# but its transport still needs a hard in-memory ceiling independent of the
+# source upload limit.
+MAX_RASTER_VIEWER_PAGE_BYTES = 32 * 1024 * 1024
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_PNG_IHDR_LENGTH = 13
+_PNG_IHDR_TOTAL_BYTES = len(_PNG_SIGNATURE) + 4 + 4 + _PNG_IHDR_LENGTH + 4
+
+
+def _png_ihdr_dimensions(content: bytes) -> tuple[int, int]:
+    """Read only the fixed PNG signature and IHDR prefix needed for dimensions.
+
+    This is deliberately not an image decode: the page bytes have already been
+    bounded at the transport boundary, and the Backend only needs a stable,
+    constant-size check that the Agent's claimed dimensions describe the PNG
+    the reviewer will receive.
+    """
+
+    if (
+        len(content) < _PNG_IHDR_TOTAL_BYTES
+        or content[: len(_PNG_SIGNATURE)] != _PNG_SIGNATURE
+    ):
+        raise ValueError("raster viewer page is not a complete PNG IHDR prefix")
+    if int.from_bytes(content[8:12], byteorder="big") != _PNG_IHDR_LENGTH:
+        raise ValueError("raster viewer page has an invalid PNG IHDR length")
+    if content[12:16] != b"IHDR":
+        raise ValueError("raster viewer page has an invalid PNG IHDR type")
+
+    width = int.from_bytes(content[16:20], byteorder="big")
+    height = int.from_bytes(content[20:24], byteorder="big")
+    if width < 1 or height < 1:
+        raise ValueError("raster viewer page has invalid PNG dimensions")
+    return width, height
+
+
 # Keep the compact legacy codes while adding the text documents needed for a
 # normal export workbench.  They are only labels for text input; this does not
 # imply PDF/image/OCR support.
@@ -203,6 +239,18 @@ class DocumentRecord(BaseModel):
 DocumentAssetMediaType = Literal["application/pdf", "image/jpeg", "image/png"]
 DocumentExtractionStatus = Literal[
     "queued", "preview_ready", "needs_review", "unavailable", "failed"
+]
+RasterDocumentExtractionStatus = Literal[
+    "queued", "running", "preview_ready", "needs_review", "unavailable", "failed"
+]
+# Keep the text-only path independently named even though its queue lifecycle
+# matches the structured raster preview.  A text-only activation must never be
+# mistaken for an approval of table/cell/geometry reconstruction.
+RasterTextDocumentExtractionStatus = Literal[
+    "queued", "running", "preview_ready", "needs_review", "unavailable", "failed"
+]
+RasterDocumentType = Literal[
+    "bill_of_lading", "commercial_invoice", "packing_list", "unknown"
 ]
 
 
@@ -395,13 +443,594 @@ class ExtractionJobRecord(BaseModel):
         return self
 
 
+class RasterExtractionPoint(BaseModel):
+    """One normalized point in the source page coordinate system."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    x: float = Field(ge=0, le=1)
+    y: float = Field(ge=0, le=1)
+
+
+class RasterExtractionPolygon(BaseModel):
+    """Optional provider geometry retained alongside the stable bounding box."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    points: list[RasterExtractionPoint] = Field(min_length=4, max_length=32)
+
+
+class RasterExtractionSpan(BaseModel):
+    """A raster OCR candidate; it never authorises an automatic decision."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    span_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+    ordinal: int = Field(ge=1, le=100_000)
+    text: str = Field(min_length=1, max_length=8_000)
+    bbox: ExtractionBoundingBox | None = None
+    polygon: RasterExtractionPolygon | None = None
+    confidence: float = Field(ge=0, le=1)
+    reading_order: int = Field(ge=1, le=100_000)
+
+
+class RasterExtractionPage(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    page_number: int = Field(ge=1, le=MAX_DOCUMENT_ASSET_PAGES)
+    width: int = Field(ge=1, le=100_000)
+    height: int = Field(ge=1, le=100_000)
+    coordinate_unit: Literal["pixels"]
+    spans: list[RasterExtractionSpan] = Field(default_factory=list, max_length=20_000)
+
+    @model_validator(mode="after")
+    def span_identity_and_order_are_consistent(self) -> "RasterExtractionPage":
+        span_ids = [span.span_id for span in self.spans]
+        ordinals = [span.ordinal for span in self.spans]
+        reading_order = [span.reading_order for span in self.spans]
+        if (
+            len(span_ids) != len(set(span_ids))
+            or len(ordinals) != len(set(ordinals))
+            or len(reading_order) != len(set(reading_order))
+            or ordinals != sorted(ordinals)
+            or reading_order != sorted(reading_order)
+        ):
+            raise ValueError("raster extraction spans are not uniquely ordered")
+        return self
+
+
+class RasterFieldCandidate(BaseModel):
+    """One evidence-linked field candidate for the reviewer workbench."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    field_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z][A-Za-z0-9._:-]{0,127}$"
+    )
+    value: str = Field(min_length=1, max_length=8_000)
+    confidence: float = Field(ge=0, le=1)
+    evidence_span_ids: list[str] = Field(min_length=1, max_length=256)
+    bbox: ExtractionBoundingBox | None = None
+
+
+class RasterTableCell(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    cell_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+    row_index: int = Field(ge=0, le=100_000)
+    column_index: int = Field(ge=0, le=100_000)
+    text: str = Field(min_length=1, max_length=8_000)
+    bbox: ExtractionBoundingBox | None = None
+    confidence: float = Field(ge=0, le=1)
+    evidence_span_ids: list[str] = Field(min_length=1, max_length=256)
+
+
+class RasterTableRow(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    row_index: int = Field(ge=0, le=100_000)
+    cells: list[RasterTableCell] = Field(min_length=1, max_length=1_000)
+
+    @model_validator(mode="after")
+    def cell_coordinates_match_row(self) -> "RasterTableRow":
+        columns = [cell.column_index for cell in self.cells]
+        if any(cell.row_index != self.row_index for cell in self.cells) or len(columns) != len(
+            set(columns)
+        ):
+            raise ValueError("raster table row cells are inconsistent")
+        return self
+
+
+class RasterTable(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    table_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+    page_number: int = Field(ge=1, le=MAX_DOCUMENT_ASSET_PAGES)
+    bbox: ExtractionBoundingBox | None = None
+    rows: list[RasterTableRow] = Field(min_length=1, max_length=10_000)
+
+    @model_validator(mode="after")
+    def rows_are_unique_and_ordered(self) -> "RasterTable":
+        row_indexes = [row.row_index for row in self.rows]
+        if len(row_indexes) != len(set(row_indexes)) or row_indexes != sorted(row_indexes):
+            raise ValueError("raster table rows are not uniquely ordered")
+        return self
+
+
+class RasterExtractionWarning(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    code: str = Field(min_length=2, max_length=128, pattern=r"^[a-z][a-z0-9_]{1,127}$")
+
+
+def canonical_raster_extraction_text_sha256(pages: list[RasterExtractionPage]) -> str:
+    """Bind the visible raster spans to the Agent text provenance receipt."""
+
+    text = "\n".join(
+        unicodedata.normalize("NFC", span.text).replace("\r\n", "\n").replace("\r", "\n")
+        for page in sorted(pages, key=lambda item: item.page_number)
+        for span in sorted(page.spans, key=lambda item: (item.reading_order, item.ordinal))
+    )
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+class RasterDocumentExtractionResult(BaseModel):
+    """Versioned human-review-only OCR/layout projection for raster inputs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["2.0"] = "2.0"
+    document_asset_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+    extraction_request_id: str = Field(min_length=1, max_length=128)
+    media_type: DocumentAssetMediaType
+    byte_size: int = Field(ge=1, le=MAX_DOCUMENT_ASSET_BYTES)
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    raster_profile_revision: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+    status: Literal["preview_ready", "needs_review", "unavailable"]
+    canonical_text_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    extractor_revision: str | None = Field(default=None, min_length=1, max_length=256)
+    document_type: RasterDocumentType
+    classification_confidence: float | None = Field(default=None, ge=0, le=1)
+    pages: list[RasterExtractionPage] = Field(default_factory=list, max_length=MAX_DOCUMENT_ASSET_PAGES)
+    field_candidates: list[RasterFieldCandidate] = Field(default_factory=list, max_length=256)
+    tables: list[RasterTable] = Field(default_factory=list, max_length=100)
+    warnings: list[RasterExtractionWarning] = Field(default_factory=list, max_length=32)
+    needs_review_reasons: list[RasterExtractionWarning] = Field(default_factory=list, max_length=32)
+
+    @model_validator(mode="after")
+    def preview_result_is_coherent(self) -> "RasterDocumentExtractionResult":
+        page_numbers = [page.page_number for page in self.pages]
+        if page_numbers != list(range(1, len(page_numbers) + 1)):
+            raise ValueError("raster extraction page numbers must be contiguous")
+        span_ids = {span.span_id for page in self.pages for span in page.spans}
+        if self.status == "unavailable":
+            if any(
+                (
+                    self.canonical_text_sha256 is not None,
+                    self.extractor_revision is not None,
+                    self.classification_confidence is not None,
+                    self.pages,
+                    self.field_candidates,
+                    self.tables,
+                )
+            ):
+                raise ValueError("an unavailable raster extraction must not expose preview content")
+            return self
+        has_content = bool(self.pages or self.field_candidates or self.tables)
+        has_text_provenance = (
+            self.canonical_text_sha256 is not None or self.extractor_revision is not None
+        )
+        # A pre-OCR safety stop (for example a JPEG with EXIF rotation) is a
+        # genuine reviewer-held ``needs_review`` outcome, not an unavailable
+        # engine or a failed job.  It deliberately contains no extracted text
+        # or geometry, so it must not be forced through the contentful-preview
+        # provenance invariant below.
+        if not has_content:
+            if has_text_provenance:
+                raise ValueError("an empty raster extraction must not claim text provenance")
+            if self.status == "preview_ready":
+                raise ValueError("a preview-ready raster extraction requires positioned spans")
+            if self.status == "needs_review" and not self.needs_review_reasons:
+                raise ValueError("an empty needs-review raster extraction requires a reason")
+            return self
+        if self.canonical_text_sha256 is None or not self.extractor_revision or not self.pages:
+            raise ValueError("a contentful raster extraction requires text provenance and pages")
+        if self.canonical_text_sha256 != canonical_raster_extraction_text_sha256(self.pages):
+            raise ValueError("raster extraction text receipt does not match preview spans")
+        if any(table.page_number not in page_numbers for table in self.tables):
+            raise ValueError("raster extraction table page is outside the source")
+        evidence = [
+            evidence_span_id
+            for candidate in self.field_candidates
+            for evidence_span_id in candidate.evidence_span_ids
+        ] + [
+            evidence_span_id
+            for table in self.tables
+            for row in table.rows
+            for cell in row.cells
+            for evidence_span_id in cell.evidence_span_ids
+        ]
+        if any(evidence_span_id not in span_ids for evidence_span_id in evidence):
+            raise ValueError("raster extraction evidence does not reference a visible span")
+        if self.status == "preview_ready":
+            if (
+                self.document_type == "unknown"
+                or self.classification_confidence is None
+                or self.needs_review_reasons
+                or any(span.bbox is None for page in self.pages for span in page.spans)
+                or any(candidate.bbox is None for candidate in self.field_candidates)
+                or any(
+                    table.bbox is None or any(cell.bbox is None for row in table.rows for cell in row.cells)
+                    for table in self.tables
+                )
+            ):
+                raise ValueError("a preview-ready raster extraction requires complete geometry")
+        return self
+
+
+class AgentRasterDocumentExtractionRequest(BaseModel):
+    """Header metadata for one raw raster OCR/layout request to Agent v3."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    document_asset_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    )
+    extraction_request_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    )
+    media_type: DocumentAssetMediaType
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    byte_size: int = Field(ge=1, le=MAX_DOCUMENT_ASSET_BYTES)
+    raster_profile_revision: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+
+    def to_agent_wire(self) -> dict[str, str]:
+        return {
+            "document_asset_id": self.document_asset_id,
+            "extraction_request_id": self.extraction_request_id,
+            "source_sha256": self.source_sha256,
+            "media_type": self.media_type,
+            "raster_profile_revision": self.raster_profile_revision,
+        }
+
+
+class RasterDocumentPreviewStatus(BaseModel):
+    """The currently usable raster profile, without implementation detail.
+
+    This is intentionally a small internal Agent contract.  It tells Backend
+    whether a profile can be pinned for a new job, but never reveals pointer
+    paths, hashes, model names, or why an unavailable profile failed.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.0"] = "1.0"
+    availability: Literal["available", "unavailable"]
+    raster_profile_revision: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+    )
+
+    @model_validator(mode="after")
+    def availability_matches_profile_revision(self) -> "RasterDocumentPreviewStatus":
+        if (self.availability == "available") != (self.raster_profile_revision is not None):
+            raise ValueError("raster preview availability does not match its profile revision")
+        return self
+
+
+class RasterDocumentPageRender(BaseModel):
+    """One ephemeral, provenance-bound PNG page for the reviewer overlay.
+
+    This internal model must never become a public JSON response.  The
+    Backend verifies every Agent response binding before returning only the
+    bytes through its authenticated, no-store image endpoint.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    page_number: int = Field(ge=1, le=MAX_DOCUMENT_ASSET_PAGES)
+    width: int = Field(ge=1, le=100_000)
+    height: int = Field(ge=1, le=100_000)
+    media_type: Literal["image/png"]
+    content: bytes = Field(min_length=1, max_length=MAX_RASTER_VIEWER_PAGE_BYTES)
+    content_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    raster_profile_revision: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+    renderer_revision: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+
+    @model_validator(mode="after")
+    def content_matches_declared_digest(self) -> "RasterDocumentPageRender":
+        if hashlib.sha256(self.content).hexdigest() != self.content_sha256:
+            raise ValueError("raster viewer page digest does not match content")
+        png_width, png_height = _png_ihdr_dimensions(self.content)
+        if (png_width, png_height) != (self.width, self.height):
+            raise ValueError("raster viewer page dimensions do not match PNG IHDR")
+        return self
+
+
+class RasterExtractionJobRecord(BaseModel):
+    """Persisted queue record; leases make restarts and retries fail closed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    raster_extraction_job_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    )
+    asset_id: str = Field(min_length=1, max_length=128)
+    case_id: str = Field(min_length=1, max_length=128)
+    org_id: str = Field(min_length=1, max_length=128)
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    profile_revision: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+    status: RasterDocumentExtractionStatus
+    attempt_count: int = Field(default=0, ge=0, le=3)
+    lease_token: str | None = Field(default=None, min_length=1, max_length=128)
+    lease_expires_at: datetime | None = None
+    result: RasterDocumentExtractionResult | None = None
+    error_code: str | None = Field(default=None, min_length=1, max_length=128)
+    created_by: str = Field(min_length=1, max_length=256)
+    created_at: datetime
+    updated_at: datetime
+
+    @model_validator(mode="after")
+    def job_result_matches_status(self) -> "RasterExtractionJobRecord":
+        terminal_result = {"preview_ready", "needs_review", "unavailable"}
+        if self.status in terminal_result and self.result is None:
+            raise ValueError("a completed raster extraction job requires a result")
+        if self.status in {"queued", "running", "failed"} and self.result is not None:
+            raise ValueError("a non-completed raster extraction job must not contain a result")
+        if self.status == "running" and (self.lease_token is None or self.lease_expires_at is None):
+            raise ValueError("a running raster extraction job requires a lease")
+        if self.status != "running" and (
+            self.lease_token is not None or self.lease_expires_at is not None
+        ):
+            raise ValueError("only a running raster extraction job may retain a lease")
+        if self.result is not None and (
+            self.result.document_asset_id != self.asset_id
+            or self.result.source_sha256 != self.source_sha256
+            or self.result.raster_profile_revision != self.profile_revision
+        ):
+            raise ValueError("raster extraction result provenance does not match its job")
+        return self
+
+
+class RasterTextExtractionPage(BaseModel):
+    """One page of text-only OCR output.
+
+    This deliberately has no layout, field, table, cell, or coordinate
+    claims.  The text remains a reviewer-editable draft, not a review input.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    page_number: int = Field(ge=1, le=MAX_DOCUMENT_ASSET_PAGES)
+    text: str = Field(min_length=1, max_length=MAX_TEXT_DOCUMENT_CHARACTERS)
+    confidence: float | None = Field(default=None, ge=0, le=1)
+
+
+def canonical_raster_text_extraction_text(pages: list[RasterTextExtractionPage]) -> str:
+    """Return the exact reviewer-visible text receipt for text-only OCR.
+
+    Form-feed separators retain the page boundary without implying spatial
+    structure.  Normalising here also makes the Agent and Backend reject a
+    result whose text digest was calculated over a different representation.
+    """
+
+    return "\n\f\n".join(
+        unicodedata.normalize("NFC", page.text).replace("\r\n", "\n").replace("\r", "\n")
+        for page in sorted(pages, key=lambda item: item.page_number)
+    )
+
+
+class RasterTextDocumentExtractionResult(BaseModel):
+    """Versioned, text-only OCR preview for a human to edit before review."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"] = "1.0"
+    document_asset_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+    extraction_request_id: str = Field(min_length=1, max_length=128)
+    media_type: DocumentAssetMediaType
+    byte_size: int = Field(ge=1, le=MAX_DOCUMENT_ASSET_BYTES)
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    raster_text_profile_revision: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+    status: Literal["preview_ready", "needs_review", "unavailable"]
+    canonical_text: str | None = Field(default=None, max_length=MAX_TEXT_DOCUMENT_CHARACTERS)
+    canonical_text_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    extractor_revision: str | None = Field(default=None, min_length=1, max_length=256)
+    pages: list[RasterTextExtractionPage] = Field(
+        default_factory=list, max_length=MAX_DOCUMENT_ASSET_PAGES
+    )
+    warnings: list[RasterExtractionWarning] = Field(default_factory=list, max_length=32)
+    needs_review_reasons: list[RasterExtractionWarning] = Field(default_factory=list, max_length=32)
+
+    @model_validator(mode="after")
+    def text_preview_is_coherent(self) -> "RasterTextDocumentExtractionResult":
+        page_numbers = [page.page_number for page in self.pages]
+        if page_numbers != list(range(1, len(page_numbers) + 1)):
+            raise ValueError("raster text extraction page numbers must be contiguous")
+        has_content = bool(self.pages)
+        has_provenance = (
+            self.canonical_text is not None
+            or self.canonical_text_sha256 is not None
+            or self.extractor_revision is not None
+        )
+        if self.status == "unavailable":
+            if has_content or has_provenance or self.needs_review_reasons:
+                raise ValueError("an unavailable raster text extraction must not expose preview content")
+            return self
+        if not has_content:
+            if has_provenance:
+                raise ValueError("an empty raster text extraction must not claim text provenance")
+            if self.status == "preview_ready":
+                raise ValueError("a preview-ready raster text extraction requires text pages")
+            if not self.needs_review_reasons:
+                raise ValueError("an empty raster text extraction requires a review reason")
+            return self
+        if (
+            self.canonical_text is None
+            or self.canonical_text_sha256 is None
+            or self.extractor_revision is None
+        ):
+            raise ValueError("a contentful raster text extraction requires text provenance")
+        expected_text = canonical_raster_text_extraction_text(self.pages)
+        if self.canonical_text != expected_text:
+            raise ValueError("raster text extraction receipt does not match page text")
+        if len(expected_text.encode("utf-8")) > MAX_TEXT_DOCUMENT_UTF8_BYTES:
+            raise ValueError("raster text extraction exceeds the text confirmation safety limit")
+        if hashlib.sha256(expected_text.encode("utf-8")).hexdigest() != self.canonical_text_sha256:
+            raise ValueError("raster text extraction digest does not match preview text")
+        if self.status == "needs_review" and not self.needs_review_reasons:
+            raise ValueError("a needs-review raster text extraction requires a reason")
+        if self.status == "preview_ready" and self.needs_review_reasons:
+            raise ValueError("a preview-ready raster text extraction cannot require review")
+        return self
+
+
+class AgentRasterTextDocumentExtractionRequest(BaseModel):
+    """Header metadata for one raw raster text OCR request to Agent v3."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    document_asset_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    )
+    extraction_request_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    )
+    media_type: DocumentAssetMediaType
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    byte_size: int = Field(ge=1, le=MAX_DOCUMENT_ASSET_BYTES)
+    raster_text_profile_revision: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+
+    def to_agent_wire(self) -> dict[str, str]:
+        return {
+            "document_asset_id": self.document_asset_id,
+            "extraction_request_id": self.extraction_request_id,
+            "source_sha256": self.source_sha256,
+            "media_type": self.media_type,
+            "raster_text_profile_revision": self.raster_text_profile_revision,
+        }
+
+
+class RasterTextDocumentPreviewStatus(BaseModel):
+    """Current activation state for the separate text-only raster profile."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.0"] = "1.0"
+    availability: Literal["available", "unavailable"]
+    raster_text_profile_revision: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+    )
+
+    @model_validator(mode="after")
+    def availability_matches_profile_revision(self) -> "RasterTextDocumentPreviewStatus":
+        if (self.availability == "available") != (self.raster_text_profile_revision is not None):
+            raise ValueError("raster text preview availability does not match its profile revision")
+        return self
+
+
+class RasterTextExtractionJobRecord(BaseModel):
+    """Persisted text-only queue record with a profile-pinned lease."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    raster_text_extraction_job_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    )
+    asset_id: str = Field(min_length=1, max_length=128)
+    case_id: str = Field(min_length=1, max_length=128)
+    org_id: str = Field(min_length=1, max_length=128)
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    profile_revision: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+    status: RasterTextDocumentExtractionStatus
+    attempt_count: int = Field(default=0, ge=0, le=3)
+    lease_token: str | None = Field(default=None, min_length=1, max_length=128)
+    lease_expires_at: datetime | None = None
+    result: RasterTextDocumentExtractionResult | None = None
+    error_code: str | None = Field(default=None, min_length=1, max_length=128)
+    created_by: str = Field(min_length=1, max_length=256)
+    created_at: datetime
+    updated_at: datetime
+
+    @model_validator(mode="after")
+    def job_result_matches_status(self) -> "RasterTextExtractionJobRecord":
+        terminal_result = {"preview_ready", "needs_review", "unavailable"}
+        if self.status in terminal_result and self.result is None:
+            raise ValueError("a completed raster text extraction job requires a result")
+        if self.status in {"queued", "running", "failed"} and self.result is not None:
+            raise ValueError("a non-completed raster text extraction job must not contain a result")
+        if self.status == "running" and (self.lease_token is None or self.lease_expires_at is None):
+            raise ValueError("a running raster text extraction job requires a lease")
+        if self.status != "running" and (
+            self.lease_token is not None or self.lease_expires_at is not None
+        ):
+            raise ValueError("only a running raster text extraction job may retain a lease")
+        if self.result is not None and (
+            self.result.document_asset_id != self.asset_id
+            or self.result.source_sha256 != self.source_sha256
+            or self.result.raster_text_profile_revision != self.profile_revision
+        ):
+            raise ValueError("raster text extraction result provenance does not match its job")
+        return self
+
+
 class ConfirmedExtractedTextCreate(BaseModel):
     """Human-confirmed text may enter the existing text-review workflow."""
 
     model_config = ConfigDict(extra="forbid")
 
-    extraction_job_id: str = Field(
-        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    # Retain the v1 name while allowing the raster v2 job to use the same
+    # human-confirmation endpoint.  Exactly one value is accepted so a
+    # browser cannot accidentally bind text to two previews.
+    extraction_job_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    raster_extraction_job_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    raster_text_extraction_job_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
     )
     content_text: str = Field(min_length=1, max_length=MAX_TEXT_DOCUMENT_CHARACTERS)
     filename: str = Field(min_length=1, max_length=255)
@@ -418,6 +1047,20 @@ class ConfirmedExtractedTextCreate(BaseModel):
         if len(value.encode("utf-8")) > MAX_TEXT_DOCUMENT_UTF8_BYTES:
             raise ValueError("confirmed extracted text exceeds the UTF-8 byte safety limit")
         return value
+
+    @model_validator(mode="after")
+    def exactly_one_extraction_job_is_selected(self) -> "ConfirmedExtractedTextCreate":
+        selected = sum(
+            value is not None
+            for value in (
+                self.extraction_job_id,
+                self.raster_extraction_job_id,
+                self.raster_text_extraction_job_id,
+            )
+        )
+        if selected != 1:
+            raise ValueError("exactly one extraction job identifier is required")
+        return self
 
 
 class ReviewEnqueueRequest(BaseModel):

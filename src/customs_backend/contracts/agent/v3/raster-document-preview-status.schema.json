@@ -1,0 +1,19 @@
+{
+  "$id": "https://schemas.customs.local/agent/v3/raster-document-preview-status.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Current activation state for the trusted raster preview profile. It intentionally exposes no pointer path, receipt, model, package, hash, or failure detail.",
+  "properties": {
+    "schema_version": {"const": "1.0", "type": "string"},
+    "availability": {"enum": ["available", "unavailable"], "type": "string"},
+    "raster_profile_revision": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"}
+      ]
+    }
+  },
+  "required": ["schema_version", "availability", "raster_profile_revision"],
+  "title": "Customs AI Agent raster preview activation status",
+  "type": "object"
+}
