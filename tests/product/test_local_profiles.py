@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import shutil
+import subprocess
 from datetime import date
 from pathlib import Path
 
@@ -344,3 +346,59 @@ def test_profile_loader_is_local_only_and_does_not_echo_values() -> None:
     assert "$allowedKeys = if ($Scope -eq 'backend') { $backendKeys } else { $agentKeys }" in loader
     assert 'Write-Host "Imported local $Profile $Scope profile values."' in loader
     assert "Invoke-Expression" not in loader
+
+
+@pytest.mark.parametrize(
+    "relative_tool_directory",
+    [
+        Path("customs-backend") / "tools",
+        Path("_worktrees") / "task-0067-raster-backend" / "tools",
+    ],
+)
+def test_profile_loader_uses_the_shared_workspace_for_a_linked_worktree(
+    tmp_path: Path, relative_tool_directory: Path
+) -> None:
+    pwsh = shutil.which("pwsh")
+    if pwsh is None:
+        pytest.skip("PowerShell 7 is required to exercise the profile loader")
+
+    workspace = tmp_path / "workspace"
+    tool_directory = workspace / relative_tool_directory
+    tool_directory.mkdir(parents=True)
+    loader_source = (
+        Path(__file__).resolve().parents[2] / "tools" / "Import-LocalProfile.ps1"
+    ).read_text(encoding="utf-8")
+    loader_path = tool_directory / "Import-LocalProfile.ps1"
+    loader_path.write_text(loader_source, encoding="utf-8")
+
+    canonical_loader = workspace / "customs-backend" / "tools" / "Import-LocalProfile.ps1"
+    canonical_loader.parent.mkdir(parents=True, exist_ok=True)
+    canonical_loader.write_text(loader_source, encoding="utf-8")
+    profile_path = workspace / "_local" / "profiles" / "dev-fixture" / "backend.env"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        "CUSTOMS_BACKEND_ENVIRONMENT=local-development\n"
+        "CUSTOMS_BACKEND_AGENT_BASE_URL=http://127.0.0.1:18090\n",
+        encoding="utf-8",
+    )
+
+    escaped_loader = str(loader_path).replace("'", "''")
+    result = subprocess.run(
+        [
+            pwsh,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            (
+                f". '{escaped_loader}' -Profile dev-fixture -Scope backend; "
+                "if ($env:CUSTOMS_BACKEND_ENVIRONMENT -ne 'local-development') { exit 1 }"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "Imported local dev-fixture backend profile values.\n"

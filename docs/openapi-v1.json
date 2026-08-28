@@ -456,17 +456,52 @@
             "type": "string"
           },
           "extraction_job_id": {
-            "maxLength": 128,
-            "minLength": 1,
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
-            "title": "Extraction Job Id",
-            "type": "string"
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extraction Job Id"
           },
           "filename": {
             "maxLength": 255,
             "minLength": 1,
             "title": "Filename",
             "type": "string"
+          },
+          "raster_extraction_job_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Raster Extraction Job Id"
+          },
+          "raster_text_extraction_job_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Raster Text Extraction Job Id"
           },
           "replaces_document_id": {
             "anyOf": [
@@ -484,7 +519,6 @@
           }
         },
         "required": [
-          "extraction_job_id",
           "content_text",
           "filename"
         ],
@@ -3611,6 +3645,721 @@
         "title": "PublicDocumentRecord",
         "type": "object"
       },
+      "RasterExtractionJobResponse": {
+        "properties": {
+          "asset": {
+            "$ref": "#/components/schemas/DocumentAssetView"
+          },
+          "current_profile_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Profile Revision"
+          },
+          "idempotency_reused": {
+            "title": "Idempotency Reused",
+            "type": "boolean"
+          },
+          "job": {
+            "$ref": "#/components/schemas/RasterExtractionJobView"
+          },
+          "profile_superseded": {
+            "title": "Profile Superseded",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "asset",
+          "job",
+          "idempotency_reused",
+          "current_profile_revision",
+          "profile_superseded"
+        ],
+        "title": "RasterExtractionJobResponse",
+        "type": "object"
+      },
+      "RasterExtractionJobView": {
+        "properties": {
+          "asset_id": {
+            "title": "Asset Id",
+            "type": "string"
+          },
+          "attempt_count": {
+            "maximum": 3.0,
+            "minimum": 0.0,
+            "title": "Attempt Count",
+            "type": "integer"
+          },
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "created_by": {
+            "title": "Created By",
+            "type": "string"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "profile_revision": {
+            "title": "Profile Revision",
+            "type": "string"
+          },
+          "raster_extraction_job_id": {
+            "title": "Raster Extraction Job Id",
+            "type": "string"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RasterExtractionPreviewView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "running",
+              "preview_ready",
+              "needs_review",
+              "unavailable",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "raster_extraction_job_id",
+          "asset_id",
+          "case_id",
+          "profile_revision",
+          "status",
+          "attempt_count",
+          "created_by",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "RasterExtractionJobView",
+        "type": "object"
+      },
+      "RasterExtractionPageView": {
+        "properties": {
+          "coordinate_unit": {
+            "const": "pixels",
+            "title": "Coordinate Unit",
+            "type": "string"
+          },
+          "height": {
+            "minimum": 1.0,
+            "title": "Height",
+            "type": "integer"
+          },
+          "page_number": {
+            "minimum": 1.0,
+            "title": "Page Number",
+            "type": "integer"
+          },
+          "spans": {
+            "items": {
+              "$ref": "#/components/schemas/RasterExtractionSpanView"
+            },
+            "title": "Spans",
+            "type": "array"
+          },
+          "width": {
+            "minimum": 1.0,
+            "title": "Width",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "page_number",
+          "width",
+          "height",
+          "coordinate_unit",
+          "spans"
+        ],
+        "title": "RasterExtractionPageView",
+        "type": "object"
+      },
+      "RasterExtractionPolygonView": {
+        "properties": {
+          "points": {
+            "items": {
+              "additionalProperties": {
+                "type": "number"
+              },
+              "type": "object"
+            },
+            "title": "Points",
+            "type": "array"
+          }
+        },
+        "required": [
+          "points"
+        ],
+        "title": "RasterExtractionPolygonView",
+        "type": "object"
+      },
+      "RasterExtractionPreviewView": {
+        "description": "Safe reviewer projection; provenance digests stay Backend-internal.",
+        "properties": {
+          "classification_confidence": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Classification Confidence"
+          },
+          "document_type": {
+            "anyOf": [
+              {
+                "enum": [
+                  "bill_of_lading",
+                  "commercial_invoice",
+                  "packing_list"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Document Type"
+          },
+          "field_candidates": {
+            "items": {
+              "$ref": "#/components/schemas/RasterFieldCandidateView"
+            },
+            "title": "Field Candidates",
+            "type": "array"
+          },
+          "needs_review_reasons": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Needs Review Reasons",
+            "type": "array"
+          },
+          "pages": {
+            "items": {
+              "$ref": "#/components/schemas/RasterExtractionPageView"
+            },
+            "title": "Pages",
+            "type": "array"
+          },
+          "status": {
+            "enum": [
+              "preview_ready",
+              "needs_review",
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "tables": {
+            "items": {
+              "$ref": "#/components/schemas/RasterTableView"
+            },
+            "title": "Tables",
+            "type": "array"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Warnings",
+            "type": "array"
+          }
+        },
+        "required": [
+          "status",
+          "document_type",
+          "pages",
+          "field_candidates",
+          "tables",
+          "warnings",
+          "needs_review_reasons"
+        ],
+        "title": "RasterExtractionPreviewView",
+        "type": "object"
+      },
+      "RasterExtractionSpanView": {
+        "properties": {
+          "bbox": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "number"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bbox"
+          },
+          "confidence": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Confidence",
+            "type": "number"
+          },
+          "ordinal": {
+            "minimum": 1.0,
+            "title": "Ordinal",
+            "type": "integer"
+          },
+          "polygon": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RasterExtractionPolygonView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reading_order": {
+            "minimum": 1.0,
+            "title": "Reading Order",
+            "type": "integer"
+          },
+          "span_id": {
+            "title": "Span Id",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "span_id",
+          "ordinal",
+          "text",
+          "confidence",
+          "reading_order"
+        ],
+        "title": "RasterExtractionSpanView",
+        "type": "object"
+      },
+      "RasterFieldCandidateView": {
+        "properties": {
+          "bbox": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "number"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bbox"
+          },
+          "confidence": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Confidence",
+            "type": "number"
+          },
+          "evidence_span_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Evidence Span Ids",
+            "type": "array"
+          },
+          "field_id": {
+            "title": "Field Id",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "field_id",
+          "value",
+          "confidence",
+          "evidence_span_ids"
+        ],
+        "title": "RasterFieldCandidateView",
+        "type": "object"
+      },
+      "RasterTableCellView": {
+        "properties": {
+          "bbox": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "number"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bbox"
+          },
+          "cell_id": {
+            "title": "Cell Id",
+            "type": "string"
+          },
+          "column_index": {
+            "minimum": 0.0,
+            "title": "Column Index",
+            "type": "integer"
+          },
+          "confidence": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Confidence",
+            "type": "number"
+          },
+          "evidence_span_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Evidence Span Ids",
+            "type": "array"
+          },
+          "row_index": {
+            "minimum": 0.0,
+            "title": "Row Index",
+            "type": "integer"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "cell_id",
+          "row_index",
+          "column_index",
+          "text",
+          "confidence",
+          "evidence_span_ids"
+        ],
+        "title": "RasterTableCellView",
+        "type": "object"
+      },
+      "RasterTableRowView": {
+        "properties": {
+          "cells": {
+            "items": {
+              "$ref": "#/components/schemas/RasterTableCellView"
+            },
+            "title": "Cells",
+            "type": "array"
+          },
+          "row_index": {
+            "minimum": 0.0,
+            "title": "Row Index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "row_index",
+          "cells"
+        ],
+        "title": "RasterTableRowView",
+        "type": "object"
+      },
+      "RasterTableView": {
+        "properties": {
+          "bbox": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "number"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bbox"
+          },
+          "page_number": {
+            "minimum": 1.0,
+            "title": "Page Number",
+            "type": "integer"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/RasterTableRowView"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "table_id": {
+            "title": "Table Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "table_id",
+          "page_number",
+          "rows"
+        ],
+        "title": "RasterTableView",
+        "type": "object"
+      },
+      "RasterTextExtractionJobResponse": {
+        "properties": {
+          "asset": {
+            "$ref": "#/components/schemas/DocumentAssetView"
+          },
+          "current_profile_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Profile Revision"
+          },
+          "idempotency_reused": {
+            "title": "Idempotency Reused",
+            "type": "boolean"
+          },
+          "job": {
+            "$ref": "#/components/schemas/RasterTextExtractionJobView"
+          },
+          "profile_superseded": {
+            "title": "Profile Superseded",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "asset",
+          "job",
+          "idempotency_reused",
+          "current_profile_revision",
+          "profile_superseded"
+        ],
+        "title": "RasterTextExtractionJobResponse",
+        "type": "object"
+      },
+      "RasterTextExtractionJobView": {
+        "properties": {
+          "asset_id": {
+            "title": "Asset Id",
+            "type": "string"
+          },
+          "attempt_count": {
+            "maximum": 3.0,
+            "minimum": 0.0,
+            "title": "Attempt Count",
+            "type": "integer"
+          },
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "created_by": {
+            "title": "Created By",
+            "type": "string"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "profile_revision": {
+            "title": "Profile Revision",
+            "type": "string"
+          },
+          "raster_text_extraction_job_id": {
+            "title": "Raster Text Extraction Job Id",
+            "type": "string"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RasterTextExtractionPreviewView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "running",
+              "preview_ready",
+              "needs_review",
+              "unavailable",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "raster_text_extraction_job_id",
+          "asset_id",
+          "case_id",
+          "profile_revision",
+          "status",
+          "attempt_count",
+          "created_by",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "RasterTextExtractionJobView",
+        "type": "object"
+      },
+      "RasterTextExtractionPageView": {
+        "properties": {
+          "confidence": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence"
+          },
+          "page_number": {
+            "minimum": 1.0,
+            "title": "Page Number",
+            "type": "integer"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "page_number",
+          "text",
+          "confidence"
+        ],
+        "title": "RasterTextExtractionPageView",
+        "type": "object"
+      },
+      "RasterTextExtractionPreviewView": {
+        "description": "Reviewer-editable text draft; no layout/table/field projection exists.",
+        "properties": {
+          "canonical_text": {
+            "anyOf": [
+              {
+                "maxLength": 200000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Canonical Text"
+          },
+          "needs_review_reasons": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Needs Review Reasons",
+            "type": "array"
+          },
+          "pages": {
+            "items": {
+              "$ref": "#/components/schemas/RasterTextExtractionPageView"
+            },
+            "title": "Pages",
+            "type": "array"
+          },
+          "status": {
+            "enum": [
+              "preview_ready",
+              "needs_review",
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Warnings",
+            "type": "array"
+          }
+        },
+        "required": [
+          "status",
+          "canonical_text",
+          "pages",
+          "warnings",
+          "needs_review_reasons"
+        ],
+        "title": "RasterTextExtractionPreviewView",
+        "type": "object"
+      },
       "RequiredAction": {
         "additionalProperties": false,
         "properties": {
@@ -5938,6 +6687,782 @@
           }
         ],
         "summary": "Get Document Extraction Endpoint"
+      }
+    },
+    "/api/v1/cases/{case_id}/document-assets/{asset_id}/raster-extractions": {
+      "post": {
+        "operationId": "request_raster_document_extraction_endpoint_api_v1_cases__case_id__document_assets__asset_id__raster_extractions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "asset_id",
+            "required": true,
+            "schema": {
+              "title": "Asset Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RasterExtractionJobResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Request Raster Document Extraction Endpoint"
+      }
+    },
+    "/api/v1/cases/{case_id}/document-assets/{asset_id}/raster-extractions/{raster_extraction_job_id}": {
+      "get": {
+        "operationId": "get_raster_document_extraction_endpoint_api_v1_cases__case_id__document_assets__asset_id__raster_extractions__raster_extraction_job_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "asset_id",
+            "required": true,
+            "schema": {
+              "title": "Asset Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "raster_extraction_job_id",
+            "required": true,
+            "schema": {
+              "title": "Raster Extraction Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RasterExtractionJobResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Raster Document Extraction Endpoint"
+      }
+    },
+    "/api/v1/cases/{case_id}/document-assets/{asset_id}/raster-extractions/{raster_extraction_job_id}/pages/{page_number}": {
+      "get": {
+        "description": "Return one provenance-checked PDFium PNG only for the reviewer overlay.",
+        "operationId": "get_raster_document_page_endpoint_api_v1_cases__case_id__document_assets__asset_id__raster_extractions__raster_extraction_job_id__pages__page_number__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "asset_id",
+            "required": true,
+            "schema": {
+              "title": "Asset Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "raster_extraction_job_id",
+            "required": true,
+            "schema": {
+              "title": "Raster Extraction Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "page_number",
+            "required": true,
+            "schema": {
+              "maximum": 20,
+              "minimum": 1,
+              "title": "Page Number",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "image/png": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Raster Document Page Endpoint"
+      }
+    },
+    "/api/v1/cases/{case_id}/document-assets/{asset_id}/raster-text-extractions": {
+      "post": {
+        "operationId": "request_raster_text_document_extraction_endpoint_api_v1_cases__case_id__document_assets__asset_id__raster_text_extractions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "asset_id",
+            "required": true,
+            "schema": {
+              "title": "Asset Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RasterTextExtractionJobResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Request Raster Text Document Extraction Endpoint"
+      }
+    },
+    "/api/v1/cases/{case_id}/document-assets/{asset_id}/raster-text-extractions/{raster_text_extraction_job_id}": {
+      "get": {
+        "operationId": "get_raster_text_document_extraction_endpoint_api_v1_cases__case_id__document_assets__asset_id__raster_text_extractions__raster_text_extraction_job_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "asset_id",
+            "required": true,
+            "schema": {
+              "title": "Asset Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "raster_text_extraction_job_id",
+            "required": true,
+            "schema": {
+              "title": "Raster Text Extraction Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RasterTextExtractionJobResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Raster Text Document Extraction Endpoint"
+      }
+    },
+    "/api/v1/cases/{case_id}/document-assets/{asset_id}/source": {
+      "get": {
+        "operationId": "get_document_asset_source_endpoint_api_v1_cases__case_id__document_assets__asset_id__source_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "asset_id",
+            "required": true,
+            "schema": {
+              "title": "Asset Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Document Asset Source Endpoint"
       }
     },
     "/api/v1/cases/{case_id}/documents": {

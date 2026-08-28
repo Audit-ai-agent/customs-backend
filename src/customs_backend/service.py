@@ -38,6 +38,8 @@ from customs_backend.domain import (
     AgentKnowledgeAnswerRequest,
     AgentKnowledgeAnswerResponse,
     AgentDocumentExtractionRequest,
+    AgentRasterDocumentExtractionRequest,
+    AgentRasterTextDocumentExtractionRequest,
     AgentDocumentInput,
     AgentAssistantAnswerRequest,
     AgentAssistantAnswerResponse,
@@ -72,6 +74,14 @@ from customs_backend.domain import (
     DocumentExtractionResult,
     DocumentType,
     ExtractionJobRecord,
+    RasterDocumentExtractionResult,
+    RasterDocumentPageRender,
+    RasterDocumentPreviewStatus,
+    RasterExtractionWarning,
+    RasterExtractionJobRecord,
+    RasterTextDocumentExtractionResult,
+    RasterTextDocumentPreviewStatus,
+    RasterTextExtractionJobRecord,
     ExecutionStatus,
     FindingDecisionRecord,
     FindingDecisionRequest,
@@ -111,6 +121,7 @@ from customs_backend.ports import (
     ObjectStore,
     WorkbenchRepository,
 )
+from customs_backend.raster_limits import RASTER_WORKER_LEASE_SECONDS
 from customs_backend.law_reference import (
     LawCatalogView,
     LawReferenceError,
@@ -971,12 +982,105 @@ class DocumentAssetExtractionView:
     job: ExtractionJobRecord
 
 
+@dataclass(frozen=True)
+class RasterDocumentAssetExtractionView:
+    """Versioned raster OCR/layout state, still outside text-review input."""
+
+    asset: DocumentAssetRecord
+    job: RasterExtractionJobRecord
+    created: bool
+    current_profile_revision: str | None
+    profile_superseded: bool
+
+
+@dataclass(frozen=True)
+class RasterTextDocumentAssetExtractionView:
+    """Independent text-only OCR state, never a structured-raster approval."""
+
+    asset: DocumentAssetRecord
+    job: RasterTextExtractionJobRecord
+    created: bool
+    current_profile_revision: str | None
+    profile_superseded: bool
+
+
+@dataclass(frozen=True)
+class DocumentAssetSourceView:
+    """Reviewer-only raw source projection used by the in-browser overlay."""
+
+    asset: DocumentAssetRecord
+    content: bytes
+
+
+class RasterDocumentPageUnavailable(RuntimeError):
+    """The approved Agent renderer cannot safely supply a viewer page."""
+
+
+class RasterDocumentPreviewUnavailable(RuntimeError):
+    """No active, safe raster profile can be pinned for a new job."""
+
+
+class RasterDocumentProfileSuperseded(RuntimeError):
+    """A job's immutable profile differs from the currently active profile."""
+
+
 class _AssistantTurnLock:
     """Reference-counted keyed lock for one synchronous assistant exchange."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.waiters = 0
+
+
+class RasterExtractionWorker:
+    """Small local worker around durable queue/lease transitions.
+
+    It has no access to request principals or Browser output.  If a process
+    stops mid-call, the lease is reclaimed by a later worker after expiry.
+    """
+
+    def __init__(self, service: "WorkbenchService", *, poll_seconds: float = 0.25) -> None:
+        self._service = service
+        self._poll_seconds = poll_seconds
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._guard = threading.Lock()
+
+    def start(self) -> None:
+        with self._guard:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._run,
+                name="raster-extraction-worker",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                did_process = self._service.process_next_raster_extraction_job() is not None
+                if not did_process:
+                    # Text-only jobs share the bounded local worker process,
+                    # not structured-raster state or profile semantics.
+                    did_process = (
+                        self._service.process_next_raster_text_extraction_job() is not None
+                    )
+            except Exception:
+                # Unexpected worker failures must not terminate the local
+                # polling loop.  Any leased record becomes reclaimable after
+                # its persisted expiry; never emit provider details here.
+                did_process = False
+            if not did_process:
+                self._stop.wait(self._poll_seconds)
 
 
 class WorkbenchService:
@@ -1290,6 +1394,594 @@ class WorkbenchService:
             raise NotFoundError("document extraction job not found")
         return DocumentAssetExtractionView(asset=asset, job=job)
 
+    @staticmethod
+    def _validate_raster_extraction_result(
+        *, asset: DocumentAssetRecord, request: AgentRasterDocumentExtractionRequest, raw: dict[str, Any]
+    ) -> RasterDocumentExtractionResult:
+        """Validate an Agent v3 raster result before it can leave the worker."""
+
+        try:
+            validate_agent_v3_payload("raster_document_extraction_result", raw)
+            result = RasterDocumentExtractionResult.model_validate(raw)
+        except (AgentContractPayloadError, ValidationError) as exc:
+            raise AgentResponseRejectedError("Agent raster extraction contract is invalid") from exc
+        if (
+            result.document_asset_id != asset.asset_id
+            or result.extraction_request_id != request.extraction_request_id
+            or result.media_type != asset.media_type
+            or result.byte_size != asset.byte_size
+            or result.source_sha256 != asset.source_sha256
+            or result.raster_profile_revision != request.raster_profile_revision
+        ):
+            raise AgentResponseRejectedError("Agent raster extraction provenance does not match")
+        page_numbers = [page.page_number for page in result.pages]
+        if len(page_numbers) != len(set(page_numbers)) or any(
+            number > asset.page_count for number in page_numbers
+        ):
+            raise AgentResponseRejectedError("Agent raster extraction page provenance is invalid")
+        return result
+
+    def _read_raster_preview_status(self) -> RasterDocumentPreviewStatus | None:
+        """Return a validated active-profile snapshot or fail closed.
+
+        A status read is small and intentionally performed around each
+        profile-sensitive operation.  Backend does not cache it because the
+        Agent pointer can change while this process remains alive.
+        """
+
+        try:
+            return self.agent.raster_document_preview_status()
+        except (AgentResponseRejectedError, ValueError, RuntimeError):
+            return None
+
+    def _current_raster_profile_revision(self) -> str | None:
+        status = self._read_raster_preview_status()
+        if status is None or status.availability != "available":
+            return None
+        # The domain contract enforces this non-null relationship.  Keep the
+        # defensive check so an alternate port cannot make Backend guess.
+        return status.raster_profile_revision
+
+    def _require_current_raster_profile_revision(self) -> str:
+        revision = self._current_raster_profile_revision()
+        if revision is None:
+            raise RasterDocumentPreviewUnavailable("raster preview profile is unavailable")
+        return revision
+
+    @staticmethod
+    def _unavailable_raster_result(
+        *, asset: DocumentAssetRecord, job: RasterExtractionJobRecord, reason_code: str
+    ) -> RasterDocumentExtractionResult:
+        """Make a content-free terminal result for a stale/unavailable profile."""
+
+        reason = RasterExtractionWarning(code=reason_code)
+        return RasterDocumentExtractionResult(
+            document_asset_id=asset.asset_id,
+            extraction_request_id=job.raster_extraction_job_id,
+            media_type=asset.media_type,
+            byte_size=asset.byte_size,
+            source_sha256=asset.source_sha256,
+            raster_profile_revision=job.profile_revision,
+            status="unavailable",
+            canonical_text_sha256=None,
+            extractor_revision=None,
+            document_type="unknown",
+            classification_confidence=None,
+            pages=[],
+            field_candidates=[],
+            tables=[],
+            warnings=[reason],
+            needs_review_reasons=[],
+        )
+
+    def _mark_raster_profile_unavailable(
+        self,
+        *,
+        asset: DocumentAssetRecord,
+        job: RasterExtractionJobRecord,
+        reason_code: Literal["raster_profile_unavailable", "raster_profile_superseded"],
+    ) -> RasterExtractionJobRecord | None:
+        return self.repository.mark_raster_extraction_job_unavailable(
+            raster_extraction_job_id=job.raster_extraction_job_id,
+            expected_profile_revision=job.profile_revision,
+            result=self._unavailable_raster_result(
+                asset=asset, job=job, reason_code=reason_code
+            ),
+            error_code=reason_code,
+            completed_at=utc_now(),
+        )
+
+    def request_raster_document_extraction(
+        self, principal: Principal, case_id: str, asset_id: str
+    ) -> RasterDocumentAssetExtractionView:
+        """Queue exactly one profile-pinned raster job for an immutable asset.
+
+        This method intentionally does not call Agent.  The repository-backed
+        worker owns claiming and execution so the HTTP response always
+        represents a genuinely queued (or idempotently reused) operation.
+        """
+
+        self._require_role(principal, Role.reviewer)
+        case = self.get_case(principal, case_id)
+        if case.status == CaseStatus.closed:
+            raise ConflictError("raster extraction cannot be started for a closed case")
+        asset = self.get_document_asset(principal, case_id, asset_id)
+        profile_revision = self._require_current_raster_profile_revision()
+        now = utc_now()
+        job, created = self.repository.create_raster_extraction_job(
+            RasterExtractionJobRecord(
+                raster_extraction_job_id=_id("raster_extract"),
+                asset_id=asset.asset_id,
+                case_id=case_id,
+                org_id=principal.org_id,
+                source_sha256=asset.source_sha256,
+                profile_revision=profile_revision,
+                status="queued",
+                created_by=principal.subject,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        return RasterDocumentAssetExtractionView(
+            asset=asset,
+            job=job,
+            created=created,
+            current_profile_revision=profile_revision,
+            profile_superseded=False,
+        )
+
+    def get_raster_document_extraction(
+        self, principal: Principal, case_id: str, asset_id: str, raster_extraction_job_id: str
+    ) -> RasterDocumentAssetExtractionView:
+        asset = self.get_document_asset(principal, case_id, asset_id)
+        job = self.repository.get_raster_extraction_job(
+            principal.org_id, case_id, raster_extraction_job_id
+        )
+        if job is None or job.asset_id != asset.asset_id:
+            raise NotFoundError("raster extraction job not found")
+        current_profile_revision = self._current_raster_profile_revision()
+        return RasterDocumentAssetExtractionView(
+            asset=asset,
+            job=job,
+            created=False,
+            current_profile_revision=current_profile_revision,
+            profile_superseded=(
+                current_profile_revision is not None
+                and current_profile_revision != job.profile_revision
+            ),
+        )
+
+    def process_next_raster_extraction_job(self) -> RasterExtractionJobRecord | None:
+        """Claim and execute one raster job for the local worker.
+
+        The only retryable error is a controlled Agent-boundary failure.  A
+        missing or hash-invalid immutable source is a terminal operational
+        fault, not something a model retry may repair.  Provider detail is
+        deliberately collapsed to a stable public-safe error code.
+        """
+
+        claimed_at = utc_now()
+        job = self.repository.claim_next_raster_extraction_job(
+            now=claimed_at,
+            lease_expires_at=claimed_at + timedelta(seconds=RASTER_WORKER_LEASE_SECONDS),
+        )
+        if job is None:
+            return None
+        if job.lease_token is None:  # defensive: repository must fail closed
+            return None
+        lease_token = job.lease_token
+        asset = self.repository.get_document_asset(job.org_id, job.case_id, job.asset_id)
+        if asset is None or asset.source_sha256 != job.source_sha256:
+            return self.repository.fail_raster_extraction_job(
+                raster_extraction_job_id=job.raster_extraction_job_id,
+                lease_token=lease_token,
+                error_code="document_asset_unavailable",
+                retryable=False,
+                completed_at=utc_now(),
+            )
+        current_profile_revision = self._current_raster_profile_revision()
+        if current_profile_revision is None:
+            return self._mark_raster_profile_unavailable(
+                asset=asset, job=job, reason_code="raster_profile_unavailable"
+            )
+        if current_profile_revision != job.profile_revision:
+            return self._mark_raster_profile_unavailable(
+                asset=asset, job=job, reason_code="raster_profile_superseded"
+            )
+        request = AgentRasterDocumentExtractionRequest(
+            document_asset_id=asset.asset_id,
+            extraction_request_id=job.raster_extraction_job_id,
+            media_type=asset.media_type,
+            source_sha256=asset.source_sha256,
+            byte_size=asset.byte_size,
+            raster_profile_revision=job.profile_revision,
+        )
+        try:
+            validate_agent_v3_payload("raster_document_extraction_request", request.to_agent_wire())
+            content = self.object_store.get_bytes(
+                key=asset.object_key,
+                expected_sha256=asset.source_sha256,
+                maximum_bytes=asset.byte_size,
+            )
+        except (AgentContractPayloadError, KeyError, ValueError):
+            return self.repository.fail_raster_extraction_job(
+                raster_extraction_job_id=job.raster_extraction_job_id,
+                lease_token=lease_token,
+                error_code="document_asset_unavailable",
+                retryable=False,
+                completed_at=utc_now(),
+            )
+        try:
+            result = self._validate_raster_extraction_result(
+                asset=asset,
+                request=request,
+                raw=self.agent.extract_raster_document(request, content),
+            )
+        except (AgentResponseRejectedError, ValueError, RuntimeError):
+            return self.repository.fail_raster_extraction_job(
+                raster_extraction_job_id=job.raster_extraction_job_id,
+                lease_token=lease_token,
+                error_code="raster_extraction_unavailable",
+                retryable=True,
+                completed_at=utc_now(),
+            )
+        current_profile_revision = self._current_raster_profile_revision()
+        if current_profile_revision is None:
+            return self._mark_raster_profile_unavailable(
+                asset=asset, job=job, reason_code="raster_profile_unavailable"
+            )
+        if current_profile_revision != job.profile_revision:
+            return self._mark_raster_profile_unavailable(
+                asset=asset, job=job, reason_code="raster_profile_superseded"
+            )
+        return self.repository.complete_raster_extraction_job(
+            raster_extraction_job_id=job.raster_extraction_job_id,
+            lease_token=lease_token,
+            result=result,
+            completed_at=utc_now(),
+        )
+
+    @staticmethod
+    def _validate_raster_text_extraction_result(
+        *,
+        asset: DocumentAssetRecord,
+        request: AgentRasterTextDocumentExtractionRequest,
+        raw: dict[str, Any],
+    ) -> RasterTextDocumentExtractionResult:
+        """Validate text-only OCR without treating it as a layout result."""
+
+        try:
+            validate_agent_v3_payload("raster_text_extraction_result", raw)
+            result = RasterTextDocumentExtractionResult.model_validate(raw)
+        except (AgentContractPayloadError, ValidationError) as exc:
+            raise AgentResponseRejectedError("Agent raster text extraction contract is invalid") from exc
+        if (
+            result.document_asset_id != asset.asset_id
+            or result.extraction_request_id != request.extraction_request_id
+            or result.media_type != asset.media_type
+            or result.byte_size != asset.byte_size
+            or result.source_sha256 != asset.source_sha256
+            or result.raster_text_profile_revision != request.raster_text_profile_revision
+        ):
+            raise AgentResponseRejectedError("Agent raster text extraction provenance does not match")
+        page_numbers = [page.page_number for page in result.pages]
+        if len(page_numbers) != len(set(page_numbers)) or any(
+            number > asset.page_count for number in page_numbers
+        ):
+            raise AgentResponseRejectedError("Agent raster text extraction page provenance is invalid")
+        return result
+
+    def _read_raster_text_preview_status(self) -> RasterTextDocumentPreviewStatus | None:
+        """Read a fresh text-only activation snapshot; never cache or guess it."""
+
+        try:
+            return self.agent.raster_text_document_preview_status()
+        except (AgentResponseRejectedError, ValueError, RuntimeError):
+            return None
+
+    def _current_raster_text_profile_revision(self) -> str | None:
+        status = self._read_raster_text_preview_status()
+        if status is None or status.availability != "available":
+            return None
+        return status.raster_text_profile_revision
+
+    def _require_current_raster_text_profile_revision(self) -> str:
+        revision = self._current_raster_text_profile_revision()
+        if revision is None:
+            raise RasterDocumentPreviewUnavailable("raster text preview profile is unavailable")
+        return revision
+
+    @staticmethod
+    def _unavailable_raster_text_result(
+        *, asset: DocumentAssetRecord, job: RasterTextExtractionJobRecord, reason_code: str
+    ) -> RasterTextDocumentExtractionResult:
+        return RasterTextDocumentExtractionResult(
+            document_asset_id=asset.asset_id,
+            extraction_request_id=job.raster_text_extraction_job_id,
+            media_type=asset.media_type,
+            byte_size=asset.byte_size,
+            source_sha256=asset.source_sha256,
+            raster_text_profile_revision=job.profile_revision,
+            status="unavailable",
+            canonical_text=None,
+            canonical_text_sha256=None,
+            extractor_revision=None,
+            pages=[],
+            warnings=[RasterExtractionWarning(code=reason_code)],
+            needs_review_reasons=[],
+        )
+
+    def _mark_raster_text_profile_unavailable(
+        self,
+        *,
+        asset: DocumentAssetRecord,
+        job: RasterTextExtractionJobRecord,
+        reason_code: Literal[
+            "raster_text_profile_unavailable", "raster_text_profile_superseded"
+        ],
+    ) -> RasterTextExtractionJobRecord | None:
+        return self.repository.mark_raster_text_extraction_job_unavailable(
+            raster_text_extraction_job_id=job.raster_text_extraction_job_id,
+            expected_profile_revision=job.profile_revision,
+            result=self._unavailable_raster_text_result(
+                asset=asset, job=job, reason_code=reason_code
+            ),
+            error_code=reason_code,
+            completed_at=utc_now(),
+        )
+
+    def request_raster_text_document_extraction(
+        self, principal: Principal, case_id: str, asset_id: str
+    ) -> RasterTextDocumentAssetExtractionView:
+        """Queue one immutable, profile-pinned text-only raster OCR job."""
+
+        self._require_role(principal, Role.reviewer)
+        case = self.get_case(principal, case_id)
+        if case.status == CaseStatus.closed:
+            raise ConflictError("raster text extraction cannot be started for a closed case")
+        asset = self.get_document_asset(principal, case_id, asset_id)
+        profile_revision = self._require_current_raster_text_profile_revision()
+        now = utc_now()
+        job, created = self.repository.create_raster_text_extraction_job(
+            RasterTextExtractionJobRecord(
+                raster_text_extraction_job_id=_id("raster_text_extract"),
+                asset_id=asset.asset_id,
+                case_id=case_id,
+                org_id=principal.org_id,
+                source_sha256=asset.source_sha256,
+                profile_revision=profile_revision,
+                status="queued",
+                created_by=principal.subject,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        return RasterTextDocumentAssetExtractionView(
+            asset=asset,
+            job=job,
+            created=created,
+            current_profile_revision=profile_revision,
+            profile_superseded=False,
+        )
+
+    def get_raster_text_document_extraction(
+        self, principal: Principal, case_id: str, asset_id: str, raster_text_extraction_job_id: str
+    ) -> RasterTextDocumentAssetExtractionView:
+        asset = self.get_document_asset(principal, case_id, asset_id)
+        job = self.repository.get_raster_text_extraction_job(
+            principal.org_id, case_id, raster_text_extraction_job_id
+        )
+        if job is None or job.asset_id != asset.asset_id:
+            raise NotFoundError("raster text extraction job not found")
+        current_profile_revision = self._current_raster_text_profile_revision()
+        # ``unavailable`` is a transient transport/warmup observation, not
+        # proof that an immutable profile was replaced.  Only a different
+        # verified revision may terminally supersede this job.  Confirmation
+        # still requires the pinned revision to be available again.
+        profile_superseded = (
+            current_profile_revision is not None
+            and current_profile_revision != job.profile_revision
+        )
+        if profile_superseded:
+            closed = self._mark_raster_text_profile_unavailable(
+                asset=asset,
+                job=job,
+                reason_code="raster_text_profile_superseded",
+            )
+            if closed is not None:
+                job = closed
+        return RasterTextDocumentAssetExtractionView(
+            asset=asset,
+            job=job,
+            created=False,
+            current_profile_revision=current_profile_revision,
+            profile_superseded=profile_superseded,
+        )
+
+    def process_next_raster_text_extraction_job(self) -> RasterTextExtractionJobRecord | None:
+        """Claim and run one bounded local-only text OCR job.
+
+        A profile change is terminal rather than a retry: a new profile must
+        create a distinct job.  Adapter failures may retry up to three times;
+        source-binding failures may not.
+        """
+
+        claimed_at = utc_now()
+        job = self.repository.claim_next_raster_text_extraction_job(
+            now=claimed_at,
+            lease_expires_at=claimed_at + timedelta(seconds=RASTER_WORKER_LEASE_SECONDS),
+        )
+        if job is None or job.lease_token is None:
+            return None
+        lease_token = job.lease_token
+        asset = self.repository.get_document_asset(job.org_id, job.case_id, job.asset_id)
+        if asset is None or asset.source_sha256 != job.source_sha256:
+            return self.repository.fail_raster_text_extraction_job(
+                raster_text_extraction_job_id=job.raster_text_extraction_job_id,
+                lease_token=lease_token,
+                error_code="document_asset_unavailable",
+                retryable=False,
+                completed_at=utc_now(),
+            )
+        current_profile_revision = self._current_raster_text_profile_revision()
+        if (
+            current_profile_revision is not None
+            and current_profile_revision != job.profile_revision
+        ):
+            return self._mark_raster_text_profile_unavailable(
+                asset=asset, job=job, reason_code="raster_text_profile_superseded"
+            )
+        request = AgentRasterTextDocumentExtractionRequest(
+            document_asset_id=asset.asset_id,
+            extraction_request_id=job.raster_text_extraction_job_id,
+            media_type=asset.media_type,
+            source_sha256=asset.source_sha256,
+            byte_size=asset.byte_size,
+            raster_text_profile_revision=job.profile_revision,
+        )
+        try:
+            validate_agent_v3_payload("raster_text_extraction_request", request.to_agent_wire())
+            content = self.object_store.get_bytes(
+                key=asset.object_key,
+                expected_sha256=asset.source_sha256,
+                maximum_bytes=asset.byte_size,
+            )
+        except (AgentContractPayloadError, KeyError, ValueError):
+            return self.repository.fail_raster_text_extraction_job(
+                raster_text_extraction_job_id=job.raster_text_extraction_job_id,
+                lease_token=lease_token,
+                error_code="document_asset_unavailable",
+                retryable=False,
+                completed_at=utc_now(),
+            )
+        try:
+            result = self._validate_raster_text_extraction_result(
+                asset=asset,
+                request=request,
+                raw=self.agent.extract_raster_text_document(request, content),
+            )
+        except (AgentResponseRejectedError, ValueError, RuntimeError):
+            return self.repository.fail_raster_text_extraction_job(
+                raster_text_extraction_job_id=job.raster_text_extraction_job_id,
+                lease_token=lease_token,
+                error_code="raster_text_extraction_unavailable",
+                retryable=True,
+                completed_at=utc_now(),
+            )
+        current_profile_revision = self._current_raster_text_profile_revision()
+        if (
+            current_profile_revision is not None
+            and current_profile_revision != job.profile_revision
+        ):
+            return self._mark_raster_text_profile_unavailable(
+                asset=asset, job=job, reason_code="raster_text_profile_superseded"
+            )
+        return self.repository.complete_raster_text_extraction_job(
+            raster_text_extraction_job_id=job.raster_text_extraction_job_id,
+            lease_token=lease_token,
+            result=result,
+            completed_at=utc_now(),
+        )
+
+    def get_document_asset_source(
+        self, principal: Principal, case_id: str, asset_id: str
+    ) -> DocumentAssetSourceView:
+        """Return raw source bytes only to a reviewer for an inline viewer."""
+
+        self._require_role(principal, Role.reviewer)
+        asset = self.get_document_asset(principal, case_id, asset_id)
+        return DocumentAssetSourceView(
+            asset=asset,
+            content=self.object_store.get_bytes(
+                key=asset.object_key,
+                expected_sha256=asset.source_sha256,
+                maximum_bytes=asset.byte_size,
+            ),
+        )
+
+    def get_raster_document_page(
+        self,
+        principal: Principal,
+        case_id: str,
+        asset_id: str,
+        raster_extraction_job_id: str,
+        page_number: int,
+    ) -> RasterDocumentPageRender:
+        """Proxy one approved PDFium page after binding it to a completed v2 job.
+
+        The raw PDF and resulting PNG remain ephemeral.  This does not reuse
+        the raw-source endpoint for a browser PDF viewer because a native
+        browser PDF page has no trustworthy coordinate transform for an OCR
+        overlay.
+        """
+
+        self._require_role(principal, Role.reviewer)
+        asset = self.get_document_asset(principal, case_id, asset_id)
+        job = self.repository.get_raster_extraction_job(
+            principal.org_id, case_id, raster_extraction_job_id
+        )
+        if job is None or job.asset_id != asset.asset_id:
+            raise NotFoundError("raster extraction job not found")
+        if (
+            asset.media_type != "application/pdf"
+            or job.status not in {"preview_ready", "needs_review"}
+            or job.result is None
+        ):
+            raise ConflictError("raster page requires a completed PDF preview")
+        expected_page = next(
+            (page for page in job.result.pages if page.page_number == page_number), None
+        )
+        if expected_page is None:
+            raise ConflictError("raster page is not part of the completed preview")
+        current_profile_revision = self._current_raster_profile_revision()
+        if current_profile_revision is None:
+            self._mark_raster_profile_unavailable(
+                asset=asset, job=job, reason_code="raster_profile_unavailable"
+            )
+            raise RasterDocumentPageUnavailable("approved raster page renderer is unavailable")
+        if current_profile_revision != job.profile_revision:
+            self._mark_raster_profile_unavailable(
+                asset=asset, job=job, reason_code="raster_profile_superseded"
+            )
+            raise RasterDocumentProfileSuperseded("raster extraction profile is superseded")
+        request = AgentRasterDocumentExtractionRequest(
+            document_asset_id=asset.asset_id,
+            extraction_request_id=job.raster_extraction_job_id,
+            media_type=asset.media_type,
+            source_sha256=asset.source_sha256,
+            byte_size=asset.byte_size,
+            raster_profile_revision=job.profile_revision,
+        )
+        try:
+            content = self.object_store.get_bytes(
+                key=asset.object_key,
+                expected_sha256=asset.source_sha256,
+                maximum_bytes=asset.byte_size,
+            )
+            rendered = self.agent.render_raster_document_page(request, content, page_number)
+        except (AgentResponseRejectedError, KeyError, ValueError, RuntimeError):
+            raise RasterDocumentPageUnavailable("approved raster page renderer is unavailable") from None
+        if (
+            rendered.page_number != expected_page.page_number
+            or rendered.width != expected_page.width
+            or rendered.height != expected_page.height
+            or rendered.source_sha256 != asset.source_sha256
+            or rendered.raster_profile_revision != job.profile_revision
+        ):
+            raise RasterDocumentPageUnavailable("raster page renderer provenance is invalid")
+        current_profile_revision = self._current_raster_profile_revision()
+        if current_profile_revision is None:
+            self._mark_raster_profile_unavailable(
+                asset=asset, job=job, reason_code="raster_profile_unavailable"
+            )
+            raise RasterDocumentPageUnavailable("approved raster page renderer is unavailable")
+        if current_profile_revision != job.profile_revision:
+            self._mark_raster_profile_unavailable(
+                asset=asset, job=job, reason_code="raster_profile_superseded"
+            )
+            raise RasterDocumentProfileSuperseded("raster extraction profile is superseded")
+        return rendered
+
     def confirm_extracted_text(
         self,
         principal: Principal,
@@ -1300,14 +1992,43 @@ class WorkbenchService:
         """Require a human supplied text value before it joins text-only review."""
 
         asset = self.get_document_asset(principal, case_id, asset_id)
-        job = self.repository.get_extraction_job(
-            principal.org_id, case_id, request.extraction_job_id
-        )
-        if (
-            job is None
-            or job.asset_id != asset.asset_id
-            or job.status not in {"preview_ready", "needs_review"}
-        ):
+        job: ExtractionJobRecord | RasterExtractionJobRecord | RasterTextExtractionJobRecord | None
+        if request.extraction_job_id is not None:
+            job = self.repository.get_extraction_job(
+                principal.org_id, case_id, request.extraction_job_id
+            )
+        elif request.raster_extraction_job_id is not None:
+            job = self.repository.get_raster_extraction_job(
+                principal.org_id, case_id, request.raster_extraction_job_id
+            )
+        else:
+            assert request.raster_text_extraction_job_id is not None  # domain XOR guard
+            job = self.repository.get_raster_text_extraction_job(
+                principal.org_id, case_id, request.raster_text_extraction_job_id
+            )
+            if job is not None and job.asset_id == asset.asset_id:
+                # Confirmation is the last boundary before a draft becomes
+                # normal text-review input.  Re-read the profile here even if
+                # the browser never polled GET, and close the stale job before
+                # returning a fail-closed public error.
+                current_profile_revision = self._current_raster_text_profile_revision()
+                if current_profile_revision is None:
+                    raise RasterDocumentPreviewUnavailable(
+                        "raster text preview profile is unavailable"
+                    )
+                if current_profile_revision != job.profile_revision:
+                    self._mark_raster_text_profile_unavailable(
+                        asset=asset,
+                        job=job,
+                        reason_code="raster_text_profile_superseded",
+                    )
+                    raise RasterDocumentProfileSuperseded(
+                        "raster text extraction profile is superseded"
+                    )
+        if job is None or job.asset_id != asset.asset_id or job.status not in {
+            "preview_ready",
+            "needs_review",
+        }:
             raise ConflictError(
                 "an available extraction preview is required before text confirmation"
             )

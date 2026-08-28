@@ -35,6 +35,12 @@ AGENT_SCHEMA_PATHS = (
     AGENT_SCHEMA_DIRECTORY / "knowledge-answer-response.schema.json",
     AGENT_SCHEMA_DIRECTORY / "document-extraction-request.schema.json",
     AGENT_SCHEMA_DIRECTORY / "document-extraction-result.schema.json",
+    AGENT_SCHEMA_DIRECTORY / "raster-document-extraction-request.schema.json",
+    AGENT_SCHEMA_DIRECTORY / "raster-document-extraction-result.schema.json",
+    AGENT_SCHEMA_DIRECTORY / "raster-document-preview-status.schema.json",
+    AGENT_SCHEMA_DIRECTORY / "raster-text-extraction-request.schema.json",
+    AGENT_SCHEMA_DIRECTORY / "raster-text-extraction-result.schema.json",
+    AGENT_SCHEMA_DIRECTORY / "raster-text-preview-status.schema.json",
 )
 EVIDENCE_MANIFEST_PATHS = (
     EVIDENCE_MANIFEST_DIRECTORY / "guidance_registry_v1.manifest.json",

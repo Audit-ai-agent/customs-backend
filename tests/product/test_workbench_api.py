@@ -12,6 +12,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
+from pypdf import PdfWriter
 from starlette.requests import Request
 
 from tests.product.agent_v3_fixture import build_agent_v3_result
@@ -27,9 +28,11 @@ from customs_backend.auth import StaticTokenVerifier
 from customs_backend.case_input_boundary import CASE_DOCUMENT_CONTEXT_PLACEHOLDER
 from customs_backend.domain import (
     AgentReviewRequest,
+    CaseCreate,
     ConversationMessageCreate,
     MAX_DOCUMENT_ASSET_BYTES,
     Principal,
+    RasterDocumentPageRender,
     Role,
     canonical_digest,
 )
@@ -51,6 +54,11 @@ def _client(
     answer_handler=None,
     knowledge_answer_handler=None,
     extract_handler=None,
+    raster_extract_handler=None,
+    raster_page_handler=None,
+    raster_preview_status_handler=None,
+    raster_text_extract_handler=None,
+    raster_text_preview_status_handler=None,
     settings: Settings | None = None,
 ) -> TestClient:
     settings = settings or Settings(_env_file=None, environment="test")
@@ -72,6 +80,11 @@ def _client(
         answer=answer_handler,
         knowledge_answer=knowledge_answer_handler,
         extract_document=extract_handler,
+        extract_raster_document=raster_extract_handler,
+        render_raster_document_page=raster_page_handler,
+        raster_preview_status=raster_preview_status_handler,
+        extract_raster_text_document=raster_text_extract_handler,
+        raster_text_preview_status=raster_text_preview_status_handler,
     )
     service = WorkbenchService(
         repository=repository,
@@ -103,6 +116,71 @@ def _client(
     )
 
 
+def _needs_review_raster_result(request, *, visible_text: str = "Invoice No. INV-RASTER-001") -> dict[str, object]:
+    """Small valid v2 result used only by profile-binding tests."""
+
+    return {
+        "schema_version": "2.0",
+        "document_asset_id": request.document_asset_id,
+        "extraction_request_id": request.extraction_request_id,
+        "media_type": request.media_type,
+        "byte_size": request.byte_size,
+        "source_sha256": request.source_sha256,
+        "raster_profile_revision": request.raster_profile_revision,
+        "status": "needs_review",
+        "canonical_text_sha256": hashlib.sha256(visible_text.encode()).hexdigest(),
+        "extractor_revision": "fixture-raster-r1",
+        "document_type": "commercial_invoice",
+        "classification_confidence": 0.98,
+        "pages": [
+            {
+                "page_number": 1,
+                "width": 1,
+                "height": 1,
+                "coordinate_unit": "pixels",
+                "spans": [
+                    {
+                        "span_id": "span-raster-profile",
+                        "ordinal": 1,
+                        "text": visible_text,
+                        "bbox": {"x": 0, "y": 0, "width": 1, "height": 1},
+                        "polygon": None,
+                        "confidence": 0.92,
+                        "reading_order": 1,
+                    }
+                ],
+            }
+        ],
+        "field_candidates": [],
+        "tables": [],
+        "warnings": [],
+        "needs_review_reasons": [{"code": "human_confirmation_required"}],
+    }
+
+
+def _needs_review_raster_text_result(
+    request, *, visible_text: str = "Invoice No. INV-RASTER-TEXT-001"
+) -> dict[str, object]:
+    """Small valid text-only result used by profile-binding tests."""
+
+    return {
+        "schema_version": "1.0",
+        "document_asset_id": request.document_asset_id,
+        "extraction_request_id": request.extraction_request_id,
+        "media_type": request.media_type,
+        "byte_size": request.byte_size,
+        "source_sha256": request.source_sha256,
+        "raster_text_profile_revision": request.raster_text_profile_revision,
+        "status": "needs_review",
+        "canonical_text": visible_text,
+        "canonical_text_sha256": hashlib.sha256(visible_text.encode()).hexdigest(),
+        "extractor_revision": "fixture-raster-text-r1",
+        "pages": [{"page_number": 1, "text": visible_text, "confidence": 0.91}],
+        "warnings": [],
+        "needs_review_reasons": [{"code": "human_confirmation_required"}],
+    }
+
+
 def _auth() -> dict[str, str]:
     return {"Authorization": "Bearer test-token"}
 
@@ -120,6 +198,14 @@ def _tiny_png() -> bytes:
 
     output = BytesIO()
     Image.new("RGB", (1, 1), color=(0, 0, 0)).save(output, format="PNG")
+    return output.getvalue()
+
+
+def _tiny_pdf() -> bytes:
+    output = BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.write(output)
     return output.getvalue()
 
 
@@ -421,6 +507,876 @@ def test_binary_preview_stays_outside_text_review_until_human_confirmation(
         assert "source_asset_id" not in confirmed.json()["record"]
         documents = client.get(f"/api/v1/cases/{case_id}/documents", headers=_auth())
         assert len(documents.json()["items"]) == 1
+
+
+def test_raster_extraction_is_queued_idempotently_then_runs_with_reviewer_source_viewer() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    observed: list[bytes] = []
+
+    def raster_handler(request, content: bytes) -> dict[str, object]:
+        observed.append(content)
+        started.set()
+        assert release.wait(timeout=2)
+        visible_text = "Invoice No. INV-RASTER-001"
+        return {
+            "schema_version": "2.0",
+            "document_asset_id": request.document_asset_id,
+            "extraction_request_id": request.extraction_request_id,
+            "media_type": request.media_type,
+            "byte_size": request.byte_size,
+            "source_sha256": request.source_sha256,
+            "raster_profile_revision": request.raster_profile_revision,
+            "status": "needs_review",
+            "canonical_text_sha256": hashlib.sha256(visible_text.encode()).hexdigest(),
+            "extractor_revision": "fixture-raster-r1",
+            "document_type": "commercial_invoice",
+            "classification_confidence": 0.98,
+            "pages": [
+                {
+                    "page_number": 1,
+                    "width": 1,
+                    "height": 1,
+                    "coordinate_unit": "pixels",
+                    "spans": [
+                        {
+                            "span_id": "span-raster-1",
+                            "ordinal": 1,
+                            "text": visible_text,
+                            "bbox": {"x": 0, "y": 0, "width": 1, "height": 1},
+                            "polygon": None,
+                            "confidence": 0.92,
+                            "reading_order": 1,
+                        }
+                    ],
+                }
+            ],
+            "field_candidates": [
+                {
+                    "field_id": "invoice_number",
+                    "value": "INV-RASTER-001",
+                    "confidence": 0.92,
+                    "evidence_span_ids": ["span-raster-1"],
+                    "bbox": {"x": 0, "y": 0, "width": 1, "height": 1},
+                }
+            ],
+            "tables": [],
+            "warnings": [],
+            "needs_review_reasons": [{"code": "human_confirmation_required"}],
+        }
+
+    with _client(raster_extract_handler=raster_handler) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Raster queue"}, headers=_auth()
+        ).json()["case_id"]
+        payload = _tiny_png()
+        asset = client.post(
+            f"/api/v1/cases/{case_id}/document-assets",
+            params={"document_type": "CI", "filename": "invoice.png"},
+            content=payload,
+            headers={**_auth(), "Content-Type": "image/png"},
+        ).json()
+        path = f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/raster-extractions"
+
+        queued = client.post(path, headers=_auth())
+        assert queued.status_code == 202, queued.text
+        queued_job = queued.json()["job"]
+        assert queued_job["status"] == "queued"
+        assert queued_job["attempt_count"] == 0
+        assert queued.json()["idempotency_reused"] is False
+
+        replay = client.post(path, headers=_auth())
+        assert replay.status_code == 202
+        assert replay.json()["idempotency_reused"] is True
+        assert replay.json()["job"]["raster_extraction_job_id"] == queued_job["raster_extraction_job_id"]
+
+        service = client.app.state.container.service
+        worker = threading.Thread(target=service.process_next_raster_extraction_job)
+        worker.start()
+        assert started.wait(timeout=2)
+        running = client.get(
+            f"{path}/{queued_job['raster_extraction_job_id']}", headers=_auth()
+        )
+        assert running.status_code == 200
+        assert running.json()["job"]["status"] == "running"
+        assert running.json()["job"]["attempt_count"] == 1
+        release.set()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+
+        finished = client.get(
+            f"{path}/{queued_job['raster_extraction_job_id']}", headers=_auth()
+        )
+        assert finished.status_code == 200, finished.text
+        result = finished.json()["job"]
+        assert result["status"] == "needs_review"
+        assert result["result"]["field_candidates"][0]["field_id"] == "invoice_number"
+        assert result["result"]["pages"][0]["spans"][0]["confidence"] == 0.92
+        assert "source_sha256" not in result["result"]
+        assert "canonical_text_sha256" not in result["result"]
+        assert "extractor_revision" not in result["result"]
+        assert observed == [payload]
+
+        source = client.get(
+            f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/source",
+            headers=_auth(),
+        )
+        assert source.status_code == 200
+        assert source.content == payload
+        assert source.headers["content-type"].startswith("image/png")
+        assert source.headers["cache-control"] == "no-store"
+        assert source.headers["content-disposition"] == "inline"
+        assert source.headers["x-content-type-options"] == "nosniff"
+        assert source.headers["content-security-policy"] == "sandbox"
+        assert (
+            client.get(
+                f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/source",
+                headers=_approver_auth(),
+            ).status_code
+            == 403
+        )
+
+        confirmed = client.post(
+            f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/confirmed-document",
+            json={
+                "raster_extraction_job_id": queued_job["raster_extraction_job_id"],
+                "filename": "invoice-confirmed.txt",
+                "content_text": "reviewer-confirmed raster text",
+            },
+            headers=_auth(),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+
+
+def test_raster_request_fails_closed_before_an_active_profile_exists() -> None:
+    with _client(
+        raster_preview_status_handler=lambda: {
+            "schema_version": "1.0",
+            "availability": "unavailable",
+            "raster_profile_revision": None,
+        }
+    ) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Raster preactivation"}, headers=_auth()
+        ).json()["case_id"]
+        asset = client.post(
+            f"/api/v1/cases/{case_id}/document-assets",
+            params={"document_type": "CI", "filename": "invoice.png"},
+            content=_tiny_png(),
+            headers={**_auth(), "Content-Type": "image/png"},
+        ).json()
+        path = f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/raster-extractions"
+
+        response = client.post(path, headers=_auth())
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "raster_ocr_unavailable"
+    assert client.app.state.container.service.process_next_raster_extraction_job() is None
+
+
+def test_raster_text_extraction_is_independent_profile_pinned_and_confirmable() -> None:
+    active_profile = {"revision": "synthetic-raster-text-v1-a"}
+    observed: list[tuple[str, bytes]] = []
+    visible_text = "Invoice No. INV-TEXT-001\nTotal: USD 120.00"
+
+    def status() -> dict[str, object]:
+        return {
+            "schema_version": "1.0",
+            "availability": "available",
+            "raster_text_profile_revision": active_profile["revision"],
+        }
+
+    def raster_text_handler(request, content: bytes) -> dict[str, object]:
+        observed.append((request.raster_text_profile_revision, content))
+        return {
+            "schema_version": "1.0",
+            "document_asset_id": request.document_asset_id,
+            "extraction_request_id": request.extraction_request_id,
+            "media_type": request.media_type,
+            "byte_size": request.byte_size,
+            "source_sha256": request.source_sha256,
+            "raster_text_profile_revision": request.raster_text_profile_revision,
+            "status": "needs_review",
+            "canonical_text": visible_text,
+            "canonical_text_sha256": hashlib.sha256(visible_text.encode()).hexdigest(),
+            "extractor_revision": "fixture-raster-text-r1",
+            "pages": [{"page_number": 1, "text": visible_text, "confidence": 0.93}],
+            "warnings": [],
+            "needs_review_reasons": [{"code": "human_confirmation_required"}],
+        }
+
+    with _client(
+        raster_text_extract_handler=raster_text_handler,
+        raster_text_preview_status_handler=status,
+    ) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Raster text queue"}, headers=_auth()
+        ).json()["case_id"]
+        payload = _tiny_png()
+        asset = client.post(
+            f"/api/v1/cases/{case_id}/document-assets",
+            params={"document_type": "CI", "filename": "invoice.png"},
+            content=payload,
+            headers={**_auth(), "Content-Type": "image/png"},
+        ).json()
+        path = (
+            f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/"
+            "raster-text-extractions"
+        )
+
+        queued = client.post(path, headers=_auth())
+        assert queued.status_code == 202, queued.text
+        queued_job = queued.json()["job"]
+        assert queued_job["status"] == "queued"
+        assert client.post(path, headers=_auth()).json()["idempotency_reused"] is True
+
+        service = client.app.state.container.service
+        terminal = service.process_next_raster_text_extraction_job()
+        assert terminal is not None and terminal.status == "needs_review"
+        finished = client.get(
+            f"{path}/{queued_job['raster_text_extraction_job_id']}", headers=_auth()
+        )
+        assert finished.status_code == 200, finished.text
+        result = finished.json()["job"]
+        assert result["result"]["canonical_text"] == visible_text
+        assert result["result"]["pages"] == [
+            {"page_number": 1, "text": visible_text, "confidence": 0.93}
+        ]
+        assert "canonical_text_sha256" not in result["result"]
+        assert observed == [("synthetic-raster-text-v1-a", payload)]
+
+        confirmed = client.post(
+            f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/confirmed-document",
+            json={
+                "raster_text_extraction_job_id": queued_job["raster_text_extraction_job_id"],
+                "filename": "invoice-confirmed.txt",
+                "content_text": "reviewer-confirmed raster text",
+            },
+            headers=_auth(),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+
+        # A new profile creates a distinct job and closes the old job without
+        # sending its source to the new engine.
+        active_profile["revision"] = "synthetic-raster-text-v1-b"
+        stale = client.get(
+            f"{path}/{queued_job['raster_text_extraction_job_id']}", headers=_auth()
+        ).json()
+        assert stale["profile_superseded"] is True
+        assert stale["job"]["status"] == "unavailable"
+        assert stale["job"]["result"]["warnings"] == ["raster_text_profile_superseded"]
+        new_job = client.post(path, headers=_auth()).json()["job"]
+        assert new_job["profile_revision"] == "synthetic-raster-text-v1-b"
+        assert new_job["raster_text_extraction_job_id"] != queued_job["raster_text_extraction_job_id"]
+
+
+def test_raster_text_confirmation_rechecks_a_changed_profile_without_a_get_bypass() -> None:
+    active_profile = {"revision": "synthetic-raster-text-v1-a"}
+
+    def status() -> dict[str, object]:
+        return {
+            "schema_version": "1.0",
+            "availability": "available",
+            "raster_text_profile_revision": active_profile["revision"],
+        }
+
+    with _client(
+        raster_text_extract_handler=lambda request, _content: _needs_review_raster_text_result(request),
+        raster_text_preview_status_handler=status,
+    ) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Raster text confirmation binding"}, headers=_auth()
+        ).json()["case_id"]
+        asset = client.post(
+            f"/api/v1/cases/{case_id}/document-assets",
+            params={"document_type": "CI", "filename": "invoice.png"},
+            content=_tiny_png(),
+            headers={**_auth(), "Content-Type": "image/png"},
+        ).json()
+        path = (
+            f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/"
+            "raster-text-extractions"
+        )
+        job = client.post(path, headers=_auth()).json()["job"]
+        assert client.app.state.container.service.process_next_raster_text_extraction_job() is not None
+
+        # Do not poll the job after changing the profile.  Confirmation itself
+        # must perform the fresh status read and reject the stale draft.
+        active_profile["revision"] = "synthetic-raster-text-v1-b"
+        response = client.post(
+            f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/confirmed-document",
+            json={
+                "raster_text_extraction_job_id": job["raster_text_extraction_job_id"],
+                "filename": "invoice-confirmed.txt",
+                "content_text": "reviewer-confirmed text",
+            },
+            headers=_auth(),
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()["code"] == "raster_profile_superseded"
+        assert client.get(f"/api/v1/cases/{case_id}/documents", headers=_auth()).json() == {
+            "items": []
+        }
+        stale = client.get(
+            f"{path}/{job['raster_text_extraction_job_id']}", headers=_auth()
+        ).json()
+
+    assert stale["profile_superseded"] is True
+    assert stale["job"]["status"] == "unavailable"
+    assert stale["job"]["error_code"] == "raster_text_profile_superseded"
+
+
+def test_raster_text_unavailable_is_transient_and_confirmation_recovers() -> None:
+    active_profile = {"available": True, "revision": "synthetic-raster-text-v1-a"}
+
+    def status() -> dict[str, object]:
+        return {
+            "schema_version": "1.0",
+            "availability": "available" if active_profile["available"] else "unavailable",
+            "raster_text_profile_revision": (
+                active_profile["revision"] if active_profile["available"] else None
+            ),
+        }
+
+    with _client(
+        raster_text_extract_handler=lambda request, _content: _needs_review_raster_text_result(request),
+        raster_text_preview_status_handler=status,
+    ) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Raster text missing profile"}, headers=_auth()
+        ).json()["case_id"]
+        asset = client.post(
+            f"/api/v1/cases/{case_id}/document-assets",
+            params={"document_type": "CI", "filename": "invoice.png"},
+            content=_tiny_png(),
+            headers={**_auth(), "Content-Type": "image/png"},
+        ).json()
+        path = (
+            f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/"
+            "raster-text-extractions"
+        )
+        job = client.post(path, headers=_auth()).json()["job"]
+        assert client.app.state.container.service.process_next_raster_text_extraction_job() is not None
+
+        active_profile["available"] = False
+        response = client.post(
+            f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/confirmed-document",
+            json={
+                "raster_text_extraction_job_id": job["raster_text_extraction_job_id"],
+                "filename": "invoice-confirmed.txt",
+                "content_text": "reviewer-confirmed text",
+            },
+            headers=_auth(),
+        )
+        assert response.status_code == 503, response.text
+        assert response.json()["code"] == "raster_ocr_unavailable"
+        assert client.get(f"/api/v1/cases/{case_id}/documents", headers=_auth()).json() == {
+            "items": []
+        }
+        stale = client.get(
+            f"{path}/{job['raster_text_extraction_job_id']}", headers=_auth()
+        ).json()
+        assert stale["current_profile_revision"] is None
+        assert stale["profile_superseded"] is False
+        assert stale["job"]["status"] == "needs_review"
+        assert stale["job"]["error_code"] is None
+
+        # The same attested revision becoming reachable again must leave the
+        # original idempotent job usable instead of permanently poisoning it.
+        active_profile["available"] = True
+        recovered = client.post(
+            f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/confirmed-document",
+            json={
+                "raster_text_extraction_job_id": job["raster_text_extraction_job_id"],
+                "filename": "invoice-confirmed.txt",
+                "content_text": "reviewer-confirmed text",
+            },
+            headers=_auth(),
+        )
+        assert recovered.status_code == 201, recovered.text
+
+
+def test_raster_text_worker_does_not_destroy_job_on_transient_status_unavailable() -> None:
+    active_profile = {"available": True, "revision": "synthetic-raster-text-v1-a"}
+    extraction_calls: list[str] = []
+
+    def status() -> dict[str, object]:
+        return {
+            "schema_version": "1.0",
+            "availability": "available" if active_profile["available"] else "unavailable",
+            "raster_text_profile_revision": (
+                active_profile["revision"] if active_profile["available"] else None
+            ),
+        }
+
+    def extract(request, _content: bytes) -> dict[str, object]:
+        extraction_calls.append(request.raster_text_profile_revision)
+        return _needs_review_raster_text_result(request)
+
+    with _client(
+        raster_text_extract_handler=extract,
+        raster_text_preview_status_handler=status,
+    ) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Raster text transient status"}, headers=_auth()
+        ).json()["case_id"]
+        asset = client.post(
+            f"/api/v1/cases/{case_id}/document-assets",
+            params={"document_type": "CI", "filename": "invoice.png"},
+            content=_tiny_png(),
+            headers={**_auth(), "Content-Type": "image/png"},
+        ).json()
+        path = (
+            f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/"
+            "raster-text-extractions"
+        )
+        job = client.post(path, headers=_auth()).json()["job"]
+        active_profile["available"] = False
+
+        terminal = client.app.state.container.service.process_next_raster_text_extraction_job()
+        view = client.get(
+            f"{path}/{job['raster_text_extraction_job_id']}", headers=_auth()
+        ).json()
+
+    assert terminal is not None and terminal.status == "needs_review"
+    assert extraction_calls == ["synthetic-raster-text-v1-a"]
+    assert view["current_profile_revision"] is None
+    assert view["profile_superseded"] is False
+    assert view["job"]["status"] == "needs_review"
+
+
+def test_raster_profile_replacement_creates_a_new_job_and_closes_the_old_profile() -> None:
+    active_profile = {"revision": "synthetic-raster-v1-a"}
+    observed_revisions: list[str] = []
+
+    def status() -> dict[str, object]:
+        return {
+            "schema_version": "1.0",
+            "availability": "available",
+            "raster_profile_revision": active_profile["revision"],
+        }
+
+    def raster_handler(request, _content: bytes) -> dict[str, object]:
+        observed_revisions.append(request.raster_profile_revision)
+        return _needs_review_raster_result(request)
+
+    with _client(
+        raster_extract_handler=raster_handler,
+        raster_preview_status_handler=status,
+    ) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Raster replacement"}, headers=_auth()
+        ).json()["case_id"]
+        asset = client.post(
+            f"/api/v1/cases/{case_id}/document-assets",
+            params={"document_type": "CI", "filename": "invoice.png"},
+            content=_tiny_png(),
+            headers={**_auth(), "Content-Type": "image/png"},
+        ).json()
+        path = f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/raster-extractions"
+
+        old_job = client.post(path, headers=_auth()).json()
+        assert old_job["job"]["profile_revision"] == "synthetic-raster-v1-a"
+        assert old_job["current_profile_revision"] == "synthetic-raster-v1-a"
+        active_profile["revision"] = "synthetic-raster-v1-b"
+
+        stale_view = client.get(
+            f"{path}/{old_job['job']['raster_extraction_job_id']}", headers=_auth()
+        ).json()
+        assert stale_view["profile_superseded"] is True
+        assert stale_view["current_profile_revision"] == "synthetic-raster-v1-b"
+
+        new_job = client.post(path, headers=_auth()).json()
+        assert new_job["idempotency_reused"] is False
+        assert new_job["job"]["profile_revision"] == "synthetic-raster-v1-b"
+        assert new_job["job"]["raster_extraction_job_id"] != old_job["job"]["raster_extraction_job_id"]
+
+        service = client.app.state.container.service
+        old_terminal = service.process_next_raster_extraction_job()
+        assert old_terminal is not None and old_terminal.status == "unavailable"
+        assert old_terminal.error_code == "raster_profile_superseded"
+        assert observed_revisions == []
+        new_terminal = service.process_next_raster_extraction_job()
+        assert new_terminal is not None and new_terminal.status == "needs_review"
+        assert observed_revisions == ["synthetic-raster-v1-b"]
+
+        old_response = client.get(
+            f"{path}/{old_job['job']['raster_extraction_job_id']}", headers=_auth()
+        ).json()
+
+    assert old_response["job"]["status"] == "unavailable"
+    assert old_response["job"]["result"]["warnings"] == ["raster_profile_superseded"]
+    assert old_response["job"]["error_code"] == "raster_profile_superseded"
+
+
+def test_profile_replacement_blocks_the_old_pdf_overlay_and_marks_its_job_unavailable() -> None:
+    active_profile = {"revision": "synthetic-raster-v1-a"}
+    page_requested = False
+
+    def status() -> dict[str, object]:
+        return {
+            "schema_version": "1.0",
+            "availability": "available",
+            "raster_profile_revision": active_profile["revision"],
+        }
+
+    def page_handler(_request, _content: bytes, _page_number: int) -> RasterDocumentPageRender:
+        nonlocal page_requested
+        page_requested = True
+        raise AssertionError("a superseded profile must not render a page")
+
+    with _client(
+        raster_extract_handler=lambda request, _content: _needs_review_raster_result(request),
+        raster_page_handler=page_handler,
+        raster_preview_status_handler=status,
+    ) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Raster PDF replacement"}, headers=_auth()
+        ).json()["case_id"]
+        asset = client.post(
+            f"/api/v1/cases/{case_id}/document-assets",
+            params={"document_type": "CI", "filename": "invoice.pdf"},
+            content=_tiny_pdf(),
+            headers={**_auth(), "Content-Type": "application/pdf"},
+        ).json()
+        path = f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/raster-extractions"
+        job = client.post(path, headers=_auth()).json()["job"]
+        assert client.app.state.container.service.process_next_raster_extraction_job() is not None
+
+        active_profile["revision"] = "synthetic-raster-v1-b"
+        page = client.get(
+            f"{path}/{job['raster_extraction_job_id']}/pages/1", headers=_auth()
+        )
+        terminal = client.get(
+            f"{path}/{job['raster_extraction_job_id']}", headers=_auth()
+        ).json()
+
+    assert page.status_code == 409
+    assert page.json()["code"] == "raster_profile_superseded"
+    assert page_requested is False
+    assert terminal["profile_superseded"] is True
+    assert terminal["job"]["status"] == "unavailable"
+    assert terminal["job"]["error_code"] == "raster_profile_superseded"
+
+
+def test_confirmed_raster_text_is_redacted_from_public_transcript(tmp_path: Path) -> None:
+    """A browser-confirmed OCR draft must not reappear in Functional-UAT evidence."""
+
+    settings = _functional_settings()
+    principal = Principal(
+        subject="reviewer-1", org_id="local-dev", roles=frozenset({Role.reviewer})
+    )
+    transcript_root = tmp_path / "_local" / "state" / "scenario-runs"
+    transcript = FunctionalTranscriptController(
+        root=ScenarioTranscriptRoot.create(transcript_root)
+    )
+    ocr_text = "OCR transcript text must stay out of public evidence"
+
+    def raster_handler(request, _content: bytes) -> dict[str, object]:
+        return {
+            "schema_version": "2.0",
+            "document_asset_id": request.document_asset_id,
+            "extraction_request_id": request.extraction_request_id,
+            "media_type": request.media_type,
+            "byte_size": request.byte_size,
+            "source_sha256": request.source_sha256,
+            "raster_profile_revision": request.raster_profile_revision,
+            "status": "needs_review",
+            "canonical_text_sha256": hashlib.sha256(ocr_text.encode()).hexdigest(),
+            "extractor_revision": "fixture-raster-r1",
+            "document_type": "commercial_invoice",
+            "classification_confidence": 0.98,
+            "pages": [
+                {
+                    "page_number": 1,
+                    "width": 1,
+                    "height": 1,
+                    "coordinate_unit": "pixels",
+                    "spans": [
+                        {
+                            "span_id": "span-raster-transcript",
+                            "ordinal": 1,
+                            "text": ocr_text,
+                            "bbox": {"x": 0, "y": 0, "width": 1, "height": 1},
+                            "polygon": None,
+                            "confidence": 0.92,
+                            "reading_order": 1,
+                        }
+                    ],
+                }
+            ],
+            "field_candidates": [],
+            "tables": [],
+            "warnings": [{"code": "human_confirmation_required"}],
+            "needs_review_reasons": [{"code": "human_confirmation_required"}],
+        }
+
+    repository = InMemoryWorkbenchRepository()
+    objects = InMemoryObjectStore()
+    agent = CallableAgentClient(
+        lambda request: build_agent_v3_result(request, include_finding=False),
+        extract_raster_document=raster_handler,
+    )
+    service = WorkbenchService(repository=repository, object_store=objects, agent=agent)
+    case = service.create_case(principal, CaseCreate(title="Raster transcript redaction"))
+    asset = service.add_document_asset(
+        principal,
+        case.case_id,
+        document_type="CI",
+        filename="invoice.png",
+        declared_media_type="image/png",
+        content=_tiny_png(),
+    )
+    queued = service.request_raster_document_extraction(principal, case.case_id, asset.asset_id)
+    completed = service.process_next_raster_extraction_job()
+    assert completed is not None and completed.status == "needs_review"
+
+    app = create_app(
+        settings=settings,
+        container=Container(
+            settings=settings,
+            repository=repository,
+            object_store=objects,
+            agent=agent,
+            token_verifier=StaticTokenVerifier({"test-token": principal}),
+            service=service,
+            transcript=transcript,
+        ),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/v1/cases/{case.case_id}/document-assets/{asset.asset_id}/confirmed-document",
+            json={
+                "raster_extraction_job_id": queued.job.raster_extraction_job_id,
+                "filename": "invoice-confirmed.txt",
+                "content_text": ocr_text,
+            },
+            headers=_auth(),
+        )
+
+    assert response.status_code == 201, response.text
+    # Redaction affects only the evidence copy; the reviewer still receives
+    # the normal API representation for the document they just confirmed.
+    assert response.json()["content_text"] == ocr_text
+    transcript.bind_review(
+        case_id=case.case_id,
+        review_run_id="raster-transcript-redaction-run",
+        job_id="raster-transcript-redaction-job",
+        review_request={"trade_type": "import"},
+        response_status=202,
+        response_body={"job_id": "raster-transcript-redaction-job"},
+        job_status="succeeded",
+    )
+    public = (
+        transcript_root / "raster-transcript-redaction-run" / "public-api.jsonl"
+    ).read_text(encoding="utf-8")
+    confirmation = next(
+        json.loads(line)["payload"]
+        for line in public.splitlines()
+        if line
+        and json.loads(line)["payload"]["path"].endswith("/confirmed-document")
+    )
+
+    assert ocr_text not in public
+    assert confirmation["request_body"] == {
+        "extraction_job_id": None,
+        "raster_extraction_job_id": queued.job.raster_extraction_job_id,
+        "raster_text_extraction_job_id": None,
+        "filename": "invoice-confirmed.txt",
+        "replaces_document_id": None,
+        "document_body_redacted": True,
+    }
+    assert confirmation["response_body"]["document_body_redacted"] is True
+    assert "content_text" not in confirmation["request_body"]
+    assert "content_text" not in confirmation["response_body"]
+
+
+@pytest.mark.parametrize(
+    ("preview_width", "expected_status"),
+    [(1, 200), (2, 503)],
+    ids=["matching-ocr-preview", "ocr-preview-dimension-mismatch"],
+)
+def test_raster_pdf_page_overlay_uses_a_reviewer_only_provenance_checked_png(
+    preview_width: int, expected_status: int
+) -> None:
+    source = _tiny_pdf()
+    rendered_png = _tiny_png()
+
+    def raster_handler(request, content: bytes) -> dict[str, object]:
+        assert content == source
+        visible_text = "Invoice No. INV-PDF-001"
+        return {
+            "schema_version": "2.0",
+            "document_asset_id": request.document_asset_id,
+            "extraction_request_id": request.extraction_request_id,
+            "media_type": request.media_type,
+            "byte_size": request.byte_size,
+            "source_sha256": request.source_sha256,
+            "raster_profile_revision": request.raster_profile_revision,
+            "status": "needs_review",
+            "canonical_text_sha256": hashlib.sha256(visible_text.encode()).hexdigest(),
+            "extractor_revision": "fixture-raster-r1",
+            "document_type": "commercial_invoice",
+            "classification_confidence": 0.98,
+            "pages": [
+                {
+                    "page_number": 1,
+                    "width": preview_width,
+                    "height": 1,
+                    "coordinate_unit": "pixels",
+                    "spans": [
+                        {
+                            "span_id": "span-pdf-1",
+                            "ordinal": 1,
+                            "text": visible_text,
+                            "bbox": {"x": 0, "y": 0, "width": 1, "height": 1},
+                            "polygon": None,
+                            "confidence": 0.92,
+                            "reading_order": 1,
+                        }
+                    ],
+                }
+            ],
+            "field_candidates": [],
+            "tables": [],
+            "warnings": [],
+            "needs_review_reasons": [{"code": "human_confirmation_required"}],
+        }
+
+    def page_handler(request, content: bytes, page_number: int) -> RasterDocumentPageRender:
+        assert content == source
+        assert page_number == 1
+        return RasterDocumentPageRender(
+            page_number=1,
+            width=1,
+            height=1,
+            media_type="image/png",
+            content=rendered_png,
+            content_sha256=hashlib.sha256(rendered_png).hexdigest(),
+            source_sha256=request.source_sha256,
+            raster_profile_revision=request.raster_profile_revision,
+            renderer_revision="pdfium-fixture-dpi-216",
+        )
+
+    with _client(
+        raster_extract_handler=raster_handler, raster_page_handler=page_handler
+    ) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Raster PDF overlay"}, headers=_auth()
+        ).json()["case_id"]
+        asset = client.post(
+            f"/api/v1/cases/{case_id}/document-assets",
+            params={"document_type": "CI", "filename": "invoice.pdf"},
+            content=source,
+            headers={**_auth(), "Content-Type": "application/pdf"},
+        ).json()
+        extraction_path = (
+            f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/raster-extractions"
+        )
+        job = client.post(extraction_path, headers=_auth()).json()["job"]
+        assert client.app.state.container.service.process_next_raster_extraction_job() is not None
+
+        page_path = (
+            f"{extraction_path}/{job['raster_extraction_job_id']}/pages/1"
+        )
+        response = client.get(page_path, headers=_auth())
+        if expected_status == 503:
+            assert response.status_code == 503, response.text
+            assert response.json()["detail"] == "The request could not be completed safely."
+            return
+        assert response.status_code == 200, response.text
+        assert response.content == rendered_png
+        assert response.headers["content-type"].startswith("image/png")
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["content-disposition"] == "inline"
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.headers["content-security-policy"] == "sandbox"
+        assert "x-document-sha256" not in response.headers
+        assert "x-raster-page-sha256" not in response.headers
+
+        assert client.get(page_path, headers=_approver_auth()).status_code == 403
+        assert client.get(f"{extraction_path}/{job['raster_extraction_job_id']}/pages/2", headers=_auth()).status_code == 409
+
+
+def test_raster_extraction_retries_three_times_then_fails_without_exposing_provider_detail() -> None:
+    def invalid_raster_handler(_request, _content: bytes) -> dict[str, object]:
+        return {"not": "a valid result"}
+
+    with _client(raster_extract_handler=invalid_raster_handler) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Raster retry"}, headers=_auth()
+        ).json()["case_id"]
+        asset = client.post(
+            f"/api/v1/cases/{case_id}/document-assets",
+            params={"document_type": "CI", "filename": "invoice.png"},
+            content=_tiny_png(),
+            headers={**_auth(), "Content-Type": "image/png"},
+        ).json()
+        path = f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/raster-extractions"
+        queued = client.post(path, headers=_auth()).json()["job"]
+        service = client.app.state.container.service
+        for _ in range(3):
+            assert service.process_next_raster_extraction_job() is not None
+        terminal = client.get(
+            f"{path}/{queued['raster_extraction_job_id']}", headers=_auth()
+        )
+        assert terminal.status_code == 200
+        assert terminal.json()["job"]["status"] == "failed"
+        assert terminal.json()["job"]["attempt_count"] == 3
+        assert terminal.json()["job"]["error_code"] == "raster_extraction_unavailable"
+        assert terminal.json()["job"]["result"] is None
+
+
+def test_raster_pre_ocr_safety_stop_is_a_content_free_needs_review_result() -> None:
+    """EXIF/unknown-type stops are reviewer outcomes, not worker failures."""
+
+    def orientation_stop(request, _content: bytes) -> dict[str, object]:
+        return {
+            "schema_version": "2.0",
+            "document_asset_id": request.document_asset_id,
+            "extraction_request_id": request.extraction_request_id,
+            "media_type": request.media_type,
+            "byte_size": request.byte_size,
+            "source_sha256": request.source_sha256,
+            "raster_profile_revision": request.raster_profile_revision,
+            "status": "needs_review",
+            "canonical_text_sha256": None,
+            "extractor_revision": None,
+            "document_type": "unknown",
+            "classification_confidence": None,
+            "pages": [],
+            "field_candidates": [],
+            "tables": [],
+            "warnings": [{"code": "jpeg_exif_orientation_unsupported"}],
+            "needs_review_reasons": [{"code": "jpeg_exif_orientation_unsupported"}],
+        }
+
+    with _client(raster_extract_handler=orientation_stop) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Raster orientation stop"}, headers=_auth()
+        ).json()["case_id"]
+        asset = client.post(
+            f"/api/v1/cases/{case_id}/document-assets",
+            params={"document_type": "CI", "filename": "rotated.png"},
+            content=_tiny_png(),
+            headers={**_auth(), "Content-Type": "image/png"},
+        ).json()
+        path = f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/raster-extractions"
+        queued = client.post(path, headers=_auth()).json()["job"]
+
+        service = client.app.state.container.service
+        assert service.process_next_raster_extraction_job() is not None
+        result = client.get(
+            f"{path}/{queued['raster_extraction_job_id']}", headers=_auth()
+        ).json()["job"]
+
+    assert result["status"] == "needs_review"
+    assert result["attempt_count"] == 1
+    assert result["result"]["document_type"] is None
+    assert result["result"]["pages"] == []
+    assert result["result"]["needs_review_reasons"] == [
+        "jpeg_exif_orientation_unsupported"
+    ]
 
 
 def test_binary_asset_magic_mismatch_is_rejected_before_storage() -> None:

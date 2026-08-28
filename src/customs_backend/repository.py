@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+from datetime import datetime
 from threading import RLock
 from typing import Any
 
@@ -28,6 +30,10 @@ from customs_backend.domain import (
     JobRecord,
     KnowledgeConversationRecord,
     ReviewRunRecord,
+    RasterDocumentExtractionResult,
+    RasterExtractionJobRecord,
+    RasterTextDocumentExtractionResult,
+    RasterTextExtractionJobRecord,
     utc_now,
 )
 from customs_backend.ports import ConflictError
@@ -42,6 +48,10 @@ class InMemoryWorkbenchRepository:
         self._documents: dict[str, DocumentRecord] = {}
         self._document_assets: dict[str, DocumentAssetRecord] = {}
         self._extraction_jobs: dict[str, ExtractionJobRecord] = {}
+        self._raster_extraction_jobs: dict[str, RasterExtractionJobRecord] = {}
+        self._raster_extraction_by_asset_profile: dict[tuple[str, str, str, str], str] = {}
+        self._raster_text_extraction_jobs: dict[str, RasterTextExtractionJobRecord] = {}
+        self._raster_text_extraction_by_asset_profile: dict[tuple[str, str, str, str], str] = {}
         self._jobs: dict[str, JobRecord] = {}
         self._idempotency: dict[tuple[str, str], str] = {}
         self._runs: dict[str, ReviewRunRecord] = {}
@@ -271,6 +281,393 @@ class InMemoryWorkbenchRepository:
             if record is None or record.org_id != org_id or record.case_id != case_id:
                 return None
             return self._copy(record)
+
+    def create_raster_extraction_job(
+        self, job: RasterExtractionJobRecord
+    ) -> tuple[RasterExtractionJobRecord, bool]:
+        """Persist one asset/profile queue entry or safely reuse the prior one.
+
+        Binary assets are immutable, so this key also binds the source hash.
+        Reusing a terminal record is intentional: retries must not silently
+        create a different OCR claim for the same approved profile.
+        """
+
+        with self._lock:
+            asset = self._document_assets.get(job.asset_id)
+            if (
+                asset is None
+                or asset.org_id != job.org_id
+                or asset.case_id != job.case_id
+                or asset.source_sha256 != job.source_sha256
+            ):
+                raise ConflictError("raster extraction job cannot be created")
+            key = (job.org_id, job.case_id, job.asset_id, job.profile_revision)
+            existing_id = self._raster_extraction_by_asset_profile.get(key)
+            if existing_id is not None:
+                existing = self._raster_extraction_jobs.get(existing_id)
+                if existing is None:
+                    raise ConflictError("raster extraction idempotency state is invalid")
+                return self._copy(existing), False
+            if job.raster_extraction_job_id in self._raster_extraction_jobs:
+                raise ConflictError("raster extraction job identifier already exists")
+            self._raster_extraction_jobs[job.raster_extraction_job_id] = self._copy(job)
+            self._raster_extraction_by_asset_profile[key] = job.raster_extraction_job_id
+            return self._copy(job), True
+
+    def get_raster_extraction_job(
+        self, org_id: str, case_id: str, raster_extraction_job_id: str
+    ) -> RasterExtractionJobRecord | None:
+        with self._lock:
+            record = self._raster_extraction_jobs.get(raster_extraction_job_id)
+            if record is None or record.org_id != org_id or record.case_id != case_id:
+                return None
+            return self._copy(record)
+
+    def claim_next_raster_extraction_job(
+        self, *, now: datetime, lease_expires_at: datetime
+    ) -> RasterExtractionJobRecord | None:
+        """Atomically claim the oldest queued/expired job with a fresh lease."""
+
+        with self._lock:
+            candidates = sorted(
+                (
+                    item
+                    for item in self._raster_extraction_jobs.values()
+                    if item.status == "queued"
+                    or (
+                        item.status == "running"
+                        and item.lease_expires_at is not None
+                        and item.lease_expires_at <= now
+                    )
+                ),
+                key=lambda item: (item.created_at, item.raster_extraction_job_id),
+            )
+            for record in candidates:
+                if record.attempt_count >= 3:
+                    self._raster_extraction_jobs[record.raster_extraction_job_id] = self._copy(
+                        record.model_copy(
+                            update={
+                                "status": "failed",
+                                "lease_token": None,
+                                "lease_expires_at": None,
+                                "error_code": "raster_extraction_attempts_exhausted",
+                                "updated_at": now,
+                            }
+                        )
+                    )
+                    continue
+                claimed = record.model_copy(
+                    update={
+                        "status": "running",
+                        "attempt_count": record.attempt_count + 1,
+                        "lease_token": uuid.uuid4().hex,
+                        "lease_expires_at": lease_expires_at,
+                        "error_code": None,
+                        "updated_at": now,
+                    }
+                )
+                self._raster_extraction_jobs[claimed.raster_extraction_job_id] = self._copy(claimed)
+                return self._copy(claimed)
+            return None
+
+    def complete_raster_extraction_job(
+        self,
+        *,
+        raster_extraction_job_id: str,
+        lease_token: str,
+        result: RasterDocumentExtractionResult,
+        completed_at: datetime,
+    ) -> RasterExtractionJobRecord | None:
+        with self._lock:
+            record = self._raster_extraction_jobs.get(raster_extraction_job_id)
+            if (
+                record is None
+                or record.status != "running"
+                or record.lease_token != lease_token
+                or result.extraction_request_id != record.raster_extraction_job_id
+            ):
+                return None
+            completed = record.model_copy(
+                update={
+                    "status": result.status,
+                    "result": result,
+                    "lease_token": None,
+                    "lease_expires_at": None,
+                    "error_code": None,
+                    "updated_at": completed_at,
+                }
+            )
+            self._raster_extraction_jobs[raster_extraction_job_id] = self._copy(completed)
+            return self._copy(completed)
+
+    def mark_raster_extraction_job_unavailable(
+        self,
+        *,
+        raster_extraction_job_id: str,
+        expected_profile_revision: str,
+        result: RasterDocumentExtractionResult,
+        error_code: str,
+        completed_at: datetime,
+    ) -> RasterExtractionJobRecord | None:
+        """Close a job when its immutable profile is no longer usable.
+
+        This is not a retry.  A replacement profile must create a distinct
+        asset/profile job so a reviewer never receives text from one profile
+        with page geometry from another one.  It is intentionally safe for a
+        worker/page-view race: either caller can close the old record and the
+        late caller gets the already terminal copy.
+        """
+
+        with self._lock:
+            record = self._raster_extraction_jobs.get(raster_extraction_job_id)
+            if (
+                record is None
+                or record.profile_revision != expected_profile_revision
+                or result.extraction_request_id != record.raster_extraction_job_id
+                or result.raster_profile_revision != record.profile_revision
+                or result.status != "unavailable"
+            ):
+                return None
+            if record.status == "failed":
+                return None
+            if record.status == "unavailable":
+                return self._copy(record)
+            updated = record.model_copy(
+                update={
+                    "status": "unavailable",
+                    "result": result,
+                    "lease_token": None,
+                    "lease_expires_at": None,
+                    "error_code": error_code,
+                    "updated_at": completed_at,
+                }
+            )
+            self._raster_extraction_jobs[raster_extraction_job_id] = self._copy(updated)
+            return self._copy(updated)
+
+    def fail_raster_extraction_job(
+        self,
+        *,
+        raster_extraction_job_id: str,
+        lease_token: str,
+        error_code: str,
+        retryable: bool,
+        completed_at: datetime,
+    ) -> RasterExtractionJobRecord | None:
+        """Release a matching lease, retrying at most three total attempts."""
+
+        with self._lock:
+            record = self._raster_extraction_jobs.get(raster_extraction_job_id)
+            if (
+                record is None
+                or record.status != "running"
+                or record.lease_token != lease_token
+            ):
+                return None
+            should_retry = retryable and record.attempt_count < 3
+            updated = record.model_copy(
+                update={
+                    "status": "queued" if should_retry else "failed",
+                    "lease_token": None,
+                    "lease_expires_at": None,
+                    # Do not expose a provider error while a retry may later
+                    # succeed.  The public failed code remains generic.
+                    "error_code": None if should_retry else error_code,
+                    "updated_at": completed_at,
+                }
+            )
+            self._raster_extraction_jobs[raster_extraction_job_id] = self._copy(updated)
+            return self._copy(updated)
+
+    def create_raster_text_extraction_job(
+        self, job: RasterTextExtractionJobRecord
+    ) -> tuple[RasterTextExtractionJobRecord, bool]:
+        """Persist one independent text-only asset/profile queue entry.
+
+        The idempotency map is intentionally separate from structured raster
+        extraction.  The two paths may use the same source asset and even a
+        similarly named profile without granting each other approval.
+        """
+
+        with self._lock:
+            asset = self._document_assets.get(job.asset_id)
+            if (
+                asset is None
+                or asset.org_id != job.org_id
+                or asset.case_id != job.case_id
+                or asset.source_sha256 != job.source_sha256
+            ):
+                raise ConflictError("raster text extraction job cannot be created")
+            key = (job.org_id, job.case_id, job.asset_id, job.profile_revision)
+            existing_id = self._raster_text_extraction_by_asset_profile.get(key)
+            if existing_id is not None:
+                existing = self._raster_text_extraction_jobs.get(existing_id)
+                if existing is None:
+                    raise ConflictError("raster text extraction idempotency state is invalid")
+                return self._copy(existing), False
+            if job.raster_text_extraction_job_id in self._raster_text_extraction_jobs:
+                raise ConflictError("raster text extraction job identifier already exists")
+            self._raster_text_extraction_jobs[job.raster_text_extraction_job_id] = self._copy(job)
+            self._raster_text_extraction_by_asset_profile[key] = job.raster_text_extraction_job_id
+            return self._copy(job), True
+
+    def get_raster_text_extraction_job(
+        self, org_id: str, case_id: str, raster_text_extraction_job_id: str
+    ) -> RasterTextExtractionJobRecord | None:
+        with self._lock:
+            record = self._raster_text_extraction_jobs.get(raster_text_extraction_job_id)
+            if record is None or record.org_id != org_id or record.case_id != case_id:
+                return None
+            return self._copy(record)
+
+    def claim_next_raster_text_extraction_job(
+        self, *, now: datetime, lease_expires_at: datetime
+    ) -> RasterTextExtractionJobRecord | None:
+        """Atomically claim the oldest queued/expired text-only OCR job."""
+
+        with self._lock:
+            candidates = sorted(
+                (
+                    item
+                    for item in self._raster_text_extraction_jobs.values()
+                    if item.status == "queued"
+                    or (
+                        item.status == "running"
+                        and item.lease_expires_at is not None
+                        and item.lease_expires_at <= now
+                    )
+                ),
+                key=lambda item: (item.created_at, item.raster_text_extraction_job_id),
+            )
+            for record in candidates:
+                if record.attempt_count >= 3:
+                    self._raster_text_extraction_jobs[record.raster_text_extraction_job_id] = self._copy(
+                        record.model_copy(
+                            update={
+                                "status": "failed",
+                                "lease_token": None,
+                                "lease_expires_at": None,
+                                "error_code": "raster_text_extraction_attempts_exhausted",
+                                "updated_at": now,
+                            }
+                        )
+                    )
+                    continue
+                claimed = record.model_copy(
+                    update={
+                        "status": "running",
+                        "attempt_count": record.attempt_count + 1,
+                        "lease_token": uuid.uuid4().hex,
+                        "lease_expires_at": lease_expires_at,
+                        "error_code": None,
+                        "updated_at": now,
+                    }
+                )
+                self._raster_text_extraction_jobs[claimed.raster_text_extraction_job_id] = self._copy(
+                    claimed
+                )
+                return self._copy(claimed)
+            return None
+
+    def complete_raster_text_extraction_job(
+        self,
+        *,
+        raster_text_extraction_job_id: str,
+        lease_token: str,
+        result: RasterTextDocumentExtractionResult,
+        completed_at: datetime,
+    ) -> RasterTextExtractionJobRecord | None:
+        with self._lock:
+            record = self._raster_text_extraction_jobs.get(raster_text_extraction_job_id)
+            if (
+                record is None
+                or record.status != "running"
+                or record.lease_token != lease_token
+                or result.extraction_request_id != record.raster_text_extraction_job_id
+            ):
+                return None
+            completed = record.model_copy(
+                update={
+                    "status": result.status,
+                    "result": result,
+                    "lease_token": None,
+                    "lease_expires_at": None,
+                    "error_code": None,
+                    "updated_at": completed_at,
+                }
+            )
+            self._raster_text_extraction_jobs[raster_text_extraction_job_id] = self._copy(completed)
+            return self._copy(completed)
+
+    def mark_raster_text_extraction_job_unavailable(
+        self,
+        *,
+        raster_text_extraction_job_id: str,
+        expected_profile_revision: str,
+        result: RasterTextDocumentExtractionResult,
+        error_code: str,
+        completed_at: datetime,
+    ) -> RasterTextExtractionJobRecord | None:
+        """Close a stale text-only job without reusing a replacement profile."""
+
+        with self._lock:
+            record = self._raster_text_extraction_jobs.get(raster_text_extraction_job_id)
+            if (
+                record is None
+                or record.profile_revision != expected_profile_revision
+                or result.extraction_request_id != record.raster_text_extraction_job_id
+                or result.raster_text_profile_revision != record.profile_revision
+                or result.status != "unavailable"
+            ):
+                return None
+            if record.status == "failed":
+                return None
+            if record.status == "unavailable":
+                return self._copy(record)
+            updated = record.model_copy(
+                update={
+                    "status": "unavailable",
+                    "result": result,
+                    "lease_token": None,
+                    "lease_expires_at": None,
+                    "error_code": error_code,
+                    "updated_at": completed_at,
+                }
+            )
+            self._raster_text_extraction_jobs[raster_text_extraction_job_id] = self._copy(updated)
+            return self._copy(updated)
+
+    def fail_raster_text_extraction_job(
+        self,
+        *,
+        raster_text_extraction_job_id: str,
+        lease_token: str,
+        error_code: str,
+        retryable: bool,
+        completed_at: datetime,
+    ) -> RasterTextExtractionJobRecord | None:
+        """Release a matching text-only lease, retrying at most three times."""
+
+        with self._lock:
+            record = self._raster_text_extraction_jobs.get(raster_text_extraction_job_id)
+            if (
+                record is None
+                or record.status != "running"
+                or record.lease_token != lease_token
+            ):
+                return None
+            should_retry = retryable and record.attempt_count < 3
+            updated = record.model_copy(
+                update={
+                    "status": "queued" if should_retry else "failed",
+                    "lease_token": None,
+                    "lease_expires_at": None,
+                    "error_code": None if should_retry else error_code,
+                    "updated_at": completed_at,
+                }
+            )
+            self._raster_text_extraction_jobs[raster_text_extraction_job_id] = self._copy(updated)
+            return self._copy(updated)
 
     def create_review_job(
         self, job: JobRecord, *, expected_case_revision: int

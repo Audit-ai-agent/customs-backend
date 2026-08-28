@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import json
 from typing import Any
 
@@ -23,6 +24,10 @@ from customs_backend.domain import (
     JobRecord,
     KnowledgeConversationRecord,
     ReviewRunRecord,
+    RasterDocumentExtractionResult,
+    RasterExtractionJobRecord,
+    RasterTextDocumentExtractionResult,
+    RasterTextExtractionJobRecord,
 )
 from customs_backend.repository import InMemoryWorkbenchRepository
 
@@ -124,6 +129,24 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
                 key: ExtractionJobRecord.model_validate(value)
                 for key, value in dict(state.get("extraction_jobs", {})).items()
             }
+            self._raster_extraction_jobs = {
+                key: RasterExtractionJobRecord.model_validate(value)
+                for key, value in dict(state.get("raster_extraction_jobs", {})).items()
+            }
+            self._raster_extraction_by_asset_profile = {
+                (str(item[0]), str(item[1]), str(item[2]), str(item[3])): str(item[4])
+                for item in list(state.get("raster_extraction_by_asset_profile", []))
+                if isinstance(item, list) and len(item) == 5
+            }
+            self._raster_text_extraction_jobs = {
+                key: RasterTextExtractionJobRecord.model_validate(value)
+                for key, value in dict(state.get("raster_text_extraction_jobs", {})).items()
+            }
+            self._raster_text_extraction_by_asset_profile = {
+                (str(item[0]), str(item[1]), str(item[2]), str(item[3])): str(item[4])
+                for item in list(state.get("raster_text_extraction_by_asset_profile", []))
+                if isinstance(item, list) and len(item) == 5
+            }
             self._jobs = {
                 key: JobRecord.model_validate(value)
                 for key, value in dict(state.get("jobs", {})).items()
@@ -192,6 +215,22 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
                 key: value.model_dump(mode="json")
                 for key, value in self._extraction_jobs.items()
             },
+            "raster_extraction_jobs": {
+                key: value.model_dump(mode="json")
+                for key, value in self._raster_extraction_jobs.items()
+            },
+            "raster_extraction_by_asset_profile": [
+                [org_id, case_id, asset_id, profile_revision, job_id]
+                for (org_id, case_id, asset_id, profile_revision), job_id in self._raster_extraction_by_asset_profile.items()
+            ],
+            "raster_text_extraction_jobs": {
+                key: value.model_dump(mode="json")
+                for key, value in self._raster_text_extraction_jobs.items()
+            },
+            "raster_text_extraction_by_asset_profile": [
+                [org_id, case_id, asset_id, profile_revision, job_id]
+                for (org_id, case_id, asset_id, profile_revision), job_id in self._raster_text_extraction_by_asset_profile.items()
+            ],
             "jobs": {key: value.model_dump(mode="json") for key, value in self._jobs.items()},
             "idempotency": [[org, key, job_id] for (org, key), job_id in self._idempotency.items()],
             "runs": {key: value.model_dump(mode="json") for key, value in self._runs.items()},
@@ -278,6 +317,158 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
     def update_extraction_job(self, job: ExtractionJobRecord) -> ExtractionJobRecord:
         value = super().update_extraction_job(job)
         self._persist()
+        return value
+
+    def create_raster_extraction_job(
+        self, job: RasterExtractionJobRecord
+    ) -> tuple[RasterExtractionJobRecord, bool]:
+        value = super().create_raster_extraction_job(job)
+        if value[1]:
+            self._persist()
+        return value
+
+    def claim_next_raster_extraction_job(
+        self, *, now: datetime, lease_expires_at: datetime
+    ) -> RasterExtractionJobRecord | None:
+        value = super().claim_next_raster_extraction_job(
+            now=now, lease_expires_at=lease_expires_at
+        )
+        # An expired maximum-attempt record can be finalized even when there
+        # is no next claim; always persist this bounded state transition.
+        self._persist()
+        return value
+
+    def complete_raster_extraction_job(
+        self,
+        *,
+        raster_extraction_job_id: str,
+        lease_token: str,
+        result: RasterDocumentExtractionResult,
+        completed_at: datetime,
+    ) -> RasterExtractionJobRecord | None:
+        value = super().complete_raster_extraction_job(
+            raster_extraction_job_id=raster_extraction_job_id,
+            lease_token=lease_token,
+            result=result,
+            completed_at=completed_at,
+        )
+        if value is not None:
+            self._persist()
+        return value
+
+    def mark_raster_extraction_job_unavailable(
+        self,
+        *,
+        raster_extraction_job_id: str,
+        expected_profile_revision: str,
+        result: RasterDocumentExtractionResult,
+        error_code: str,
+        completed_at: datetime,
+    ) -> RasterExtractionJobRecord | None:
+        value = super().mark_raster_extraction_job_unavailable(
+            raster_extraction_job_id=raster_extraction_job_id,
+            expected_profile_revision=expected_profile_revision,
+            result=result,
+            error_code=error_code,
+            completed_at=completed_at,
+        )
+        if value is not None:
+            self._persist()
+        return value
+
+    def fail_raster_extraction_job(
+        self,
+        *,
+        raster_extraction_job_id: str,
+        lease_token: str,
+        error_code: str,
+        retryable: bool,
+        completed_at: datetime,
+    ) -> RasterExtractionJobRecord | None:
+        value = super().fail_raster_extraction_job(
+            raster_extraction_job_id=raster_extraction_job_id,
+            lease_token=lease_token,
+            error_code=error_code,
+            retryable=retryable,
+            completed_at=completed_at,
+        )
+        if value is not None:
+            self._persist()
+        return value
+
+    def create_raster_text_extraction_job(
+        self, job: RasterTextExtractionJobRecord
+    ) -> tuple[RasterTextExtractionJobRecord, bool]:
+        value = super().create_raster_text_extraction_job(job)
+        if value[1]:
+            self._persist()
+        return value
+
+    def claim_next_raster_text_extraction_job(
+        self, *, now: datetime, lease_expires_at: datetime
+    ) -> RasterTextExtractionJobRecord | None:
+        value = super().claim_next_raster_text_extraction_job(
+            now=now, lease_expires_at=lease_expires_at
+        )
+        self._persist()
+        return value
+
+    def complete_raster_text_extraction_job(
+        self,
+        *,
+        raster_text_extraction_job_id: str,
+        lease_token: str,
+        result: RasterTextDocumentExtractionResult,
+        completed_at: datetime,
+    ) -> RasterTextExtractionJobRecord | None:
+        value = super().complete_raster_text_extraction_job(
+            raster_text_extraction_job_id=raster_text_extraction_job_id,
+            lease_token=lease_token,
+            result=result,
+            completed_at=completed_at,
+        )
+        if value is not None:
+            self._persist()
+        return value
+
+    def mark_raster_text_extraction_job_unavailable(
+        self,
+        *,
+        raster_text_extraction_job_id: str,
+        expected_profile_revision: str,
+        result: RasterTextDocumentExtractionResult,
+        error_code: str,
+        completed_at: datetime,
+    ) -> RasterTextExtractionJobRecord | None:
+        value = super().mark_raster_text_extraction_job_unavailable(
+            raster_text_extraction_job_id=raster_text_extraction_job_id,
+            expected_profile_revision=expected_profile_revision,
+            result=result,
+            error_code=error_code,
+            completed_at=completed_at,
+        )
+        if value is not None:
+            self._persist()
+        return value
+
+    def fail_raster_text_extraction_job(
+        self,
+        *,
+        raster_text_extraction_job_id: str,
+        lease_token: str,
+        error_code: str,
+        retryable: bool,
+        completed_at: datetime,
+    ) -> RasterTextExtractionJobRecord | None:
+        value = super().fail_raster_text_extraction_job(
+            raster_text_extraction_job_id=raster_text_extraction_job_id,
+            lease_token=lease_token,
+            error_code=error_code,
+            retryable=retryable,
+            completed_at=completed_at,
+        )
+        if value is not None:
+            self._persist()
         return value
 
     def create_review_job(
