@@ -826,14 +826,16 @@ def test_raster_text_confirmation_rechecks_a_changed_profile_without_a_get_bypas
     assert stale["job"]["error_code"] == "raster_text_profile_superseded"
 
 
-def test_raster_text_confirmation_fails_closed_when_the_active_profile_disappears() -> None:
+def test_raster_text_unavailable_is_transient_and_confirmation_recovers() -> None:
     active_profile = {"available": True, "revision": "synthetic-raster-text-v1-a"}
 
     def status() -> dict[str, object]:
         return {
             "schema_version": "1.0",
             "availability": "available" if active_profile["available"] else "unavailable",
-            "raster_text_profile_revision": active_profile["revision"] if active_profile["available"] else None,
+            "raster_text_profile_revision": (
+                active_profile["revision"] if active_profile["available"] else None
+            ),
         }
 
     with _client(
@@ -874,11 +876,73 @@ def test_raster_text_confirmation_fails_closed_when_the_active_profile_disappear
         stale = client.get(
             f"{path}/{job['raster_text_extraction_job_id']}", headers=_auth()
         ).json()
+        assert stale["current_profile_revision"] is None
+        assert stale["profile_superseded"] is False
+        assert stale["job"]["status"] == "needs_review"
+        assert stale["job"]["error_code"] is None
 
-    assert stale["current_profile_revision"] is None
-    assert stale["profile_superseded"] is True
-    assert stale["job"]["status"] == "unavailable"
-    assert stale["job"]["error_code"] == "raster_text_profile_unavailable"
+        # The same attested revision becoming reachable again must leave the
+        # original idempotent job usable instead of permanently poisoning it.
+        active_profile["available"] = True
+        recovered = client.post(
+            f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/confirmed-document",
+            json={
+                "raster_text_extraction_job_id": job["raster_text_extraction_job_id"],
+                "filename": "invoice-confirmed.txt",
+                "content_text": "reviewer-confirmed text",
+            },
+            headers=_auth(),
+        )
+        assert recovered.status_code == 201, recovered.text
+
+
+def test_raster_text_worker_does_not_destroy_job_on_transient_status_unavailable() -> None:
+    active_profile = {"available": True, "revision": "synthetic-raster-text-v1-a"}
+    extraction_calls: list[str] = []
+
+    def status() -> dict[str, object]:
+        return {
+            "schema_version": "1.0",
+            "availability": "available" if active_profile["available"] else "unavailable",
+            "raster_text_profile_revision": (
+                active_profile["revision"] if active_profile["available"] else None
+            ),
+        }
+
+    def extract(request, _content: bytes) -> dict[str, object]:
+        extraction_calls.append(request.raster_text_profile_revision)
+        return _needs_review_raster_text_result(request)
+
+    with _client(
+        raster_text_extract_handler=extract,
+        raster_text_preview_status_handler=status,
+    ) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Raster text transient status"}, headers=_auth()
+        ).json()["case_id"]
+        asset = client.post(
+            f"/api/v1/cases/{case_id}/document-assets",
+            params={"document_type": "CI", "filename": "invoice.png"},
+            content=_tiny_png(),
+            headers={**_auth(), "Content-Type": "image/png"},
+        ).json()
+        path = (
+            f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/"
+            "raster-text-extractions"
+        )
+        job = client.post(path, headers=_auth()).json()["job"]
+        active_profile["available"] = False
+
+        terminal = client.app.state.container.service.process_next_raster_text_extraction_job()
+        view = client.get(
+            f"{path}/{job['raster_text_extraction_job_id']}", headers=_auth()
+        ).json()
+
+    assert terminal is not None and terminal.status == "needs_review"
+    assert extraction_calls == ["synthetic-raster-text-v1-a"]
+    assert view["current_profile_revision"] is None
+    assert view["profile_superseded"] is False
+    assert view["job"]["status"] == "needs_review"
 
 
 def test_raster_profile_replacement_creates_a_new_job_and_closes_the_old_profile() -> None:

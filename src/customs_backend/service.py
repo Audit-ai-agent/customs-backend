@@ -1774,25 +1774,19 @@ class WorkbenchService:
         if job is None or job.asset_id != asset.asset_id:
             raise NotFoundError("raster text extraction job not found")
         current_profile_revision = self._current_raster_text_profile_revision()
-        # A stored OCR draft is not independently trustworthy after the text
-        # profile disappears or changes.  Close it here as well as in the
-        # worker so a GET cannot leave a formerly ready draft confirmable.
+        # ``unavailable`` is a transient transport/warmup observation, not
+        # proof that an immutable profile was replaced.  Only a different
+        # verified revision may terminally supersede this job.  Confirmation
+        # still requires the pinned revision to be available again.
         profile_superseded = (
-            current_profile_revision is None
-            or current_profile_revision != job.profile_revision
+            current_profile_revision is not None
+            and current_profile_revision != job.profile_revision
         )
         if profile_superseded:
-            reason_code: Literal[
-                "raster_text_profile_unavailable", "raster_text_profile_superseded"
-            ] = (
-                "raster_text_profile_unavailable"
-                if current_profile_revision is None
-                else "raster_text_profile_superseded"
-            )
             closed = self._mark_raster_text_profile_unavailable(
                 asset=asset,
                 job=job,
-                reason_code=reason_code,
+                reason_code="raster_text_profile_superseded",
             )
             if closed is not None:
                 job = closed
@@ -1830,11 +1824,10 @@ class WorkbenchService:
                 completed_at=utc_now(),
             )
         current_profile_revision = self._current_raster_text_profile_revision()
-        if current_profile_revision is None:
-            return self._mark_raster_text_profile_unavailable(
-                asset=asset, job=job, reason_code="raster_text_profile_unavailable"
-            )
-        if current_profile_revision != job.profile_revision:
+        if (
+            current_profile_revision is not None
+            and current_profile_revision != job.profile_revision
+        ):
             return self._mark_raster_text_profile_unavailable(
                 asset=asset, job=job, reason_code="raster_text_profile_superseded"
             )
@@ -1876,11 +1869,10 @@ class WorkbenchService:
                 completed_at=utc_now(),
             )
         current_profile_revision = self._current_raster_text_profile_revision()
-        if current_profile_revision is None:
-            return self._mark_raster_text_profile_unavailable(
-                asset=asset, job=job, reason_code="raster_text_profile_unavailable"
-            )
-        if current_profile_revision != job.profile_revision:
+        if (
+            current_profile_revision is not None
+            and current_profile_revision != job.profile_revision
+        ):
             return self._mark_raster_text_profile_unavailable(
                 asset=asset, job=job, reason_code="raster_text_profile_superseded"
             )
@@ -2021,11 +2013,6 @@ class WorkbenchService:
                 # returning a fail-closed public error.
                 current_profile_revision = self._current_raster_text_profile_revision()
                 if current_profile_revision is None:
-                    self._mark_raster_text_profile_unavailable(
-                        asset=asset,
-                        job=job,
-                        reason_code="raster_text_profile_unavailable",
-                    )
                     raise RasterDocumentPreviewUnavailable(
                         "raster text preview profile is unavailable"
                     )
