@@ -7,7 +7,7 @@ import re
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 
@@ -22,6 +22,7 @@ from customs_backend.case_input_boundary import (
 )
 from customs_backend.guidance_registry import (
     GuidanceRegistryProjectionError,
+    validate_development_fixture_citation,
     validate_guidance_citation,
     validate_guidance_resolution,
 )
@@ -44,9 +45,12 @@ from customs_backend.domain import (
     AgentAssistantAnswerResponse,
     AgentConversationTurn,
     AgentHumanCorrection,
+    AgentReviewerHsSelection,
     AgentReviewRequest,
     Assessment,
     AssuranceLevel,
+    CaseClosureRecord,
+    CaseClosureRequest,
     CaseCreate,
     CaseRecord,
     CaseStatus,
@@ -83,6 +87,8 @@ from customs_backend.domain import (
     FindingDecisionRequest,
     GuidanceResolution,
     GuidanceRegistryVersion,
+    HsSelectionRecord,
+    HsSelectionRequest,
     InputDocumentManifestEntry,
     KnowledgeConversationCreate,
     KnowledgeConversationRecord,
@@ -116,6 +122,32 @@ from customs_backend.ports import (
     WorkbenchRepository,
 )
 from customs_backend.raster_limits import RASTER_WORKER_LEASE_SECONDS
+from customs_backend.law_reference import (
+    LawCatalogView,
+    LawReferenceError,
+    LawSearchView,
+    build_law_catalog_request,
+    build_law_search_request,
+    law_catalog_view,
+    law_search_view,
+)
+from customs_backend.operations_metrics import (
+    OperationsMetricsView,
+    build_operations_metrics,
+)
+from customs_backend.trade_features import (
+    DutyAssessmentView,
+    HsClassificationView,
+    HsReferenceEntryView,
+    HsReferenceSearchView,
+    OriginVerificationView,
+    build_duty_assessment,
+    build_hs_classification,
+    build_origin_verification,
+    lookup_hs_reference,
+    search_hs_reference,
+    validate_hs_selection_code,
+)
 
 
 _DECLARED_TYPE_MAP: dict[
@@ -320,6 +352,22 @@ def _validate_guidance_citations(
                     # identity.  They remain valid but cannot be upgraded or
                     # made to claim V2 provenance retroactively.
                     continue
+                if not functional_uat and citation.source_kind == "development_fixture":
+                    # The Agent's deterministic local fixture binds a real
+                    # registry source but a clearly synthetic fixed URI, so
+                    # the official title/URI equality below can never hold.
+                    # Its registry binding is still validated, and the
+                    # Functional-UAT check later rejects this kind outright.
+                    validate_development_fixture_citation(
+                        registry=registry,
+                        registry_source_id=citation.registry_source_id,
+                        source_uri=str(citation.source_uri),
+                        topic=resolution.topic,
+                        scope=resolution.scope,
+                        requested_direction=resolution.requested_direction,
+                        applicable_directions=resolution.applicable_directions,
+                    )
+                    continue
                 validate_guidance_citation(
                     registry=registry,
                     registry_source_id=citation.registry_source_id,
@@ -466,17 +514,31 @@ def _validate_multi_scope_guidance_citations(
         if citation.registry_source_id is None:
             raise ConflictError("multi-scope V2 guidance citation has no registry source")
         try:
-            validate_guidance_citation(
-                registry=registry,
-                registry_source_id=citation.registry_source_id,
-                source_kind=str(citation.source_kind),
-                source_title=str(citation.source_title),
-                source_uri=str(citation.source_uri),
-                topic=resolution.topic,
-                scope=resolution.scope,
-                requested_direction=resolution.requested_direction,
-                applicable_directions=resolution.applicable_directions,
-            )
+            if not functional_uat and citation.source_kind == "development_fixture":
+                # Same deterministic-fixture boundary as the single-scope
+                # validation: keep the registry binding, replace the official
+                # title/URI equality with the exact fixed fixture URI.
+                validate_development_fixture_citation(
+                    registry=registry,
+                    registry_source_id=citation.registry_source_id,
+                    source_uri=str(citation.source_uri),
+                    topic=resolution.topic,
+                    scope=resolution.scope,
+                    requested_direction=resolution.requested_direction,
+                    applicable_directions=resolution.applicable_directions,
+                )
+            else:
+                validate_guidance_citation(
+                    registry=registry,
+                    registry_source_id=citation.registry_source_id,
+                    source_kind=str(citation.source_kind),
+                    source_title=str(citation.source_title),
+                    source_uri=str(citation.source_uri),
+                    topic=resolution.topic,
+                    scope=resolution.scope,
+                    requested_direction=resolution.requested_direction,
+                    applicable_directions=resolution.applicable_directions,
+                )
         except (AttributeError, GuidanceRegistryProjectionError) as exc:
             raise ConflictError("multi-scope guidance citation is outside the registry projection") from exc
         if functional_uat and citation.source_kind == "development_fixture":
@@ -876,6 +938,11 @@ def _agent_request_from_snapshot(
             AgentHumanCorrection.model_validate(value)
             for value in list(snapshot.get("human_corrections", []))
         ]
+        reviewer_hs_selection = (
+            AgentReviewerHsSelection.model_validate(snapshot["reviewer_hs_selection"])
+            if snapshot.get("reviewer_hs_selection") is not None
+            else None
+        )
     except (KeyError, TypeError, ValueError, ValidationError) as exc:
         raise ConflictError("review job has an invalid immutable input snapshot") from exc
     return AgentReviewRequest(
@@ -897,6 +964,7 @@ def _agent_request_from_snapshot(
         parent_review_run_id=parent_review_run_id,
         applied_correction_proposal_ids=applied_correction_proposal_ids,
         human_corrections=human_corrections,
+        reviewer_hs_selection=reviewer_hs_selection,
     )
 
 
@@ -2013,6 +2081,14 @@ class WorkbenchService:
             ),
         )
 
+    def _latest_hs_selection_code(self, principal: Principal, case_id: str) -> str | None:
+        """Return the case's most recent reviewer-confirmed HSK code, if any."""
+
+        for run in self.repository.list_runs(principal.org_id, case_id):
+            if run.hs_selection is not None:
+                return run.hs_selection.code
+        return None
+
     def review(
         self,
         principal: Principal,
@@ -2042,6 +2118,12 @@ class WorkbenchService:
             "input_document_manifest": [item.model_dump(mode="json") for item in manifest],
             "input_manifest_digest": input_manifest_digest,
         }
+        reviewer_hs_code = self._latest_hs_selection_code(principal, case_id)
+        if reviewer_hs_code is not None:
+            snapshot["reviewer_hs_selection"] = {
+                "code": reviewer_hs_code,
+                "source_kind": "human_provided",
+            }
         supplied_digest = canonical_digest(
             {"case_id": case_id, "request": request.model_dump(mode="json")}
         )
@@ -3102,6 +3184,12 @@ class WorkbenchService:
             "applied_correction_proposal_ids": list(request.proposal_ids),
             "human_corrections": correction_context,
         }
+        revision_hs_code = self._latest_hs_selection_code(principal, case.case_id)
+        if revision_hs_code is not None:
+            snapshot["reviewer_hs_selection"] = {
+                "code": revision_hs_code,
+                "source_kind": "human_provided",
+            }
         now = utc_now()
         job = JobRecord(
             job_id=_id("job"),
@@ -3156,3 +3244,158 @@ class WorkbenchService:
             reason=request.reason.strip(),
             decided_by=principal.subject,
         )
+
+    def delete_case(self, principal: Principal, case_id: str) -> None:
+        """Local admin removal of a whole case; reviewer-only, irreversible."""
+
+        self._require_role(principal, Role.reviewer)
+        self.get_case(principal, case_id)
+        self.repository.delete_case(org_id=principal.org_id, case_id=case_id)
+
+    def close_case(
+        self, principal: Principal, case_id: str, request: CaseClosureRequest
+    ) -> CaseRecord:
+        """Record the reviewer's final internal disposition and close the case.
+
+        Closing requires a completed review run whose findings all carry a
+        reviewer decision - a case is never closed over undecided findings.
+        Nothing is transmitted anywhere; this is an internal state change.
+        """
+
+        self._require_role(principal, Role.reviewer)
+        case = self.get_case(principal, case_id)
+        if case.status == CaseStatus.closed:
+            raise ConflictError("the case is already closed")
+        runs = self.repository.list_runs(principal.org_id, case_id)
+        latest = max(runs, key=lambda run: run.created_at, default=None)
+        if latest is None:
+            raise ConflictError("a case needs a completed review before it can be closed")
+        decided = {decision.finding_id for decision in latest.reviewer_decisions}
+        undecided = [
+            str(item.get("finding_id"))
+            for item in latest.findings
+            if isinstance(item, dict)
+            and isinstance(item.get("finding_id"), str)
+            and item["finding_id"] not in decided
+        ]
+        if undecided:
+            raise ConflictError(
+                "every finding needs a reviewer decision before the case can be closed"
+            )
+        closure = CaseClosureRecord(
+            disposition=request.disposition,
+            reason=request.reason.strip(),
+            review_run_id=latest.review_run_id,
+            closed_by=principal.subject,
+            closed_at=utc_now(),
+        )
+        return self.repository.close_case(
+            org_id=principal.org_id, case_id=case_id, closure=closure
+        )
+
+    def review_progress(self, principal: Principal, case_id: str) -> dict[str, Any]:
+        """Display-only live progress of the newest in-flight review, if any.
+
+        The Agent keeps this in memory during the synchronous review call; a
+        missing or stale snapshot degrades to "running with no stages" or
+        "idle" rather than an error.
+        """
+
+        self.get_case(principal, case_id)
+        job = self.repository.latest_review_job(principal.org_id, case_id)
+        if job is None or job.status not in {JobStatus.queued, JobStatus.running}:
+            return {"status": "idle", "stages": []}
+        snapshot = self.agent.get_review_progress(job.review_run_id)
+        if not isinstance(snapshot, dict):
+            return {
+                "status": "running",
+                "review_run_id": job.review_run_id,
+                "stages": [],
+            }
+        stages = [
+            {"stage": str(item.get("stage", "")), "status": str(item.get("status", ""))}
+            for item in snapshot.get("stages", [])
+            if isinstance(item, dict)
+        ]
+        return {
+            "status": "running",
+            "review_run_id": job.review_run_id,
+            "stages": stages,
+        }
+
+    def hs_classification(
+        self, principal: Principal, review_run_id: str
+    ) -> HsClassificationView:
+        run = self.get_run(principal, review_run_id)
+        return build_hs_classification(run)
+
+    def hs_reference_entry(self, principal: Principal, code: str) -> HsReferenceEntryView:
+        del principal  # the packaged reference table has no org scope
+        if re.fullmatch(r"[0-9]{10}", code) is None:
+            raise NotFoundError("an HSK reference lookup takes a 10-digit code")
+        return lookup_hs_reference(code)
+
+    def hs_reference_search(self, principal: Principal, query: str) -> HsReferenceSearchView:
+        del principal  # the packaged reference table has no org scope
+        return search_hs_reference(query)
+
+    def law_search(self, principal: Principal, query: str, top_k: int | None) -> LawSearchView:
+        """Reviewer-facing statute search over the loaded Data law store."""
+
+        del principal  # the statute store is a shared read-only reference
+        as_of = datetime.now(timezone.utc).date()
+        try:
+            request = build_law_search_request(query, top_k, as_of)
+            return law_search_view(query, self.agent.law_search(request))
+        except LawReferenceError as exc:
+            raise KnowledgeInputRejectedError() from exc
+
+    def law_catalog(self, principal: Principal) -> LawCatalogView:
+        """The statutes the loaded Data law store can search."""
+
+        del principal  # the statute store is a shared read-only reference
+        as_of = datetime.now(timezone.utc).date()
+        try:
+            return law_catalog_view(self.agent.law_catalog(build_law_catalog_request(as_of)))
+        except LawReferenceError as exc:
+            raise KnowledgeInputRejectedError() from exc
+
+    def operations_metrics(self, principal: Principal) -> OperationsMetricsView:
+        cases = self.repository.list_cases(principal.org_id)
+        runs_by_case = {
+            case.case_id: self.repository.list_runs(principal.org_id, case.case_id)
+            for case in cases
+        }
+        return build_operations_metrics(
+            cases, runs_by_case, now=datetime.now(timezone.utc)
+        )
+
+    def record_hs_selection(
+        self,
+        principal: Principal,
+        review_run_id: str,
+        request: HsSelectionRequest,
+    ) -> HsSelectionRecord:
+        self._require_role(principal, Role.reviewer)
+        run = self.get_run(principal, review_run_id)
+        try:
+            validate_hs_selection_code(request.code)
+        except ValueError as exc:
+            raise ConflictError(str(exc)) from exc
+        return self.repository.record_hs_selection(
+            org_id=principal.org_id,
+            review_run_id=run.review_run_id,
+            code=request.code,
+            reason=request.reason.strip(),
+            selected_by=principal.subject,
+        )
+
+    def origin_verification(
+        self, principal: Principal, review_run_id: str
+    ) -> OriginVerificationView:
+        run = self.get_run(principal, review_run_id)
+        return build_origin_verification(run)
+
+    def duty_assessment(self, principal: Principal, review_run_id: str) -> DutyAssessmentView:
+        run = self.get_run(principal, review_run_id)
+        return build_duty_assessment(run)

@@ -168,6 +168,32 @@ class CaseCreate(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class CaseClosureRequest(BaseModel):
+    """A reviewer-owned closure decision; it never sends anything anywhere."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    disposition: Literal["cleared", "returned"]
+    reason: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("reason")
+    @classmethod
+    def non_blank_reason(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("a closure reason is required")
+        return value
+
+
+class CaseClosureRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    disposition: Literal["cleared", "returned"]
+    reason: str = Field(min_length=1, max_length=4000)
+    review_run_id: str = Field(min_length=1, max_length=128)
+    closed_by: str = Field(min_length=1, max_length=256)
+    closed_at: datetime
+
+
 class CaseRecord(BaseModel):
     case_id: str
     org_id: str
@@ -177,6 +203,9 @@ class CaseRecord(BaseModel):
     revision: int = Field(default=0, ge=0)
     document_manifest_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # The reviewer's final internal disposition. Historic cases stay readable
+    # with no closure; a closed case never carries an external transmission.
+    closure: CaseClosureRecord | None = None
     created_by: str
     created_at: datetime
     updated_at: datetime
@@ -1146,6 +1175,43 @@ class FindingDecisionRecord(BaseModel):
     history: list[FindingDecisionHistoryEntry] = Field(min_length=1, max_length=100)
 
 
+class HsSelectionRequest(BaseModel):
+    """A reviewer-owned HS code confirmation which never changes the Agent result."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: str = Field(pattern=r"^[0-9]{10}$")
+    reason: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("reason")
+    @classmethod
+    def non_blank_reason(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("an HS selection reason is required")
+        return value
+
+
+class HsSelectionHistoryEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    code: str = Field(pattern=r"^[0-9]{10}$")
+    reason: str = Field(min_length=1, max_length=4000)
+    selected_by: str = Field(min_length=1, max_length=256)
+    selected_at: datetime
+
+
+class HsSelectionRecord(BaseModel):
+    """Current reviewer HS code selection plus every prior selection."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: str = Field(pattern=r"^[0-9]{10}$")
+    reason: str = Field(min_length=1, max_length=4000)
+    selected_by: str = Field(min_length=1, max_length=256)
+    selected_at: datetime
+    history: list[HsSelectionHistoryEntry] = Field(min_length=1, max_length=100)
+
+
 class ConversationCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1794,6 +1860,11 @@ class ReviewRunRecord(BaseModel):
     document_analyses: list[dict[str, Any]] = Field(default_factory=list)
     comparisons: list[dict[str, Any]] = Field(default_factory=list)
     reviewer_decisions: list[FindingDecisionRecord] = Field(default_factory=list)
+    # Reviewer-owned HS code confirmation.  Like reviewer decisions it is
+    # Backend state layered next to the Agent result, never inside it, so it
+    # must stay out of the provider hash reconstruction.  Historic runs load
+    # with no selection.
+    hs_selection: HsSelectionRecord | None = None
     # Existing Browser key; it is display-only and never controls completion.
     release_identity: dict[str, Any] = Field(default_factory=dict)
     created_by: str
@@ -1838,6 +1909,19 @@ class AgentHumanCorrection(BaseModel):
     source_kind: Literal["human_provided"] = "human_provided"
 
 
+class AgentReviewerHsSelection(BaseModel):
+    """Reviewer-confirmed HSK code carried as labelled human-provided context.
+
+    It never overrides a document-cited HS code; the Agent may use it only
+    as the retrieval commodity when no input document cites a code itself.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    code: str = Field(pattern=r"^[0-9]{10}$")
+    source_kind: Literal["human_provided"] = "human_provided"
+
+
 class AgentReviewRequest(BaseModel):
     """The exact compact input sent to the Agent V3.2 endpoint."""
 
@@ -1854,6 +1938,7 @@ class AgentReviewRequest(BaseModel):
     parent_review_run_id: str | None = Field(default=None, max_length=128)
     applied_correction_proposal_ids: list[str] = Field(default_factory=list, max_length=50)
     human_corrections: list[AgentHumanCorrection] = Field(default_factory=list, max_length=50)
+    reviewer_hs_selection: AgentReviewerHsSelection | None = None
 
     @model_validator(mode="after")
     def correction_context_is_bound(self) -> "AgentReviewRequest":
@@ -1899,6 +1984,8 @@ class AgentReviewRequest(BaseModel):
                     ],
                 }
             )
+        if self.reviewer_hs_selection is not None:
+            wire["reviewer_hs_selection"] = self.reviewer_hs_selection.model_dump(mode="json")
         return wire
 
     @property

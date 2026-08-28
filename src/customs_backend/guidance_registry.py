@@ -460,6 +460,49 @@ def validate_guidance_citation(
         raise GuidanceRegistryProjectionError("guidance citation URI does not match registry")
 
 
+def validate_development_fixture_citation(
+    *,
+    registry: GuidanceRegistryProjection,
+    registry_source_id: str,
+    source_uri: str,
+    topic: str,
+    scope: str,
+    requested_direction: GuidanceRequestedDirection,
+    applicable_directions: list[GuidanceDirection],
+) -> None:
+    """Verify a local deterministic fixture citation keeps its registry binding.
+
+    The Agent's registry check emits development-fixture guidance with a real
+    registry source binding but a clearly synthetic fixed URI, so the official
+    title/URI equality of ``validate_guidance_citation`` can never hold for it.
+    The registry source and its (topic, scope, direction) support must still
+    hold; only the official title/URI comparison is replaced by the exact
+    fixed fixture URI.  Functional-UAT rejects this source kind separately.
+    """
+
+    source = registry.sources.get(registry_source_id)
+    source_directions = source.scope_directions.get((topic, scope)) if source else None
+    required_directions = (
+        set(applicable_directions)
+        if requested_direction == "both"
+        else {requested_direction}
+    )
+    expected_uri = (
+        f"https://customs.local.invalid/dev-fixture/guidance/{topic}"
+        if registry.version == "1.0"
+        else f"https://customs.local.invalid/dev-fixture/guidance/{topic}/{scope}"
+    )
+    if (
+        source is None
+        or source_directions is None
+        or not required_directions.issubset(source_directions)
+        or source_uri != expected_uri
+    ):
+        raise GuidanceRegistryProjectionError(
+            "development fixture citation is outside registry coverage"
+        )
+
+
 def verify_guidance_registry_projection_bundle() -> None:
     """Fail closed when either checked-in V1/V2 public projection drifts."""
 
@@ -471,6 +514,7 @@ __all__ = [
     "GuidanceRegistryProjection",
     "GuidanceRegistryProjectionError",
     "guidance_registry_projection",
+    "validate_development_fixture_citation",
     "validate_guidance_citation",
     "validate_guidance_resolution",
     "verify_guidance_registry_projection_bundle",

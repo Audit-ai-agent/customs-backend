@@ -1,0 +1,64 @@
+{
+  "as_of": "2026-01-01",
+  "source": "관세법 별표 관세율표 및 FTA 협정관세율 스냅샷 — 운영자 관리 참조 데이터",
+  "disclaimer": "참조용 스냅샷 세율입니다. 실제 적용 세율·환율·과세가격은 관세평가분류원 및 UNI-PASS에서 확인해야 하며, 이 진단은 통관 승인 판단이 아닙니다.",
+  "vat_rate_pct": 10.0,
+  "agreements": {
+    "KR-ASEAN": {
+      "name_ko": "한-아세안 FTA",
+      "countries": ["BN", "KH", "ID", "LA", "MY", "MM", "PH", "SG", "TH", "VN"],
+      "certificate_form": "원산지증명서 (AK Form)",
+      "source_uri": "https://www.customs.go.kr/ftaportalkor/main.do"
+    },
+    "KR-VN": {
+      "name_ko": "한-베트남 FTA",
+      "countries": ["VN"],
+      "certificate_form": "원산지증명서 (KV Form)",
+      "source_uri": "https://www.customs.go.kr/ftaportalkor/main.do"
+    },
+    "KR-CN": {
+      "name_ko": "한-중 FTA",
+      "countries": ["CN"],
+      "certificate_form": "원산지증명서 (한-중 FTA 서식)",
+      "source_uri": "https://www.customs.go.kr/ftaportalkor/main.do"
+    }
+  },
+  "rates": {
+    "0303540000": {
+      "basic": {
+        "rate_pct": 10.0,
+        "label": "기본세율",
+        "source_uri": "https://unipass.customs.go.kr/clip/index.do"
+      },
+      "fta": [
+        {
+          "agreement": "KR-ASEAN",
+          "rate_pct": 0.0,
+          "label": "한-아세안 FTA 협정세율",
+          "source_uri": "https://unipass.customs.go.kr/clip/index.do"
+        },
+        {
+          "agreement": "KR-VN",
+          "rate_pct": 0.0,
+          "label": "한-베트남 FTA 협정세율",
+          "source_uri": "https://unipass.customs.go.kr/clip/index.do"
+        }
+      ]
+    },
+    "7318151000": {
+      "basic": {
+        "rate_pct": 8.0,
+        "label": "기본세율",
+        "source_uri": "https://unipass.customs.go.kr/clip/index.do"
+      },
+      "fta": [
+        {
+          "agreement": "KR-CN",
+          "rate_pct": 0.0,
+          "label": "한-중 FTA 협정세율",
+          "source_uri": "https://unipass.customs.go.kr/clip/index.do"
+        }
+      ]
+    }
+  }
+}

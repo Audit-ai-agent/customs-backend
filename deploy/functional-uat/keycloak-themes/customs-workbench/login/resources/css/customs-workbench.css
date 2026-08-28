@@ -1,34 +1,257 @@
+/*
+ * KRDS skin for the Keycloak login screen, mirroring the workbench FRAME 00
+ * login card (customs-frontend src/krds.css + components.css). Token values are
+ * copied verbatim from those files; keep the two in sync when tokens change.
+ */
 :root {
-  --customs-workbench-navy: #10304f;
-  --customs-workbench-teal: #007f86;
+  --krds-primary: #256ef4;
+  --krds-primary-strong: #0b50d0;
+  --krds-ink: #1e2124;
+  --krds-text: #464c53;
+  --krds-muted: #6d7882;
+  --krds-line-2: #dde1e5;
+  --krds-line-3: #d3d8dd;
+  --krds-surface: #ffffff;
+  --krds-danger: #de3412;
+  --krds-danger-strong: #c8290b;
+  --krds-danger-bg: #fdf1ee;
+  --r: 0.625rem;
+  --r-sm: 0.5rem;
+  --ui: 'Pretendard GOV', Pretendard, 'Noto Sans KR', 'Malgun Gothic', system-ui, -apple-system, sans-serif;
 }
 
-body {
-  background:
-    linear-gradient(135deg, rgb(16 48 79 / 94%), rgb(0 127 134 / 86%)),
-    var(--customs-workbench-navy);
+/* ── 페이지: 앱 로그인 화면과 동일한 밝은 그라데이션 ─────────────── */
+/* 부모 테마는 html.login-pf 아래 `.login-pf body`로 어두운 배경 이미지를
+   깔기 때문에 같은 특이도 이상으로 다시 선언합니다. */
+html,
+html.login-pf {
+  background: none;
 }
 
-.kc-login-container,
-.login-pf-page .card-pf,
-.pf-v5-c-login__main {
-  border-top: 4px solid var(--customs-workbench-teal);
+body,
+.login-pf body {
+  background: linear-gradient(180deg, #e9f1fe 0%, #f7f8fa 60%) fixed;
+  font-family: var(--ui);
+  color: var(--krds-text);
 }
 
-.kc-header-wrapper,
-.login-pf-page .login-pf-header h1 {
-  color: var(--customs-workbench-navy);
+.login-pf-page {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  margin: 0;
+  padding: 2rem 1rem;
+}
+
+/* 카드 위 흰색 대제목은 카드 내부 브랜드로 대체합니다. */
+#kc-header {
+  display: none;
+}
+
+/* ── 카드: .login-card 문법 그대로 ───────────────────────────── */
+.card-pf {
+  width: min(30rem, 100%);
+  margin: 0;
+  padding: 2.2rem 2rem;
+  background: var(--krds-surface);
+  border: 1px solid var(--krds-line-2);
+  border-top: 1px solid var(--krds-line-2);
+  border-radius: 1rem;
+  box-shadow: 0 14px 44px rgb(30 33 36 / 10%);
+}
+
+.login-pf-page .login-pf-header {
+  margin-bottom: 1.15rem;
+  text-align: center;
+}
+
+/* 통 인장 마크(.seal-mark.lg 상당) — CSS content로 재현 */
+.login-pf-page .login-pf-header::before {
+  content: "通";
+  display: grid;
+  place-items: center;
+  width: 60px;
+  height: 60px;
+  margin: 0 auto 14px;
+  border-radius: var(--r);
+  background: linear-gradient(135deg, #4a8af6, var(--krds-primary-strong));
+  box-shadow: 0 3px 8px rgb(37 110 244 / 28%);
+  color: #fff;
+  font-size: 23px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+
+h1#kc-page-title {
+  margin: 0;
+  color: var(--krds-ink);
+  font-family: var(--ui);
+  font-size: 20px;
   font-weight: 700;
+  letter-spacing: -0.02em;
 }
 
-.pf-v5-c-button.pf-m-primary,
-.btn-primary {
-  background-color: var(--customs-workbench-teal);
-  border-color: var(--customs-workbench-teal);
+/* 제목 아래 안내문(.login-hint 상당) */
+.login-pf-page .login-pf-header::after {
+  content: "기관 통합 인증(OIDC)으로 본인 계정을 확인합니다.";
+  display: block;
+  margin-top: 9px;
+  color: var(--krds-muted);
+  font-size: 12.5px;
+  font-weight: 400;
+  line-height: 1.6;
 }
 
-.pf-v5-c-button.pf-m-primary:hover,
-.btn-primary:hover {
-  background-color: #006970;
-  border-color: #006970;
+/* ── 입력 필드: .field 문법 그대로 ───────────────────────────── */
+.form-group {
+  margin-bottom: 14px;
+}
+
+.pf-c-form__label,
+.pf-c-form__label-text,
+#kc-form label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--krds-text);
+  font-family: var(--ui);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+input.pf-c-form-control,
+.login-pf-page input[type="text"],
+.login-pf-page input[type="password"] {
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--krds-line-3);
+  border-radius: var(--r-sm);
+  padding: 11px 13px;
+  background: var(--krds-surface);
+  color: var(--krds-ink);
+  font-family: var(--ui);
+  font-size: 13px;
+  box-shadow: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+input.pf-c-form-control:focus,
+.login-pf-page input[type="text"]:focus,
+.login-pf-page input[type="password"]:focus {
+  outline: none;
+  border-color: var(--krds-primary);
+  box-shadow: 0 0 0 3px rgb(37 110 244 / 18%);
+}
+
+/* 비밀번호 표시 토글: 입력과 한 몸으로 */
+.pf-c-input-group {
+  display: flex;
+  align-items: stretch;
+}
+
+.pf-c-input-group input.pf-c-form-control {
+  flex: 1 1 auto;
+  min-width: 0;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  border-right: 0;
+}
+
+.pf-c-input-group .pf-c-button.pf-m-control {
+  border: 1px solid var(--krds-line-3);
+  border-top-right-radius: var(--r-sm);
+  border-bottom-right-radius: var(--r-sm);
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  padding: 0 13px;
+  background: var(--krds-surface);
+  color: var(--krds-muted);
+}
+
+.pf-c-input-group .pf-c-button.pf-m-control:hover {
+  color: var(--krds-ink);
+}
+
+.pf-c-input-group:focus-within .pf-c-button.pf-m-control {
+  border-color: var(--krds-primary);
+}
+
+/* ── 로그인 버튼: .login-btn 문법 그대로 ─────────────────────── */
+#kc-form-buttons {
+  margin-bottom: 0;
+}
+
+input#kc-login.pf-c-button.pf-m-primary,
+.login-pf-page .pf-c-button.pf-m-primary {
+  width: 100%;
+  min-height: 2.875rem;
+  margin-top: 6px;
+  border: 1px solid var(--krds-primary);
+  border-radius: var(--r-sm);
+  padding: 13px;
+  background: var(--krds-primary);
+  color: #fff;
+  font-family: var(--ui);
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.15s, box-shadow 0.15s;
+}
+
+input#kc-login.pf-c-button.pf-m-primary:hover,
+input#kc-login.pf-c-button.pf-m-primary:focus,
+.login-pf-page .pf-c-button.pf-m-primary:hover {
+  border-color: var(--krds-primary-strong);
+  background: var(--krds-primary-strong);
+  box-shadow: 0 4px 12px rgb(37 110 244 / 26%);
+}
+
+input#kc-login.pf-c-button.pf-m-primary:focus-visible {
+  outline: 3px solid rgb(37 110 244 / 35%);
+  outline-offset: 2px;
+}
+
+/* ── 오류·안내 알림: KRDS danger 토큰 ────────────────────────── */
+.login-pf-page .alert-error,
+.login-pf-page .pf-c-alert.pf-m-danger {
+  border: 1px solid var(--krds-danger);
+  border-radius: var(--r-sm);
+  padding: 11px 13px;
+  background: var(--krds-danger-bg);
+  color: var(--krds-danger-strong);
+}
+
+.login-pf-page .alert-error .pf-c-alert__title,
+.login-pf-page .kc-feedback-text {
+  color: var(--krds-danger-strong);
+  font-size: 13px;
+}
+
+/* 필드 아래 인라인 오류 문구 */
+.login-pf-page #input-error,
+.login-pf-page .pf-c-form__helper-text.pf-m-error,
+.login-pf-page span.pf-c-form__helper-text {
+  display: block;
+  margin-top: 6px;
+  color: var(--krds-danger-strong);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.login-pf-page input[aria-invalid="true"] {
+  border-color: var(--krds-danger);
+}
+
+/* PF 잔재 정리 */
+#kc-form-options {
+  display: none;
+}
+
+.login-pf-page .login-pf-settings {
+  margin: 0;
+}
+
+@media (max-width: 480px) {
+  .card-pf {
+    padding: 1.6rem 1.15rem;
+  }
 }

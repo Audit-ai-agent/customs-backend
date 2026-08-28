@@ -8,6 +8,7 @@ from threading import RLock
 from typing import Any
 
 from customs_backend.domain import (
+    CaseClosureRecord,
     CaseRecord,
     ConversationMessageExchange,
     ConversationMessageRecord,
@@ -24,6 +25,8 @@ from customs_backend.domain import (
     FindingDecisionRecord,
     FindingDecisionStatus,
     GuidanceRegistryVersion,
+    HsSelectionHistoryEntry,
+    HsSelectionRecord,
     JobRecord,
     KnowledgeConversationRecord,
     ReviewRunRecord,
@@ -88,6 +91,72 @@ class InMemoryWorkbenchRepository:
         with self._lock:
             records = [record for record in self._cases.values() if record.org_id == org_id]
             return self._copy(sorted(records, key=lambda record: record.created_at, reverse=True))
+
+    def close_case(
+        self, *, org_id: str, case_id: str, closure: CaseClosureRecord
+    ) -> CaseRecord:
+        with self._lock:
+            record = self._cases.get(case_id)
+            if record is None or record.org_id != org_id:
+                raise ConflictError("case does not exist")
+            if record.status == CaseStatus.closed:
+                raise ConflictError("the case is already closed")
+            updated = record.model_copy(
+                update={
+                    "status": CaseStatus.closed,
+                    "closure": closure,
+                    "updated_at": utc_now(),
+                }
+            )
+            self._cases[case_id] = self._copy(updated)
+            return self._copy(updated)
+
+    def delete_case(self, *, org_id: str, case_id: str) -> None:
+        """Remove a case and every record attached to it (local admin path).
+
+        Object-store blobs are left behind; both local modes tolerate orphans.
+        """
+
+        with self._lock:
+            record = self._cases.get(case_id)
+            if record is None or record.org_id != org_id:
+                raise ConflictError("case does not exist")
+            removed_runs = {
+                k for k, v in self._runs.items() if v.case_id == case_id
+            }
+            removed_jobs = {k for k, v in self._jobs.items() if v.case_id == case_id}
+            removed_convs = {
+                k for k, v in self._conversations.items() if v.review_run_id in removed_runs
+            }
+            self._cases.pop(case_id, None)
+            self._documents = {
+                k: v for k, v in self._documents.items() if v.case_id != case_id
+            }
+            self._document_assets = {
+                k: v for k, v in self._document_assets.items() if v.case_id != case_id
+            }
+            self._extraction_jobs = {
+                k: v for k, v in self._extraction_jobs.items() if v.case_id != case_id
+            }
+            self._jobs = {k: v for k, v in self._jobs.items() if k not in removed_jobs}
+            self._runs = {k: v for k, v in self._runs.items() if k not in removed_runs}
+            self._conversations = {
+                k: v for k, v in self._conversations.items() if k not in removed_convs
+            }
+            self._messages = {
+                k: v for k, v in self._messages.items() if v.conversation_id not in removed_convs
+            }
+            self._correction_proposals = {
+                k: v
+                for k, v in self._correction_proposals.items()
+                if v.review_run_id not in removed_runs
+            }
+            self._idempotency = {
+                k: v for k, v in self._idempotency.items() if v not in removed_jobs
+            }
+            self._chat_idempotency = {
+                k: v for k, v in self._chat_idempotency.items() if k[1] not in removed_convs
+            }
 
     def add_document(
         self,
@@ -782,6 +851,45 @@ class InMemoryWorkbenchRepository:
             )
             return self._copy(decision)
 
+    def record_hs_selection(
+        self,
+        *,
+        org_id: str,
+        review_run_id: str,
+        code: str,
+        reason: str,
+        selected_by: str,
+    ) -> HsSelectionRecord:
+        """Atomically replace the run's reviewer HS code selection.
+
+        Agent output is immutable.  This only appends reviewer-owned history
+        and deliberately does not recompute the Agent result digest.
+        """
+
+        with self._lock:
+            run = self._runs.get(review_run_id)
+            if run is None or run.org_id != org_id:
+                raise ConflictError("review run does not exist")
+            now = utc_now()
+            entry = HsSelectionHistoryEntry(
+                code=code,
+                reason=reason,
+                selected_by=selected_by,
+                selected_at=now,
+            )
+            history = [*run.hs_selection.history, entry] if run.hs_selection else [entry]
+            selection = HsSelectionRecord(
+                code=code,
+                reason=reason,
+                selected_by=selected_by,
+                selected_at=now,
+                history=history,
+            )
+            self._runs[review_run_id] = self._copy(
+                run.model_copy(update={"hs_selection": selection})
+            )
+            return self._copy(selection)
+
     def create_conversation(self, record: ConversationRecord) -> ConversationRecord:
         with self._lock:
             if record.conversation_id in self._conversations:
@@ -1159,6 +1267,17 @@ class InMemoryWorkbenchRepository:
             )
             self._correction_proposals[correction_proposal_id] = self._copy(updated)
             return self._copy(updated)
+
+    def latest_review_job(self, org_id: str, case_id: str) -> JobRecord | None:
+        with self._lock:
+            jobs = [
+                job
+                for job in self._jobs.values()
+                if job.org_id == org_id and job.case_id == case_id
+            ]
+            if not jobs:
+                return None
+            return self._copy(max(jobs, key=lambda job: job.created_at))
 
     def get_job(self, org_id: str, job_id: str) -> JobRecord | None:
         with self._lock:

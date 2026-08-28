@@ -118,6 +118,15 @@ def _functional_uat(*, realm_path: Path) -> tuple[list[tuple[str, str]], dict[st
     realm: dict[str, object] = {
         "realm": "customs",
         "enabled": True,
+        # Local UAT sessions must survive a full demo/recording day. Keycloak's
+        # defaults (5-minute access tokens, 30-minute idle) force a re-login in
+        # the middle of a journey; the Browser renews the access token silently
+        # against these longer, loopback-only lifetimes.
+        "accessTokenLifespan": 3600,
+        "ssoSessionIdleTimeout": 43200,
+        "ssoSessionMaxLifespan": 43200,
+        "clientSessionIdleTimeout": 43200,
+        "clientSessionMaxLifespan": 43200,
         "roles": {"realm": [{"name": "reviewer"}, {"name": "approver"}]},
         "clients": [
             {

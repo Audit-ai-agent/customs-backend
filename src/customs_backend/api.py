@@ -23,6 +23,7 @@ from customs_backend.agent_contract import BackendConfigurationError, validate_a
 from customs_backend.auth import StaticTokenVerifier, principal_dependency, require_roles
 from customs_backend.case_input_boundary import case_input_notice, safe_case_transcript_content
 from customs_backend.domain import (
+    CaseClosureRequest,
     CaseCreate,
     CaseRecord,
     ConfirmedExtractedTextCreate,
@@ -44,6 +45,8 @@ from customs_backend.domain import (
     RasterTextExtractionJobRecord,
     FindingDecisionRecord,
     FindingDecisionRequest,
+    HsSelectionRecord,
+    HsSelectionRequest,
     JobStatus,
     KnowledgeConversationCreate,
     KnowledgeConversationRecord,
@@ -65,6 +68,15 @@ from customs_backend.ports import (
     ObjectStore,
     TokenVerifier,
     WorkbenchRepository,
+)
+from customs_backend.law_reference import LawCatalogView, LawSearchView
+from customs_backend.operations_metrics import OperationsMetricsView
+from customs_backend.trade_features import (
+    DutyAssessmentView,
+    HsClassificationView,
+    HsReferenceEntryView,
+    HsReferenceSearchView,
+    OriginVerificationView,
 )
 from customs_backend.repository import InMemoryWorkbenchRepository
 from customs_backend.scenario_transcript import (
@@ -155,6 +167,19 @@ class DocumentViewResponse(BaseModel):
 
 class CaseListResponse(BaseModel):
     items: list[CaseRecord]
+
+
+class ReviewProgressStageView(BaseModel):
+    stage: str
+    status: str
+
+
+class ReviewProgressView(BaseModel):
+    """Display-only live progress; never part of the immutable review result."""
+
+    status: Literal["idle", "running"]
+    review_run_id: str | None = None
+    stages: list[ReviewProgressStageView] = []
 
 
 class DocumentListResponse(BaseModel):
@@ -1288,6 +1313,52 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
     ) -> CaseRecord:
         return service.get_case(principal, case_id)
 
+    @app.delete("/api/v1/cases/{case_id}", status_code=204)
+    def delete_case_endpoint(
+        case_id: str,
+        principal: Principal = Depends(writers),
+        service: WorkbenchService = Depends(_service),
+    ) -> None:
+        service.delete_case(principal, case_id)
+        record_public_exchange(
+            case_id=case_id,
+            method="DELETE",
+            path=f"/api/v1/cases/{case_id}",
+            request_body={},
+            response_status=204,
+            response_body={},
+        )
+
+    @app.post("/api/v1/cases/{case_id}/closure", response_model=CaseRecord)
+    def close_case_endpoint(
+        case_id: str,
+        body: CaseClosureRequest,
+        principal: Principal = Depends(writers),
+        service: WorkbenchService = Depends(_service),
+    ) -> CaseRecord:
+        result = service.close_case(principal, case_id, body)
+        record_public_exchange(
+            case_id=case_id,
+            method="POST",
+            path=f"/api/v1/cases/{case_id}/closure",
+            request_body=body.model_dump(mode="json"),
+            response_status=200,
+            response_body=result.model_dump(mode="json"),
+        )
+        return result
+
+    @app.get(
+        "/api/v1/cases/{case_id}/review-progress",
+        response_model=ReviewProgressView,
+        response_model_exclude_none=True,
+    )
+    def review_progress_endpoint(
+        case_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> ReviewProgressView:
+        return ReviewProgressView.model_validate(service.review_progress(principal, case_id))
+
     @app.post(
         "/api/v1/cases/{case_id}/documents", response_model=DocumentViewResponse, status_code=201
     )
@@ -1801,6 +1872,125 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
                 },
             )
         return result
+
+    @app.get(
+        "/api/v1/law-search",
+        response_model=LawSearchView,
+        response_model_exclude_none=True,
+    )
+    def law_search_endpoint(
+        q: str = Query(min_length=1, max_length=200),
+        top_k: int | None = Query(default=None, ge=1, le=20),
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> LawSearchView:
+        return service.law_search(principal, q, top_k)
+
+    @app.get(
+        "/api/v1/laws",
+        response_model=LawCatalogView,
+        response_model_exclude_none=True,
+    )
+    def law_catalog_endpoint(
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> LawCatalogView:
+        return service.law_catalog(principal)
+
+    @app.get(
+        "/api/v1/operations-metrics",
+        response_model=OperationsMetricsView,
+        response_model_exclude_none=True,
+    )
+    def get_operations_metrics_endpoint(
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> OperationsMetricsView:
+        return service.operations_metrics(principal)
+
+    @app.get(
+        "/api/v1/hsk-reference",
+        response_model=HsReferenceSearchView,
+        response_model_exclude_none=True,
+    )
+    def search_hsk_reference_endpoint(
+        q: str = Query(min_length=1, max_length=100),
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> HsReferenceSearchView:
+        return service.hs_reference_search(principal, q)
+
+    @app.get(
+        "/api/v1/hsk-reference/{code}",
+        response_model=HsReferenceEntryView,
+        response_model_exclude_none=True,
+    )
+    def get_hsk_reference_entry_endpoint(
+        code: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> HsReferenceEntryView:
+        return service.hs_reference_entry(principal, code)
+
+    @app.get(
+        "/api/v1/review-runs/{review_run_id}/hs-classification",
+        response_model=HsClassificationView,
+        response_model_exclude_none=True,
+    )
+    def get_hs_classification_endpoint(
+        review_run_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> HsClassificationView:
+        return service.hs_classification(principal, review_run_id)
+
+    @app.post(
+        "/api/v1/review-runs/{review_run_id}/hs-classification",
+        response_model=HsSelectionRecord,
+        status_code=200,
+    )
+    def record_hs_selection_endpoint(
+        review_run_id: str,
+        body: HsSelectionRequest,
+        principal: Principal = Depends(writers),
+        service: WorkbenchService = Depends(_service),
+    ) -> HsSelectionRecord:
+        result = service.record_hs_selection(principal, review_run_id, body)
+        run = service.get_run(principal, review_run_id)
+        record_public_exchange(
+            case_id=run.case_id,
+            method="POST",
+            path=f"/api/v1/review-runs/{review_run_id}/hs-classification",
+            request_body=body.model_dump(mode="json"),
+            response_status=200,
+            response_body=result.model_dump(mode="json"),
+            review_run_id=review_run_id,
+        )
+        return result
+
+    @app.get(
+        "/api/v1/review-runs/{review_run_id}/origin-verification",
+        response_model=OriginVerificationView,
+        response_model_exclude_none=True,
+    )
+    def get_origin_verification_endpoint(
+        review_run_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> OriginVerificationView:
+        return service.origin_verification(principal, review_run_id)
+
+    @app.get(
+        "/api/v1/review-runs/{review_run_id}/duty-assessment",
+        response_model=DutyAssessmentView,
+        response_model_exclude_none=True,
+    )
+    def get_duty_assessment_endpoint(
+        review_run_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> DutyAssessmentView:
+        return service.duty_assessment(principal, review_run_id)
 
     @app.put(
         "/api/v1/review-runs/{review_run_id}/findings/{finding_id}/decision",
