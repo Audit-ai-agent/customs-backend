@@ -28,20 +28,20 @@
       "basic": {
         "rate_pct": 10.0,
         "label": "기본세율",
-        "source_uri": "https://unipass.customs.go.kr/clip/index.do"
+        "source_uri": "https://unipass.customs.go.kr/clip/index.do?opnurl=%2Fhsinfosrch%2FopenULS0201002Q.do%3FcntyCd%3DKR"
       },
       "fta": [
         {
           "agreement": "KR-ASEAN",
           "rate_pct": 0.0,
           "label": "한-아세안 FTA 협정세율",
-          "source_uri": "https://unipass.customs.go.kr/clip/index.do"
+          "source_uri": "https://unipass.customs.go.kr/clip/index.do?opnurl=%2Fhsinfosrch%2FopenULS0201002Q.do%3FcntyCd%3DKR"
         },
         {
           "agreement": "KR-VN",
           "rate_pct": 0.0,
           "label": "한-베트남 FTA 협정세율",
-          "source_uri": "https://unipass.customs.go.kr/clip/index.do"
+          "source_uri": "https://unipass.customs.go.kr/clip/index.do?opnurl=%2Fhsinfosrch%2FopenULS0201002Q.do%3FcntyCd%3DKR"
         }
       ]
     },
@@ -49,14 +49,14 @@
       "basic": {
         "rate_pct": 8.0,
         "label": "기본세율",
-        "source_uri": "https://unipass.customs.go.kr/clip/index.do"
+        "source_uri": "https://unipass.customs.go.kr/clip/index.do?opnurl=%2Fhsinfosrch%2FopenULS0201002Q.do%3FcntyCd%3DKR"
       },
       "fta": [
         {
           "agreement": "KR-CN",
           "rate_pct": 0.0,
           "label": "한-중 FTA 협정세율",
-          "source_uri": "https://unipass.customs.go.kr/clip/index.do"
+          "source_uri": "https://unipass.customs.go.kr/clip/index.do?opnurl=%2Fhsinfosrch%2FopenULS0201002Q.do%3FcntyCd%3DKR"
         }
       ]
     }

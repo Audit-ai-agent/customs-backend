@@ -27,6 +27,15 @@ from customs_backend.trade_features import (
 from tests.product.test_workbench_api import _auth, _client
 
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _snapshot_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests pin the packaged snapshot; ignore any operator DB env."""
+    monkeypatch.delenv("CUSTOMS_BACKEND_DUTY_REFERENCE_DB", raising=False)
+
+
 def _fact(
     fact_id: str, name: str, raw_value: str, document_id: str, *, normalized: str | None = None
 ) -> dict[str, Any]:

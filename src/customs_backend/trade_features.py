@@ -22,6 +22,11 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from customs_backend.domain import HsSelectionRecord, ReviewRunRecord
+from customs_backend.duty_reference import (
+    UNIPASS_SOURCE_URI,
+    DutyReferenceStore,
+    load_store,
+)
 
 _HS_FACT_NAMES = frozenset({"hs_code", "hs_codes"})
 _ORIGIN_FACT_NAMES = frozenset({"origin_country", "country_of_origin"})
@@ -207,11 +212,16 @@ class DutyRateRequirement(BaseModel):
     satisfied: bool
 
 
+DutyRateKind = Literal["basic", "wto", "preferential", "conditional", "fta"]
+
+
 class DutyRate(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    rate_kind: Literal["basic", "fta"]
+    rate_kind: DutyRateKind
     agreement_code: str | None = None
+    # 관세율구분코드 from the full reference dataset (e.g. "A", "C", "FVN1").
+    code: str | None = None
     label: str
     rate_pct: float = Field(ge=0)
     source_uri: str
@@ -222,7 +232,7 @@ class DutyRate(BaseModel):
 class DutyEstimate(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    rate_kind: Literal["basic", "fta"]
+    rate_kind: DutyRateKind
     agreement_code: str | None = None
     rate_pct: float
     duty_amount: float
@@ -639,12 +649,16 @@ def build_origin_verification(run: ReviewRunRecord) -> OriginVerificationView:
 
 def _fta_hints(origin_country: str | None) -> list[OriginFtaHint]:
     hints: list[OriginFtaHint] = []
-    agreements = duty_rates().get("agreements", {})
+    store = load_store()
+    agreements = (
+        store.agreement_hint_entries() if store is not None else duty_rates().get("agreements", {})
+    )
     for code in sorted(agreements):
         entry = agreements[code]
         if not isinstance(entry, dict):
             continue
-        countries = [str(item) for item in entry.get("countries", [])]
+        raw_countries = entry.get("countries")
+        countries = [str(item) for item in raw_countries] if isinstance(raw_countries, list) else []
         hints.append(
             OriginFtaHint(
                 agreement_code=code,
@@ -660,11 +674,96 @@ def _fta_hints(origin_country: str | None) -> list[OriginFtaHint]:
 # ── Duty assessment ──────────────────────────────────────────────
 
 
+def _rates_from_store(
+    store: DutyReferenceStore,
+    hs_code: str,
+    origin_country: str | None,
+    certificate_present: bool,
+    certificate_origin_match: bool,
+) -> list[DutyRate]:
+    """Build the ladder for one HS code from the full reference dataset.
+
+    Rows are grouped per 세율구분 family; the family's base row (no staging
+    suffix) represents it in the ladder, and quota/staging variants are
+    surfaced as conditional reference rows only for families the reviewer
+    could actually apply.
+    """
+    rows = store.rates_for(hs_code)
+    groups: dict[str, list] = {}
+    for row in rows:
+        groups.setdefault(row.spec.family, []).append(row)
+
+    rates: list[DutyRate] = []
+    for _family, members in sorted(groups.items()):
+        base = next((item for item in members if not item.spec.is_variant), None)
+        representative = base or max(members, key=lambda item: item.rate_pct)
+        spec = representative.spec
+        requirements: list[DutyRateRequirement] = []
+        if spec.category in ("basic", "wto"):
+            applicable = True
+        elif spec.category == "preferential":
+            member_ok = (
+                spec.countries is not None
+                and origin_country is not None
+                and origin_country in spec.countries
+            )
+            requirements = [
+                DutyRateRequirement(code="origin_in_agreement", satisfied=member_ok)
+            ]
+            applicable = member_ok
+        elif spec.category == "fta":
+            origin_ok = (
+                spec.countries is not None
+                and origin_country is not None
+                and origin_country in spec.countries
+            )
+            requirements = [
+                DutyRateRequirement(code="origin_in_agreement", satisfied=origin_ok),
+                DutyRateRequirement(code="certificate_present", satisfied=certificate_present),
+                DutyRateRequirement(
+                    code="certificate_origin_match", satisfied=certificate_origin_match
+                ),
+            ]
+            applicable = all(item.satisfied for item in requirements)
+        else:  # conditional: quota/safeguard/uncertain — display, never apply
+            applicable = False
+        rates.append(
+            DutyRate(
+                rate_kind=spec.category,  # type: ignore[arg-type]
+                agreement_code=spec.agreement_code,
+                code=representative.kind,
+                label=spec.label,
+                rate_pct=representative.rate_pct,
+                source_uri=UNIPASS_SOURCE_URI,
+                requirements=requirements,
+                applicable=applicable,
+            )
+        )
+        if applicable:
+            for item in members:
+                if item is representative:
+                    continue
+                rates.append(
+                    DutyRate(
+                        rate_kind="conditional",
+                        agreement_code=spec.agreement_code,
+                        code=item.kind,
+                        label=f"{spec.label} · 세부구분 {item.kind}",
+                        rate_pct=item.rate_pct,
+                        source_uri=UNIPASS_SOURCE_URI,
+                        requirements=[],
+                        applicable=False,
+                    )
+                )
+    return rates
+
+
 def build_duty_assessment(run: ReviewRunRecord) -> DutyAssessmentView:
     dataset = duty_rates()
+    store = load_store()
     reference = DutyReferenceInfo(
-        as_of=str(dataset.get("as_of", "")),
-        source=str(dataset.get("source", "")),
+        as_of=store.as_of if store is not None else str(dataset.get("as_of", "")),
+        source=store.source if store is not None else str(dataset.get("source", "")),
         disclaimer=str(dataset.get("disclaimer", "")),
     )
 
@@ -698,14 +797,30 @@ def build_duty_assessment(run: ReviewRunRecord) -> DutyAssessmentView:
     origin = build_origin_verification(run)
     origin_country = origin.origin_country
 
-    rate_entry = dataset.get("rates", {}).get(hs_code.code)
-    if not isinstance(rate_entry, dict):
-        return view("rates_unavailable", hs_code=hs_code, origin_country=origin_country)
-
     certificate_present = origin.certificate is not None
     certificate_origin_match = any(
         check.field == "origin_country" and check.status == "match" for check in origin.checks
     )
+
+    if store is not None:
+        store_rates = _rates_from_store(
+            store, hs_code.code, origin_country, certificate_present, certificate_origin_match
+        )
+        if not store_rates:
+            return view("rates_unavailable", hs_code=hs_code, origin_country=origin_country)
+        applicable = [item for item in store_rates if item.applicable]
+        if not applicable:
+            return view(
+                "rates_unavailable",
+                hs_code=hs_code,
+                origin_country=origin_country,
+                rates=store_rates,
+            )
+        return _estimate_view(view, run, hs_code, origin_country, store_rates)
+
+    rate_entry = dataset.get("rates", {}).get(hs_code.code)
+    if not isinstance(rate_entry, dict):
+        return view("rates_unavailable", hs_code=hs_code, origin_country=origin_country)
 
     rates: list[DutyRate] = []
     basic = rate_entry.get("basic")
@@ -751,6 +866,16 @@ def build_duty_assessment(run: ReviewRunRecord) -> DutyAssessmentView:
     if not rates:
         return view("rates_unavailable", hs_code=hs_code, origin_country=origin_country)
 
+    return _estimate_view(view, run, hs_code, origin_country, rates)
+
+
+def _estimate_view(
+    view: Any,
+    run: ReviewRunRecord,
+    hs_code: DutyHsCode,
+    origin_country: str | None,
+    rates: list[DutyRate],
+) -> DutyAssessmentView:
     analyses = [item for item in run.document_analyses if isinstance(item, dict)]
     invoices = [a for a in analyses if _analysis_type(a) == "invoice"] or analyses
     amount_fact = _first_fact(invoices, _AMOUNT_FACT_NAMES)
@@ -776,7 +901,7 @@ def build_duty_assessment(run: ReviewRunRecord) -> DutyAssessmentView:
     applicable = [item for item in rates if item.applicable]
     chosen = min(applicable, key=lambda item: item.rate_pct)
     basic_rate = next((item for item in rates if item.rate_kind == "basic"), chosen)
-    vat_rate = float(dataset.get("vat_rate_pct", 10.0))
+    vat_rate = float(duty_rates().get("vat_rate_pct", 10.0))
 
     duty_amount = round(dutiable.amount * chosen.rate_pct / 100.0, 2)
     vat_amount = round((dutiable.amount + duty_amount) * vat_rate / 100.0, 2)

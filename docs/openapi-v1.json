@@ -1713,6 +1713,9 @@
           "rate_kind": {
             "enum": [
               "basic",
+              "wto",
+              "preferential",
+              "conditional",
               "fta"
             ],
             "title": "Rate Kind",
@@ -1800,6 +1803,17 @@
             "title": "Applicable",
             "type": "boolean"
           },
+          "code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code"
+          },
           "label": {
             "title": "Label",
             "type": "string"
@@ -1807,6 +1821,9 @@
           "rate_kind": {
             "enum": [
               "basic",
+              "wto",
+              "preferential",
+              "conditional",
               "fta"
             ],
             "title": "Rate Kind",
