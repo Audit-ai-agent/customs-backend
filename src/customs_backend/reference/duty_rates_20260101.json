@@ -8,19 +8,19 @@
       "name_ko": "한-아세안 FTA",
       "countries": ["BN", "KH", "ID", "LA", "MY", "MM", "PH", "SG", "TH", "VN"],
       "certificate_form": "원산지증명서 (AK Form)",
-      "source_uri": "https://www.customs.go.kr/ftaportalkor/main.do"
+      "source_uri": "https://www.fta.go.kr/asean/"
     },
     "KR-VN": {
       "name_ko": "한-베트남 FTA",
       "countries": ["VN"],
       "certificate_form": "원산지증명서 (KV Form)",
-      "source_uri": "https://www.customs.go.kr/ftaportalkor/main.do"
+      "source_uri": "https://www.fta.go.kr/vn/"
     },
     "KR-CN": {
       "name_ko": "한-중 FTA",
       "countries": ["CN"],
       "certificate_form": "원산지증명서 (한-중 FTA 서식)",
-      "source_uri": "https://www.customs.go.kr/ftaportalkor/main.do"
+      "source_uri": "https://www.fta.go.kr/cn/"
     }
   },
   "rates": {

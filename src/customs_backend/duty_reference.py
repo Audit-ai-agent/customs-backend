@@ -23,6 +23,39 @@ from functools import lru_cache
 from pathlib import Path
 
 _FTA_PORTAL = "https://www.customs.go.kr/ftaportalkor/main.do"
+# Per-agreement pages on the government FTA portal (산업통상자원부 FTA 강국 KOREA).
+# Each path was checked to respond 200 on 2026-09-09; unknown codes fall back
+# to the Korea Customs FTA portal main page above.
+_FTA_AGREEMENT_PAGES: dict[str, str] = {
+    "KR-CL": "https://www.fta.go.kr/cl/",
+    "KR-SG": "https://www.fta.go.kr/sg/",
+    "KR-EFTA": "https://www.fta.go.kr/efta/",
+    "KR-ASEAN": "https://www.fta.go.kr/asean/",
+    "KR-IN": "https://www.fta.go.kr/in/",
+    "KR-EU": "https://www.fta.go.kr/eu/",
+    "KR-PE": "https://www.fta.go.kr/pe/",
+    "KR-US": "https://www.fta.go.kr/us/",
+    "KR-TR": "https://www.fta.go.kr/tr/",
+    "KR-CO": "https://www.fta.go.kr/co/",
+    "KR-AU": "https://www.fta.go.kr/au/",
+    "KR-CA": "https://www.fta.go.kr/ca/",
+    "KR-CN": "https://www.fta.go.kr/cn/",
+    "KR-NZ": "https://www.fta.go.kr/nz/",
+    "KR-VN": "https://www.fta.go.kr/vn/",
+    "KR-CAM": "https://www.fta.go.kr/ca_5/",
+    "KR-GB": "https://www.fta.go.kr/uk/",
+    "KR-ID": "https://www.fta.go.kr/id/",
+    "KR-IL": "https://www.fta.go.kr/il/",
+    "KR-KH": "https://www.fta.go.kr/kh/",
+    "KR-PH": "https://www.fta.go.kr/ph/",
+    "RCEP": "https://www.fta.go.kr/rcep/",
+}
+
+
+def agreement_source_uri(code: str) -> str:
+    """The agreement-specific official page, or the portal main page."""
+
+    return _FTA_AGREEMENT_PAGES.get(code, _FTA_PORTAL)
 # CLIP cannot deep-link a specific HS code (POST/session-only navigation);
 # the closest stable target is the Korea tariff-table search screen.
 _UNIPASS = "https://unipass.customs.go.kr/clip/index.do?opnurl=%2Fhsinfosrch%2FopenULS0201002Q.do%3FcntyCd%3DKR"
@@ -237,7 +270,7 @@ class DutyReferenceStore:
                 "name_ko": name,
                 "countries": list(countries),
                 "certificate_form": form,
-                "source_uri": _FTA_PORTAL,
+                "source_uri": agreement_source_uri(code),
             }
             for code, (name, countries, form) in AGREEMENTS.items()
         }
