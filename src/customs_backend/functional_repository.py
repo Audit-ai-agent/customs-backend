@@ -18,6 +18,7 @@ from customs_backend.domain import (
     DocumentRecord,
     ExtractionJobRecord,
     FindingDecisionRecord,
+    FindingDecisionReasonCode,
     FindingDecisionStatus,
     GuidanceRegistryVersion,
     HsSelectionRecord,
@@ -515,6 +516,7 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
         status: FindingDecisionStatus,
         reason: str,
         decided_by: str,
+        reason_code: FindingDecisionReasonCode | None = None,
     ) -> FindingDecisionRecord:
         value = super().record_finding_decision(
             org_id=org_id,
@@ -523,6 +525,7 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
             status=status,
             reason=reason,
             decided_by=decided_by,
+            reason_code=reason_code,
         )
         self._persist()
         return value

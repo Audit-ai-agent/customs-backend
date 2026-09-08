@@ -48,6 +48,8 @@ def _run(
     parent: str | None = None,
     findings: list[dict[str, Any]] | None = None,
     decided: list[str] | None = None,
+    comparisons: list[dict[str, Any]] | None = None,
+    reason_code: str | None = None,
 ) -> ReviewRunRecord:
     return ReviewRunRecord(
         review_run_id=run_id,
@@ -71,17 +73,23 @@ def _run(
         report={},
         evidence=[],
         findings=findings or [],
+        comparisons=comparisons or [],
         required_actions=[],
         reviewer_decisions=[
             FindingDecisionRecord(
                 finding_id=finding_id,
                 status="confirmed",
+                reason_code=reason_code,
                 reason="checked",
                 decided_by="tester",
                 decided_at=_NOW,
                 history=[
                     FindingDecisionHistoryEntry(
-                        status="confirmed", reason="checked", decided_by="tester", decided_at=_NOW
+                        status="confirmed",
+                        reason_code=reason_code,
+                        reason="checked",
+                        decided_by="tester",
+                        decided_at=_NOW,
                     )
                 ],
             )
@@ -135,6 +143,69 @@ def test_metrics_count_cases_reviews_and_latest_run_findings() -> None:
     assert view.findings.open == 1
     assert view.closures.cleared == 1
     assert view.closures.returned == 0
+
+
+def test_metrics_review_load_counts_latest_run_rules_and_reasons() -> None:
+    cases = [_case("c1", "in_review"), _case("c2", "in_review"), _case("c3", "open")]
+    superseded = _run(
+        "r1",
+        "c1",
+        created_at=datetime(2026, 8, 10, tzinfo=timezone.utc),
+        findings=[{"finding_id": "old", "code": "invoice_total_amount"}],
+    )
+    latest = _run(
+        "r2",
+        "c1",
+        created_at=datetime(2026, 8, 17, tzinfo=timezone.utc),
+        parent="r1",
+        findings=[
+            {"finding_id": "f1", "code": "invoice_packing_quantity_unit"},
+            {"finding_id": "f2", "code": "invoice_packing_quantity_unit"},
+            {"finding_id": "f3", "code": "required_field_presence"},
+        ],
+        comparisons=[
+            {"comparison_id": "k1", "status": "pass"},
+            {"comparison_id": "k2", "status": "mismatch"},
+            {"comparison_id": "k3", "status": "needs_review"},
+            {"comparison_id": "k4", "status": "skip"},
+            {"comparison_id": "k5", "status": "pass"},
+        ],
+        decided=["f1", "f2"],
+        reason_code="notation_difference",
+    )
+    clean = _run(
+        "r3",
+        "c2",
+        created_at=datetime(2026, 8, 12, tzinfo=timezone.utc),
+        assessment="no_issue_detected",
+        comparisons=[{"comparison_id": "k6", "status": "pass"}],
+    )
+    view = build_operations_metrics(
+        cases, {"c1": [superseded, latest], "c2": [clean], "c3": []}, now=_NOW
+    )
+
+    load = view.review_load
+    assert (load.cases_with_findings, load.cases_without_findings) == (1, 1)
+    assert load.comparisons.model_dump() == {
+        "total": 6,
+        "passed": 3,
+        "mismatch": 1,
+        "needs_review": 1,
+        "skipped": 1,
+    }
+    # The superseded run's rule must not count; frequent codes come first.
+    assert [(item.code, item.count) for item in load.findings_by_code] == [
+        ("invoice_packing_quantity_unit", 2),
+        ("required_field_presence", 1),
+    ]
+    assert load.decision_statuses.model_dump() == {
+        "confirmed": 2,
+        "needs_information": 0,
+        "resolved": 0,
+    }
+    assert [(item.code, item.count) for item in load.decision_reason_codes] == [
+        ("notation_difference", 2)
+    ]
 
 
 def test_metrics_daily_series_covers_a_gapless_trailing_window() -> None:

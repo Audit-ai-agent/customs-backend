@@ -23,6 +23,7 @@ from customs_backend.domain import (
     ExtractionJobRecord,
     FindingDecisionHistoryEntry,
     FindingDecisionRecord,
+    FindingDecisionReasonCode,
     FindingDecisionStatus,
     GuidanceRegistryVersion,
     HsSelectionHistoryEntry,
@@ -801,6 +802,7 @@ class InMemoryWorkbenchRepository:
         status: FindingDecisionStatus,
         reason: str,
         decided_by: str,
+        reason_code: FindingDecisionReasonCode | None = None,
     ) -> FindingDecisionRecord:
         """Atomically replace a finding's current reviewer decision.
 
@@ -815,6 +817,7 @@ class InMemoryWorkbenchRepository:
             now = utc_now()
             entry = FindingDecisionHistoryEntry(
                 status=status,
+                reason_code=reason_code,
                 reason=reason,
                 decided_by=decided_by,
                 decided_at=now,
@@ -826,6 +829,7 @@ class InMemoryWorkbenchRepository:
                 decision = FindingDecisionRecord(
                     finding_id=finding_id,
                     status=status,
+                    reason_code=reason_code,
                     reason=reason,
                     decided_by=decided_by,
                     decided_at=now,
@@ -836,6 +840,7 @@ class InMemoryWorkbenchRepository:
                 decision = existing.model_copy(
                     update={
                         "status": status,
+                        "reason_code": reason_code,
                         "reason": reason,
                         "decided_by": decided_by,
                         "decided_at": now,

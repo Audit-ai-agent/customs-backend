@@ -1961,6 +1961,37 @@ def test_reviewer_decisions_are_append_only_and_do_not_change_agent_result_diges
             headers=_auth(),
         )
         assert blank.status_code == 422
+        # A preset rationale needs no prose; the Backend stores the preset's label.
+        preset = client.put(
+            f"/api/v1/review-runs/{run_id}/findings/finding_fixture_quantity/decision",
+            json={"status": "confirmed", "reason_code": "notation_difference"},
+            headers=_auth(),
+        )
+        assert preset.status_code == 200, preset.text
+        assert preset.json()["reason_code"] == "notation_difference"
+        assert preset.json()["reason"] == "표기·단위·반올림 차이로 실질 불일치 아님"
+        assert preset.json()["history"][-1]["reason_code"] == "notation_difference"
+        assert len(preset.json()["history"]) == 3
+        # "other" is the only preset that still insists on the reviewer's words.
+        other_blank = client.put(
+            f"/api/v1/review-runs/{run_id}/findings/finding_fixture_quantity/decision",
+            json={"status": "confirmed", "reason_code": "other", "reason": " "},
+            headers=_auth(),
+        )
+        assert other_blank.status_code == 422
+        other = client.put(
+            f"/api/v1/review-runs/{run_id}/findings/finding_fixture_quantity/decision",
+            json={"status": "confirmed", "reason_code": "other", "reason": "현장 확인 완료"},
+            headers=_auth(),
+        )
+        assert other.status_code == 200, other.text
+        assert other.json()["reason"] == "현장 확인 완료"
+        unknown_code = client.put(
+            f"/api/v1/review-runs/{run_id}/findings/finding_fixture_quantity/decision",
+            json={"status": "confirmed", "reason_code": "made_up"},
+            headers=_auth(),
+        )
+        assert unknown_code.status_code == 422
         missing = client.put(
             f"/api/v1/review-runs/{run_id}/findings/unknown/decision",
             json={"status": "resolved", "reason": "No matching finding."},

@@ -3228,8 +3228,9 @@ class WorkbenchService:
             review_run_id=review_run_id,
             finding_id=finding_id,
             status=request.status,
-            reason=request.reason.strip(),
+            reason=request.stored_reason(),
             decided_by=principal.subject,
+            reason_code=request.reason_code,
         )
 
     def delete_case(self, principal: Principal, case_id: str) -> None:

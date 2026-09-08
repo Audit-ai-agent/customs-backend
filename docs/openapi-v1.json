@@ -420,6 +420,68 @@
         "title": "ClosureMetrics",
         "type": "object"
       },
+      "CodeCount": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Code",
+            "type": "string"
+          },
+          "count": {
+            "minimum": 0.0,
+            "title": "Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "code",
+          "count"
+        ],
+        "title": "CodeCount",
+        "type": "object"
+      },
+      "ComparisonOutcomeMetrics": {
+        "additionalProperties": false,
+        "description": "Automatic comparison outcomes on the latest run of every case.",
+        "properties": {
+          "mismatch": {
+            "minimum": 0.0,
+            "title": "Mismatch",
+            "type": "integer"
+          },
+          "needs_review": {
+            "minimum": 0.0,
+            "title": "Needs Review",
+            "type": "integer"
+          },
+          "passed": {
+            "minimum": 0.0,
+            "title": "Passed",
+            "type": "integer"
+          },
+          "skipped": {
+            "minimum": 0.0,
+            "title": "Skipped",
+            "type": "integer"
+          },
+          "total": {
+            "minimum": 0.0,
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "passed",
+          "mismatch",
+          "needs_review",
+          "skipped"
+        ],
+        "title": "ComparisonOutcomeMetrics",
+        "type": "object"
+      },
       "CompletionEligibility": {
         "additionalProperties": false,
         "properties": {
@@ -1299,6 +1361,33 @@
         "title": "DailyReviewCount",
         "type": "object"
       },
+      "DecisionStatusMetrics": {
+        "additionalProperties": false,
+        "properties": {
+          "confirmed": {
+            "minimum": 0.0,
+            "title": "Confirmed",
+            "type": "integer"
+          },
+          "needs_information": {
+            "minimum": 0.0,
+            "title": "Needs Information",
+            "type": "integer"
+          },
+          "resolved": {
+            "minimum": 0.0,
+            "title": "Resolved",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "confirmed",
+          "needs_information",
+          "resolved"
+        ],
+        "title": "DecisionStatusMetrics",
+        "type": "object"
+      },
       "DevelopmentSessionRequest": {
         "description": "Explicit local identity selection; the endpoint is loopback-only.",
         "properties": {
@@ -2074,6 +2163,16 @@
             "title": "Reason",
             "type": "string"
           },
+          "reason_code": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FindingDecisionReasonCode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "status": {
             "$ref": "#/components/schemas/FindingDecisionStatus"
           }
@@ -2086,6 +2185,20 @@
         ],
         "title": "FindingDecisionHistoryEntry",
         "type": "object"
+      },
+      "FindingDecisionReasonCode": {
+        "description": "Coded reviewer rationale so decisions stay comparable across cases.\n\nThe free-text ``reason`` remains the reviewer's own words; the code makes\nthe recurring rationale countable without parsing prose.  ``other`` is the\nescape hatch and is the only code that insists on free text.",
+        "enum": [
+          "document_verified",
+          "notation_difference",
+          "supplement_requested",
+          "correction_proposed",
+          "requirement_satisfied",
+          "requirement_not_applicable",
+          "other"
+        ],
+        "title": "FindingDecisionReasonCode",
+        "type": "string"
       },
       "FindingDecisionRecord": {
         "additionalProperties": false,
@@ -2123,6 +2236,16 @@
             "title": "Reason",
             "type": "string"
           },
+          "reason_code": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FindingDecisionReasonCode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "status": {
             "$ref": "#/components/schemas/FindingDecisionStatus"
           }
@@ -2143,18 +2266,27 @@
         "description": "A reviewer-owned decision which never changes the Agent result.",
         "properties": {
           "reason": {
+            "default": "",
             "maxLength": 4000,
-            "minLength": 1,
             "title": "Reason",
             "type": "string"
+          },
+          "reason_code": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FindingDecisionReasonCode"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "status": {
             "$ref": "#/components/schemas/FindingDecisionStatus"
           }
         },
         "required": [
-          "status",
-          "reason"
+          "status"
         ],
         "title": "FindingDecisionRequest",
         "type": "object"
@@ -3312,6 +3444,9 @@
             "title": "Generated At",
             "type": "string"
           },
+          "review_load": {
+            "$ref": "#/components/schemas/ReviewLoadMetrics"
+          },
           "reviews": {
             "$ref": "#/components/schemas/ReviewMetrics"
           }
@@ -3322,7 +3457,8 @@
           "reviews",
           "findings",
           "closures",
-          "daily_reviews"
+          "daily_reviews",
+          "review_load"
         ],
         "title": "OperationsMetricsView",
         "type": "object"
@@ -4426,6 +4562,52 @@
           }
         },
         "title": "ReviewEnqueueRequest",
+        "type": "object"
+      },
+      "ReviewLoadMetrics": {
+        "additionalProperties": false,
+        "description": "Which rules and rationales create the reviewer's judgement work.",
+        "properties": {
+          "cases_with_findings": {
+            "minimum": 0.0,
+            "title": "Cases With Findings",
+            "type": "integer"
+          },
+          "cases_without_findings": {
+            "minimum": 0.0,
+            "title": "Cases Without Findings",
+            "type": "integer"
+          },
+          "comparisons": {
+            "$ref": "#/components/schemas/ComparisonOutcomeMetrics"
+          },
+          "decision_reason_codes": {
+            "items": {
+              "$ref": "#/components/schemas/CodeCount"
+            },
+            "title": "Decision Reason Codes",
+            "type": "array"
+          },
+          "decision_statuses": {
+            "$ref": "#/components/schemas/DecisionStatusMetrics"
+          },
+          "findings_by_code": {
+            "items": {
+              "$ref": "#/components/schemas/CodeCount"
+            },
+            "title": "Findings By Code",
+            "type": "array"
+          }
+        },
+        "required": [
+          "cases_with_findings",
+          "cases_without_findings",
+          "comparisons",
+          "findings_by_code",
+          "decision_statuses",
+          "decision_reason_codes"
+        ],
+        "title": "ReviewLoadMetrics",
         "type": "object"
       },
       "ReviewMetrics": {

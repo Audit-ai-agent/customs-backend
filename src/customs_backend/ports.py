@@ -24,6 +24,7 @@ from customs_backend.domain import (
     RasterTextExtractionJobRecord,
     DocumentRecord,
     FindingDecisionRecord,
+    FindingDecisionReasonCode,
     FindingDecisionStatus,
     GuidanceRegistryVersion,
     HsSelectionRecord,
@@ -178,6 +179,7 @@ class WorkbenchRepository(Protocol):
         status: FindingDecisionStatus,
         reason: str,
         decided_by: str,
+        reason_code: FindingDecisionReasonCode | None = None,
     ) -> FindingDecisionRecord: ...
     def delete_case(self, *, org_id: str, case_id: str) -> None: ...
     def close_case(

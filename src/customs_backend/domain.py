@@ -1137,26 +1137,70 @@ class FindingDecisionStatus(str, Enum):
     resolved = "resolved"
 
 
+class FindingDecisionReasonCode(str, Enum):
+    """Coded reviewer rationale so decisions stay comparable across cases.
+
+    The free-text ``reason`` remains the reviewer's own words; the code makes
+    the recurring rationale countable without parsing prose.  ``other`` is the
+    escape hatch and is the only code that insists on free text.
+    """
+
+    document_verified = "document_verified"
+    notation_difference = "notation_difference"
+    supplement_requested = "supplement_requested"
+    correction_proposed = "correction_proposed"
+    requirement_satisfied = "requirement_satisfied"
+    requirement_not_applicable = "requirement_not_applicable"
+    other = "other"
+
+
+# Canonical reviewer-facing wording for each code.  The Backend stores this as
+# the decision reason when the reviewer picks a preset without adding words, so
+# every stored decision still carries readable prose.
+FINDING_DECISION_REASON_LABELS: dict[FindingDecisionReasonCode, str] = {
+    FindingDecisionReasonCode.document_verified: "원본 서류 대조 결과 이상 없음",
+    FindingDecisionReasonCode.notation_difference: "표기·단위·반올림 차이로 실질 불일치 아님",
+    FindingDecisionReasonCode.supplement_requested: "신고인에게 보완 자료 요청",
+    FindingDecisionReasonCode.correction_proposed: "정정 제안으로 처리",
+    FindingDecisionReasonCode.requirement_satisfied: "법령 요건 충족 확인",
+    FindingDecisionReasonCode.requirement_not_applicable: "해당 요건 미적용 대상",
+    FindingDecisionReasonCode.other: "기타",
+}
+
+
 class FindingDecisionRequest(BaseModel):
     """A reviewer-owned decision which never changes the Agent result."""
 
     model_config = ConfigDict(extra="forbid")
 
     status: FindingDecisionStatus
-    reason: str = Field(min_length=1, max_length=4000)
+    reason_code: FindingDecisionReasonCode | None = None
+    reason: str = Field(default="", max_length=4000)
 
-    @field_validator("reason")
-    @classmethod
-    def non_blank_reason(cls, value: str) -> str:
-        if not value.strip():
+    @model_validator(mode="after")
+    def require_reason_or_preset(self) -> FindingDecisionRequest:
+        preset = (
+            self.reason_code is not None and self.reason_code != FindingDecisionReasonCode.other
+        )
+        if not preset and not self.reason.strip():
             raise ValueError("a reviewer decision reason is required")
-        return value
+        return self
+
+    def stored_reason(self) -> str:
+        """The prose the Backend records: the reviewer's words, else the preset label."""
+
+        text = self.reason.strip()
+        if text:
+            return text
+        assert self.reason_code is not None  # the validator guarantees a preset here
+        return FINDING_DECISION_REASON_LABELS[self.reason_code]
 
 
 class FindingDecisionHistoryEntry(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     status: FindingDecisionStatus
+    reason_code: FindingDecisionReasonCode | None = None
     reason: str = Field(min_length=1, max_length=4000)
     decided_by: str = Field(min_length=1, max_length=256)
     decided_at: datetime
@@ -1169,6 +1213,7 @@ class FindingDecisionRecord(BaseModel):
 
     finding_id: str = Field(min_length=1, max_length=128)
     status: FindingDecisionStatus
+    reason_code: FindingDecisionReasonCode | None = None
     reason: str = Field(min_length=1, max_length=4000)
     decided_by: str = Field(min_length=1, max_length=256)
     decided_at: datetime
