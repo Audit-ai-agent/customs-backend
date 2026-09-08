@@ -64,12 +64,19 @@ from customs_backend.ports import (
     AuthorizationError,
     ConflictError,
     KnowledgeInputRejectedError,
+    LlmSettingsRejectedError,
     NotFoundError,
     ObjectStore,
     TokenVerifier,
     WorkbenchRepository,
 )
 from customs_backend.law_reference import LawCatalogView, LawSearchView
+from customs_backend.admin_settings import (
+    LlmConnectionTestView,
+    LlmSettingsChangeRequest,
+    LlmSettingsUpdateRequest,
+    LlmSettingsView,
+)
 from customs_backend.operations_metrics import OperationsMetricsView
 from customs_backend.trade_features import (
     DutyAssessmentView,
@@ -1150,6 +1157,11 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         # This stable response deliberately contains no rejected value.
         return _error_response(422, "knowledge_input_not_allowed", instance=request.url.path)
 
+    @app.exception_handler(LlmSettingsRejectedError)
+    async def llm_settings_rejected_handler(request: Request, exc: LlmSettingsRejectedError):
+        # The Agent's stable code passes through; it never carries provider text.
+        return _error_response(exc.status, exc.code, instance=request.url.path)
+
     @app.exception_handler(ValueError)
     async def value_handler(request: Request, _exc: ValueError):
         return _error_response(422, "invalid_operation", instance=request.url.path)
@@ -1907,6 +1919,60 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         service: WorkbenchService = Depends(_service),
     ) -> OperationsMetricsView:
         return service.operations_metrics(principal)
+
+    @app.get(
+        "/api/v1/admin/llm-settings",
+        response_model=LlmSettingsView,
+        response_model_exclude_none=False,
+    )
+    def get_llm_settings_endpoint(
+        principal: Principal = Depends(approvers),
+        service: WorkbenchService = Depends(_service),
+    ) -> LlmSettingsView:
+        """The Agent's effective LLM configuration (approver-only, no secrets)."""
+
+        return service.llm_settings(principal)
+
+    @app.put(
+        "/api/v1/admin/llm-settings",
+        response_model=LlmSettingsView,
+        response_model_exclude_none=False,
+    )
+    def update_llm_settings_endpoint(
+        payload: LlmSettingsChangeRequest,
+        principal: Principal = Depends(approvers),
+        service: WorkbenchService = Depends(_service),
+    ) -> LlmSettingsView:
+        """Apply a provider/model/limit override at the Agent without a restart."""
+
+        return service.update_llm_settings(principal, payload)
+
+    @app.delete(
+        "/api/v1/admin/llm-settings",
+        response_model=LlmSettingsView,
+        response_model_exclude_none=False,
+    )
+    def reset_llm_settings_endpoint(
+        principal: Principal = Depends(approvers),
+        service: WorkbenchService = Depends(_service),
+    ) -> LlmSettingsView:
+        """Drop the operator override and return to the Agent's environment configuration."""
+
+        return service.reset_llm_settings(principal)
+
+    @app.post(
+        "/api/v1/admin/llm-settings/test",
+        response_model=LlmConnectionTestView,
+        response_model_exclude_none=False,
+    )
+    def test_llm_settings_endpoint(
+        payload: LlmSettingsUpdateRequest,
+        principal: Principal = Depends(approvers),
+        service: WorkbenchService = Depends(_service),
+    ) -> LlmConnectionTestView:
+        """One minimal provider request with the active (empty body) or a candidate configuration."""
+
+        return service.test_llm_settings(principal, payload)
 
     @app.get(
         "/api/v1/hsk-reference",

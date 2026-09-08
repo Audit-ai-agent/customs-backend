@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -26,12 +27,19 @@ from customs_backend.domain import (
     MAX_TEXT_DOCUMENT_UTF8_BYTES,
     canonical_json_bytes,
 )
-from customs_backend.ports import AgentResponseRejectedError, KnowledgeInputRejectedError
+from customs_backend.ports import (
+    AgentResponseRejectedError,
+    KnowledgeInputRejectedError,
+    LlmSettingsRejectedError,
+)
 from customs_backend.raster_limits import (
     RASTER_AGENT_EXECUTION_TIMEOUT_SECONDS,
     RASTER_PAGE_RENDER_TIMEOUT_SECONDS,
     RASTER_PROFILE_STATUS_TIMEOUT_SECONDS,
 )
+
+
+_SAFE_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 
 
 class InMemoryObjectStore:
@@ -686,6 +694,77 @@ class HttpAgentClient:
             ) from exc
         return self._decode_object(response, maximum_bytes=1_000_000, label="metadata")
 
+    _LLM_SETTINGS_PATH = "/internal/agent/v3/llm-settings"
+    _LLM_SETTINGS_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+    _LLM_SETTINGS_MAX_BYTES = 64 * 1024
+
+    def _llm_settings_response(
+        self, method: str, path: str, *, body: dict[str, Any] | None, timeout: httpx.Timeout
+    ) -> dict[str, Any]:
+        """Shared transport for the operator LLM-settings surface.
+
+        The Agent answers a refused request with a stable, content-free code
+        (422 invalid/credential, 409 not adjustable in this profile).  Those
+        codes pass through unchanged; every other failure is a boundary
+        rejection.  Provider text never appears in any of these payloads.
+        """
+
+        try:
+            response = self._client.request(
+                method,
+                path,
+                content=None if body is None else canonical_json_bytes(body),
+                headers=None if body is None else {"Content-Type": "application/json"},
+                timeout=timeout,
+            )
+        except httpx.HTTPError as exc:
+            raise AgentResponseRejectedError("Agent LLM settings transport failed") from exc
+        self._require_service_mode(response)
+        if response.status_code in (409, 422):
+            code = "llm_settings_unavailable" if response.status_code == 409 else "llm_settings_invalid"
+            try:
+                error = self._decode_object(
+                    response, maximum_bytes=self._LLM_SETTINGS_MAX_BYTES, label="LLM settings"
+                ).get("error")
+            except AgentResponseRejectedError:
+                error = None
+            if isinstance(error, dict) and isinstance(error.get("code"), str):
+                candidate = error["code"]
+                if _SAFE_ERROR_CODE.fullmatch(candidate):
+                    code = candidate
+            raise LlmSettingsRejectedError(code, status=response.status_code)
+        if response.status_code != 200:
+            raise AgentResponseRejectedError(
+                f"Agent LLM settings returned HTTP {response.status_code}"
+            )
+        return self._decode_object(
+            response, maximum_bytes=self._LLM_SETTINGS_MAX_BYTES, label="LLM settings"
+        )
+
+    def llm_settings(self) -> dict[str, Any]:
+        return self._llm_settings_response(
+            "GET", self._LLM_SETTINGS_PATH, body=None, timeout=self._LLM_SETTINGS_TIMEOUT
+        )
+
+    def update_llm_settings(self, request: dict[str, Any]) -> dict[str, Any]:
+        return self._llm_settings_response(
+            "PUT", self._LLM_SETTINGS_PATH, body=request, timeout=self._LLM_SETTINGS_TIMEOUT
+        )
+
+    def reset_llm_settings(self) -> dict[str, Any]:
+        return self._llm_settings_response(
+            "DELETE", self._LLM_SETTINGS_PATH, body=None, timeout=self._LLM_SETTINGS_TIMEOUT
+        )
+
+    def test_llm_settings(self, request: dict[str, Any]) -> dict[str, Any]:
+        # One real provider round trip; allow the Agent's own request budget.
+        return self._llm_settings_response(
+            "POST",
+            f"{self._LLM_SETTINGS_PATH}/test",
+            body=request,
+            timeout=httpx.Timeout(120.0, connect=10.0),
+        )
+
     def close(self) -> None:
         self._client.close()
 
@@ -715,6 +794,10 @@ class CallableAgentClient:
         raster_preview_status: Callable[[], dict[str, Any]] | None = None,
         raster_text_preview_status: Callable[[], dict[str, Any]] | None = None,
         metadata: dict[str, Any] | None = None,
+        llm_settings: Callable[[], dict[str, Any]] | None = None,
+        update_llm_settings: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        reset_llm_settings: Callable[[], dict[str, Any]] | None = None,
+        test_llm_settings: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self._review = review
         self._answer = answer
@@ -726,6 +809,10 @@ class CallableAgentClient:
         self._raster_preview_status = raster_preview_status
         self._raster_text_preview_status = raster_text_preview_status
         self._metadata = metadata or {"status": "ready"}
+        self._llm_settings = llm_settings
+        self._update_llm_settings = update_llm_settings
+        self._reset_llm_settings = reset_llm_settings
+        self._test_llm_settings = test_llm_settings
 
     def review(self, request: AgentReviewRequest) -> dict[str, Any]:
         return self._review(request)
@@ -920,3 +1007,55 @@ class CallableAgentClient:
 
     def metadata(self) -> dict[str, Any]:
         return dict(self._metadata)
+
+    @staticmethod
+    def default_llm_settings_view() -> dict[str, Any]:
+        """A deterministic, adjustable OpenAI view for fixtures and tests."""
+
+        return {
+            "provider": "openai",
+            "model": "gpt-5.6-luna",
+            "max_tokens": 16384,
+            "timeout_seconds": 90.0,
+            "source": "environment",
+            "version": 1,
+            "updated_at": None,
+            "error_code": None,
+            "service_mode": "functional-uat",
+            "adjustable": True,
+            "providers": [
+                {"provider": "anthropic", "credential_present": False, "default_model": "claude-haiku-4-5-20251001"},
+                {"provider": "openai", "credential_present": True, "default_model": "gpt-4.1-mini"},
+            ],
+        }
+
+    def llm_settings(self) -> dict[str, Any]:
+        if self._llm_settings is not None:
+            return self._llm_settings()
+        return self.default_llm_settings_view()
+
+    def update_llm_settings(self, request: dict[str, Any]) -> dict[str, Any]:
+        if self._update_llm_settings is not None:
+            return self._update_llm_settings(request)
+        view = self.default_llm_settings_view()
+        view.update({key: request[key] for key in ("provider", "model", "max_tokens", "timeout_seconds") if key in request})
+        view["source"] = "override"
+        view["version"] = 2
+        return view
+
+    def reset_llm_settings(self) -> dict[str, Any]:
+        if self._reset_llm_settings is not None:
+            return self._reset_llm_settings()
+        return self.default_llm_settings_view()
+
+    def test_llm_settings(self, request: dict[str, Any]) -> dict[str, Any]:
+        if self._test_llm_settings is not None:
+            return self._test_llm_settings(request)
+        view = self.default_llm_settings_view()
+        return {
+            "ok": True,
+            "provider": request.get("provider", view["provider"]),
+            "model": request.get("model", view["model"]),
+            "latency_ms": 1,
+            "error_code": None,
+        }

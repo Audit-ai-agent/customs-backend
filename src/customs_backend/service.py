@@ -8,6 +8,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from collections.abc import Callable
 from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 
@@ -111,12 +112,21 @@ from customs_backend.domain import (
     canonical_json_bytes,
     utc_now,
 )
+from customs_backend.admin_settings import (
+    LlmConnectionTestView,
+    LlmSettingsChangeRequest,
+    LlmSettingsUpdateRequest,
+    LlmSettingsView,
+    decode_llm_connection_test_view,
+    decode_llm_settings_view,
+)
 from customs_backend.ports import (
     AgentClient,
     AgentResponseRejectedError,
     AuthorizationError,
     ConflictError,
     KnowledgeInputRejectedError,
+    LlmSettingsRejectedError,
     NotFoundError,
     ObjectStore,
     WorkbenchRepository,
@@ -3347,6 +3357,42 @@ class WorkbenchService:
             return law_catalog_view(self.agent.law_catalog(build_law_catalog_request(as_of)))
         except LawReferenceError as exc:
             raise KnowledgeInputRejectedError() from exc
+
+    # ---- approver-only LLM settings (proxied to the Agent) -------------------
+
+    def llm_settings(self, principal: Principal) -> LlmSettingsView:
+        self._require_role(principal, Role.approver)
+        return self._decode_view(self.agent.llm_settings)
+
+    def update_llm_settings(
+        self, principal: Principal, request: LlmSettingsChangeRequest
+    ) -> LlmSettingsView:
+        self._require_role(principal, Role.approver)
+        wire = request.to_agent_wire()
+        return self._decode_view(lambda: self.agent.update_llm_settings(wire))
+
+    def reset_llm_settings(self, principal: Principal) -> LlmSettingsView:
+        self._require_role(principal, Role.approver)
+        return self._decode_view(self.agent.reset_llm_settings)
+
+    def test_llm_settings(
+        self, principal: Principal, request: LlmSettingsUpdateRequest
+    ) -> LlmConnectionTestView:
+        self._require_role(principal, Role.approver)
+        wire = request.to_agent_wire()
+        try:
+            return decode_llm_connection_test_view(self.agent.test_llm_settings(wire))
+        except AgentResponseRejectedError as exc:
+            raise LlmSettingsRejectedError("agent_unavailable", status=503) from exc
+
+    @staticmethod
+    def _decode_view(call: Callable[[], dict[str, Any]]) -> LlmSettingsView:
+        """A boundary rejection (transport, shape, mode) becomes a 503 with a stable code."""
+
+        try:
+            return decode_llm_settings_view(call())
+        except AgentResponseRejectedError as exc:
+            raise LlmSettingsRejectedError("agent_unavailable", status=503) from exc
 
     def operations_metrics(self, principal: Principal) -> OperationsMetricsView:
         cases = self.repository.list_cases(principal.org_id)

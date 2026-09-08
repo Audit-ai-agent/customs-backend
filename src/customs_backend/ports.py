@@ -61,6 +61,20 @@ class AgentResponseRejectedError(RuntimeError):
     """The Agent response did not satisfy the direct HTTP boundary."""
 
 
+class LlmSettingsRejectedError(ValueError):
+    """The Agent refused an operator LLM-settings request with a stable code.
+
+    ``code`` is the Agent's content-free identifier (for example
+    ``llm_settings_invalid`` or ``llm_credential_missing``); ``status`` is
+    the HTTP status the public API repeats.  No provider text travels here.
+    """
+
+    def __init__(self, code: str, *, status: int = 422) -> None:
+        super().__init__(f"LLM settings rejected: {code}")
+        self.code = code
+        self.status = status
+
+
 class WorkbenchRepository(Protocol):
     def health(self) -> bool: ...
     def create_case(self, record: CaseRecord) -> CaseRecord: ...
@@ -299,6 +313,10 @@ class AgentClient(Protocol):
     def answer(self, request: Any) -> dict[str, Any]: ...
     def answer_knowledge(self, request: Any) -> dict[str, Any]: ...
     def metadata(self) -> dict[str, Any]: ...
+    def llm_settings(self) -> dict[str, Any]: ...
+    def update_llm_settings(self, request: dict[str, Any]) -> dict[str, Any]: ...
+    def reset_llm_settings(self) -> dict[str, Any]: ...
+    def test_llm_settings(self, request: dict[str, Any]) -> dict[str, Any]: ...
 
 
 class TokenVerifier(Protocol):
