@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     oidc_authorization_endpoint: str | None = None
     oidc_token_endpoint: str | None = None
     oidc_end_session_endpoint: str | None = None
+    # Optional single HTTPS origin under which the browser-facing OIDC values
+    # may live when a functional UAT is reached through a tunnel or reverse
+    # proxy. JWKS, stores, and every service address stay literal loopback.
+    public_oidc_origin: str | None = None
     oidc_org_claim: str = "org_id"
     oidc_roles_claim: str = "roles"
 
@@ -80,6 +84,26 @@ class Settings(BaseSettings):
             or parsed.fragment
         ):
             raise ValueError(f"{name} must use a literal HTTP loopback endpoint")
+
+    def _public_oidc_origin(self) -> str | None:
+        """Return the configured bare HTTPS public origin, or None when unset."""
+        value = (self.public_oidc_origin or "").rstrip("/")
+        if not value:
+            return None
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("public_oidc_origin must be a bare HTTPS origin")
+        return value
+
+    @staticmethod
+    def _under_public_origin(value: str, origin: str | None) -> bool:
+        return origin is not None and value.startswith(origin + "/")
 
     @model_validator(mode="after")
     def validate_supported_profiles(self) -> "Settings":
@@ -146,6 +170,12 @@ class Settings(BaseSettings):
             "::1",
         }:
             raise ValueError("functional-uat database_url must use PostgreSQL on literal loopback")
+        # When CUSTOMS_BACKEND_PUBLIC_OIDC_ORIGIN names one explicit HTTPS origin,
+        # the issuer and the three browser-facing OIDC endpoints may live under
+        # exactly that origin so a tunnelled or reverse-proxied functional UAT
+        # can finish the redirect.  The JWKS fetch, the stores, and every other
+        # address stay literal loopback.
+        public_origin = self._public_oidc_origin()
         for name in (
             "oidc_issuer",
             "oidc_jwks_url",
@@ -154,8 +184,12 @@ class Settings(BaseSettings):
         ):
             value = getattr(self, name)
             assert isinstance(value, str)
+            if name != "oidc_jwks_url" and self._under_public_origin(value, public_origin):
+                continue
             self._literal_loopback_url(value, name=name)
-        if self.oidc_end_session_endpoint is not None:
+        if self.oidc_end_session_endpoint is not None and not self._under_public_origin(
+            self.oidc_end_session_endpoint, public_origin
+        ):
             self._literal_loopback_url(
                 self.oidc_end_session_endpoint, name="oidc_end_session_endpoint"
             )

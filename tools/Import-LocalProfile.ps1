@@ -53,6 +53,7 @@ $backendKeys = [System.Collections.Generic.HashSet[string]]::new([string[]]@(
     'CUSTOMS_BACKEND_OIDC_AUTHORIZATION_ENDPOINT',
     'CUSTOMS_BACKEND_OIDC_TOKEN_ENDPOINT',
     'CUSTOMS_BACKEND_OIDC_END_SESSION_ENDPOINT',
+    'CUSTOMS_BACKEND_PUBLIC_OIDC_ORIGIN',
     'CUSTOMS_BACKEND_DUTY_REFERENCE_DB'
 ))
 $agentKeys = [System.Collections.Generic.HashSet[string]]::new([string[]]@(

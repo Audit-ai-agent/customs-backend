@@ -223,6 +223,63 @@ def test_functional_uat_rejects_nonlocal_store_or_identity_endpoints() -> None:
         )
 
 
+def _functional_values(**overrides: object) -> dict[str, object]:
+    values: dict[str, object] = {
+        "environment": "functional-uat",
+        "public_base_url": "http://127.0.0.1:18081",
+        "agent_base_url": "http://127.0.0.1:18090",
+        "agent_service_token": "a" * 32,
+        "database_url": "postgresql://customs:local@127.0.0.1/customs",
+        "minio_endpoint": "127.0.0.1:19000",
+        "minio_access_key": "local-user",
+        "minio_secret_key": "m" * 32,
+        "oidc_issuer": "http://127.0.0.1:18088/realms/customs",
+        "oidc_audience": "customs-workbench-api",
+        "oidc_jwks_url": "http://127.0.0.1:18088/realms/customs/protocol/openid-connect/certs",
+        "oidc_client_id": "customs-workbench-spa",
+        "oidc_authorization_endpoint": "http://127.0.0.1:18088/realms/customs/protocol/openid-connect/auth",
+        "oidc_token_endpoint": "http://127.0.0.1:18088/realms/customs/protocol/openid-connect/token",
+    }
+    values.update(overrides)
+    return values
+
+
+def test_functional_uat_allows_browser_oidc_under_one_public_https_origin() -> None:
+    public = "https://uat.example.test"
+    realm = f"{public}/realms/customs"
+    settings = Settings(
+        _env_file=None,
+        **_functional_values(
+            public_oidc_origin=public + "/",
+            oidc_issuer=realm,
+            oidc_authorization_endpoint=f"{realm}/protocol/openid-connect/auth",
+            oidc_token_endpoint=f"{realm}/protocol/openid-connect/token",
+            oidc_end_session_endpoint=f"{realm}/protocol/openid-connect/logout",
+        ),
+    )
+    assert settings.oidc_issuer == realm
+
+    # JWKS is fetched by the Backend itself and must stay on loopback.
+    with pytest.raises(ValueError, match="oidc_jwks_url must use a literal HTTP loopback"):
+        Settings(
+            _env_file=None,
+            **_functional_values(
+                public_oidc_origin=public, oidc_jwks_url=f"{realm}/protocol/openid-connect/certs"
+            ),
+        )
+    # Only the single configured origin is exempt.
+    with pytest.raises(ValueError, match="oidc_issuer must use a literal HTTP loopback"):
+        Settings(
+            _env_file=None,
+            **_functional_values(
+                public_oidc_origin=public, oidc_issuer="https://other.example.test/realms/customs"
+            ),
+        )
+    for invalid in ("http://uat.example.test", "https://uat.example.test/realms", "https://"):
+        with pytest.raises(ValueError, match="bare HTTPS origin"):
+            Settings(_env_file=None, **_functional_values(public_oidc_origin=invalid))
+
+
 def test_http_agent_mode_header_is_bidirectionally_bound() -> None:
     def accepted(request: httpx.Request) -> httpx.Response:
         assert request.headers["X-Customs-Service-Mode"] == "local-development"
