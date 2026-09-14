@@ -4,13 +4,37 @@
   "additionalProperties": false,
   "description": "Text-only request for one human-review Agent pass. Approved human corrections are append-only context for a child run and never alter an original document.",
   "$defs": {
+    "LayoutSummary": {
+      "additionalProperties": false,
+      "description": "Counts from the OCR + layout pass that produced the confirmed text.",
+      "properties": {
+        "page_count": {"type": "integer", "minimum": 0, "maximum": 1000},
+        "table_count": {"type": "integer", "minimum": 0, "maximum": 10000},
+        "span_count": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "field_candidate_count": {"type": "integer", "minimum": 0, "maximum": 100000},
+        "mean_confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1}
+      },
+      "required": ["page_count", "table_count", "span_count", "field_candidate_count"],
+      "type": "object"
+    },
+    "DocumentExtraction": {
+      "additionalProperties": false,
+      "description": "Provenance of content_text: born-digital text layer, VLM OCR, or the raster OCR + layout engine.",
+      "properties": {
+        "source": {"type": "string", "enum": ["text_layer", "vlm_ocr", "raster_ocr"]},
+        "layout_summary": {"anyOf": [{"$ref": "#/$defs/LayoutSummary"}, {"type": "null"}]}
+      },
+      "required": ["source"],
+      "type": "object"
+    },
     "Document": {
       "additionalProperties": false,
       "properties": {
         "content_text": {"type": "string", "minLength": 1, "maxLength": 200000},
         "declared_type": {"type": ["string", "null"], "maxLength": 64},
         "document_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"},
-        "filename": {"type": "string", "minLength": 1, "maxLength": 255}
+        "filename": {"type": "string", "minLength": 1, "maxLength": 255},
+        "extraction": {"anyOf": [{"$ref": "#/$defs/DocumentExtraction"}, {"type": "null"}]}
       },
       "required": ["document_id", "filename", "content_text"],
       "type": "object"

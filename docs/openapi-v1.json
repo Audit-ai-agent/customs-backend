@@ -4057,9 +4057,37 @@
             "title": "Document Type",
             "type": "string"
           },
+          "extraction_source": {
+            "anyOf": [
+              {
+                "enum": [
+                  "text_layer",
+                  "vlm_ocr",
+                  "raster_ocr"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extraction Source"
+          },
           "filename": {
             "title": "Filename",
             "type": "string"
+          },
+          "layout_summary": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Layout Summary"
           },
           "media_type": {
             "title": "Media Type",
@@ -5075,6 +5103,30 @@
       "ReviewRunRecord": {
         "additionalProperties": false,
         "properties": {
+          "agent_confidence": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Confidence"
+          },
+          "agent_eligibility_verdict": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Eligibility Verdict"
+          },
           "agent_engine": {
             "anyOf": [
               {
@@ -5342,6 +5394,18 @@
       "ReviewRunSummary": {
         "description": "Compact case-history projection; use the detail endpoint for facts.",
         "properties": {
+          "agent_engine_kind": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Engine Kind"
+          },
           "applied_correction_proposal_ids": {
             "items": {
               "type": "string"
@@ -5362,6 +5426,22 @@
             "format": "date-time",
             "title": "Created At",
             "type": "string"
+          },
+          "eligibility_verdict": {
+            "anyOf": [
+              {
+                "enum": [
+                  "eligible",
+                  "ineligible",
+                  "indeterminate"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eligibility Verdict"
           },
           "execution_status": {
             "title": "Execution Status",
@@ -5403,6 +5483,21 @@
           "review_run_id": {
             "title": "Review Run Id",
             "type": "string"
+          },
+          "review_track": {
+            "anyOf": [
+              {
+                "enum": [
+                  "detailed_review",
+                  "expedited_check"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Review Track"
           },
           "reviewer_decision_count": {
             "minimum": 0.0,

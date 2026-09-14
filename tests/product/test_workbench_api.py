@@ -398,6 +398,9 @@ def test_v1_case_document_review_flow_always_needs_human_review() -> None:
             "result_digest",
             "finding_count",
             "reviewer_decision_count",
+            "review_track",
+            "eligibility_verdict",
+            "agent_engine_kind",
             "parent_review_run_id",
             "applied_correction_proposal_ids",
             "created_at",
@@ -410,7 +413,7 @@ def test_v1_case_document_review_flow_always_needs_human_review() -> None:
         assert (
             "human_review_required" in detail.json()["completion_eligibility"]["unmet_reason_codes"]
         )
-        assert detail.json()["agent_schema_version"] == "3.2"
+        assert detail.json()["agent_schema_version"] == "3.3"
         assert detail.json()["agent_jurisdiction"] == "KR"
         assert detail.json()["agent_requires_human_review"] is True
         assert detail.json()["temporal_context"] is None

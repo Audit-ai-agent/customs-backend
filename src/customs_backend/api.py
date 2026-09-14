@@ -167,6 +167,8 @@ class DocumentViewResponse(BaseModel):
         replaces_document_id: str | None = None
         superseded_by_document_id: str | None = None
         superseded_at: datetime | None = None
+        extraction_source: Literal["text_layer", "vlm_ocr", "raster_ocr"] | None = None
+        layout_summary: dict[str, Any] | None = None
 
     record: PublicDocumentRecord
     content_text: str | None = None
@@ -695,10 +697,20 @@ class ReviewRunSummary(BaseModel):
     reviewer_decision_count: int = Field(ge=0)
     parent_review_run_id: str | None = None
     applied_correction_proposal_ids: list[str] = Field(default_factory=list, max_length=50)
+    # Agent 3.3 advisory signals; both stay display-only in the history list.
+    review_track: Literal["detailed_review", "expedited_check"] | None = None
+    eligibility_verdict: Literal["eligible", "ineligible", "indeterminate"] | None = None
+    agent_engine_kind: str | None = Field(default=None, max_length=32)
     created_at: datetime
 
     @classmethod
     def from_run(cls, run: ReviewRunRecord) -> "ReviewRunSummary":
+        confidence = run.agent_confidence or {}
+        verdict = run.agent_eligibility_verdict or {}
+        engine = run.agent_engine or {}
+        review_track = confidence.get("review_track")
+        verdict_value = verdict.get("verdict")
+        engine_kind = engine.get("kind")
         return cls(
             review_run_id=run.review_run_id,
             case_id=run.case_id,
@@ -713,6 +725,15 @@ class ReviewRunSummary(BaseModel):
             reviewer_decision_count=len(run.reviewer_decisions),
             parent_review_run_id=run.parent_review_run_id,
             applied_correction_proposal_ids=list(run.applied_correction_proposal_ids),
+            review_track=(
+                review_track if review_track in {"detailed_review", "expedited_check"} else None
+            ),
+            eligibility_verdict=(
+                verdict_value
+                if verdict_value in {"eligible", "ineligible", "indeterminate"}
+                else None
+            ),
+            agent_engine_kind=str(engine_kind)[:32] if isinstance(engine_kind, str) else None,
             created_at=run.created_at,
         )
 

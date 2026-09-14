@@ -4,6 +4,15 @@
   "additionalProperties": false,
   "description": "One grounded assistant answer. It never mutates Case state, approves a correction, or makes a final customs decision.",
   "$defs": {
+    "Orchestrator": {
+      "additionalProperties": false,
+      "properties": {
+        "framework": {"const": "langgraph", "type": "string"},
+        "version": {"type": "string", "minLength": 1, "maxLength": 64}
+      },
+      "required": ["framework", "version"],
+      "type": "object"
+    },
     "CaseCitation": {
       "additionalProperties": false,
       "properties": {
@@ -80,8 +89,9 @@
     "Engine": {
       "additionalProperties": false,
       "properties": {
-        "kind": {"type": "string", "enum": ["deterministic", "claude"]},
-        "model_id": {"type": "string", "minLength": 1, "maxLength": 256}
+        "kind": {"type": "string", "enum": ["deterministic", "anthropic", "openai", "claude"]},
+        "model_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "orchestrator": {"anyOf": [{"$ref": "#/$defs/Orchestrator"}, {"type": "null"}]}
       },
       "required": ["kind", "model_id"],
       "type": "object"

@@ -41,7 +41,9 @@ from customs_backend.domain import (
     AgentDocumentExtractionRequest,
     AgentRasterDocumentExtractionRequest,
     AgentRasterTextDocumentExtractionRequest,
+    AgentDocumentExtraction,
     AgentDocumentInput,
+    AgentLayoutSummary,
     AgentAssistantAnswerRequest,
     AgentAssistantAnswerResponse,
     AgentConversationTurn,
@@ -70,6 +72,7 @@ from customs_backend.domain import (
     CorrectionProposalHistoryEntry,
     CorrectionProposalRecord,
     CorrectionProposalStatus,
+    DocumentExtractionSource,
     DocumentRecord,
     DocumentAssetRecord,
     DocumentExtractionResult,
@@ -812,6 +815,11 @@ def _agent_result_hash_payload(result: dict[str, Any]) -> dict[str, Any]:
         payload.pop("temporal_context", None)
     if payload.get("temporal_coverage") is None:
         payload.pop("temporal_coverage", None)
+    # The 3.3 additive fields follow the same null-omission rule.
+    if payload.get("confidence") is None:
+        payload.pop("confidence", None)
+    if payload.get("eligibility_verdict") is None:
+        payload.pop("eligibility_verdict", None)
     return payload
 
 
@@ -858,6 +866,8 @@ def _agent_result_snapshot(run: ReviewRunRecord) -> dict[str, Any]:
         if run.temporal_coverage is not None
         else None
     )
+    result["confidence"] = run.agent_confidence
+    result["eligibility_verdict"] = run.agent_eligibility_verdict
     if canonical_digest(_agent_result_hash_payload(result)) != run.provider_result_sha256:
         raise ConflictError("persisted Agent result is not hash-consistent for assistant context")
     return result
@@ -968,6 +978,7 @@ def _agent_request_from_snapshot(
                     key=document.object_key, expected_sha256=document.content_sha256
                 ),
                 declared_type=_DECLARED_TYPE_MAP[document.document_type],
+                extraction=_agent_document_extraction(document),
             )
             for document in _review_documents(documents)
         ],
@@ -976,6 +987,41 @@ def _agent_request_from_snapshot(
         human_corrections=human_corrections,
         reviewer_hs_selection=reviewer_hs_selection,
     )
+
+
+def _agent_document_extraction(document: DocumentRecord) -> AgentDocumentExtraction | None:
+    """Forward stored extraction provenance; plain text uploads carry none."""
+
+    if document.extraction_source is None:
+        return None
+    layout_summary: AgentLayoutSummary | None = None
+    if document.layout_summary is not None:
+        try:
+            layout_summary = AgentLayoutSummary.model_validate(document.layout_summary)
+        except ValidationError:
+            layout_summary = None
+    return AgentDocumentExtraction(source=document.extraction_source, layout_summary=layout_summary)
+
+
+def _layout_summary_from_raster_result(result: Any) -> dict[str, Any] | None:
+    """Count-only summary of a raster OCR + layout result."""
+
+    pages = getattr(result, "pages", None)
+    if not isinstance(pages, list):
+        return None
+    confidences = [
+        float(span.confidence)
+        for page in pages
+        for span in getattr(page, "spans", [])
+        if getattr(span, "confidence", None) is not None
+    ]
+    return {
+        "page_count": len(pages),
+        "table_count": len(getattr(result, "tables", []) or []),
+        "span_count": len(confidences),
+        "field_candidate_count": len(getattr(result, "field_candidates", []) or []),
+        "mean_confidence": round(sum(confidences) / len(confidences), 4) if confidences else None,
+    }
 
 
 @dataclass(frozen=True)
@@ -1180,6 +1226,8 @@ class WorkbenchService:
         request: TextDocumentCreate,
         *,
         source_asset_id: str | None = None,
+        extraction_source: DocumentExtractionSource | None = None,
+        layout_summary: dict[str, Any] | None = None,
     ) -> tuple[CaseRecord, DocumentRecord]:
         self._require_role(principal, Role.reviewer)
         case = self.get_case(principal, case_id)
@@ -1203,6 +1251,8 @@ class WorkbenchService:
             created_by=principal.subject,
             created_at=utc_now(),
             source_asset_id=source_asset_id,
+            extraction_source=extraction_source,
+            layout_summary=layout_summary,
             replaces_document_id=request.replaces_document_id,
         )
         existing = self.repository.list_documents(principal.org_id, case_id)
@@ -2042,6 +2092,14 @@ class WorkbenchService:
             raise ConflictError(
                 "an available extraction preview is required before text confirmation"
             )
+        extraction_source: DocumentExtractionSource
+        layout_summary: dict[str, Any] | None = None
+        if request.extraction_job_id is not None:
+            revision = str(getattr(job.result, "extractor_revision", "") or "")
+            extraction_source = "vlm_ocr" if revision.startswith("vlm-ocr") else "text_layer"
+        else:
+            extraction_source = "raster_ocr"
+            layout_summary = _layout_summary_from_raster_result(job.result)
         return self.add_document(
             principal,
             case_id,
@@ -2052,6 +2110,8 @@ class WorkbenchService:
                 replaces_document_id=request.replaces_document_id,
             ),
             source_asset_id=asset.asset_id,
+            extraction_source=extraction_source,
+            layout_summary=layout_summary,
         )
 
     def list_document_records(self, principal: Principal, case_id: str) -> list[DocumentRecord]:
@@ -2194,6 +2254,19 @@ class WorkbenchService:
                 raise ValueError("temporal law_as_of must match review_as_of")
             if temporal_coverage is not None and temporal_context is None:
                 raise ValueError("temporal coverage requires temporal context")
+            agent_confidence = (
+                dict(result["confidence"]) if result.get("confidence") is not None else None
+            )
+            agent_eligibility_verdict = (
+                dict(result["eligibility_verdict"])
+                if result.get("eligibility_verdict") is not None
+                else None
+            )
+            if (
+                agent_eligibility_verdict is not None
+                and agent_eligibility_verdict.get("advisory") is not True
+            ):
+                raise ValueError("eligibility verdict must be advisory")
         except (AgentContractPayloadError, KeyError, TypeError, ValueError, ValidationError) as exc:
             raise ConflictError("Agent result does not satisfy the V3 review contract") from exc
         expected_provider_result_sha256 = canonical_digest(_agent_result_hash_payload(result))
@@ -2278,6 +2351,8 @@ class WorkbenchService:
             agent_requires_human_review=True,
             temporal_context=temporal_context,
             temporal_coverage=temporal_coverage,
+            agent_confidence=agent_confidence,
+            agent_eligibility_verdict=agent_eligibility_verdict,
             review_disposition=ReviewDisposition.human_review_required,
             assurance_level=AssuranceLevel.diagnostic,
             completion_eligibility=eligibility,

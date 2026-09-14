@@ -240,6 +240,9 @@ class TextDocumentCreate(BaseModel):
         return value
 
 
+DocumentExtractionSource = Literal["text_layer", "vlm_ocr", "raster_ocr"]
+
+
 class DocumentRecord(BaseModel):
     document_id: str
     case_id: str
@@ -257,6 +260,11 @@ class DocumentRecord(BaseModel):
     # extraction preview.  The review contract still receives text only; this
     # link is operational provenance and never authorises OCR-based findings.
     source_asset_id: str | None = None
+    # How the confirmed text was obtained (born-digital text layer, VLM OCR,
+    # or the raster OCR + layout engine) and a count-only layout summary.
+    # Provenance for the Agent's confidence signal; never review input itself.
+    extraction_source: DocumentExtractionSource | None = None
+    layout_summary: dict[str, Any] | None = None
     # A document is immutable.  A correction creates a new record and marks
     # the earlier record as superseded, so historic review input snapshots
     # remain reproducible.
@@ -1892,6 +1900,11 @@ class ReviewRunRecord(BaseModel):
     # can retain a baseline HSK/CCCT date while safely reporting that its
     # corresponding official archive is unavailable.
     temporal_coverage: TemporalCoverage | None = None
+    # Agent 3.3 additions.  Both are advisory: confidence only labels the
+    # review track and the verdict never closes a Case.  Historic runs load
+    # with ``None``; both stay inside the provider hash when populated.
+    agent_confidence: dict[str, Any] | None = None
+    agent_eligibility_verdict: dict[str, Any] | None = None
     review_disposition: ReviewDisposition = ReviewDisposition.human_review_required
     assurance_level: AssuranceLevel = AssuranceLevel.diagnostic
     completion_eligibility: CompletionEligibility
@@ -1926,6 +1939,25 @@ class ReviewRunRecord(BaseModel):
         return self
 
 
+class AgentLayoutSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    page_count: int = Field(ge=0, le=1000)
+    table_count: int = Field(ge=0, le=10_000)
+    span_count: int = Field(ge=0, le=1_000_000)
+    field_candidate_count: int = Field(ge=0, le=100_000)
+    mean_confidence: float | None = Field(default=None, ge=0, le=1)
+
+
+class AgentDocumentExtraction(BaseModel):
+    """Provenance of one confirmed text document, forwarded to the Agent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: DocumentExtractionSource
+    layout_summary: AgentLayoutSummary | None = None
+
+
 class AgentDocumentInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1933,6 +1965,7 @@ class AgentDocumentInput(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
     content_text: str = Field(min_length=1, max_length=MAX_TEXT_DOCUMENT_CHARACTERS)
     declared_type: str | None = Field(default=None, max_length=64)
+    extraction: AgentDocumentExtraction | None = None
 
     def to_agent_wire(self) -> dict[str, Any]:
         return self.model_dump(mode="json", exclude_none=True)

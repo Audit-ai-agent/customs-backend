@@ -1184,6 +1184,22 @@ def _assert_agent_result(
         or len(actions) > 6
     ):
         raise MatrixError(f"{scenario.name}_planner_limit")
+    graph_trace = workflow.get("graph_trace")
+    if graph_trace is not None:
+        # The LangGraph node trace mirrors the planner bound: at most one
+        # audit loop, and never more nodes than the five-node graph can run.
+        trace = _require_mapping(graph_trace, code="graph_trace_invalid")
+        node_runs = trace.get("node_runs")
+        iteration_count = trace.get("iteration_count")
+        if (
+            trace.get("framework") != "langgraph"
+            or not isinstance(iteration_count, int)
+            or not 1 <= iteration_count <= 2
+            or iteration_count != cycles
+            or not isinstance(node_runs, list)
+            or not 1 <= len(node_runs) <= 8
+        ):
+            raise MatrixError(f"{scenario.name}_graph_trace_limit")
     reextractions = workflow.get("reextractions")
     if not isinstance(reextractions, list) or any(
         not isinstance(item, Mapping) or item.get("attempt_count") not in {1, 2}

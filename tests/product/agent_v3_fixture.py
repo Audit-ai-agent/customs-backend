@@ -98,7 +98,7 @@ def build_agent_v3_result(
         actions[0]["finding_ids"] = ["finding_fixture_quantity"]
 
     result: dict[str, Any] = {
-        "schema_version": "3.2",
+        "schema_version": "3.3",
         "case_id": request.case_id,
         "review_run_id": request.review_run_id,
         "review_as_of": request.review_as_of.isoformat(),
@@ -150,6 +150,19 @@ def build_agent_v3_result(
                 }
             ],
             "reextractions": [],
+            "graph_trace": {
+                "framework": "langgraph",
+                "iteration_count": 1,
+                "loop_reason": None,
+                "node_runs": [
+                    {
+                        "node": "report_generation",
+                        "iteration": 1,
+                        "status": "completed",
+                        "summary": "Fixture generated the bounded report.",
+                    }
+                ],
+            },
             "planner": {
                 "cycle_count": 1,
                 "actions": [
@@ -168,7 +181,24 @@ def build_agent_v3_result(
         "evidence": [],
         "findings": findings,
         "required_actions": actions,
-        "engine": {"kind": "deterministic", "model_id": "backend-fixture"},
+        "engine": {
+            "kind": "deterministic",
+            "model_id": "backend-fixture",
+            "orchestrator": {"framework": "langgraph", "version": "fixture"},
+        },
+        "confidence": {
+            "overall": 0.9,
+            "threshold": 0.8,
+            "review_track": "expedited_check",
+            "method": "deterministic_signals",
+            "components": {"extraction": 1.0, "comparison": 0.75, "evidence": 1.0},
+        },
+        "eligibility_verdict": {
+            "verdict": "indeterminate" if include_finding else "eligible",
+            "advisory": True,
+            "source": "rule",
+            "reasons": [],
+        },
         "result_sha256": "0" * 64,
     }
     result["result_sha256"] = canonical_digest(
