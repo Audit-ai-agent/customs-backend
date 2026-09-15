@@ -40,21 +40,31 @@ _DESCRIPTION_LINE_PATTERN = re.compile(r"(?i)\bdescription\b|\bgoods\b|품명|�
 # "Description: Frozen mackerel | HS Code: ... | Quantity: ..." -> "Frozen mackerel".
 _DESCRIPTION_LABEL_PATTERN = re.compile(r"(?i)^(?:goods\s+)?(?:description|품명|물품명|품목명)\s*[:：]\s*")
 # A description cell rendered as its own text line ("Description of Goods",
-# "Goods Description", "6. Description of Goods / Quantity"): the item name
-# then sits on one of the following lines, among other table cells.
+# "Goods Description", "6. Description of Goods / Quantity", "⑪ Description of
+# Goods"): the item name then sits on one of the following lines, among other
+# table cells.  Box numbers come in many shapes (6., (6), ⑪), so anything that
+# is not a letter may precede the label.
+_CELL_LABEL_PREFIX = r"[^A-Za-z가-힣]*"
 _DESCRIPTION_HEADER_ONLY_PATTERN = re.compile(
-    r"(?i)^[\s\d.]*(?:goods\s+description|description\s+of\s+goods|description|품명|물품명|품목명)"
+    r"(?i)^"
+    + _CELL_LABEL_PREFIX
+    + r"(?:goods\s+description|description\s+of\s+goods|description|품명|물품명|품목명)"
     r"(?:\s*/\s*(?:quantity|qty|수량))?\s*[:：]?\s*$"
 )
+# Other table labels: column headers before the values and the total/weight/
+# signature cells after them.
 _TABLE_CELL_NOISE_PATTERN = re.compile(
-    r"(?i)^(?:\d+\.?\s*)?(?:quantity|qty|unit\s*price|amount|net\s*weight|gross\s*weight|measurement|"
-    r"marks?(?:\s*(?:&|and)\s*(?:no\.?|numbers?))?|no\.?\s*(?:&\s*kind\s*)?of\s*pkgs|total|signed|remarks?|"
-    r"hs\s*code|origin|country\s*of\s*origin|수량|단가|금액|순중량|총중량)\b"
+    r"(?i)^"
+    + _CELL_LABEL_PREFIX
+    + r"(?:quantity|qty|unit\s*price|amount|net\s*weight|gross\s*weight|measurement|"
+    r"marks?(?:\s*(?:&|and)\s*(?:no\.?|numbers?))?|no\.?\s*(?:&\s*kinds?\s*)?of\s*(?:pkgs|packages|containers)|"
+    r"containers?\s*/\s*packages|total|signed|remarks?|hs\s*code|origin|country\s*of\s*origin|"
+    r"freight|revenue\s*tons|rate|per|prepaid|collect|place\s+(?:and|of)|signature|"
+    r"수량|단가|금액|순중량|총중량|합계)\b"
 )
-# After the item name, the next cells are quantities/amounts; stop there.
-_ITEM_STOP_PATTERN = re.compile(
-    r"(?i)\b(?:pcs?|kgs?|cbm|usd|eur|jpy|cny|krw|cartons?|ctns?|sets?|ea|mt)\b|^total\b|^합계"
-)
+# "31,214 PCS", "4 CNTR", "11,927.0 KGS": a count with its unit is a quantity
+# cell, never an item name.
+_QUANTITY_CELL_PATTERN = re.compile(r"^\(?[0-9][0-9,.]*\s*[A-Za-z]{1,8}\)?\.?$")
 _DESCRIPTION_FOLLOW_LINES = 16
 _CASE_TEXT_LINE_LIMIT = 400
 
@@ -62,7 +72,9 @@ _CASE_TEXT_LINE_LIMIT = 400
 def _looks_like_item_name(line: str) -> bool:
     """A table cell that can be an item name: mostly words, not a number/unit cell."""
 
-    if _TABLE_CELL_NOISE_PATTERN.match(line):
+    if _TABLE_CELL_NOISE_PATTERN.match(line) or _QUANTITY_CELL_PATTERN.match(line):
+        return False
+    if _DESCRIPTION_HEADER_ONLY_PATTERN.match(line):
         return False
     letters = len(re.findall(r"[A-Za-z가-힣]", line))
     digits = len(re.findall(r"[0-9]", line))
@@ -70,7 +82,15 @@ def _looks_like_item_name(line: str) -> bool:
 
 
 def _description_values(lines: list[str]) -> list[tuple[int, str]]:
-    """Item-name text from labelled lines and from cells below a header cell."""
+    """Item-name text from labelled lines and from cells below a header cell.
+
+    Below a header cell the text layer emits the remaining column headers,
+    then the row's cells (marks, item name, quantities).  Quantity cells are
+    skipped, and the row ends at the next label cell (TOTAL, Gross Weight,
+    Signed …) once something has been collected -- a bill of lading lists
+    "4 CNTR / 372 CTNS" before the item name, so a unit alone must not end
+    the row.
+    """
 
     values: list[tuple[int, str]] = []
     follow_until = -1
@@ -83,7 +103,7 @@ def _description_values(lines: list[str]) -> list[tuple[int, str]]:
             if _looks_like_item_name(stripped):
                 values.append((line_no, stripped[:200]))
                 collected_below_header += 1
-            elif collected_below_header and _ITEM_STOP_PATTERN.search(stripped):
+            elif collected_below_header and _TABLE_CELL_NOISE_PATTERN.match(stripped):
                 follow_until = -1
             continue
         keyword = _DESCRIPTION_LINE_PATTERN.search(stripped)
@@ -449,7 +469,15 @@ _DESCRIPTION_STOPWORDS = frozenset(
     {
         "and", "for", "from", "its", "not", "of", "or", "other", "than",
         "the", "with", "made", "kind", "kinds", "part", "parts",
+        # Words that name the *column*, not the goods: they appear in table
+        # labels ("Description of Goods") and in many tariff lines alike.
+        "goods", "good", "description", "descriptions", "item", "items",
+        "article", "articles", "commodity", "commodities", "merchandise", "cargo",
+        # Units next to a size or count ("24 INCH", "372 CTNS") describe the
+        # quantity, not the goods.
+        "inch", "inches", "mm", "cm", "kg", "kgs", "pcs", "pc", "ctn", "ctns", "cbm", "unit", "units",
         "기타", "그", "밖의", "이나", "및", "것", "한정한다", "제외한다", "포함한다",
+        "물품", "품명", "품목",
     }
 )
 _DESCRIPTION_CANDIDATE_LIMIT = 5
@@ -457,15 +485,19 @@ _DESCRIPTION_CONFIDENCE_CAP = 0.4
 
 
 def _description_stems(text: str) -> frozenset[str]:
+    """Lower-cased word stems; a plural keeps only its singular so one word counts once."""
+
     lowered = text.lower().replace("'", "")
     stems: set[str] = set()
     for compact in (lowered, lowered.replace("-", "")):
         for token in _DESCRIPTION_TOKEN_PATTERN.findall(compact):
             if len(token) < 2 or token in _DESCRIPTION_STOPWORDS or token.isdigit():
                 continue
-            stems.add(token)
             if len(token) > 3 and token.endswith("s"):
-                stems.add(token[:-1])
+                token = token[:-1]
+                if token in _DESCRIPTION_STOPWORDS:
+                    continue
+            stems.add(token)
     return frozenset(stems)
 
 
@@ -512,31 +544,48 @@ def _description_candidates_from_facts(
     *,
     limit: int = _DESCRIPTION_CANDIDATE_LIMIT,
 ) -> list[HsCandidate]:
-    stems: set[str] = set()
-    for _, fact in facts:
-        stems |= _description_stems(_fact_value(fact))
-    if not stems:
+    """Match each description value on its own, then merge the codes.
+
+    Values are scored separately rather than as one pooled bag of words: a
+    stray cell picked up next to the item name ("ROTTERDAM", "4 CNTR") must
+    not dilute the real name's share, and a generic word must not let hundreds
+    of unrelated tariff lines tie with the goods actually described.  The
+    same value repeated across the invoice, packing list, bill of lading and
+    certificate of origin counts as agreement between documents.
+    """
+
+    # Distinct stem sets, with every fact (and document) that produced them.
+    groups: dict[frozenset[str], list[tuple[str, dict[str, Any]]]] = {}
+    for document_id, fact in facts:
+        stems = _description_stems(_fact_value(fact))
+        if stems:
+            groups.setdefault(stems, []).append((document_id, fact))
+    if not groups:
         return []
 
-    scored: list[tuple[int, float, str]] = []
-    for code, entry_stems in _description_index():
-        matched = len(stems & entry_stems)
-        if matched == 0:
-            continue
-        scored.append((matched, matched / len(stems), code))
-    scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    # code -> (best matched, best share, distinct documents, basis facts)
+    scored: dict[str, tuple[int, float, set[str], list[tuple[str, dict[str, Any]]]]] = {}
+    for stems, group in groups.items():
+        for code, entry_stems in _description_index():
+            matched = len(stems & entry_stems)
+            if matched == 0:
+                continue
+            share = matched / len(stems)
+            current = scored.get(code)
+            if current is None:
+                scored[code] = (matched, share, {doc for doc, _ in group}, list(group))
+                continue
+            best_matched, best_share, documents, basis = current
+            documents.update(doc for doc, _ in group)
+            basis.extend(group)
+            scored[code] = (max(best_matched, matched), max(best_share, share), documents, basis)
+    ranked = sorted(
+        scored.items(),
+        key=lambda item: (-item[1][0], -item[1][1], -len(item[1][2]), item[0]),
+    )
 
-    basis = [
-        HsCandidateBasis(
-            document_id=document_id,
-            fact_id=str(fact.get("fact_id", "")),
-            fact_name=str(fact.get("name", "")),
-            raw_value=str(fact.get("raw_value", ""))[:200],
-        )
-        for document_id, fact in facts[:20]
-    ]
     candidates: list[HsCandidate] = []
-    for matched, share, code in scored[:limit]:
+    for code, (_, share, _, basis_facts) in ranked[:limit]:
         name_ko, name_en = _leaf_names(code)
         candidates.append(
             HsCandidate(
@@ -548,7 +597,15 @@ def _description_candidates_from_facts(
                 in_reference=True,
                 recommended=False,
                 origin="description_match",
-                basis=basis,
+                basis=[
+                    HsCandidateBasis(
+                        document_id=document_id,
+                        fact_id=str(fact.get("fact_id", "")),
+                        fact_name=str(fact.get("name", "")),
+                        raw_value=str(fact.get("raw_value", ""))[:200],
+                    )
+                    for document_id, fact in basis_facts[:20]
+                ],
             )
         )
     return candidates

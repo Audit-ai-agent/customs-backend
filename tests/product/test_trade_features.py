@@ -670,6 +670,144 @@ def test_case_hs_classification_reads_item_name_below_a_table_header_cell() -> N
         assert not any(value.startswith("USD") for value in raw_values)
 
 
+_MONITOR_CO = "\n".join(
+    [
+        "CERTIFICATE OF ORIGIN",
+        "6. Description of Goods / Quantity",
+        "   LED MONITOR 24 INCH",
+        "   Quantity: 31,214 PCS  /  372 CARTONS",
+        "The undersigned hereby certifies that the goods described above",
+    ]
+)
+_MONITOR_INVOICE = "\n".join(
+    [
+        "COMMERCIAL INVOICE",
+        "Marks & No. of PKGS",
+        "Description of Goods",
+        "Quantity",
+        "Unit price",
+        "Amount",
+        "EURO",
+        "C/NO. 1-372",
+        "ROTTERDAM",
+        "LED MONITOR 24 INCH",
+        "31,214 PCS",
+        "@ 59.38",
+        "USD 1,853,487.32",
+        "TOTAL",
+    ]
+)
+_MONITOR_PACKING_LIST = "\n".join(
+    [
+        "PACKING LIST",
+        "Goods Description",
+        "13",
+        "Net Weight",
+        "EURO",
+        "C/NO. 1-372",
+        "ROTTERDAM",
+        "C/T: 372",
+        "LED MONITOR 24 INCH",
+        "31,214 PCS",
+        "11,049.0 KG",
+        "TOTAL: 372 CARTONS",
+    ]
+)
+# A bill of lading numbers its boxes with circled digits and lists the
+# container/package counts before the item name.
+_MONITOR_BL = "\n".join(
+    [
+        "Bill of Lading",
+        "⑪ No.& Kinds of",
+        "Containers/Packages",
+        "⑪ Description of Goods",
+        "⑪ Gross Weight",
+        "Measurement",
+        "MSKU8931413",
+        "EURO",
+        "C/NO. 1-372",
+        "ROTTERDAM",
+        "4 CNTR",
+        "372 CTNS",
+        "LED MONITOR 24 INCH",
+        "(31,214 PCS)",
+        "11,927.0 KGS",
+        "30.0 CBM",
+        "Total No. of Containers or",
+        "Packages(in words): 4 CONTAINER(S)",
+        "⑪ Freight and Charges",
+    ]
+)
+
+
+def test_case_hs_classification_reads_a_bill_of_lading_description_cell() -> None:
+    with _client(review_handler=_review_result_with_facts) as client:
+        case_id = _case_with_documents(client, [("BL", "bl.txt", _MONITOR_BL)])
+        body = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
+        assert body["candidates"][0]["code"] == "8528726000"
+        raw_values = {basis["raw_value"] for candidate in body["candidates"] for basis in candidate["basis"]}
+        assert "LED MONITOR 24 INCH" in raw_values
+        # Neither the circled-number header nor the count cells are item names.
+        assert "⑪ Description of Goods" not in raw_values
+        assert not any(value.endswith(("CNTR", "CTNS", "Charges")) for value in raw_values)
+
+
+def test_case_hs_shortlist_is_stable_as_documents_are_added() -> None:
+    """Adding the packing list and bill of lading must not push the goods out.
+
+    Before, every document's words were pooled into one bag and a header
+    word ("goods") that names hundreds of tariff lines tied with the real
+    item, so the true code left the Agent's 40-code shortlist.
+    """
+
+    shortlists: list[list[str]] = []
+
+    def handler(request: dict[str, Any]) -> dict[str, Any]:
+        shortlists.append([item["code"] for item in request["reference_candidates"]])
+        return {"schema_version": "1.0", "status": "ok", "items": [], "picks": []}
+
+    documents = [
+        ("CO", "co.txt", _MONITOR_CO),
+        ("CI", "ci.txt", _MONITOR_INVOICE),
+        ("PL", "pl.txt", _MONITOR_PACKING_LIST),
+        ("BL", "bl.txt", _MONITOR_BL),
+    ]
+    with _client(review_handler=_review_result_with_facts, hs_candidates_handler=handler) as client:
+        for count in range(1, len(documents) + 1):
+            case_id = _case_with_documents(client, documents[:count])
+            body = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
+            assert body["candidates"][0]["code"] == "8528726000", count
+            assert shortlists[-1][0] == "8528726000", count
+    # The item name repeated across four documents is one agreement, not four
+    # separate names; every candidate cites the documents it came from.
+    assert all(len(shortlist) <= 40 for shortlist in shortlists)
+    assert {basis["document_id"] for basis in body["candidates"][0]["basis"]} and len(
+        body["candidates"][0]["basis"]
+    ) >= 4
+
+
+def test_description_match_scores_each_value_separately() -> None:
+    from customs_backend.trade_features import _description_candidates_from_facts
+
+    def fact(fact_id: str, value: str) -> dict[str, Any]:
+        return {"fact_id": fact_id, "name": "description", "raw_value": value, "normalized_value": value}
+
+    clean = _description_candidates_from_facts([("d1", fact("f1", "MEN'S COTTON T-SHIRTS"))])
+    noisy = _description_candidates_from_facts(
+        [
+            ("d1", fact("f1", "MEN'S COTTON T-SHIRTS")),
+            ("d1", fact("f2", "ROTTERDAM")),
+            ("d2", fact("f3", "⑪ Description of Goods")),
+            ("d2", fact("f4", "MEN'S COTTON T-SHIRTS")),
+        ]
+    )
+    assert [candidate.code for candidate in noisy] == [candidate.code for candidate in clean]
+    assert "6109101000" in {candidate.code for candidate in noisy}
+    # A stray cell in another document does not lower the real name's share.
+    assert noisy[0].confidence == clean[0].confidence
+    assert {basis.document_id for basis in noisy[0].basis} == {"d1", "d2"}
+
+
 def test_case_hs_selection_rejects_codes_outside_reference_and_closed_cases() -> None:
     with _client(review_handler=_review_result_with_facts) as client:
         case_id = _case_with_documents(client, [("CI", "ci.txt", "COMMERCIAL INVOICE\nHS CODE: 0303540000")])
