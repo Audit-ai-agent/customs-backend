@@ -728,47 +728,167 @@ def build_case_hs_classification(
 
 _AGENT_SHORTLIST_LIMIT = 40
 _AGENT_TEXT_LIMIT = 20_000
+_AGENT_SEARCH_CONFIDENCE = 0.3
+_AGENT_CITED_PREFIX_PATTERN = re.compile(r"^[0-9]{6,9}$")
+
+
+class AgentHsItem(BaseModel):
+    """One commodity as the Agent read it from the documents.
+
+    The Agent reads the confirmed text by meaning, so this is the layout- and
+    language-independent starting point for the shortlist: the item name as
+    written, the documents it appears in, any tariff code the documents cite
+    for it, and Korean tariff-nomenclature terms for looking it up.
+    """
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    description: str = Field(min_length=1, max_length=300)
+    document_ids: list[str] = Field(default_factory=list)
+    cited_hs_codes: list[str] = Field(default_factory=list)
+    search_terms: list[str] = Field(default_factory=list)
+
+
+def agent_hs_items(response: dict[str, Any]) -> list[AgentHsItem]:
+    """The goods the Agent read from the documents; malformed entries are dropped."""
+
+    items: list[AgentHsItem] = []
+    raw_items = response.get("items")
+    for raw in raw_items if isinstance(raw_items, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        description = raw.get("description")
+        if not isinstance(description, str) or not description.strip():
+            continue
+        items.append(
+            AgentHsItem(
+                description=" ".join(description.split())[:300],
+                document_ids=_string_list(raw.get("document_ids"), limit=20, max_length=128),
+                cited_hs_codes=[
+                    code
+                    for code in _string_list(raw.get("cited_hs_codes"), limit=10, max_length=10)
+                    if re.fullmatch(r"[0-9]{6,10}", code)
+                ],
+                search_terms=_string_list(raw.get("search_terms"), limit=10, max_length=80),
+            )
+        )
+    return items[:20]
+
+
+def _string_list(value: object, *, limit: int, max_length: int) -> list[str]:
+    result: list[str] = []
+    for raw in value if isinstance(value, list) else []:
+        if isinstance(raw, str):
+            text = " ".join(raw.split())
+            if text and len(text) <= max_length and text not in result:
+                result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _agent_item_basis(item: AgentHsItem, index: int) -> list[HsCandidateBasis]:
+    return [
+        HsCandidateBasis(
+            document_id=document_id,
+            fact_id=f"agent-item-{index}",
+            fact_name="description",
+            raw_value=item.description[:200],
+        )
+        for document_id in (item.document_ids or ["agent"])
+    ]
+
+
+def _agent_search_queries(item: AgentHsItem) -> list[str]:
+    """Reference-table lookups for one item: its product noun, all its terms, and cited prefixes."""
+
+    queries: list[str] = []
+    if item.search_terms:
+        queries.append(item.search_terms[0])
+        if len(item.search_terms) > 1:
+            queries.append(" ".join(item.search_terms))
+    # A 6- to 9-digit code on the documents names a heading or subheading;
+    # every HSK leaf under it belongs in the shortlist.
+    queries.extend(code for code in item.cited_hs_codes if _AGENT_CITED_PREFIX_PATTERN.match(code))
+    return list(dict.fromkeys(query for query in queries if query.strip()))
+
+
+def _agent_search_candidates(items: list[AgentHsItem]) -> list[HsCandidate]:
+    """Reference rows found by the Agent's Korean lookup terms and cited code prefixes."""
+
+    candidates: list[HsCandidate] = []
+    seen: set[str] = set()
+    for index, item in enumerate(items, start=1):
+        basis = _agent_item_basis(item, index)
+        for query in _agent_search_queries(item):
+            for result in search_hs_reference(query).results:
+                if result.code in seen:
+                    continue
+                seen.add(result.code)
+                candidates.append(
+                    HsCandidate(
+                        code=result.code,
+                        name_ko=result.name_ko,
+                        name_en=result.name_en,
+                        ancestors=result.ancestors,
+                        confidence=_AGENT_SEARCH_CONFIDENCE,
+                        in_reference=True,
+                        recommended=False,
+                        origin="description_match",
+                        basis=basis,
+                    )
+                )
+    return candidates
 
 
 def case_hs_shortlist(
     documents: list[tuple[DocumentRecord, str]],
     *,
-    extra_descriptions: list[str] | None = None,
-    extra_codes: list[str] | None = None,
+    agent_items: list[AgentHsItem] | None = None,
 ) -> list[HsCandidate]:
     """Reference codes the Agent may choose among: cited codes first, then name matches.
 
-    ``extra_descriptions``/``extra_codes`` come from the Agent's own reading of
-    the documents (a second, better-informed round); they widen the shortlist
-    but every entry still comes from the packaged HSK reference table.
+    With ``agent_items`` (the Agent's own reading of the documents) the
+    shortlist is built from what the Agent read -- item names, lookup terms
+    and cited codes -- instead of from the layout-bound heuristic cells, so a
+    document in an unfamiliar form or language still reaches the right rows.
+    Codes on the documents' own tariff lines are kept in both cases.  Every
+    entry still comes from the packaged HSK reference table.
     """
 
     scan = _scan_case_text(documents)
-    for line_no, code in enumerate(extra_codes or [], start=1):
-        if re.fullmatch(r"[0-9]{10}", code) and hs_reference_has(code):
-            scan.documents_with_hs.add("agent")
-            scan.code_documents.setdefault(code, set()).add("agent")
-            scan.code_basis.setdefault(code, []).append(
-                HsCandidateBasis(
-                    document_id="agent",
-                    fact_id=f"agent-cited-{line_no}",
-                    fact_name="cited_hs_code",
-                    raw_value=code,
+    items = list(agent_items or [])
+    if items:
+        scan.description_facts = []
+    for index, item in enumerate(items, start=1):
+        document_ids = item.document_ids or ["agent"]
+        for code in item.cited_hs_codes:
+            if len(code) != 10 or not hs_reference_has(code):
+                continue
+            for document_id in document_ids:
+                scan.documents_with_hs.add(document_id)
+                scan.code_documents.setdefault(code, set()).add(document_id)
+                scan.code_basis.setdefault(code, []).append(
+                    HsCandidateBasis(
+                        document_id=document_id,
+                        fact_id=f"agent-cited-{index}",
+                        fact_name="cited_hs_code",
+                        raw_value=code,
+                    )
                 )
-            )
-    for index, description in enumerate(extra_descriptions or [], start=1):
-        if description.strip():
-            scan.description_facts.append(
-                (
-                    "agent",
-                    {
-                        "fact_id": f"agent-item-{index}",
-                        "name": "description",
-                        "raw_value": description.strip()[:200],
-                        "normalized_value": description.strip()[:200],
-                    },
-                )
-            )
+        # The item name and each lookup term are matched separately (see
+        # _description_candidates_from_facts); the basis always shows the
+        # name as the Agent read it.
+        for term_index, value in enumerate([item.description, *item.search_terms]):
+            suffix = f"-term-{term_index}" if term_index else ""
+            fact = {
+                "fact_id": f"agent-item-{index}{suffix}",
+                "name": "description",
+                "raw_value": item.description[:200],
+                "normalized_value": value[:200],
+            }
+            for document_id in document_ids:
+                scan.description_facts.append((document_id, fact))
     shortlist = [
         candidate
         for candidate in _code_candidates(
@@ -779,9 +899,10 @@ def case_hs_shortlist(
         if candidate.in_reference
     ]
     seen = {candidate.code for candidate in shortlist}
-    for candidate in _description_candidates_from_facts(
-        scan.description_facts, limit=_AGENT_SHORTLIST_LIMIT
-    ):
+    for candidate in [
+        *_agent_search_candidates(items),
+        *_description_candidates_from_facts(scan.description_facts, limit=_AGENT_SHORTLIST_LIMIT),
+    ]:
         if candidate.code not in seen:
             seen.add(candidate.code)
             shortlist.append(candidate)
@@ -795,7 +916,11 @@ def agent_hs_request(
     *,
     max_picks: int = 5,
 ) -> dict[str, Any]:
-    """The Agent request: confirmed text plus the reference codes it may pick from."""
+    """The Agent request: confirmed text plus the reference codes it may pick from.
+
+    An empty ``shortlist`` asks for the extraction-only round: the Agent reads
+    the goods and returns no picks because it has nothing to pick from.
+    """
 
     return {
         "schema_version": "1.0",
@@ -819,23 +944,6 @@ def agent_hs_request(
         ][:_AGENT_SHORTLIST_LIMIT],
         "max_picks": max_picks,
     }
-
-
-def agent_hs_items(response: dict[str, Any]) -> tuple[list[str], list[str]]:
-    """Descriptions and 10-digit cited codes the Agent read from the documents."""
-
-    descriptions: list[str] = []
-    codes: list[str] = []
-    for item in response.get("items", []) if isinstance(response.get("items"), list) else []:
-        if not isinstance(item, dict):
-            continue
-        description = item.get("description")
-        if isinstance(description, str) and description.strip():
-            descriptions.append(description.strip())
-        for code in item.get("cited_hs_codes", []) if isinstance(item.get("cited_hs_codes"), list) else []:
-            if isinstance(code, str) and re.fullmatch(r"[0-9]{10}", code):
-                codes.append(code)
-    return descriptions, codes
 
 
 def apply_agent_hs_picks(

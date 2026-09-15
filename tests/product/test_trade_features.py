@@ -865,17 +865,30 @@ def test_newer_run_level_selection_wins_over_case_level_selection() -> None:
         assert wires[1]["reviewer_hs_selection"]["code"] == codes[0]
 
 
-def test_case_hs_classification_uses_agent_ranking_when_available() -> None:
-    requests: list[dict[str, Any]] = []
+def _tshirt_agent(requests: list[dict[str, Any]], *, rank: bool = True):
+    """An Agent that reads "MEN'S COTTON T-SHIRTS" and, given codes, ranks the cotton T-shirt row."""
 
     def handler(request: dict[str, Any]) -> dict[str, Any]:
         requests.append(request)
+        document_id = request["documents"][0]["document_id"]
+        items = [
+            {
+                "description": "MEN'S COTTON T-SHIRTS",
+                "document_ids": [document_id],
+                "cited_hs_codes": [],
+                "search_terms": ["티셔츠", "면", "남성용", "t-shirts"],
+            }
+        ]
+        if not request["reference_candidates"]:
+            return {"schema_version": "1.0", "status": "ok", "items": items, "picks": []}
+        if not rank:
+            raise RuntimeError("ranking round failed")
         codes = [item["code"] for item in request["reference_candidates"]]
         assert "6109101000" in codes
         return {
             "schema_version": "1.0",
             "status": "ok",
-            "items": [{"description": "MEN'S COTTON T-SHIRTS", "document_ids": ["d"], "cited_hs_codes": []}],
+            "items": items,
             "picks": [
                 {"code": "6109101000", "rank": 1, "confidence": 0.93, "reason": "면 소재 남성용 티셔츠"},
                 {"code": "9999999999", "rank": 2, "confidence": 0.5, "reason": "not in shortlist"},
@@ -883,8 +896,15 @@ def test_case_hs_classification_uses_agent_ranking_when_available() -> None:
             ],
         }
 
+    return handler
+
+
+def test_case_hs_classification_uses_agent_ranking_when_available() -> None:
+    requests: list[dict[str, Any]] = []
     invoice = "\n".join(["COMMERCIAL INVOICE", "Description of Goods", "MEN'S COTTON T-SHIRTS", "64,444 PCS"])
-    with _client(review_handler=_review_result_with_facts, hs_candidates_handler=handler) as client:
+    with _client(
+        review_handler=_review_result_with_facts, hs_candidates_handler=_tshirt_agent(requests)
+    ) as client:
         case_id = _case_with_documents(client, [("CI", "ci.txt", invoice)])
         body = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
         assert body["basis_kind"] == "agent_ranked"
@@ -894,9 +914,103 @@ def test_case_hs_classification_uses_agent_ranking_when_available() -> None:
         assert first["confidence"] == 0.93
         assert (second["code"], second["origin"]) == ("6105100000", "llm_match")
         assert all(candidate["code"] != "9999999999" for candidate in body["candidates"])
-        # The Agent received the confirmed text and only reference-table codes.
+        # Round one reads the documents with nothing to pick from; round two
+        # ranks reference-table codes only.  Both carry the confirmed text.
+        assert len(requests) == 2
+        assert requests[0]["reference_candidates"] == []
         assert requests[0]["documents"][0]["content_text"].startswith("COMMERCIAL INVOICE")
-        assert all(len(item["code"]) == 10 for item in requests[0]["reference_candidates"])
+        assert requests[1]["reference_candidates"]
+        assert all(len(item["code"]) == 10 for item in requests[1]["reference_candidates"])
+
+
+# Free-running prose with no "Description"/"Goods" label anywhere: nothing the
+# layout heuristics can anchor on.
+_PROSE_INVOICE = "\n".join(
+    [
+        "INVOICE 2026-0917",
+        "We confirm shipment on EVER GIVEN of 64,444 pcs MEN'S COTTON T-SHIRTS",
+        "to PACIFIC IMPORTS LLC, Rotterdam, CIF, total USD 139,843.48.",
+    ]
+)
+
+
+def test_case_hs_classification_follows_the_agent_reading_for_an_unfamiliar_layout() -> None:
+    # Without a model the heuristics find nothing in this layout ...
+    with _client(review_handler=_review_result_with_facts) as client:
+        case_id = _case_with_documents(client, [("CI", "ci.txt", _PROSE_INVOICE)])
+        body = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
+        assert body["candidates"] == []
+
+    # ... but the Agent's reading of the goods reaches the right reference rows
+    # through its Korean lookup terms, and the Agent then ranks them.
+    requests: list[dict[str, Any]] = []
+    with _client(
+        review_handler=_review_result_with_facts, hs_candidates_handler=_tshirt_agent(requests)
+    ) as client:
+        case_id = _case_with_documents(client, [("CI", "ci.txt", _PROSE_INVOICE)])
+        body = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
+        assert body["basis_kind"] == "agent_ranked"
+        first = body["candidates"][0]
+        assert (first["code"], first["origin"], first["recommended"]) == ("6109101000", "llm_match", True)
+        # The basis cites the real document, with the item name as the Agent read it.
+        assert first["basis"][0]["document_id"] == requests[0]["documents"][0]["document_id"]
+        assert first["basis"][0]["raw_value"] == "MEN'S COTTON T-SHIRTS"
+        assert len(requests) == 2 and requests[0]["reference_candidates"] == []
+
+
+def test_case_hs_classification_keeps_the_agent_reading_when_ranking_fails() -> None:
+    requests: list[dict[str, Any]] = []
+    with _client(
+        review_handler=_review_result_with_facts,
+        hs_candidates_handler=_tshirt_agent(requests, rank=False),
+    ) as client:
+        case_id = _case_with_documents(client, [("CI", "ci.txt", _PROSE_INVOICE)])
+        body = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
+        # No ranking, so no AI pick -- yet the candidates come from what the
+        # Agent read, not from the empty heuristics.
+        assert body["basis_kind"] == "document_text"
+        assert "6109101000" in {candidate["code"] for candidate in body["candidates"]}
+        assert all(candidate["origin"] == "description_match" for candidate in body["candidates"])
+        assert all(not candidate["recommended"] for candidate in body["candidates"])
+        assert len(requests) == 2
+
+
+def test_case_hs_shortlist_from_the_agent_reading_expands_cited_prefixes() -> None:
+    from customs_backend.domain import DocumentRecord
+    from customs_backend.trade_features import AgentHsItem, agent_hs_items, case_hs_shortlist
+
+    items = agent_hs_items(
+        {
+            "items": [
+                {
+                    "description": " MEN'S  COTTON T-SHIRTS ",
+                    "document_ids": ["d1", 3],
+                    "cited_hs_codes": ["610910", "6109.10", "12", "0303540000"],
+                    "search_terms": ["티셔츠", "티셔츠", "", 5],
+                },
+                {"description": ""},
+                "junk",
+            ]
+        }
+    )
+    assert items == [
+        AgentHsItem(
+            description="MEN'S COTTON T-SHIRTS",
+            document_ids=["d1"],
+            cited_hs_codes=["610910", "0303540000"],
+            search_terms=["티셔츠"],
+        )
+    ]
+
+    record = DocumentRecord.model_construct(document_id="d1", document_type="CI")
+    shortlist = case_hs_shortlist([(record, _PROSE_INVOICE)], agent_items=items)
+    codes = [candidate.code for candidate in shortlist]
+    # The 10-digit code the Agent read is a cited-code candidate; the 6-digit
+    # subheading brings every HSK leaf under it; the Korean term adds the rest.
+    assert codes[0] == "0303540000"
+    assert {code for code in codes if code.startswith("610910")} >= {"6109101000"}
+    assert len(codes) <= 40
+    assert {basis.document_id for candidate in shortlist for basis in candidate.basis} == {"d1"}
 
 
 def test_case_hs_classification_keeps_heuristics_when_the_agent_fails() -> None:

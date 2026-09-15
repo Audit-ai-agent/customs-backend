@@ -26,6 +26,16 @@
             "type": "string",
             "pattern": "^[0-9]{6,10}$"
           }
+        },
+        "search_terms": {
+          "description": "Korean tariff-nomenclature terms for the goods, product noun first, for the Backend's HSK reference lookup.",
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          }
         }
       },
       "required": [

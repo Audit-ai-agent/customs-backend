@@ -2181,23 +2181,25 @@ class WorkbenchService:
         view = build_case_hs_classification(case, texts)
         if not texts:
             return view
-        # The Agent reads the documents itself and ranks reference codes; the
-        # heuristic view above is the fallback for every failure or "no model".
+        # Two Agent rounds.  First the Agent reads the goods from the text
+        # itself, whatever the form or language, with no codes to choose from;
+        # the Backend turns that reading into reference-table rows.  Then the
+        # Agent ranks those rows.  The heuristic view above is the fallback
+        # for "no model" and for every failure; when the Agent did read the
+        # documents but could not rank, its reading still drives the list.
         try:
-            shortlist = case_hs_shortlist(texts)
-            response = self.agent.hs_candidates(agent_hs_request(case.case_id, texts, shortlist))
-            if response.get("status") == "ok" and not response.get("picks"):
-                descriptions, codes = agent_hs_items(response)
-                if descriptions or codes:
-                    shortlist = case_hs_shortlist(
-                        texts, extra_descriptions=descriptions, extra_codes=codes
-                    )
-                    if shortlist:
-                        response = self.agent.hs_candidates(
-                            agent_hs_request(case.case_id, texts, shortlist)
-                        )
-            return apply_agent_hs_picks(view, response, shortlist)
-        except Exception:  # noqa: BLE001 - any Agent problem keeps the deterministic candidates
+            reading = self.agent.hs_candidates(agent_hs_request(case.case_id, texts, []))
+            if reading.get("status") != "ok":
+                return view
+            items = agent_hs_items(reading)
+            shortlist = case_hs_shortlist(texts, agent_items=items)
+            if not shortlist:
+                return view
+            if items:
+                view = view.model_copy(update={"candidates": shortlist[:10]})
+            ranking = self.agent.hs_candidates(agent_hs_request(case.case_id, texts, shortlist))
+            return apply_agent_hs_picks(view, ranking, shortlist)
+        except Exception:  # noqa: BLE001 - any Agent problem keeps the candidates built so far
             return view
 
     def record_case_hs_selection(
