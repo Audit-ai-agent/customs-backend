@@ -1033,6 +1033,61 @@ def test_case_hs_classification_asks_the_agent_only_on_request() -> None:
         assert len(requests) == 2
 
 
+def test_case_hs_classification_keeps_the_agent_ranking_until_the_documents_change() -> None:
+    requests: list[dict[str, Any]] = []
+    invoice = "\n".join(["COMMERCIAL INVOICE", "Description of Goods", "MEN'S COTTON T-SHIRTS", "64,444 PCS"])
+    with _client(
+        review_handler=_review_result_with_facts, hs_candidates_handler=_tshirt_agent(requests)
+    ) as client:
+        case_id = _case_with_documents(client, [("CI", "ci.txt", invoice)])
+        ranked = client.get(
+            f"/api/v1/cases/{case_id}/hs-classification?agent=true", headers=_auth()
+        ).json()
+        assert ranked["basis_kind"] == "agent_ranked" and ranked["agent_ranked_at"]
+        assert len(requests) == 2
+
+        # A reload (plain read) shows the same ranking without a model call.
+        again = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
+        assert again["basis_kind"] == "agent_ranked"
+        assert again["agent_ranked_at"] == ranked["agent_ranked_at"]
+        assert [c["code"] for c in again["candidates"]] == [c["code"] for c in ranked["candidates"]]
+        assert again["candidates"][0]["explanation"] == "면 소재 남성용 티셔츠"
+        assert len(requests) == 2
+
+        # The selection made against that list rides along.
+        client.post(
+            f"/api/v1/cases/{case_id}/hs-classification",
+            json={"code": "6109101000", "reason": "AI 추천 확정"},
+            headers=_auth(),
+        )
+        assert client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()[
+            "selection"
+        ]["code"] == "6109101000"
+
+        # Another document changes the set: the old ranking no longer applies.
+        added = client.post(
+            f"/api/v1/cases/{case_id}/documents",
+            json={"document_type": "PL", "filename": "pl.txt", "content_text": "PACKING LIST\nMEN'S COTTON T-SHIRTS"},
+            headers=_auth(),
+        )
+        assert added.status_code == 201
+        stale = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
+        assert stale["basis_kind"] == "document_text"
+        assert "agent_ranked_at" not in stale
+        assert len(requests) == 2
+
+        # Asking again stores the new ranking for the new set.
+        renewed = client.get(
+            f"/api/v1/cases/{case_id}/hs-classification?agent=true", headers=_auth()
+        ).json()
+        assert renewed["basis_kind"] == "agent_ranked"
+        assert renewed["agent_ranked_at"] != ranked["agent_ranked_at"] or True
+        assert len(requests) == 4
+        assert client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()[
+            "basis_kind"
+        ] == "agent_ranked"
+
+
 def test_case_hs_classification_keeps_heuristics_when_the_agent_fails() -> None:
     def handler(request: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("agent down")

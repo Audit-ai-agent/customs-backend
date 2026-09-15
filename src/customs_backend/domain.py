@@ -194,6 +194,22 @@ class CaseClosureRecord(BaseModel):
     closed_at: datetime
 
 
+class CaseHsAgentRankingRecord(BaseModel):
+    """The last Agent-ranked HSK candidate list for a case.
+
+    Kept so that reopening the case shows the ranking again without spending
+    the Agent's two model rounds.  It is bound to the document set (ids and
+    content digests) it was read from: once a document is added, replaced or
+    re-confirmed the ranking is hidden until the reviewer asks again.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    document_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    ranked_at: datetime
+    candidates: list[dict[str, Any]] = Field(default_factory=list, max_length=10)
+
+
 class CaseRecord(BaseModel):
     case_id: str
     org_id: str
@@ -210,6 +226,9 @@ class CaseRecord(BaseModel):
     # very first run can already retrieve law evidence.  Reviewer-owned;
     # never derived from or written by an Agent result.
     hs_selection: HsSelectionRecord | None = None
+    # Advisory only: the Agent's last ranking, never a source for review
+    # facts or the reviewer's selection.
+    hs_agent_ranking: CaseHsAgentRankingRecord | None = None
     created_by: str
     created_at: datetime
     updated_at: datetime

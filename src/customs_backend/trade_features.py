@@ -13,15 +13,23 @@ the view reports the gap instead of inventing a value.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from datetime import datetime
 from functools import lru_cache
 from importlib import resources
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from customs_backend.domain import CaseRecord, DocumentRecord, HsSelectionRecord, ReviewRunRecord
+from customs_backend.domain import (
+    CaseHsAgentRankingRecord,
+    CaseRecord,
+    DocumentRecord,
+    HsSelectionRecord,
+    ReviewRunRecord,
+)
 from customs_backend.duty_reference import (
     UNIPASS_SOURCE_URI,
     DutyReferenceStore,
@@ -205,6 +213,9 @@ class CaseHsClassificationView(BaseModel):
     reference: HsReferenceInfo
     candidates: list[HsCandidate]
     selection: HsSelectionRecord | None = None
+    # When the Agent ranked these candidates (stored per case, so a reload
+    # shows the same list without another model call).
+    agent_ranked_at: datetime | None = None
 
 
 class HsClassificationView(BaseModel):
@@ -705,11 +716,61 @@ def _reference_info() -> HsReferenceInfo:
     )
 
 
+def case_hs_document_digest(documents: list[tuple[DocumentRecord, str]]) -> str:
+    """Identity of the document set an Agent ranking was read from."""
+
+    parts = sorted(f"{record.document_id}:{record.content_sha256}" for record, _ in documents)
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def case_hs_agent_ranking(
+    view: CaseHsClassificationView,
+    documents: list[tuple[DocumentRecord, str]],
+    *,
+    ranked_at: datetime,
+) -> CaseHsAgentRankingRecord:
+    """The stored form of an Agent-ranked view, bound to the current documents."""
+
+    return CaseHsAgentRankingRecord(
+        document_digest=case_hs_document_digest(documents),
+        ranked_at=ranked_at,
+        candidates=[candidate.model_dump(mode="json") for candidate in view.candidates[:10]],
+    )
+
+
+def _stored_agent_ranking(
+    case: CaseRecord, documents: list[tuple[DocumentRecord, str]]
+) -> tuple[list[HsCandidate], datetime] | None:
+    ranking = case.hs_agent_ranking
+    if ranking is None or ranking.document_digest != case_hs_document_digest(documents):
+        return None
+    try:
+        candidates = [HsCandidate.model_validate(item) for item in ranking.candidates]
+    except ValueError:
+        return None
+    return (candidates, ranking.ranked_at) if candidates else None
+
+
 def build_case_hs_classification(
     case: CaseRecord, documents: list[tuple[DocumentRecord, str]]
 ) -> CaseHsClassificationView:
-    """Offer HSK candidates from confirmed document text, before any review."""
+    """Offer HSK candidates from confirmed document text, before any review.
 
+    A stored Agent ranking for exactly this document set is returned as is;
+    otherwise the candidates come from the text heuristics.
+    """
+
+    stored = _stored_agent_ranking(case, documents)
+    if stored is not None:
+        candidates, ranked_at = stored
+        return CaseHsClassificationView(
+            case_id=case.case_id,
+            basis_kind="agent_ranked",
+            reference=_reference_info(),
+            candidates=candidates,
+            selection=case.hs_selection,
+            agent_ranked_at=ranked_at,
+        )
     scan = _scan_case_text(documents)
     candidates = _code_candidates(
         code_documents=scan.code_documents,

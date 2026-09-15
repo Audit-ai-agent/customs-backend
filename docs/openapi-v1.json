@@ -249,10 +249,53 @@
         "title": "CaseCreate",
         "type": "object"
       },
+      "CaseHsAgentRankingRecord": {
+        "additionalProperties": false,
+        "description": "The last Agent-ranked HSK candidate list for a case.\n\nKept so that reopening the case shows the ranking again without spending\nthe Agent's two model rounds.  It is bound to the document set (ids and\ncontent digests) it was read from: once a document is added, replaced or\nre-confirmed the ranking is hidden until the reviewer asks again.",
+        "properties": {
+          "candidates": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "maxItems": 10,
+            "title": "Candidates",
+            "type": "array"
+          },
+          "document_digest": {
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Document Digest",
+            "type": "string"
+          },
+          "ranked_at": {
+            "format": "date-time",
+            "title": "Ranked At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "document_digest",
+          "ranked_at"
+        ],
+        "title": "CaseHsAgentRankingRecord",
+        "type": "object"
+      },
       "CaseHsClassificationView": {
         "additionalProperties": false,
         "description": "HSK candidates read from the case's confirmed document text.\n\nAvailable before any AI review: codes are collected only from text lines\nthat name a tariff code, and a description match is offered when no code\nis cited.  Confirming a code here feeds the first review's law-evidence\nretrieval as the reviewer HS selection.",
         "properties": {
+          "agent_ranked_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Ranked At"
+          },
           "basis_kind": {
             "default": "document_text",
             "enum": [
@@ -351,6 +394,16 @@
               }
             ],
             "title": "External Reference"
+          },
+          "hs_agent_ranking": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CaseHsAgentRankingRecord"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "hs_selection": {
             "anyOf": [

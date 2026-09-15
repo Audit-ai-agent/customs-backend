@@ -160,6 +160,7 @@ from customs_backend.trade_features import (
     agent_hs_request,
     apply_agent_hs_picks,
     build_case_hs_classification,
+    case_hs_agent_ranking,
     build_hs_classification,
     case_hs_shortlist,
     build_origin_verification,
@@ -2187,12 +2188,20 @@ class WorkbenchService:
         view = build_case_hs_classification(case, texts)
         if not texts or not use_agent:
             return view
+        # An explicit request always re-reads; the stored ranking (if any)
+        # only survives as the fallback when the Agent cannot answer.
+        fresh = view.model_copy(
+            update={"basis_kind": "document_text", "agent_ranked_at": None}
+        )
         # Two Agent rounds.  First the Agent reads the goods from the text
         # itself, whatever the form or language, with no codes to choose from;
         # the Backend turns that reading into reference-table rows.  Then the
         # Agent ranks those rows.  The heuristic view above is the fallback
         # for "no model" and for every failure; when the Agent did read the
         # documents but could not rank, its reading still drives the list.
+        # What to show when the Agent cannot rank: the stored ranking if one
+        # applies, otherwise the best list built so far.
+        fallback = view
         try:
             reading = self.agent.hs_candidates(agent_hs_request(case.case_id, texts, []))
             if reading.get("status") != "ok":
@@ -2202,11 +2211,22 @@ class WorkbenchService:
             if not shortlist:
                 return view
             if items:
-                view = view.model_copy(update={"candidates": shortlist[:10]})
+                fresh = fresh.model_copy(update={"candidates": shortlist[:10]})
+                if view.basis_kind != "agent_ranked":
+                    fallback = fresh
             ranking = self.agent.hs_candidates(agent_hs_request(case.case_id, texts, shortlist))
-            return apply_agent_hs_picks(view, ranking, shortlist)
+            ranked = apply_agent_hs_picks(fresh, ranking, shortlist)
+            if ranked.basis_kind != "agent_ranked":
+                return fallback
+            ranked = ranked.model_copy(update={"agent_ranked_at": utc_now()})
+            self.repository.record_case_hs_agent_ranking(
+                org_id=principal.org_id,
+                case_id=case.case_id,
+                ranking=case_hs_agent_ranking(ranked, texts, ranked_at=ranked.agent_ranked_at),
+            )
+            return ranked
         except Exception:  # noqa: BLE001 - any Agent problem keeps the candidates built so far
-            return view
+            return fallback
 
     def record_case_hs_selection(
         self, principal: Principal, case_id: str, request: HsSelectionRequest

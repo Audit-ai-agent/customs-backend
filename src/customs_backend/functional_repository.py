@@ -7,6 +7,7 @@ import json
 from typing import Any
 
 from customs_backend.domain import (
+    CaseHsAgentRankingRecord,
     CaseClosureRecord,
     CaseRecord,
     ConversationMessageExchange,
@@ -559,6 +560,16 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
         )
         self._persist()
         return value
+
+    def record_case_hs_agent_ranking(
+        self,
+        *,
+        org_id: str,
+        case_id: str,
+        ranking: CaseHsAgentRankingRecord | None,
+    ) -> None:
+        super().record_case_hs_agent_ranking(org_id=org_id, case_id=case_id, ranking=ranking)
+        self._persist()
 
     def record_hs_selection(
         self,

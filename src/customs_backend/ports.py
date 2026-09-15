@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any, Protocol
 
 from customs_backend.domain import (
+    CaseHsAgentRankingRecord,
     CaseClosureRecord,
     CaseRecord,
     ConversationMessageExchange,
@@ -205,6 +206,13 @@ class WorkbenchRepository(Protocol):
         reason: str,
         selected_by: str,
     ) -> HsSelectionRecord: ...
+    def record_case_hs_agent_ranking(
+        self,
+        *,
+        org_id: str,
+        case_id: str,
+        ranking: CaseHsAgentRankingRecord | None,
+    ) -> None: ...
     def close_case(
         self, *, org_id: str, case_id: str, closure: CaseClosureRecord
     ) -> CaseRecord: ...

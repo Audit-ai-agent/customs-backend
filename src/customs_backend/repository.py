@@ -8,6 +8,7 @@ from threading import RLock
 from typing import Any
 
 from customs_backend.domain import (
+    CaseHsAgentRankingRecord,
     CaseClosureRecord,
     CaseRecord,
     ConversationMessageExchange,
@@ -150,6 +151,27 @@ class InMemoryWorkbenchRepository:
             updated = record.model_copy(update={"hs_selection": selection, "updated_at": now})
             self._cases[case_id] = self._copy(updated)
             return self._copy(selection)
+
+    def record_case_hs_agent_ranking(
+        self,
+        *,
+        org_id: str,
+        case_id: str,
+        ranking: CaseHsAgentRankingRecord | None,
+    ) -> None:
+        """Replace (or with ``None`` drop) the case's stored Agent HSK ranking.
+
+        Advisory state only: neither the case revision nor ``updated_at``
+        moves, so queued reviews and the case list stay as they were.
+        """
+
+        with self._lock:
+            record = self._cases.get(case_id)
+            if record is None or record.org_id != org_id:
+                raise ConflictError("case does not exist")
+            self._cases[case_id] = self._copy(
+                record.model_copy(update={"hs_agent_ranking": ranking})
+            )
 
     def delete_case(self, *, org_id: str, case_id: str) -> None:
         """Remove a case and every record attached to it (local admin path).
