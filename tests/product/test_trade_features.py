@@ -636,6 +636,40 @@ def test_case_hs_classification_falls_back_to_description_match() -> None:
             assert candidate["recommended"] is False
 
 
+def test_case_hs_classification_reads_item_name_below_a_table_header_cell() -> None:
+    # Text-layer extraction of a tabular invoice renders one cell per line:
+    # the header "Description of Goods", other headers, marks, then the name.
+    invoice = "\n".join(
+        [
+            "COMMERCIAL INVOICE",
+            "Marks & No. of PKGS",
+            "Description of Goods",
+            "Quantity",
+            "Unit price",
+            "Amount",
+            "PACIFIC",
+            "C/NO. 1-204",
+            "ROTTERDAM",
+            "MEN'S COTTON T-SHIRTS",
+            "64,444 PCS",
+            "@ 2.17",
+            "USD 139,843.48",
+            "TOTAL",
+            "USD 139,843.48",
+        ]
+    )
+    with _client(review_handler=_review_result_with_facts) as client:
+        case_id = _case_with_documents(client, [("CI", "ci.txt", invoice)])
+        body = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
+        codes = [candidate["code"] for candidate in body["candidates"]]
+        assert "6109101000" in codes
+        raw_values = {basis["raw_value"] for candidate in body["candidates"] for basis in candidate["basis"]}
+        assert "MEN'S COTTON T-SHIRTS" in raw_values
+        # The header cell itself and the amount cells are not item names.
+        assert "Description of Goods" not in raw_values
+        assert not any(value.startswith("USD") for value in raw_values)
+
+
 def test_case_hs_selection_rejects_codes_outside_reference_and_closed_cases() -> None:
     with _client(review_handler=_review_result_with_facts) as client:
         case_id = _case_with_documents(client, [("CI", "ci.txt", "COMMERCIAL INVOICE\nHS CODE: 0303540000")])

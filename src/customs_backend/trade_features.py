@@ -39,7 +39,66 @@ _HS_LINE_PATTERN = re.compile(r"(?i)\bH\.?S\.?K?\b|세번|품목\s*번호|tariff
 _DESCRIPTION_LINE_PATTERN = re.compile(r"(?i)\bdescription\b|\bgoods\b|품명|물품명|품목명")
 # "Description: Frozen mackerel | HS Code: ... | Quantity: ..." -> "Frozen mackerel".
 _DESCRIPTION_LABEL_PATTERN = re.compile(r"(?i)^(?:goods\s+)?(?:description|품명|물품명|품목명)\s*[:：]\s*")
+# A description cell rendered as its own text line ("Description of Goods",
+# "Goods Description", "6. Description of Goods / Quantity"): the item name
+# then sits on one of the following lines, among other table cells.
+_DESCRIPTION_HEADER_ONLY_PATTERN = re.compile(
+    r"(?i)^[\s\d.]*(?:goods\s+description|description\s+of\s+goods|description|품명|물품명|품목명)"
+    r"(?:\s*/\s*(?:quantity|qty|수량))?\s*[:：]?\s*$"
+)
+_TABLE_CELL_NOISE_PATTERN = re.compile(
+    r"(?i)^(?:\d+\.?\s*)?(?:quantity|qty|unit\s*price|amount|net\s*weight|gross\s*weight|measurement|"
+    r"marks?(?:\s*(?:&|and)\s*(?:no\.?|numbers?))?|no\.?\s*(?:&\s*kind\s*)?of\s*pkgs|total|signed|remarks?|"
+    r"hs\s*code|origin|country\s*of\s*origin|수량|단가|금액|순중량|총중량)\b"
+)
+# After the item name, the next cells are quantities/amounts; stop there.
+_ITEM_STOP_PATTERN = re.compile(
+    r"(?i)\b(?:pcs?|kgs?|cbm|usd|eur|jpy|cny|krw|cartons?|ctns?|sets?|ea|mt)\b|^total\b|^합계"
+)
+_DESCRIPTION_FOLLOW_LINES = 16
 _CASE_TEXT_LINE_LIMIT = 400
+
+
+def _looks_like_item_name(line: str) -> bool:
+    """A table cell that can be an item name: mostly words, not a number/unit cell."""
+
+    if _TABLE_CELL_NOISE_PATTERN.match(line):
+        return False
+    letters = len(re.findall(r"[A-Za-z가-힣]", line))
+    digits = len(re.findall(r"[0-9]", line))
+    return letters >= 4 and letters > digits * 2
+
+
+def _description_values(lines: list[str]) -> list[tuple[int, str]]:
+    """Item-name text from labelled lines and from cells below a header cell."""
+
+    values: list[tuple[int, str]] = []
+    follow_until = -1
+    collected_below_header = 0
+    for line_no, raw in enumerate(lines, start=1):
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if line_no <= follow_until:
+            if _looks_like_item_name(stripped):
+                values.append((line_no, stripped[:200]))
+                collected_below_header += 1
+            elif collected_below_header and _ITEM_STOP_PATTERN.search(stripped):
+                follow_until = -1
+            continue
+        keyword = _DESCRIPTION_LINE_PATTERN.search(stripped)
+        # A label sits at the start of its line; "…the goods described above"
+        # in running prose is not a description cell.
+        if keyword is None or keyword.start() > 25:
+            continue
+        if _DESCRIPTION_HEADER_ONLY_PATTERN.match(stripped):
+            follow_until = line_no + _DESCRIPTION_FOLLOW_LINES
+            collected_below_header = 0
+            continue
+        value = _DESCRIPTION_LABEL_PATTERN.sub("", stripped.split("|", 1)[0]).strip()
+        if value:
+            values.append((line_no, value[:200]))
+    return values
 _MONEY_PATTERN = re.compile(r"(?:([A-Z]{3})\s*)?([0-9][0-9,]*(?:\.[0-9]+)?)")
 _COUNTRY_PATTERN = re.compile(r"^[A-Z]{2}$")
 
@@ -537,7 +596,20 @@ def build_case_hs_classification(
     documents_with_hs: set[str] = set()
     description_facts: list[tuple[str, dict[str, Any]]] = []
     for record, text in documents:
-        for line_no, line in enumerate(text.splitlines()[:_CASE_TEXT_LINE_LIMIT], start=1):
+        lines = text.splitlines()[:_CASE_TEXT_LINE_LIMIT]
+        for line_no, value in _description_values(lines):
+            description_facts.append(
+                (
+                    record.document_id,
+                    {
+                        "fact_id": f"text-line-{line_no}",
+                        "name": "description",
+                        "raw_value": value,
+                        "normalized_value": value,
+                    },
+                )
+            )
+        for line_no, line in enumerate(lines, start=1):
             stripped = line.strip()
             if not stripped:
                 continue
@@ -553,23 +625,6 @@ def build_case_hs_classification(
                             raw_value=stripped[:200],
                         )
                     )
-            if _DESCRIPTION_LINE_PATTERN.search(stripped):
-                # Match only the item name, not the rest of a pipe-separated
-                # line (codes, quantities, units) that would pull in noise.
-                value = _DESCRIPTION_LABEL_PATTERN.sub("", stripped.split("|", 1)[0]).strip()
-                if not value:
-                    continue
-                description_facts.append(
-                    (
-                        record.document_id,
-                        {
-                            "fact_id": f"text-line-{line_no}",
-                            "name": "description",
-                            "raw_value": value[:200],
-                            "normalized_value": value[:200],
-                        },
-                    )
-                )
     candidates = _code_candidates(
         code_documents=code_documents, code_basis=code_basis, documents_with_hs=documents_with_hs
     )
