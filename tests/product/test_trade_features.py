@@ -624,11 +624,13 @@ def test_case_hs_classification_falls_back_to_description_match() -> None:
     with _client(review_handler=_review_result_with_facts) as client:
         case_id = _case_with_documents(
             client,
-            [("CI", "ci.txt", "COMMERCIAL INVOICE\nDescription: MEN'S COTTON T-SHIRTS\nQty: 10")],
+            [("CI", "ci.txt", "COMMERCIAL INVOICE\nDescription: MEN'S COTTON T-SHIRTS | HS Code: 610910 | Quantity: 10 PCS\nQty: 10")],
         )
         body = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
         assert body["candidates"]
         assert "6109101000" in {candidate["code"] for candidate in body["candidates"]}
+        # Only the item name is matched; the pipe-separated tail is not.
+        assert body["candidates"][0]["basis"][0]["raw_value"] == "MEN'S COTTON T-SHIRTS"
         for candidate in body["candidates"]:
             assert candidate["origin"] == "description_match"
             assert candidate["recommended"] is False

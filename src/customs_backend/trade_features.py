@@ -37,6 +37,8 @@ _HS_CODE_PATTERN = re.compile(r"\b([0-9]{10})\b")
 # elsewhere (invoice or container numbers) is not an HS candidate.
 _HS_LINE_PATTERN = re.compile(r"(?i)\bH\.?S\.?K?\b|세번|품목\s*번호|tariff")
 _DESCRIPTION_LINE_PATTERN = re.compile(r"(?i)\bdescription\b|\bgoods\b|품명|물품명|품목명")
+# "Description: Frozen mackerel | HS Code: ... | Quantity: ..." -> "Frozen mackerel".
+_DESCRIPTION_LABEL_PATTERN = re.compile(r"(?i)^(?:goods\s+)?(?:description|품명|물품명|품목명)\s*[:：]\s*")
 _CASE_TEXT_LINE_LIMIT = 400
 _MONEY_PATTERN = re.compile(r"(?:([A-Z]{3})\s*)?([0-9][0-9,]*(?:\.[0-9]+)?)")
 _COUNTRY_PATTERN = re.compile(r"^[A-Z]{2}$")
@@ -552,14 +554,19 @@ def build_case_hs_classification(
                         )
                     )
             if _DESCRIPTION_LINE_PATTERN.search(stripped):
+                # Match only the item name, not the rest of a pipe-separated
+                # line (codes, quantities, units) that would pull in noise.
+                value = _DESCRIPTION_LABEL_PATTERN.sub("", stripped.split("|", 1)[0]).strip()
+                if not value:
+                    continue
                 description_facts.append(
                     (
                         record.document_id,
                         {
                             "fact_id": f"text-line-{line_no}",
                             "name": "description",
-                            "raw_value": stripped[:200],
-                            "normalized_value": stripped[:200],
+                            "raw_value": value[:200],
+                            "normalized_value": value[:200],
                         },
                     )
                 )
