@@ -206,6 +206,10 @@ class CaseRecord(BaseModel):
     # The reviewer's final internal disposition. Historic cases stay readable
     # with no closure; a closed case never carries an external transmission.
     closure: CaseClosureRecord | None = None
+    # A reviewer may confirm the HSK code before the first AI review so the
+    # very first run can already retrieve law evidence.  Reviewer-owned;
+    # never derived from or written by an Agent result.
+    hs_selection: HsSelectionRecord | None = None
     created_by: str
     created_at: datetime
     updated_at: datetime

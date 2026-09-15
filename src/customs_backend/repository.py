@@ -112,6 +112,45 @@ class InMemoryWorkbenchRepository:
             self._cases[case_id] = self._copy(updated)
             return self._copy(updated)
 
+    def record_case_hs_selection(
+        self,
+        *,
+        org_id: str,
+        case_id: str,
+        code: str,
+        reason: str,
+        selected_by: str,
+    ) -> HsSelectionRecord:
+        """Atomically replace the case's reviewer HS code selection.
+
+        Reviewer-owned history only: the case revision (part of every review
+        input digest) is left unchanged, so an already queued review keeps
+        its idempotency identity.
+        """
+
+        with self._lock:
+            record = self._cases.get(case_id)
+            if record is None or record.org_id != org_id:
+                raise ConflictError("case does not exist")
+            now = utc_now()
+            entry = HsSelectionHistoryEntry(
+                code=code,
+                reason=reason,
+                selected_by=selected_by,
+                selected_at=now,
+            )
+            history = [*record.hs_selection.history, entry] if record.hs_selection else [entry]
+            selection = HsSelectionRecord(
+                code=code,
+                reason=reason,
+                selected_by=selected_by,
+                selected_at=now,
+                history=history[-100:],
+            )
+            updated = record.model_copy(update={"hs_selection": selection, "updated_at": now})
+            self._cases[case_id] = self._copy(updated)
+            return self._copy(selection)
+
     def delete_case(self, *, org_id: str, case_id: str) -> None:
         """Remove a case and every record attached to it (local admin path).
 

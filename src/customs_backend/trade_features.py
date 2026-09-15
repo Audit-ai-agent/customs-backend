@@ -21,7 +21,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from customs_backend.domain import HsSelectionRecord, ReviewRunRecord
+from customs_backend.domain import CaseRecord, DocumentRecord, HsSelectionRecord, ReviewRunRecord
 from customs_backend.duty_reference import (
     UNIPASS_SOURCE_URI,
     DutyReferenceStore,
@@ -33,6 +33,11 @@ _ORIGIN_FACT_NAMES = frozenset({"origin_country", "country_of_origin"})
 _AMOUNT_FACT_NAMES = ("total_amount", "amount")
 _DESCRIPTION_FACT_NAMES = frozenset({"description", "goods_description"})
 _HS_CODE_PATTERN = re.compile(r"\b([0-9]{10})\b")
+# Document text lines that name a tariff code; a bare 10-digit number
+# elsewhere (invoice or container numbers) is not an HS candidate.
+_HS_LINE_PATTERN = re.compile(r"(?i)\bH\.?S\.?K?\b|세번|품목\s*번호|tariff")
+_DESCRIPTION_LINE_PATTERN = re.compile(r"(?i)\bdescription\b|\bgoods\b|품명|물품명|품목명")
+_CASE_TEXT_LINE_LIMIT = 400
 _MONEY_PATTERN = re.compile(r"(?:([A-Z]{3})\s*)?([0-9][0-9,]*(?:\.[0-9]+)?)")
 _COUNTRY_PATTERN = re.compile(r"^[A-Z]{2}$")
 
@@ -99,6 +104,24 @@ class HsReferenceInfo(BaseModel):
 
     as_of: str
     source: str
+
+
+class CaseHsClassificationView(BaseModel):
+    """HSK candidates read from the case's confirmed document text.
+
+    Available before any AI review: codes are collected only from text lines
+    that name a tariff code, and a description match is offered when no code
+    is cited.  Confirming a code here feeds the first review's law-evidence
+    retrieval as the reviewer HS selection.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    case_id: str
+    basis_kind: Literal["document_text"] = "document_text"
+    reference: HsReferenceInfo
+    candidates: list[HsCandidate]
+    selection: HsSelectionRecord | None = None
 
 
 class HsClassificationView(BaseModel):
@@ -418,7 +441,12 @@ def _description_facts(analyses: list[dict[str, Any]]) -> list[tuple[str, dict[s
 
 
 def _description_candidates(analyses: list[dict[str, Any]]) -> list[HsCandidate]:
-    facts = _description_facts(analyses)
+    return _description_candidates_from_facts(_description_facts(analyses))
+
+
+def _description_candidates_from_facts(
+    facts: list[tuple[str, dict[str, Any]]],
+) -> list[HsCandidate]:
     stems: set[str] = set()
     for _, fact in facts:
         stems |= _description_stems(_fact_value(fact))
@@ -461,6 +489,96 @@ def _description_candidates(analyses: list[dict[str, Any]]) -> list[HsCandidate]
     return candidates
 
 
+def _code_candidates(
+    *,
+    code_documents: dict[str, set[str]],
+    code_basis: dict[str, list[HsCandidateBasis]],
+    documents_with_hs: set[str],
+) -> list[HsCandidate]:
+    total_documents = len(documents_with_hs)
+    candidates: list[HsCandidate] = []
+    best_share = 0.0
+    for documents in code_documents.values():
+        share = len(documents) / total_documents if total_documents else 0.0
+        best_share = max(best_share, share)
+    for code, documents in sorted(
+        code_documents.items(), key=lambda item: (-len(item[1]), item[0])
+    ):
+        share = len(documents) / total_documents if total_documents else 0.0
+        in_reference = hs_reference_has(code)
+        name_ko, name_en = _leaf_names(code)
+        candidates.append(
+            HsCandidate(
+                code=code,
+                name_ko=name_ko,
+                name_en=name_en,
+                ancestors=_ancestors_for(code),
+                confidence=round(share if in_reference else min(share, 0.5), 4),
+                in_reference=in_reference,
+                recommended=in_reference
+                and share == best_share
+                and sum(1 for docs in code_documents.values() if len(docs) / total_documents == best_share) == 1,
+                basis=code_basis[code][:20],
+            )
+        )
+    return candidates
+
+
+def build_case_hs_classification(
+    case: CaseRecord, documents: list[tuple[DocumentRecord, str]]
+) -> CaseHsClassificationView:
+    """Offer HSK candidates from confirmed document text, before any review."""
+
+    reference = hsk_names()
+    code_basis: dict[str, list[HsCandidateBasis]] = {}
+    code_documents: dict[str, set[str]] = {}
+    documents_with_hs: set[str] = set()
+    description_facts: list[tuple[str, dict[str, Any]]] = []
+    for record, text in documents:
+        for line_no, line in enumerate(text.splitlines()[:_CASE_TEXT_LINE_LIMIT], start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if _HS_LINE_PATTERN.search(stripped):
+                for code in _hs_codes_in(stripped):
+                    documents_with_hs.add(record.document_id)
+                    code_documents.setdefault(code, set()).add(record.document_id)
+                    code_basis.setdefault(code, []).append(
+                        HsCandidateBasis(
+                            document_id=record.document_id,
+                            fact_id=f"text-line-{line_no}",
+                            fact_name="document_text",
+                            raw_value=stripped[:200],
+                        )
+                    )
+            if _DESCRIPTION_LINE_PATTERN.search(stripped):
+                description_facts.append(
+                    (
+                        record.document_id,
+                        {
+                            "fact_id": f"text-line-{line_no}",
+                            "name": "description",
+                            "raw_value": stripped[:200],
+                            "normalized_value": stripped[:200],
+                        },
+                    )
+                )
+    candidates = _code_candidates(
+        code_documents=code_documents, code_basis=code_basis, documents_with_hs=documents_with_hs
+    )
+    if not candidates:
+        candidates = _description_candidates_from_facts(description_facts)
+    return CaseHsClassificationView(
+        case_id=case.case_id,
+        reference=HsReferenceInfo(
+            as_of=str(reference.get("as_of", "")),
+            source=str(reference.get("source", "")),
+        ),
+        candidates=candidates,
+        selection=case.hs_selection,
+    )
+
+
 def build_hs_classification(run: ReviewRunRecord) -> HsClassificationView:
     reference = hsk_names()
     code_basis: dict[str, list[HsCandidateBasis]] = {}
@@ -488,32 +606,9 @@ def build_hs_classification(run: ReviewRunRecord) -> HsClassificationView:
                     )
                 )
 
-    total_documents = len(documents_with_hs)
-    candidates: list[HsCandidate] = []
-    best_share = 0.0
-    for code, documents in code_documents.items():
-        share = len(documents) / total_documents if total_documents else 0.0
-        best_share = max(best_share, share)
-    for code, documents in sorted(
-        code_documents.items(), key=lambda item: (-len(item[1]), item[0])
-    ):
-        share = len(documents) / total_documents if total_documents else 0.0
-        in_reference = hs_reference_has(code)
-        name_ko, name_en = _leaf_names(code)
-        candidates.append(
-            HsCandidate(
-                code=code,
-                name_ko=name_ko,
-                name_en=name_en,
-                ancestors=_ancestors_for(code),
-                confidence=round(share if in_reference else min(share, 0.5), 4),
-                in_reference=in_reference,
-                recommended=in_reference
-                and share == best_share
-                and sum(1 for docs in code_documents.values() if len(docs) / total_documents == best_share) == 1,
-                basis=code_basis[code][:20],
-            )
-        )
+    candidates = _code_candidates(
+        code_documents=code_documents, code_basis=code_basis, documents_with_hs=documents_with_hs
+    )
 
     if not candidates:
         candidates = _description_candidates(

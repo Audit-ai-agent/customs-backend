@@ -149,12 +149,14 @@ from customs_backend.operations_metrics import (
     build_operations_metrics,
 )
 from customs_backend.trade_features import (
+    CaseHsClassificationView,
     DutyAssessmentView,
     HsClassificationView,
     HsReferenceEntryView,
     HsReferenceSearchView,
     OriginVerificationView,
     build_duty_assessment,
+    build_case_hs_classification,
     build_hs_classification,
     build_origin_verification,
     lookup_hs_reference,
@@ -2139,12 +2141,59 @@ class WorkbenchService:
         )
 
     def _latest_hs_selection_code(self, principal: Principal, case_id: str) -> str | None:
-        """Return the case's most recent reviewer-confirmed HSK code, if any."""
+        """Return the case's most recent reviewer-confirmed HSK code, if any.
 
+        A case-level confirmation (made before or between reviews) and a
+        run-level confirmation are both reviewer-owned; the newest one wins.
+        """
+
+        selections: list[HsSelectionRecord] = []
+        case = self.repository.get_case(principal.org_id, case_id)
+        if case is not None and case.hs_selection is not None:
+            selections.append(case.hs_selection)
         for run in self.repository.list_runs(principal.org_id, case_id):
             if run.hs_selection is not None:
-                return run.hs_selection.code
-        return None
+                selections.append(run.hs_selection)
+        if not selections:
+            return None
+        return max(selections, key=lambda item: item.selected_at).code
+
+    def case_hs_classification(
+        self, principal: Principal, case_id: str
+    ) -> CaseHsClassificationView:
+        """HSK candidates from the case's confirmed documents, before any review."""
+
+        case = self.get_case(principal, case_id)
+        documents = _active_documents(self.repository.list_documents(principal.org_id, case_id))
+        texts = [
+            (
+                record,
+                self.object_store.get_text(
+                    key=record.object_key, expected_sha256=record.content_sha256
+                ),
+            )
+            for record in documents
+        ]
+        return build_case_hs_classification(case, texts)
+
+    def record_case_hs_selection(
+        self, principal: Principal, case_id: str, request: HsSelectionRequest
+    ) -> HsSelectionRecord:
+        self._require_role(principal, Role.reviewer)
+        case = self.get_case(principal, case_id)
+        if case.status == CaseStatus.closed:
+            raise ConflictError("an HS code cannot be confirmed for a closed case")
+        try:
+            validate_hs_selection_code(request.code)
+        except ValueError as exc:
+            raise ConflictError(str(exc)) from exc
+        return self.repository.record_case_hs_selection(
+            org_id=principal.org_id,
+            case_id=case.case_id,
+            code=request.code,
+            reason=request.reason.strip(),
+            selected_by=principal.subject,
+        )
 
     def review(
         self,

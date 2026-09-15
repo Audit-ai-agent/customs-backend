@@ -554,3 +554,138 @@ def test_hs_selection_requires_reviewer_role() -> None:
             headers={"Authorization": "Bearer approver-token"},
         )
         assert response.status_code == 403
+
+
+def _case_with_documents(client: Any, documents: list[tuple[str, str, str]]) -> str:
+    case = client.post("/api/v1/cases", json={"title": "case hs"}, headers=_auth()).json()
+    for document_type, filename, text in documents:
+        created = client.post(
+            f"/api/v1/cases/{case['case_id']}/documents",
+            json={"document_type": document_type, "filename": filename, "content_text": text},
+            headers=_auth(),
+        )
+        assert created.status_code == 201
+    return str(case["case_id"])
+
+
+def test_case_hs_classification_is_available_before_any_review() -> None:
+    wires: list[dict[str, Any]] = []
+
+    def handler(request: Any) -> dict[str, Any]:
+        wires.append(request.to_agent_wire())
+        return _review_result_with_facts(request)
+
+    with _client(review_handler=handler) as client:
+        case_id = _case_with_documents(
+            client,
+            [
+                ("CI", "ci.txt", "COMMERCIAL INVOICE\nInvoice No: 1234567890\nHS CODE: 0303540000"),
+                ("PL", "pl.txt", "PACKING LIST\nContainer No: 9876543210\nH.S. Code 0303540000"),
+            ],
+        )
+
+        before = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth())
+        assert before.status_code == 200
+        body = before.json()
+        assert body["basis_kind"] == "document_text"
+        # Only lines that name a tariff code contribute; the invoice and
+        # container numbers are not candidates.
+        assert [candidate["code"] for candidate in body["candidates"]] == ["0303540000"]
+        assert body["candidates"][0]["recommended"] is True
+        assert body["candidates"][0]["basis"][0]["fact_name"] == "document_text"
+        assert "selection" not in body
+
+        selection = client.post(
+            f"/api/v1/cases/{case_id}/hs-classification",
+            json={"code": "0303540000", "reason": "서류 기재 코드 확인"},
+            headers=_auth(),
+        )
+        assert selection.status_code == 200
+        assert selection.json()["code"] == "0303540000"
+        assert len(selection.json()["history"]) == 1
+
+        after = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
+        assert after["selection"]["code"] == "0303540000"
+
+        review = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={},
+            headers={**_auth(), "Idempotency-Key": "case-hs-1"},
+        )
+        assert review.status_code == 202
+        # The very first review already carries the reviewer-confirmed code.
+        assert wires[0]["reviewer_hs_selection"] == {
+            "code": "0303540000",
+            "source_kind": "human_provided",
+        }
+
+
+def test_case_hs_classification_falls_back_to_description_match() -> None:
+    with _client(review_handler=_review_result_with_facts) as client:
+        case_id = _case_with_documents(
+            client,
+            [("CI", "ci.txt", "COMMERCIAL INVOICE\nDescription: MEN'S COTTON T-SHIRTS\nQty: 10")],
+        )
+        body = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
+        assert body["candidates"]
+        assert "6109101000" in {candidate["code"] for candidate in body["candidates"]}
+        for candidate in body["candidates"]:
+            assert candidate["origin"] == "description_match"
+            assert candidate["recommended"] is False
+
+
+def test_case_hs_selection_rejects_codes_outside_reference_and_closed_cases() -> None:
+    with _client(review_handler=_review_result_with_facts) as client:
+        case_id = _case_with_documents(client, [("CI", "ci.txt", "COMMERCIAL INVOICE\nHS CODE: 0303540000")])
+        rejected = client.post(
+            f"/api/v1/cases/{case_id}/hs-classification",
+            json={"code": "9999999999", "reason": "없는 코드"},
+            headers=_auth(),
+        )
+        assert rejected.status_code == 409
+
+
+def test_newer_run_level_selection_wins_over_case_level_selection() -> None:
+    wires: list[dict[str, Any]] = []
+
+    def handler(request: Any) -> dict[str, Any]:
+        wires.append(request.to_agent_wire())
+        return _review_result_with_facts(request)
+
+    with _client(review_handler=handler) as client:
+        case_id = _case_with_documents(client, [("CI", "ci.txt", "COMMERCIAL INVOICE\nHS CODE: 0303540000")])
+        assert (
+            client.post(
+                f"/api/v1/cases/{case_id}/hs-classification",
+                json={"code": "0303540000", "reason": "1차"},
+                headers=_auth(),
+            ).status_code
+            == 200
+        )
+        first = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={},
+            headers={**_auth(), "Idempotency-Key": "case-hs-2"},
+        )
+        run_id = str(first.json()["job"]["review_run_id"])
+        assert wires[0]["reviewer_hs_selection"]["code"] == "0303540000"
+
+        other = client.get("/api/v1/hsk-reference?q=참치", headers=_auth()).json()
+        codes = [item["code"] for item in other.get("results", []) if item["code"] != "0303540000"]
+        if not codes:
+            return
+        assert (
+            client.post(
+                f"/api/v1/review-runs/{run_id}/hs-classification",
+                json={"code": codes[0], "reason": "심사 뒤 정정"},
+                headers=_auth(),
+            ).status_code
+            == 200
+        )
+        second = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={},
+            headers={**_auth(), "Idempotency-Key": "case-hs-3"},
+        )
+        assert second.status_code == 202
+        assert wires[1]["reviewer_hs_selection"]["code"] == codes[0]

@@ -196,6 +196,15 @@ class WorkbenchRepository(Protocol):
         reason_code: FindingDecisionReasonCode | None = None,
     ) -> FindingDecisionRecord: ...
     def delete_case(self, *, org_id: str, case_id: str) -> None: ...
+    def record_case_hs_selection(
+        self,
+        *,
+        org_id: str,
+        case_id: str,
+        code: str,
+        reason: str,
+        selected_by: str,
+    ) -> HsSelectionRecord: ...
     def close_case(
         self, *, org_id: str, case_id: str, closure: CaseClosureRecord
     ) -> CaseRecord: ...

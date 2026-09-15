@@ -79,6 +79,7 @@ from customs_backend.admin_settings import (
 )
 from customs_backend.operations_metrics import OperationsMetricsView
 from customs_backend.trade_features import (
+    CaseHsClassificationView,
     DutyAssessmentView,
     HsClassificationView,
     HsReferenceEntryView,
@@ -2018,6 +2019,40 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         service: WorkbenchService = Depends(_service),
     ) -> HsReferenceEntryView:
         return service.hs_reference_entry(principal, code)
+
+    @app.get(
+        "/api/v1/cases/{case_id}/hs-classification",
+        response_model=CaseHsClassificationView,
+        response_model_exclude_none=True,
+    )
+    def get_case_hs_classification_endpoint(
+        case_id: str,
+        principal: Principal = Depends(readers),
+        service: WorkbenchService = Depends(_service),
+    ) -> CaseHsClassificationView:
+        return service.case_hs_classification(principal, case_id)
+
+    @app.post(
+        "/api/v1/cases/{case_id}/hs-classification",
+        response_model=HsSelectionRecord,
+        status_code=200,
+    )
+    def record_case_hs_selection_endpoint(
+        case_id: str,
+        body: HsSelectionRequest,
+        principal: Principal = Depends(writers),
+        service: WorkbenchService = Depends(_service),
+    ) -> HsSelectionRecord:
+        result = service.record_case_hs_selection(principal, case_id, body)
+        record_public_exchange(
+            case_id=case_id,
+            method="POST",
+            path=f"/api/v1/cases/{case_id}/hs-classification",
+            request_body=body.model_dump(mode="json"),
+            response_status=200,
+            response_body=result.model_dump(mode="json"),
+        )
+        return result
 
     @app.get(
         "/api/v1/review-runs/{review_run_id}/hs-classification",
