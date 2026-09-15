@@ -2163,9 +2163,15 @@ class WorkbenchService:
         return max(selections, key=lambda item: item.selected_at).code
 
     def case_hs_classification(
-        self, principal: Principal, case_id: str
+        self, principal: Principal, case_id: str, *, use_agent: bool = False
     ) -> CaseHsClassificationView:
-        """HSK candidates from the case's confirmed documents, before any review."""
+        """HSK candidates from the case's confirmed documents, before any review.
+
+        Without ``use_agent`` only the document text and the recorded
+        selection are read.  The Agent rounds run on explicit request so that
+        registering or confirming one document after another does not spend
+        two model calls each time.
+        """
 
         case = self.get_case(principal, case_id)
         documents = _active_documents(self.repository.list_documents(principal.org_id, case_id))
@@ -2179,7 +2185,7 @@ class WorkbenchService:
             for record in documents
         ]
         view = build_case_hs_classification(case, texts)
-        if not texts:
+        if not texts or not use_agent:
             return view
         # Two Agent rounds.  First the Agent reads the goods from the text
         # itself, whatever the form or language, with no codes to choose from;

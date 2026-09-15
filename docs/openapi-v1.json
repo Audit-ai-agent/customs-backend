@@ -8938,6 +8938,7 @@
     },
     "/api/v1/cases/{case_id}/hs-classification": {
       "get": {
+        "description": "Confirmed-text HSK candidates; ``agent=true`` also has the Agent read and rank.\n\nThe plain call is cheap (document text and the recorded selection\nonly) so screens can load it freely; the Agent's two model rounds run\nonly when the reviewer asks for them, once every document is in.",
         "operationId": "get_case_hs_classification_endpoint_api_v1_cases__case_id__hs_classification_get",
         "parameters": [
           {
@@ -8947,6 +8948,16 @@
             "schema": {
               "title": "Case Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Agent",
+              "type": "boolean"
             }
           }
         ],

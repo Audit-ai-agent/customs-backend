@@ -2027,10 +2027,18 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
     )
     def get_case_hs_classification_endpoint(
         case_id: str,
+        agent: bool = False,
         principal: Principal = Depends(readers),
         service: WorkbenchService = Depends(_service),
     ) -> CaseHsClassificationView:
-        return service.case_hs_classification(principal, case_id)
+        """Confirmed-text HSK candidates; ``agent=true`` also has the Agent read and rank.
+
+        The plain call is cheap (document text and the recorded selection
+        only) so screens can load it freely; the Agent's two model rounds run
+        only when the reviewer asks for them, once every document is in.
+        """
+
+        return service.case_hs_classification(principal, case_id, use_agent=agent)
 
     @app.post(
         "/api/v1/cases/{case_id}/hs-classification",

@@ -775,7 +775,7 @@ def test_case_hs_shortlist_is_stable_as_documents_are_added() -> None:
     with _client(review_handler=_review_result_with_facts, hs_candidates_handler=handler) as client:
         for count in range(1, len(documents) + 1):
             case_id = _case_with_documents(client, documents[:count])
-            body = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
+            body = client.get(f"/api/v1/cases/{case_id}/hs-classification?agent=true", headers=_auth()).json()
             assert body["candidates"][0]["code"] == "8528726000", count
             assert shortlists[-1][0] == "8528726000", count
     # The item name repeated across four documents is one agreement, not four
@@ -906,7 +906,7 @@ def test_case_hs_classification_uses_agent_ranking_when_available() -> None:
         review_handler=_review_result_with_facts, hs_candidates_handler=_tshirt_agent(requests)
     ) as client:
         case_id = _case_with_documents(client, [("CI", "ci.txt", invoice)])
-        body = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
+        body = client.get(f"/api/v1/cases/{case_id}/hs-classification?agent=true", headers=_auth()).json()
         assert body["basis_kind"] == "agent_ranked"
         first, second = body["candidates"][0], body["candidates"][1]
         assert (first["code"], first["origin"], first["recommended"]) == ("6109101000", "llm_match", True)
@@ -948,7 +948,7 @@ def test_case_hs_classification_follows_the_agent_reading_for_an_unfamiliar_layo
         review_handler=_review_result_with_facts, hs_candidates_handler=_tshirt_agent(requests)
     ) as client:
         case_id = _case_with_documents(client, [("CI", "ci.txt", _PROSE_INVOICE)])
-        body = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
+        body = client.get(f"/api/v1/cases/{case_id}/hs-classification?agent=true", headers=_auth()).json()
         assert body["basis_kind"] == "agent_ranked"
         first = body["candidates"][0]
         assert (first["code"], first["origin"], first["recommended"]) == ("6109101000", "llm_match", True)
@@ -965,7 +965,7 @@ def test_case_hs_classification_keeps_the_agent_reading_when_ranking_fails() -> 
         hs_candidates_handler=_tshirt_agent(requests, rank=False),
     ) as client:
         case_id = _case_with_documents(client, [("CI", "ci.txt", _PROSE_INVOICE)])
-        body = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
+        body = client.get(f"/api/v1/cases/{case_id}/hs-classification?agent=true", headers=_auth()).json()
         # No ranking, so no AI pick -- yet the candidates come from what the
         # Agent read, not from the empty heuristics.
         assert body["basis_kind"] == "document_text"
@@ -1013,6 +1013,26 @@ def test_case_hs_shortlist_from_the_agent_reading_expands_cited_prefixes() -> No
     assert {basis.document_id for candidate in shortlist for basis in candidate.basis} == {"d1"}
 
 
+def test_case_hs_classification_asks_the_agent_only_on_request() -> None:
+    requests: list[dict[str, Any]] = []
+    invoice = "\n".join(["COMMERCIAL INVOICE", "Description of Goods", "MEN'S COTTON T-SHIRTS", "64,444 PCS"])
+    with _client(
+        review_handler=_review_result_with_facts, hs_candidates_handler=_tshirt_agent(requests)
+    ) as client:
+        case_id = _case_with_documents(client, [("CI", "ci.txt", invoice)])
+        # The plain read that screens make on every load: text-only, no model.
+        body = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
+        assert body["basis_kind"] == "document_text"
+        assert "6109101000" in {candidate["code"] for candidate in body["candidates"]}
+        assert requests == []
+        # The reviewer's explicit request runs both Agent rounds.
+        body = client.get(
+            f"/api/v1/cases/{case_id}/hs-classification?agent=true", headers=_auth()
+        ).json()
+        assert body["basis_kind"] == "agent_ranked"
+        assert len(requests) == 2
+
+
 def test_case_hs_classification_keeps_heuristics_when_the_agent_fails() -> None:
     def handler(request: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("agent down")
@@ -1020,7 +1040,7 @@ def test_case_hs_classification_keeps_heuristics_when_the_agent_fails() -> None:
     invoice = "\n".join(["COMMERCIAL INVOICE", "Description of Goods", "MEN'S COTTON T-SHIRTS", "64,444 PCS"])
     with _client(review_handler=_review_result_with_facts, hs_candidates_handler=handler) as client:
         case_id = _case_with_documents(client, [("CI", "ci.txt", invoice)])
-        body = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
+        body = client.get(f"/api/v1/cases/{case_id}/hs-classification?agent=true", headers=_auth()).json()
         assert body["basis_kind"] == "document_text"
         assert "6109101000" in {candidate["code"] for candidate in body["candidates"]}
         assert all(candidate["origin"] == "description_match" for candidate in body["candidates"])
