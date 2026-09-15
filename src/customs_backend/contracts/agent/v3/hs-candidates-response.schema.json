@@ -1,0 +1,156 @@
+{
+  "$id": "https://schemas.customs.local/agent/v3/hs-candidates-response.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Goods extracted from the documents and the supplied reference codes ranked for them. status=deterministic means no model was used; unavailable means the model call failed and the caller keeps its own heuristic.",
+  "$defs": {
+    "Item": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "document_ids": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "string"
+          }
+        },
+        "cited_hs_codes": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9]{6,10}$"
+          }
+        }
+      },
+      "required": [
+        "description",
+        "document_ids",
+        "cited_hs_codes"
+      ],
+      "type": "object"
+    },
+    "Pick": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^[0-9]{10}$"
+        },
+        "rank": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 400
+        }
+      },
+      "required": [
+        "code",
+        "rank",
+        "confidence",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "Engine": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "deterministic",
+            "anthropic",
+            "openai",
+            "claude"
+          ]
+        },
+        "model_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "orchestrator": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "framework": {
+              "const": "langgraph",
+              "type": "string"
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            }
+          },
+          "required": [
+            "framework",
+            "version"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "model_id"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "schema_version": {
+      "const": "1.0",
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "ok",
+        "deterministic",
+        "unavailable"
+      ]
+    },
+    "items": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "$ref": "#/$defs/Item"
+      }
+    },
+    "picks": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "$ref": "#/$defs/Pick"
+      }
+    },
+    "engine": {
+      "$ref": "#/$defs/Engine"
+    }
+  },
+  "required": [
+    "schema_version",
+    "status",
+    "items",
+    "picks",
+    "engine"
+  ],
+  "title": "Customs AI Agent HSK candidate response",
+  "type": "object"
+}

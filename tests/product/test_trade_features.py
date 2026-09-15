@@ -725,3 +725,50 @@ def test_newer_run_level_selection_wins_over_case_level_selection() -> None:
         )
         assert second.status_code == 202
         assert wires[1]["reviewer_hs_selection"]["code"] == codes[0]
+
+
+def test_case_hs_classification_uses_agent_ranking_when_available() -> None:
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: dict[str, Any]) -> dict[str, Any]:
+        requests.append(request)
+        codes = [item["code"] for item in request["reference_candidates"]]
+        assert "6109101000" in codes
+        return {
+            "schema_version": "1.0",
+            "status": "ok",
+            "items": [{"description": "MEN'S COTTON T-SHIRTS", "document_ids": ["d"], "cited_hs_codes": []}],
+            "picks": [
+                {"code": "6109101000", "rank": 1, "confidence": 0.93, "reason": "면 소재 남성용 티셔츠"},
+                {"code": "9999999999", "rank": 2, "confidence": 0.5, "reason": "not in shortlist"},
+                {"code": "6105100000", "rank": 3, "confidence": 0.3, "reason": "셔츠"},
+            ],
+        }
+
+    invoice = "\n".join(["COMMERCIAL INVOICE", "Description of Goods", "MEN'S COTTON T-SHIRTS", "64,444 PCS"])
+    with _client(review_handler=_review_result_with_facts, hs_candidates_handler=handler) as client:
+        case_id = _case_with_documents(client, [("CI", "ci.txt", invoice)])
+        body = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
+        assert body["basis_kind"] == "agent_ranked"
+        first, second = body["candidates"][0], body["candidates"][1]
+        assert (first["code"], first["origin"], first["recommended"]) == ("6109101000", "llm_match", True)
+        assert first["explanation"] == "면 소재 남성용 티셔츠"
+        assert first["confidence"] == 0.93
+        assert (second["code"], second["origin"]) == ("6105100000", "llm_match")
+        assert all(candidate["code"] != "9999999999" for candidate in body["candidates"])
+        # The Agent received the confirmed text and only reference-table codes.
+        assert requests[0]["documents"][0]["content_text"].startswith("COMMERCIAL INVOICE")
+        assert all(len(item["code"]) == 10 for item in requests[0]["reference_candidates"])
+
+
+def test_case_hs_classification_keeps_heuristics_when_the_agent_fails() -> None:
+    def handler(request: dict[str, Any]) -> dict[str, Any]:
+        raise RuntimeError("agent down")
+
+    invoice = "\n".join(["COMMERCIAL INVOICE", "Description of Goods", "MEN'S COTTON T-SHIRTS", "64,444 PCS"])
+    with _client(review_handler=_review_result_with_facts, hs_candidates_handler=handler) as client:
+        case_id = _case_with_documents(client, [("CI", "ci.txt", invoice)])
+        body = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
+        assert body["basis_kind"] == "document_text"
+        assert "6109101000" in {candidate["code"] for candidate in body["candidates"]}
+        assert all(candidate["origin"] == "description_match" for candidate in body["candidates"])

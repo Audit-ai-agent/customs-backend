@@ -156,7 +156,9 @@ class HsCandidate(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     in_reference: bool
     recommended: bool
-    origin: Literal["document_code", "description_match"] = "document_code"
+    origin: Literal["document_code", "description_match", "llm_match"] = "document_code"
+    # Present only for llm_match: the Agent's one-sentence reason for the pick.
+    explanation: str | None = Field(default=None, max_length=400)
     basis: list[HsCandidateBasis] = Field(default_factory=list)
 
 
@@ -179,7 +181,7 @@ class CaseHsClassificationView(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     case_id: str
-    basis_kind: Literal["document_text"] = "document_text"
+    basis_kind: Literal["document_text", "agent_ranked"] = "document_text"
     reference: HsReferenceInfo
     candidates: list[HsCandidate]
     selection: HsSelectionRecord | None = None
@@ -507,6 +509,8 @@ def _description_candidates(analyses: list[dict[str, Any]]) -> list[HsCandidate]
 
 def _description_candidates_from_facts(
     facts: list[tuple[str, dict[str, Any]]],
+    *,
+    limit: int = _DESCRIPTION_CANDIDATE_LIMIT,
 ) -> list[HsCandidate]:
     stems: set[str] = set()
     for _, fact in facts:
@@ -532,7 +536,7 @@ def _description_candidates_from_facts(
         for document_id, fact in facts[:20]
     ]
     candidates: list[HsCandidate] = []
-    for matched, share, code in scored[:_DESCRIPTION_CANDIDATE_LIMIT]:
+    for matched, share, code in scored[:limit]:
         name_ko, name_en = _leaf_names(code)
         candidates.append(
             HsCandidate(
@@ -585,16 +589,24 @@ def _code_candidates(
     return candidates
 
 
-def build_case_hs_classification(
-    case: CaseRecord, documents: list[tuple[DocumentRecord, str]]
-) -> CaseHsClassificationView:
-    """Offer HSK candidates from confirmed document text, before any review."""
+class _CaseTextScan:
+    """What the document text itself says: cited codes and item-name cells."""
 
-    reference = hsk_names()
-    code_basis: dict[str, list[HsCandidateBasis]] = {}
-    code_documents: dict[str, set[str]] = {}
-    documents_with_hs: set[str] = set()
-    description_facts: list[tuple[str, dict[str, Any]]] = []
+    def __init__(self) -> None:
+        self.code_basis: dict[str, list[HsCandidateBasis]] = {}
+        self.code_documents: dict[str, set[str]] = {}
+        self.documents_with_hs: set[str] = set()
+        self.description_facts: list[tuple[str, dict[str, Any]]] = []
+
+
+def _scan_case_text(documents: list[tuple[DocumentRecord, str]]) -> _CaseTextScan:
+    scan = _CaseTextScan()
+    code_basis, code_documents, documents_with_hs, description_facts = (
+        scan.code_basis,
+        scan.code_documents,
+        scan.documents_with_hs,
+        scan.description_facts,
+    )
     for record, text in documents:
         lines = text.splitlines()[:_CASE_TEXT_LINE_LIMIT]
         for line_no, value in _description_values(lines):
@@ -625,20 +637,200 @@ def build_case_hs_classification(
                             raw_value=stripped[:200],
                         )
                     )
+    return scan
+
+
+def _reference_info() -> HsReferenceInfo:
+    reference = hsk_names()
+    return HsReferenceInfo(
+        as_of=str(reference.get("as_of", "")),
+        source=str(reference.get("source", "")),
+    )
+
+
+def build_case_hs_classification(
+    case: CaseRecord, documents: list[tuple[DocumentRecord, str]]
+) -> CaseHsClassificationView:
+    """Offer HSK candidates from confirmed document text, before any review."""
+
+    scan = _scan_case_text(documents)
     candidates = _code_candidates(
-        code_documents=code_documents, code_basis=code_basis, documents_with_hs=documents_with_hs
+        code_documents=scan.code_documents,
+        code_basis=scan.code_basis,
+        documents_with_hs=scan.documents_with_hs,
     )
     if not candidates:
-        candidates = _description_candidates_from_facts(description_facts)
+        candidates = _description_candidates_from_facts(scan.description_facts)
     return CaseHsClassificationView(
         case_id=case.case_id,
-        reference=HsReferenceInfo(
-            as_of=str(reference.get("as_of", "")),
-            source=str(reference.get("source", "")),
-        ),
+        reference=_reference_info(),
         candidates=candidates,
         selection=case.hs_selection,
     )
+
+
+_AGENT_SHORTLIST_LIMIT = 40
+_AGENT_TEXT_LIMIT = 20_000
+
+
+def case_hs_shortlist(
+    documents: list[tuple[DocumentRecord, str]],
+    *,
+    extra_descriptions: list[str] | None = None,
+    extra_codes: list[str] | None = None,
+) -> list[HsCandidate]:
+    """Reference codes the Agent may choose among: cited codes first, then name matches.
+
+    ``extra_descriptions``/``extra_codes`` come from the Agent's own reading of
+    the documents (a second, better-informed round); they widen the shortlist
+    but every entry still comes from the packaged HSK reference table.
+    """
+
+    scan = _scan_case_text(documents)
+    for line_no, code in enumerate(extra_codes or [], start=1):
+        if re.fullmatch(r"[0-9]{10}", code) and hs_reference_has(code):
+            scan.documents_with_hs.add("agent")
+            scan.code_documents.setdefault(code, set()).add("agent")
+            scan.code_basis.setdefault(code, []).append(
+                HsCandidateBasis(
+                    document_id="agent",
+                    fact_id=f"agent-cited-{line_no}",
+                    fact_name="cited_hs_code",
+                    raw_value=code,
+                )
+            )
+    for index, description in enumerate(extra_descriptions or [], start=1):
+        if description.strip():
+            scan.description_facts.append(
+                (
+                    "agent",
+                    {
+                        "fact_id": f"agent-item-{index}",
+                        "name": "description",
+                        "raw_value": description.strip()[:200],
+                        "normalized_value": description.strip()[:200],
+                    },
+                )
+            )
+    shortlist = [
+        candidate
+        for candidate in _code_candidates(
+            code_documents=scan.code_documents,
+            code_basis=scan.code_basis,
+            documents_with_hs=scan.documents_with_hs,
+        )
+        if candidate.in_reference
+    ]
+    seen = {candidate.code for candidate in shortlist}
+    for candidate in _description_candidates_from_facts(
+        scan.description_facts, limit=_AGENT_SHORTLIST_LIMIT
+    ):
+        if candidate.code not in seen:
+            seen.add(candidate.code)
+            shortlist.append(candidate)
+    return shortlist[:_AGENT_SHORTLIST_LIMIT]
+
+
+def agent_hs_request(
+    case_id: str,
+    documents: list[tuple[DocumentRecord, str]],
+    shortlist: list[HsCandidate],
+    *,
+    max_picks: int = 5,
+) -> dict[str, Any]:
+    """The Agent request: confirmed text plus the reference codes it may pick from."""
+
+    return {
+        "schema_version": "1.0",
+        "case_id": case_id,
+        "documents": [
+            {
+                "document_id": record.document_id,
+                "document_type": str(record.document_type.value if hasattr(record.document_type, "value") else record.document_type),
+                "content_text": text[:_AGENT_TEXT_LIMIT] or "-",
+            }
+            for record, text in documents
+        ][:20],
+        "reference_candidates": [
+            {
+                "code": candidate.code,
+                "name_ko": candidate.name_ko,
+                "name_en": candidate.name_en,
+                "ancestors": [item.name_ko for item in candidate.ancestors if item.name_ko][:8],
+            }
+            for candidate in shortlist
+        ][:_AGENT_SHORTLIST_LIMIT],
+        "max_picks": max_picks,
+    }
+
+
+def agent_hs_items(response: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Descriptions and 10-digit cited codes the Agent read from the documents."""
+
+    descriptions: list[str] = []
+    codes: list[str] = []
+    for item in response.get("items", []) if isinstance(response.get("items"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        description = item.get("description")
+        if isinstance(description, str) and description.strip():
+            descriptions.append(description.strip())
+        for code in item.get("cited_hs_codes", []) if isinstance(item.get("cited_hs_codes"), list) else []:
+            if isinstance(code, str) and re.fullmatch(r"[0-9]{10}", code):
+                codes.append(code)
+    return descriptions, codes
+
+
+def apply_agent_hs_picks(
+    view: CaseHsClassificationView,
+    response: dict[str, Any],
+    shortlist: list[HsCandidate],
+) -> CaseHsClassificationView:
+    """Put the Agent's ranked picks first; keep the heuristic candidates behind them.
+
+    A pick is honoured only when its code is in the shortlist the Backend sent,
+    so the reference table stays the single source of codes.
+    """
+
+    if response.get("status") != "ok":
+        return view
+    raw_picks = response.get("picks")
+    if not isinstance(raw_picks, list) or not raw_picks:
+        return view
+    by_code = {candidate.code: candidate for candidate in shortlist}
+    ranked: list[HsCandidate] = []
+    for raw in raw_picks:
+        if not isinstance(raw, dict):
+            continue
+        code = raw.get("code")
+        reason = raw.get("reason")
+        confidence = raw.get("confidence")
+        if not isinstance(code, str) or code not in by_code or code in {c.code for c in ranked}:
+            continue
+        if not isinstance(reason, str) or not reason.strip():
+            continue
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+            continue
+        base = by_code[code]
+        ranked.append(
+            base.model_copy(
+                update={
+                    "confidence": round(min(max(float(confidence), 0.0), 1.0), 4),
+                    "recommended": not ranked,
+                    "origin": "llm_match",
+                    "explanation": reason.strip()[:400],
+                }
+            )
+        )
+    if not ranked:
+        return view
+    picked = {candidate.code for candidate in ranked}
+    rest = [
+        candidate.model_copy(update={"recommended": False})
+        for candidate in view.candidates
+        if candidate.code not in picked
+    ]
+    return view.model_copy(update={"basis_kind": "agent_ranked", "candidates": [*ranked, *rest][:10]})
 
 
 def build_hs_classification(run: ReviewRunRecord) -> HsClassificationView:

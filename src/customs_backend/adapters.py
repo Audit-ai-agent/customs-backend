@@ -645,6 +645,32 @@ class HttpAgentClient:
         )
         return result
 
+    def hs_candidates(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Call the case-level HSK candidate ranking endpoint.
+
+        There is no Review Run yet, so nothing is attached to a transcript.
+        Any transport or contract problem surfaces as a rejection; the caller
+        keeps its own deterministic candidates in that case.
+        """
+
+        encoded = canonical_json_bytes(request)
+        if len(encoded) > 1_000_000:
+            raise ValueError("Agent HS candidate request exceeds the 1 MiB transport limit")
+        try:
+            response = self._client.post(
+                "/internal/agent/v3/hs-candidates",
+                content=encoded,
+                headers={"Content-Type": "application/json"},
+            )
+        except httpx.HTTPError as exc:
+            raise AgentResponseRejectedError("Agent HS candidate transport failed") from exc
+        try:
+            self._require_service_mode(response)
+            response.raise_for_status()
+            return self._decode_object(response, maximum_bytes=1_000_000, label="HS candidates")
+        except httpx.HTTPStatusError as exc:
+            raise AgentResponseRejectedError("Agent HS candidate request was rejected") from exc
+
     def answer_knowledge(self, request: AgentKnowledgeAnswerRequest) -> dict[str, Any]:
         """Call the bounded standalone official-trade guidance endpoint.
 
@@ -778,6 +804,7 @@ class CallableAgentClient:
         *,
         answer: Callable[[AgentAssistantAnswerRequest], dict[str, Any]] | None = None,
         knowledge_answer: Callable[[AgentKnowledgeAnswerRequest], dict[str, Any]] | None = None,
+        hs_candidates: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         extract_document: Callable[[AgentDocumentExtractionRequest, bytes], dict[str, Any]] | None = None,
         extract_raster_document: Callable[
             [AgentRasterDocumentExtractionRequest, bytes], dict[str, Any]
@@ -802,6 +829,7 @@ class CallableAgentClient:
         self._review = review
         self._answer = answer
         self._knowledge_answer = knowledge_answer
+        self._hs_candidates = hs_candidates
         self._extract_document = extract_document
         self._extract_raster_document = extract_raster_document
         self._extract_raster_text_document = extract_raster_text_document
@@ -816,6 +844,17 @@ class CallableAgentClient:
 
     def review(self, request: AgentReviewRequest) -> dict[str, Any]:
         return self._review(request)
+
+    def hs_candidates(self, request: dict[str, Any]) -> dict[str, Any]:
+        if self._hs_candidates is None:
+            return {
+                "schema_version": "1.0",
+                "status": "deterministic",
+                "items": [],
+                "picks": [],
+                "engine": {"kind": "deterministic", "model_id": "callable-fixture"},
+            }
+        return self._hs_candidates(request)
 
     def extract_document(
         self, request: AgentDocumentExtractionRequest, content: bytes

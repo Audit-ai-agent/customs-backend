@@ -156,8 +156,12 @@ from customs_backend.trade_features import (
     HsReferenceSearchView,
     OriginVerificationView,
     build_duty_assessment,
+    agent_hs_items,
+    agent_hs_request,
+    apply_agent_hs_picks,
     build_case_hs_classification,
     build_hs_classification,
+    case_hs_shortlist,
     build_origin_verification,
     lookup_hs_reference,
     search_hs_reference,
@@ -2174,7 +2178,27 @@ class WorkbenchService:
             )
             for record in documents
         ]
-        return build_case_hs_classification(case, texts)
+        view = build_case_hs_classification(case, texts)
+        if not texts:
+            return view
+        # The Agent reads the documents itself and ranks reference codes; the
+        # heuristic view above is the fallback for every failure or "no model".
+        try:
+            shortlist = case_hs_shortlist(texts)
+            response = self.agent.hs_candidates(agent_hs_request(case.case_id, texts, shortlist))
+            if response.get("status") == "ok" and not response.get("picks"):
+                descriptions, codes = agent_hs_items(response)
+                if descriptions or codes:
+                    shortlist = case_hs_shortlist(
+                        texts, extra_descriptions=descriptions, extra_codes=codes
+                    )
+                    if shortlist:
+                        response = self.agent.hs_candidates(
+                            agent_hs_request(case.case_id, texts, shortlist)
+                        )
+            return apply_agent_hs_picks(view, response, shortlist)
+        except Exception:  # noqa: BLE001 - any Agent problem keeps the deterministic candidates
+            return view
 
     def record_case_hs_selection(
         self, principal: Principal, case_id: str, request: HsSelectionRequest

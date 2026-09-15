@@ -254,8 +254,11 @@
         "description": "HSK candidates read from the case's confirmed document text.\n\nAvailable before any AI review: codes are collected only from text lines\nthat name a tariff code, and a description match is offered when no code\nis cited.  Confirming a code here feeds the first review's law-evidence\nretrieval as the reviewer HS selection.",
         "properties": {
           "basis_kind": {
-            "const": "document_text",
             "default": "document_text",
+            "enum": [
+              "document_text",
+              "agent_ranked"
+            ],
             "title": "Basis Kind",
             "type": "string"
           },
@@ -2538,6 +2541,18 @@
             "title": "Confidence",
             "type": "number"
           },
+          "explanation": {
+            "anyOf": [
+              {
+                "maxLength": 400,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Explanation"
+          },
           "in_reference": {
             "title": "In Reference",
             "type": "boolean"
@@ -2568,7 +2583,8 @@
             "default": "document_code",
             "enum": [
               "document_code",
-              "description_match"
+              "description_match",
+              "llm_match"
             ],
             "title": "Origin",
             "type": "string"
