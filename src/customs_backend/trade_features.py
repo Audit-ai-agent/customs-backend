@@ -746,7 +746,7 @@ def agent_hs_request(
         "documents": [
             {
                 "document_id": record.document_id,
-                "document_type": str(record.document_type.value if hasattr(record.document_type, "value") else record.document_type),
+                "document_type": str(record.document_type),
                 "content_text": text[:_AGENT_TEXT_LIMIT] or "-",
             }
             for record, text in documents
