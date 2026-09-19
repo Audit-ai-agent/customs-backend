@@ -970,6 +970,12 @@ def _agent_request_from_snapshot(
             if snapshot.get("reviewer_hs_selection") is not None
             else None
         )
+        parent_document_analyses = snapshot.get("parent_document_analyses")
+        if parent_document_analyses is not None and not (
+            isinstance(parent_document_analyses, list)
+            and all(isinstance(value, dict) for value in parent_document_analyses)
+        ):
+            raise ValueError("invalid parent document analyses")
     except (KeyError, TypeError, ValueError, ValidationError) as exc:
         raise ConflictError("review job has an invalid immutable input snapshot") from exc
     return AgentReviewRequest(
@@ -993,6 +999,7 @@ def _agent_request_from_snapshot(
         applied_correction_proposal_ids=applied_correction_proposal_ids,
         human_corrections=human_corrections,
         reviewer_hs_selection=reviewer_hs_selection,
+        parent_document_analyses=parent_document_analyses,
     )
 
 
@@ -3358,6 +3365,13 @@ class WorkbenchService:
             "applied_correction_proposal_ids": list(request.proposal_ids),
             "human_corrections": correction_context,
         }
+        # Reuse the parent's extraction: re-extracting the unchanged documents
+        # with a model would change facts nobody corrected.  A grandchild's
+        # parent analyses already carry the earlier approved human facts.
+        if parent.document_analyses:
+            snapshot["parent_document_analyses"] = parent.document_analyses
+        else:
+            snapshot.pop("parent_document_analyses", None)
         revision_hs_code = self._latest_hs_selection_code(principal, case.case_id)
         if revision_hs_code is not None:
             snapshot["reviewer_hs_selection"] = {

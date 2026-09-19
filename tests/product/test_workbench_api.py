@@ -3289,6 +3289,58 @@ def test_failed_child_review_leaves_approved_correction_retryable() -> None:
         assert [item["event"] for item in proposal["history"]] == ["proposed", "approved"]
 
 
+def test_child_review_sends_parent_document_analyses_for_reuse() -> None:
+    requests = []
+
+    def review_handler(request):
+        requests.append(request)
+        return build_agent_v3_result(request, include_finding=True)
+
+    with _client(review_handler=review_handler) as client:
+        case_id = client.post(
+            "/api/v1/cases", json={"title": "Reuse parent extraction"}, headers=_auth()
+        ).json()["case_id"]
+        document_id = client.post(
+            f"/api/v1/cases/{case_id}/documents",
+            json={"document_type": "CI", "filename": "invoice.txt", "content_text": "INV-001"},
+            headers=_auth(),
+        ).json()["record"]["document_id"]
+        parent_run_id = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={},
+            headers={**_auth(), "Idempotency-Key": "reuse-parent-001"},
+        ).json()["job"]["review_run_id"]
+        parent = client.get(f"/api/v1/review-runs/{parent_run_id}", headers=_auth()).json()
+        proposal_id = client.post(
+            f"/api/v1/review-runs/{parent_run_id}/correction-proposals",
+            json={
+                "document_id": document_id,
+                "field_name": "invoice_number",
+                "new_value": "INV-001-CORRECTED",
+                "reason": "The reviewer checked the amended value.",
+            },
+            headers=_auth(),
+        ).json()["correction_proposal_id"]
+        client.put(
+            f"/api/v1/correction-proposals/{proposal_id}/decision",
+            json={"status": "approved", "reason": "A child review is required."},
+            headers=_approver_auth(),
+        )
+        child = client.post(
+            f"/api/v1/review-runs/{parent_run_id}/revisions",
+            json={"proposal_ids": [proposal_id]},
+            headers={**_approver_auth(), "Idempotency-Key": "reuse-child-001"},
+        )
+        assert child.status_code == 202, child.text
+        assert child.json()["job"]["status"] == "succeeded"
+
+    assert requests[0].parent_document_analyses is None
+    assert "parent_document_analyses" not in requests[0].to_agent_wire()
+    assert parent["document_analyses"]
+    assert requests[1].parent_document_analyses == parent["document_analyses"]
+    assert requests[1].to_agent_wire()["parent_document_analyses"] == parent["document_analyses"]
+
+
 def test_concurrent_assistant_message_retry_invokes_agent_once() -> None:
     calls = 0
     calls_lock = threading.Lock()

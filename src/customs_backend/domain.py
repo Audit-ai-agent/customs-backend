@@ -2040,12 +2040,19 @@ class AgentReviewRequest(BaseModel):
     applied_correction_proposal_ids: list[str] = Field(default_factory=list, max_length=50)
     human_corrections: list[AgentHumanCorrection] = Field(default_factory=list, max_length=50)
     reviewer_hs_selection: AgentReviewerHsSelection | None = None
+    # The parent run's stored document_analyses, so a child run reuses the
+    # parent extraction and only appends the approved human facts.
+    parent_document_analyses: list[dict[str, Any]] | None = Field(default=None, max_length=20)
 
     @model_validator(mode="after")
     def correction_context_is_bound(self) -> "AgentReviewRequest":
         correction_ids = [item.correction_proposal_id for item in self.human_corrections]
         if self.parent_review_run_id is None:
-            if self.applied_correction_proposal_ids or correction_ids:
+            if (
+                self.applied_correction_proposal_ids
+                or correction_ids
+                or self.parent_document_analyses is not None
+            ):
                 raise ValueError("correction context requires a parent review run")
             return self
         if not self.applied_correction_proposal_ids or not correction_ids:
@@ -2085,6 +2092,8 @@ class AgentReviewRequest(BaseModel):
                     ],
                 }
             )
+            if self.parent_document_analyses is not None:
+                wire["parent_document_analyses"] = self.parent_document_analyses
         if self.reviewer_hs_selection is not None:
             wire["reviewer_hs_selection"] = self.reviewer_hs_selection.model_dump(mode="json")
         return wire

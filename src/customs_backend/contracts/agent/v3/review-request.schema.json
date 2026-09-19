@@ -76,7 +76,11 @@
     "parent_review_run_id": {"type": ["string", "null"], "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"},
     "applied_correction_proposal_ids": {"type": "array", "maxItems": 50, "items": {"type": "string", "minLength": 1, "maxLength": 128}},
     "human_corrections": {"type": "array", "maxItems": 50, "items": {"$ref": "#/$defs/HumanCorrection"}},
-    "reviewer_hs_selection": {"anyOf": [{"$ref": "#/$defs/ReviewerHsSelection"}, {"type": "null"}]}
+    "reviewer_hs_selection": {"anyOf": [{"$ref": "#/$defs/ReviewerHsSelection"}, {"type": "null"}]},
+    "parent_document_analyses": {
+      "description": "Child run only: the parent run's document_analyses, exactly as returned in its review result. The Agent validates them against the unchanged input documents and reuses them instead of extracting again; approved human corrections are then appended.",
+      "anyOf": [{"type": "array", "maxItems": 20, "items": {"type": "object"}}, {"type": "null"}]
+    }
   },
   "required": ["case_id", "review_run_id", "review_as_of", "trade_type", "jurisdiction", "documents"],
   "title": "Customs AI Agent functional review request",
