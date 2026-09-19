@@ -2218,11 +2218,12 @@ class WorkbenchService:
             ranked = apply_agent_hs_picks(fresh, ranking, shortlist)
             if ranked.basis_kind != "agent_ranked":
                 return fallback
-            ranked = ranked.model_copy(update={"agent_ranked_at": utc_now()})
+            ranked_at = utc_now()
+            ranked = ranked.model_copy(update={"agent_ranked_at": ranked_at})
             self.repository.record_case_hs_agent_ranking(
                 org_id=principal.org_id,
                 case_id=case.case_id,
-                ranking=case_hs_agent_ranking(ranked, texts, ranked_at=ranked.agent_ranked_at),
+                ranking=case_hs_agent_ranking(ranked, texts, ranked_at=ranked_at),
             )
             return ranked
         except Exception:  # noqa: BLE001 - any Agent problem keeps the candidates built so far
