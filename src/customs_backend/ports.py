@@ -206,6 +206,17 @@ class WorkbenchRepository(Protocol):
         reason: str,
         selected_by: str,
     ) -> HsSelectionRecord: ...
+    def record_case_hs_item_selection(
+        self,
+        *,
+        org_id: str,
+        case_id: str,
+        item_id: str,
+        description: str,
+        code: str,
+        reason: str,
+        selected_by: str,
+    ) -> HsSelectionRecord: ...
     def record_case_hs_agent_ranking(
         self,
         *,

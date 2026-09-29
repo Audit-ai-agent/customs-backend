@@ -267,6 +267,15 @@
             "title": "Document Digest",
             "type": "string"
           },
+          "items": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "maxItems": 20,
+            "title": "Items",
+            "type": "array"
+          },
           "ranked_at": {
             "format": "date-time",
             "title": "Ranked At",
@@ -282,7 +291,7 @@
       },
       "CaseHsClassificationView": {
         "additionalProperties": false,
-        "description": "HSK candidates read from the case's confirmed document text.\n\nAvailable before any AI review: codes are collected only from text lines\nthat name a tariff code, and a description match is offered when no code\nis cited.  Confirming a code here feeds the first review's law-evidence\nretrieval as the reviewer HS selection.",
+        "description": "HSK candidates read from the case's confirmed document text.\n\nAvailable before any AI review: codes are collected only from text lines\nthat name a tariff code, and a description match is offered when no code\nis cited.  Confirming a code here feeds the first review's law-evidence\nretrieval as the reviewer HS selection.\n\n``items`` splits the same reading per goods item (several commodities on\none document each get their own candidates and confirmation);\n``candidates`` and ``selection`` remain the whole-case view.",
         "properties": {
           "agent_ranked_at": {
             "anyOf": [
@@ -316,6 +325,13 @@
             "title": "Case Id",
             "type": "string"
           },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CaseHsItemView"
+            },
+            "title": "Items",
+            "type": "array"
+          },
           "reference": {
             "$ref": "#/components/schemas/HsReferenceInfo"
           },
@@ -336,6 +352,61 @@
           "candidates"
         ],
         "title": "CaseHsClassificationView",
+        "type": "object"
+      },
+      "CaseHsItemView": {
+        "additionalProperties": false,
+        "description": "One goods item of the case with its own HSK candidates and confirmation.\n\nA shipment often lists several commodities on one invoice or packing\nlist; each gets its own candidate list and its own reviewer-confirmed\ncode.  ``item_id`` is stable for the same item name across re-reads, so\na confirmation survives the Agent reading the documents again.",
+        "properties": {
+          "candidates": {
+            "items": {
+              "$ref": "#/components/schemas/HsCandidate"
+            },
+            "title": "Candidates",
+            "type": "array"
+          },
+          "cited_hs_codes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Cited Hs Codes",
+            "type": "array"
+          },
+          "description": {
+            "maxLength": 300,
+            "minLength": 1,
+            "title": "Description",
+            "type": "string"
+          },
+          "document_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Document Ids",
+            "type": "array"
+          },
+          "item_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Item Id",
+            "type": "string"
+          },
+          "selection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/HsSelectionRecord"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "item_id",
+          "description"
+        ],
+        "title": "CaseHsItemView",
         "type": "object"
       },
       "CaseListResponse": {
@@ -404,6 +475,14 @@
                 "type": "null"
               }
             ]
+          },
+          "hs_item_selections": {
+            "items": {
+              "$ref": "#/components/schemas/HsSelectionRecord"
+            },
+            "maxItems": 50,
+            "title": "Hs Item Selections",
+            "type": "array"
           },
           "hs_selection": {
             "anyOf": [
@@ -2926,12 +3005,25 @@
       },
       "HsSelectionRecord": {
         "additionalProperties": false,
-        "description": "Current reviewer HS code selection plus every prior selection.",
+        "description": "Current reviewer HS code selection plus every prior selection.\n\n``item_id`` and ``description`` are set on a per-item confirmation of a\nmulti-item case and absent on a whole-case or run-level one.",
         "properties": {
           "code": {
             "pattern": "^[0-9]{10}$",
             "title": "Code",
             "type": "string"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 300,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
           },
           "history": {
             "items": {
@@ -2941,6 +3033,19 @@
             "minItems": 1,
             "title": "History",
             "type": "array"
+          },
+          "item_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Item Id"
           },
           "reason": {
             "maxLength": 4000,
@@ -2972,12 +3077,38 @@
       },
       "HsSelectionRequest": {
         "additionalProperties": false,
-        "description": "A reviewer-owned HS code confirmation which never changes the Agent result.",
+        "description": "A reviewer-owned HS code confirmation which never changes the Agent result.\n\nWith ``item_id`` (and the item's ``description`` as shown) the code is\nconfirmed for one goods item of a multi-item case; without it the code\nis the whole-case confirmation.",
         "properties": {
           "code": {
             "pattern": "^[0-9]{10}$",
             "title": "Code",
             "type": "string"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 300,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "item_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Item Id"
           },
           "reason": {
             "maxLength": 4000,

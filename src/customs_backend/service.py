@@ -159,9 +159,13 @@ from customs_backend.trade_features import (
     agent_hs_items,
     agent_hs_request,
     apply_agent_hs_picks,
+    apply_agent_hs_item_picks,
     build_case_hs_classification,
     case_hs_agent_ranking,
+    case_hs_item_shortlists,
+    case_hs_item_views,
     build_hs_classification,
+    with_item_selections,
     case_hs_shortlist,
     build_origin_verification,
     lookup_hs_reference,
@@ -970,6 +974,10 @@ def _agent_request_from_snapshot(
             if snapshot.get("reviewer_hs_selection") is not None
             else None
         )
+        reviewer_hs_selections = [
+            AgentReviewerHsSelection.model_validate(value)
+            for value in list(snapshot.get("reviewer_hs_selections", []))
+        ]
         parent_document_analyses = snapshot.get("parent_document_analyses")
         if parent_document_analyses is not None and not (
             isinstance(parent_document_analyses, list)
@@ -999,6 +1007,7 @@ def _agent_request_from_snapshot(
         applied_correction_proposal_ids=applied_correction_proposal_ids,
         human_corrections=human_corrections,
         reviewer_hs_selection=reviewer_hs_selection,
+        reviewer_hs_selections=reviewer_hs_selections,
         parent_document_analyses=parent_document_analyses,
     )
 
@@ -2152,23 +2161,46 @@ class WorkbenchService:
             ),
         )
 
-    def _latest_hs_selection_code(self, principal: Principal, case_id: str) -> str | None:
-        """Return the case's most recent reviewer-confirmed HSK code, if any.
+    def _reviewer_hs_context(self, principal: Principal, case_id: str) -> dict[str, Any]:
+        """The reviewer-confirmed HSK codes a review request carries.
 
-        A case-level confirmation (made before or between reviews) and a
-        run-level confirmation are both reviewer-owned; the newest one wins.
+        ``reviewer_hs_selection`` is the newest confirmation of any kind
+        (whole-case, per-item or run-level; all reviewer-owned), as before.
+        ``reviewer_hs_selections`` lists every per-item confirmation of a
+        multi-item case so the Agent can retrieve law evidence per item; it
+        is absent when the case has none.
         """
 
         selections: list[HsSelectionRecord] = []
         case = self.repository.get_case(principal.org_id, case_id)
-        if case is not None and case.hs_selection is not None:
-            selections.append(case.hs_selection)
+        item_selections: list[HsSelectionRecord] = []
+        if case is not None:
+            if case.hs_selection is not None:
+                selections.append(case.hs_selection)
+            item_selections = [item for item in case.hs_item_selections if item.item_id]
         for run in self.repository.list_runs(principal.org_id, case_id):
             if run.hs_selection is not None:
                 selections.append(run.hs_selection)
-        if not selections:
-            return None
-        return max(selections, key=lambda item: item.selected_at).code
+        context: dict[str, Any] = {}
+        if item_selections:
+            context["reviewer_hs_selections"] = [
+                {
+                    "code": item.code,
+                    "source_kind": "human_provided",
+                    "item_id": item.item_id,
+                    "description": item.description,
+                }
+                for item in sorted(item_selections, key=lambda item: item.selected_at)
+            ]
+        newest = max(
+            [*selections, *item_selections], key=lambda item: item.selected_at, default=None
+        )
+        if newest is not None:
+            context["reviewer_hs_selection"] = {
+                "code": newest.code,
+                "source_kind": "human_provided",
+            }
+        return context
 
     def case_hs_classification(
         self, principal: Principal, case_id: str, *, use_agent: bool = False
@@ -2217,12 +2249,26 @@ class WorkbenchService:
             shortlist = case_hs_shortlist(texts, agent_items=items)
             if not shortlist:
                 return view
+            # Several commodities on one document: each item gets its own
+            # shortlist, its own ranking and its own confirmation.
+            item_shortlists = case_hs_item_shortlists(items)
             if items:
-                fresh = fresh.model_copy(update={"candidates": shortlist[:10]})
+                fresh = fresh.model_copy(
+                    update={
+                        "candidates": shortlist[:10],
+                        "items": with_item_selections(case_hs_item_views(item_shortlists), case),
+                    }
+                )
                 if view.basis_kind != "agent_ranked":
                     fallback = fresh
-            ranking = self.agent.hs_candidates(agent_hs_request(case.case_id, texts, shortlist))
-            ranked = apply_agent_hs_picks(fresh, ranking, shortlist)
+            ranking = self.agent.hs_candidates(
+                agent_hs_request(case.case_id, texts, shortlist, items=item_shortlists)
+            )
+            ranked = (
+                apply_agent_hs_item_picks(fresh, ranking, shortlist, item_shortlists)
+                if items
+                else apply_agent_hs_picks(fresh, ranking, shortlist)
+            )
             if ranked.basis_kind != "agent_ranked":
                 return fallback
             ranked_at = utc_now()
@@ -2247,6 +2293,16 @@ class WorkbenchService:
             validate_hs_selection_code(request.code)
         except ValueError as exc:
             raise ConflictError(str(exc)) from exc
+        if request.item_id is not None:
+            return self.repository.record_case_hs_item_selection(
+                org_id=principal.org_id,
+                case_id=case.case_id,
+                item_id=request.item_id,
+                description=" ".join((request.description or "").split())[:300],
+                code=request.code,
+                reason=request.reason.strip(),
+                selected_by=principal.subject,
+            )
         return self.repository.record_case_hs_selection(
             org_id=principal.org_id,
             case_id=case.case_id,
@@ -2284,12 +2340,7 @@ class WorkbenchService:
             "input_document_manifest": [item.model_dump(mode="json") for item in manifest],
             "input_manifest_digest": input_manifest_digest,
         }
-        reviewer_hs_code = self._latest_hs_selection_code(principal, case_id)
-        if reviewer_hs_code is not None:
-            snapshot["reviewer_hs_selection"] = {
-                "code": reviewer_hs_code,
-                "source_kind": "human_provided",
-            }
+        snapshot.update(self._reviewer_hs_context(principal, case_id))
         supplied_digest = canonical_digest(
             {"case_id": case_id, "request": request.model_dump(mode="json")}
         )
@@ -3372,12 +3423,8 @@ class WorkbenchService:
             snapshot["parent_document_analyses"] = parent.document_analyses
         else:
             snapshot.pop("parent_document_analyses", None)
-        revision_hs_code = self._latest_hs_selection_code(principal, case.case_id)
-        if revision_hs_code is not None:
-            snapshot["reviewer_hs_selection"] = {
-                "code": revision_hs_code,
-                "source_kind": "human_provided",
-            }
+        snapshot.pop("reviewer_hs_selections", None)
+        snapshot.update(self._reviewer_hs_context(principal, case.case_id))
         now = utc_now()
         job = JobRecord(
             job_id=_id("job"),

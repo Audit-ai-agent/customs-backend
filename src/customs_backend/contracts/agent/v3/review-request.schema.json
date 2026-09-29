@@ -57,10 +57,12 @@
     },
     "ReviewerHsSelection": {
       "additionalProperties": false,
-      "description": "Reviewer-confirmed HSK code, labelled human-provided context. It never overrides a document-cited HS code; the Agent may use it only as the retrieval commodity when no input document cites a code.",
+      "description": "Reviewer-confirmed HSK code, labelled human-provided context. It never overrides a document-cited HS code; the Agent may use it to complete a shorter document-cited prefix, as the retrieval commodity for the goods item it names (item_id/description, multi-item cases), or as the only retrieval commodity when no input document cites a code.",
       "properties": {
         "code": {"type": "string", "pattern": "^[0-9]{10}$"},
-        "source_kind": {"const": "human_provided", "type": "string"}
+        "source_kind": {"const": "human_provided", "type": "string"},
+        "item_id": {"type": ["string", "null"], "maxLength": 64},
+        "description": {"type": ["string", "null"], "maxLength": 300}
       },
       "required": ["code", "source_kind"],
       "type": "object"
@@ -77,6 +79,10 @@
     "applied_correction_proposal_ids": {"type": "array", "maxItems": 50, "items": {"type": "string", "minLength": 1, "maxLength": 128}},
     "human_corrections": {"type": "array", "maxItems": 50, "items": {"$ref": "#/$defs/HumanCorrection"}},
     "reviewer_hs_selection": {"anyOf": [{"$ref": "#/$defs/ReviewerHsSelection"}, {"type": "null"}]},
+    "reviewer_hs_selections": {
+      "description": "Every reviewer-confirmed code, one per goods item, when the case has several items; reviewer_hs_selection stays the newest of them for older Agents.",
+      "type": "array", "maxItems": 20, "items": {"$ref": "#/$defs/ReviewerHsSelection"}
+    },
     "parent_document_analyses": {
       "description": "Child run only: the parent run's document_analyses, exactly as returned in its review result. The Agent validates them against the unchanged input documents and reuses them instead of extracting again; approved human corrections are then appended.",
       "anyOf": [{"type": "array", "maxItems": 20, "items": {"type": "object"}}, {"type": "null"}]

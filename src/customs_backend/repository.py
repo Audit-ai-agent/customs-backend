@@ -152,6 +152,60 @@ class InMemoryWorkbenchRepository:
             self._cases[case_id] = self._copy(updated)
             return self._copy(selection)
 
+    def record_case_hs_item_selection(
+        self,
+        *,
+        org_id: str,
+        case_id: str,
+        item_id: str,
+        description: str,
+        code: str,
+        reason: str,
+        selected_by: str,
+    ) -> HsSelectionRecord:
+        """Atomically replace the reviewer's HS code for one goods item of the case.
+
+        The item's earlier confirmations stay in its history; other items
+        are untouched.  As for the whole-case selection the case revision is
+        left unchanged.
+        """
+
+        with self._lock:
+            record = self._cases.get(case_id)
+            if record is None or record.org_id != org_id:
+                raise ConflictError("case does not exist")
+            now = utc_now()
+            entry = HsSelectionHistoryEntry(
+                code=code,
+                reason=reason,
+                selected_by=selected_by,
+                selected_at=now,
+            )
+            existing = next(
+                (item for item in record.hs_item_selections if item.item_id == item_id), None
+            )
+            history = [*existing.history, entry] if existing else [entry]
+            selection = HsSelectionRecord(
+                code=code,
+                reason=reason,
+                selected_by=selected_by,
+                selected_at=now,
+                history=history[-100:],
+                item_id=item_id,
+                description=description,
+            )
+            selections = [
+                selection if item.item_id == item_id else item
+                for item in record.hs_item_selections
+            ]
+            if existing is None:
+                selections.append(selection)
+            updated = record.model_copy(
+                update={"hs_item_selections": selections[-50:], "updated_at": now}
+            )
+            self._cases[case_id] = self._copy(updated)
+            return self._copy(selection)
+
     def record_case_hs_agent_ranking(
         self,
         *,

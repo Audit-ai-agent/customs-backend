@@ -977,7 +977,12 @@ def test_case_hs_classification_keeps_the_agent_reading_when_ranking_fails() -> 
 
 def test_case_hs_shortlist_from_the_agent_reading_expands_cited_prefixes() -> None:
     from customs_backend.domain import DocumentRecord
-    from customs_backend.trade_features import AgentHsItem, agent_hs_items, case_hs_shortlist
+    from customs_backend.trade_features import (
+        AgentHsItem,
+        agent_hs_items,
+        case_hs_item_id,
+        case_hs_shortlist,
+    )
 
     items = agent_hs_items(
         {
@@ -995,6 +1000,7 @@ def test_case_hs_shortlist_from_the_agent_reading_expands_cited_prefixes() -> No
     )
     assert items == [
         AgentHsItem(
+            item_id=case_hs_item_id("men's cotton  t-shirts"),
             description="MEN'S COTTON T-SHIRTS",
             document_ids=["d1"],
             cited_hs_codes=["610910", "0303540000"],
@@ -1099,3 +1105,245 @@ def test_case_hs_classification_keeps_heuristics_when_the_agent_fails() -> None:
         assert body["basis_kind"] == "document_text"
         assert "6109101000" in {candidate["code"] for candidate in body["candidates"]}
         assert all(candidate["origin"] == "description_match" for candidate in body["candidates"])
+
+
+# ── Several goods items on one document (2026-09-30) ─────────────
+
+_TWO_ITEM_INVOICE = "\n".join(
+    [
+        "COMMERCIAL INVOICE",
+        "Description of Goods",
+        "MEN'S COTTON T-SHIRTS",
+        "64,444 PCS",
+        "FROZEN MACKEREL, WHOLE",
+        "2,000 KG",
+    ]
+)
+
+
+def _two_item_agent(requests: list[dict[str, Any]], *, item_picks: bool = True):
+    """An Agent that reads two commodities and ranks each from its own reference list."""
+
+    def handler(request: dict[str, Any]) -> dict[str, Any]:
+        requests.append(request)
+        document_id = request["documents"][0]["document_id"]
+        items = [
+            {
+                "description": "MEN'S COTTON T-SHIRTS",
+                "document_ids": [document_id],
+                "cited_hs_codes": [],
+                "search_terms": ["티셔츠", "면", "남성용", "t-shirts"],
+            },
+            {
+                "description": "FROZEN MACKEREL, WHOLE",
+                "document_ids": [document_id],
+                "cited_hs_codes": [],
+                "search_terms": ["고등어", "냉동", "mackerel"],
+            },
+        ]
+        if not request.get("items"):
+            return {"schema_version": "1.0", "status": "ok", "items": items, "picks": []}
+        picks: list[dict[str, Any]] = []
+        for item in request["items"]:
+            codes = [ref["code"] for ref in item["reference_candidates"]]
+            wanted = "6109101000" if "T-SHIRTS" in item["description"] else "0303540000"
+            assert wanted in codes, (item["description"], codes)
+            reason = "면 소재 남성용 티셔츠" if wanted == "6109101000" else "냉동 통고등어"
+            pick = {"code": wanted, "rank": 1, "confidence": 0.9, "reason": reason}
+            if item_picks:
+                pick["item_id"] = item["item_id"]
+            picks.append(pick)
+        return {"schema_version": "1.0", "status": "ok", "items": items, "picks": picks}
+
+    return handler
+
+
+def test_case_hs_classification_lists_each_cited_code_as_its_own_item() -> None:
+    with _client(review_handler=_review_result_with_facts) as client:
+        case_id = _case_with_documents(
+            client,
+            [("CI", "ci.txt", "COMMERCIAL INVOICE\nHS CODE: 6109101000\nHS CODE: 0303540000")],
+        )
+        body = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
+        assert [item["item_id"] for item in body["items"]] == ["code-0303540000", "code-6109101000"]
+        assert all(len(item["candidates"]) == 1 for item in body["items"])
+        assert body["items"][0]["candidates"][0]["code"] == "0303540000"
+        assert body["items"][0]["cited_hs_codes"] == ["0303540000"]
+        assert "selection" not in body["items"][0]
+
+
+def test_case_hs_classification_ranks_each_item_the_agent_read() -> None:
+    requests: list[dict[str, Any]] = []
+    with _client(
+        review_handler=_review_result_with_facts, hs_candidates_handler=_two_item_agent(requests)
+    ) as client:
+        case_id = _case_with_documents(client, [("CI", "ci.txt", _TWO_ITEM_INVOICE)])
+        body = client.get(f"/api/v1/cases/{case_id}/hs-classification?agent=true", headers=_auth()).json()
+        assert body["basis_kind"] == "agent_ranked"
+        # Round two carries every item with its own reference rows.
+        assert len(requests) == 2 and "items" not in requests[0]
+        sent = requests[1]["items"]
+        assert [item["description"] for item in sent] == ["MEN'S COTTON T-SHIRTS", "FROZEN MACKEREL, WHOLE"]
+        assert all(1 <= len(item["reference_candidates"]) <= 20 for item in sent)
+        assert requests[1]["reference_candidates"]
+        # Each item shows its own AI pick first and nothing from the other item.
+        items = body["items"]
+        assert [item["description"] for item in items] == ["MEN'S COTTON T-SHIRTS", "FROZEN MACKEREL, WHOLE"]
+        assert (items[0]["candidates"][0]["code"], items[0]["candidates"][0]["origin"]) == ("6109101000", "llm_match")
+        assert items[0]["candidates"][0]["recommended"] is True
+        assert items[0]["candidates"][0]["explanation"] == "면 소재 남성용 티셔츠"
+        assert (items[1]["candidates"][0]["code"], items[1]["candidates"][0]["recommended"]) == ("0303540000", True)
+        assert all(candidate["code"] != "0303540000" for candidate in items[0]["candidates"])
+        assert all(len(item["candidates"]) <= 5 for item in items)
+        # The whole-case list still leads with the ranked picks.
+        assert [candidate["code"] for candidate in body["candidates"][:2]] == ["6109101000", "0303540000"]
+
+        # A reload shows the same items without another model call.
+        again = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
+        assert again["basis_kind"] == "agent_ranked"
+        assert [item["item_id"] for item in again["items"]] == [item["item_id"] for item in items]
+        assert again["items"][1]["candidates"][0]["explanation"] == "냉동 통고등어"
+        assert len(requests) == 2
+
+
+def test_case_hs_classification_reaches_items_from_whole_case_picks() -> None:
+    # An Agent answering without item ids still ranks the whole case; each
+    # item takes the picks its own shortlist holds.
+    requests: list[dict[str, Any]] = []
+    with _client(
+        review_handler=_review_result_with_facts,
+        hs_candidates_handler=_two_item_agent(requests, item_picks=False),
+    ) as client:
+        case_id = _case_with_documents(client, [("CI", "ci.txt", _TWO_ITEM_INVOICE)])
+        body = client.get(f"/api/v1/cases/{case_id}/hs-classification?agent=true", headers=_auth()).json()
+        assert body["basis_kind"] == "agent_ranked"
+        items = body["items"]
+        assert items[0]["candidates"][0]["code"] == "6109101000"
+        assert items[1]["candidates"][0]["code"] == "0303540000"
+        assert items[0]["candidates"][0]["recommended"] and items[1]["candidates"][0]["recommended"]
+
+
+def test_per_item_hs_selections_are_kept_per_item_and_reach_the_review() -> None:
+    requests: list[dict[str, Any]] = []
+    wires: list[dict[str, Any]] = []
+
+    def review(request: Any) -> dict[str, Any]:
+        wires.append(request.to_agent_wire())
+        return _review_result_with_facts(request)
+
+    with _client(review_handler=review, hs_candidates_handler=_two_item_agent(requests)) as client:
+        case_id = _case_with_documents(client, [("CI", "ci.txt", _TWO_ITEM_INVOICE)])
+        body = client.get(f"/api/v1/cases/{case_id}/hs-classification?agent=true", headers=_auth()).json()
+        shirts, fish = body["items"]
+
+        # A description belongs to an item selection and an item needs one.
+        assert (
+            client.post(
+                f"/api/v1/cases/{case_id}/hs-classification",
+                json={"code": "6109101000", "reason": "x", "item_id": shirts["item_id"]},
+                headers=_auth(),
+            ).status_code
+            == 422
+        )
+        assert (
+            client.post(
+                f"/api/v1/cases/{case_id}/hs-classification",
+                json={"code": "6109101000", "reason": "x", "description": "loose"},
+                headers=_auth(),
+            ).status_code
+            == 422
+        )
+
+        first = client.post(
+            f"/api/v1/cases/{case_id}/hs-classification",
+            json={
+                "code": "6109101000",
+                "reason": "AI 추천 확정",
+                "item_id": shirts["item_id"],
+                "description": shirts["description"],
+            },
+            headers=_auth(),
+        )
+        assert first.status_code == 200, first.text
+        assert first.json()["item_id"] == shirts["item_id"]
+        assert first.json()["description"] == "MEN'S COTTON T-SHIRTS"
+        second = client.post(
+            f"/api/v1/cases/{case_id}/hs-classification",
+            json={
+                "code": "0303540000",
+                "reason": "AI 추천 확정",
+                "item_id": fish["item_id"],
+                "description": fish["description"],
+            },
+            headers=_auth(),
+        )
+        assert second.status_code == 200
+        # Re-confirming one item keeps its history and leaves the other alone.
+        third = client.post(
+            f"/api/v1/cases/{case_id}/hs-classification",
+            json={
+                "code": "6105100000",
+                "reason": "셔츠로 정정",
+                "item_id": shirts["item_id"],
+                "description": shirts["description"],
+            },
+            headers=_auth(),
+        )
+        assert third.status_code == 200
+        assert [entry["code"] for entry in third.json()["history"]] == ["6109101000", "6105100000"]
+
+        view = client.get(f"/api/v1/cases/{case_id}/hs-classification", headers=_auth()).json()
+        assert "selection" not in view  # no whole-case confirmation was made
+        by_id = {item["item_id"]: item for item in view["items"]}
+        assert by_id[shirts["item_id"]]["selection"]["code"] == "6105100000"
+        assert by_id[fish["item_id"]]["selection"]["code"] == "0303540000"
+
+        review_response = client.post(
+            f"/api/v1/cases/{case_id}/reviews",
+            json={},
+            headers={**_auth(), "Idempotency-Key": "case-hs-items-1"},
+        )
+        assert review_response.status_code == 202
+        # Every per-item confirmation reaches the Agent; the newest one is
+        # also the single field older Agents read.
+        assert wires[0]["reviewer_hs_selections"] == [
+            {
+                "code": "0303540000",
+                "source_kind": "human_provided",
+                "item_id": fish["item_id"],
+                "description": "FROZEN MACKEREL, WHOLE",
+            },
+            {
+                "code": "6105100000",
+                "source_kind": "human_provided",
+                "item_id": shirts["item_id"],
+                "description": "MEN'S COTTON T-SHIRTS",
+            },
+        ]
+        assert wires[0]["reviewer_hs_selection"] == {"code": "6105100000", "source_kind": "human_provided"}
+
+
+def test_a_confirmed_item_the_new_reading_lacks_stays_listed() -> None:
+    requests: list[dict[str, Any]] = []
+    with _client(
+        review_handler=_review_result_with_facts, hs_candidates_handler=_two_item_agent(requests)
+    ) as client:
+        case_id = _case_with_documents(client, [("CI", "ci.txt", _TWO_ITEM_INVOICE)])
+        assert (
+            client.post(
+                f"/api/v1/cases/{case_id}/hs-classification",
+                json={
+                    "code": "8528726000",
+                    "reason": "직접 확정",
+                    "item_id": "item-gone",
+                    "description": "LED MONITOR 24 INCH",
+                },
+                headers=_auth(),
+            ).status_code
+            == 200
+        )
+        body = client.get(f"/api/v1/cases/{case_id}/hs-classification?agent=true", headers=_auth()).json()
+        orphan = next(item for item in body["items"] if item["item_id"] == "item-gone")
+        assert orphan["description"] == "LED MONITOR 24 INCH"
+        assert orphan["candidates"] == [] and orphan["selection"]["code"] == "8528726000"
+        assert len(body["items"]) == 3

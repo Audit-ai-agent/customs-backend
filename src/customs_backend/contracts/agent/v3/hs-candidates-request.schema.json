@@ -2,7 +2,7 @@
   "$id": "https://schemas.customs.local/agent/v3/hs-candidates-request.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
-  "description": "Case-level HSK candidate request: confirmed document text plus the reference codes the Agent may choose among. The Agent never invents a code.",
+  "description": "Case-level HSK candidate request: confirmed document text plus the reference codes the Agent may choose among. With items, each goods item carries its own reference list and the Agent ranks per item. The Agent never invents a code.",
   "$defs": {
     "Document": {
       "additionalProperties": false,
@@ -63,6 +63,49 @@
         "code"
       ],
       "type": "object"
+    },
+    "Item": {
+      "additionalProperties": false,
+      "description": "One goods item the Backend already knows (from the extraction round or its own heuristics) with the reference codes the Agent may rank for it.",
+      "properties": {
+        "item_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "document_ids": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "string"
+          }
+        },
+        "cited_hs_codes": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9]{6,10}$"
+          }
+        },
+        "reference_candidates": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "$ref": "#/$defs/ReferenceCandidate"
+          }
+        }
+      },
+      "required": [
+        "item_id",
+        "description"
+      ],
+      "type": "object"
     }
   },
   "properties": {
@@ -88,6 +131,14 @@
       "maxItems": 40,
       "items": {
         "$ref": "#/$defs/ReferenceCandidate"
+      }
+    },
+    "items": {
+      "description": "Multi-item ranking round: picks are made per item and max_picks bounds each item; reference_candidates is then ignored.",
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "$ref": "#/$defs/Item"
       }
     },
     "max_picks": {

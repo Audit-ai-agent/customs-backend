@@ -208,6 +208,9 @@ class CaseHsAgentRankingRecord(BaseModel):
     document_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     ranked_at: datetime
     candidates: list[dict[str, Any]] = Field(default_factory=list, max_length=10)
+    # The goods items the Agent read, each with its own ranked candidates
+    # (2026-09-30).  Selections are not stored here; they live on the case.
+    items: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
 
 
 class CaseRecord(BaseModel):
@@ -226,6 +229,11 @@ class CaseRecord(BaseModel):
     # very first run can already retrieve law evidence.  Reviewer-owned;
     # never derived from or written by an Agent result.
     hs_selection: HsSelectionRecord | None = None
+    # One confirmation per goods item when the documents list several
+    # commodities (2026-09-30).  Each entry carries ``item_id`` and
+    # ``description``; ``hs_selection`` above stays the whole-case
+    # confirmation for cases with a single item.
+    hs_item_selections: list[HsSelectionRecord] = Field(default_factory=list, max_length=50)
     # Advisory only: the Agent's last ranking, never a source for review
     # facts or the reviewer's selection.
     hs_agent_ranking: CaseHsAgentRankingRecord | None = None
@@ -1252,12 +1260,19 @@ class FindingDecisionRecord(BaseModel):
 
 
 class HsSelectionRequest(BaseModel):
-    """A reviewer-owned HS code confirmation which never changes the Agent result."""
+    """A reviewer-owned HS code confirmation which never changes the Agent result.
+
+    With ``item_id`` (and the item's ``description`` as shown) the code is
+    confirmed for one goods item of a multi-item case; without it the code
+    is the whole-case confirmation.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     code: str = Field(pattern=r"^[0-9]{10}$")
     reason: str = Field(min_length=1, max_length=4000)
+    item_id: str | None = Field(default=None, min_length=1, max_length=64)
+    description: str | None = Field(default=None, min_length=1, max_length=300)
 
     @field_validator("reason")
     @classmethod
@@ -1265,6 +1280,14 @@ class HsSelectionRequest(BaseModel):
         if not value.strip():
             raise ValueError("an HS selection reason is required")
         return value
+
+    @model_validator(mode="after")
+    def item_has_description(self) -> "HsSelectionRequest":
+        if self.item_id is not None and not (self.description or "").strip():
+            raise ValueError("an item selection names the item it confirms")
+        if self.item_id is None and self.description is not None:
+            raise ValueError("a description belongs to an item selection")
+        return self
 
 
 class HsSelectionHistoryEntry(BaseModel):
@@ -1277,7 +1300,11 @@ class HsSelectionHistoryEntry(BaseModel):
 
 
 class HsSelectionRecord(BaseModel):
-    """Current reviewer HS code selection plus every prior selection."""
+    """Current reviewer HS code selection plus every prior selection.
+
+    ``item_id`` and ``description`` are set on a per-item confirmation of a
+    multi-item case and absent on a whole-case or run-level one.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1286,6 +1313,8 @@ class HsSelectionRecord(BaseModel):
     selected_by: str = Field(min_length=1, max_length=256)
     selected_at: datetime
     history: list[HsSelectionHistoryEntry] = Field(min_length=1, max_length=100)
+    item_id: str | None = Field(default=None, min_length=1, max_length=64)
+    description: str | None = Field(default=None, min_length=1, max_length=300)
 
 
 class ConversationCreate(BaseModel):
@@ -2021,6 +2050,9 @@ class AgentReviewerHsSelection(BaseModel):
 
     code: str = Field(pattern=r"^[0-9]{10}$")
     source_kind: Literal["human_provided"] = "human_provided"
+    # Per-item confirmation: which goods item of the case the code is for.
+    item_id: str | None = Field(default=None, min_length=1, max_length=64)
+    description: str | None = Field(default=None, min_length=1, max_length=300)
 
 
 class AgentReviewRequest(BaseModel):
@@ -2040,6 +2072,11 @@ class AgentReviewRequest(BaseModel):
     applied_correction_proposal_ids: list[str] = Field(default_factory=list, max_length=50)
     human_corrections: list[AgentHumanCorrection] = Field(default_factory=list, max_length=50)
     reviewer_hs_selection: AgentReviewerHsSelection | None = None
+    # Every per-item confirmation of a multi-item case; the single field
+    # above stays the newest confirmation for older Agents.
+    reviewer_hs_selections: list[AgentReviewerHsSelection] = Field(
+        default_factory=list, max_length=20
+    )
     # The parent run's stored document_analyses, so a child run reuses the
     # parent extraction and only appends the approved human facts.
     parent_document_analyses: list[dict[str, Any]] | None = Field(default=None, max_length=20)
@@ -2095,7 +2132,14 @@ class AgentReviewRequest(BaseModel):
             if self.parent_document_analyses is not None:
                 wire["parent_document_analyses"] = self.parent_document_analyses
         if self.reviewer_hs_selection is not None:
-            wire["reviewer_hs_selection"] = self.reviewer_hs_selection.model_dump(mode="json")
+            wire["reviewer_hs_selection"] = self.reviewer_hs_selection.model_dump(
+                mode="json", exclude_none=True
+            )
+        if self.reviewer_hs_selections:
+            wire["reviewer_hs_selections"] = [
+                item.model_dump(mode="json", exclude_none=True)
+                for item in self.reviewer_hs_selections
+            ]
         return wire
 
     @property

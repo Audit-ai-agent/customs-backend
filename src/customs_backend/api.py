@@ -2043,6 +2043,7 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
     @app.post(
         "/api/v1/cases/{case_id}/hs-classification",
         response_model=HsSelectionRecord,
+        response_model_exclude_none=True,
         status_code=200,
     )
     def record_case_hs_selection_endpoint(

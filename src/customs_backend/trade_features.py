@@ -197,6 +197,25 @@ class HsReferenceInfo(BaseModel):
     source: str
 
 
+class CaseHsItemView(BaseModel):
+    """One goods item of the case with its own HSK candidates and confirmation.
+
+    A shipment often lists several commodities on one invoice or packing
+    list; each gets its own candidate list and its own reviewer-confirmed
+    code.  ``item_id`` is stable for the same item name across re-reads, so
+    a confirmation survives the Agent reading the documents again.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: str = Field(min_length=1, max_length=64)
+    description: str = Field(min_length=1, max_length=300)
+    document_ids: list[str] = Field(default_factory=list)
+    cited_hs_codes: list[str] = Field(default_factory=list)
+    candidates: list[HsCandidate] = Field(default_factory=list)
+    selection: HsSelectionRecord | None = None
+
+
 class CaseHsClassificationView(BaseModel):
     """HSK candidates read from the case's confirmed document text.
 
@@ -204,6 +223,10 @@ class CaseHsClassificationView(BaseModel):
     that name a tariff code, and a description match is offered when no code
     is cited.  Confirming a code here feeds the first review's law-evidence
     retrieval as the reviewer HS selection.
+
+    ``items`` splits the same reading per goods item (several commodities on
+    one document each get their own candidates and confirmation);
+    ``candidates`` and ``selection`` remain the whole-case view.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -213,6 +236,7 @@ class CaseHsClassificationView(BaseModel):
     reference: HsReferenceInfo
     candidates: list[HsCandidate]
     selection: HsSelectionRecord | None = None
+    items: list[CaseHsItemView] = Field(default_factory=list)
     # When the Agent ranked these candidates (stored per case, so a reload
     # shows the same list without another model call).
     agent_ranked_at: datetime | None = None
@@ -735,20 +759,124 @@ def case_hs_agent_ranking(
         document_digest=case_hs_document_digest(documents),
         ranked_at=ranked_at,
         candidates=[candidate.model_dump(mode="json") for candidate in view.candidates[:10]],
+        items=[
+            item.model_dump(mode="json", exclude={"selection"}) for item in view.items[:20]
+        ],
     )
 
 
 def _stored_agent_ranking(
     case: CaseRecord, documents: list[tuple[DocumentRecord, str]]
-) -> tuple[list[HsCandidate], datetime] | None:
+) -> tuple[list[HsCandidate], list[CaseHsItemView], datetime] | None:
     ranking = case.hs_agent_ranking
     if ranking is None or ranking.document_digest != case_hs_document_digest(documents):
         return None
     try:
         candidates = [HsCandidate.model_validate(item) for item in ranking.candidates]
+        items = [CaseHsItemView.model_validate(item) for item in ranking.items]
     except ValueError:
         return None
-    return (candidates, ranking.ranked_at) if candidates else None
+    return (candidates, items, ranking.ranked_at) if candidates else None
+
+
+def case_hs_item_id(description: str) -> str:
+    """Identity of a goods item: the same item name gives the same id on every read."""
+
+    normalized = " ".join(re.sub(r"[^0-9a-z가-힣]+", " ", description.lower()).split())
+    return "item-" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+
+
+def _normalized_description(description: str | None) -> str:
+    return " ".join(re.sub(r"[^0-9a-z가-힣]+", " ", (description or "").lower()).split())
+
+
+def with_item_selections(items: list[CaseHsItemView], case: CaseRecord) -> list[CaseHsItemView]:
+    """Attach the case's per-item confirmations; a confirmed item that no longer appears is kept.
+
+    A confirmation binds by ``item_id`` first and by the normalised item name
+    second, so a re-read that rewords an item slightly still shows it as
+    confirmed.  A confirmation whose item the current reading lacks is
+    listed on its own: the reviewer's decision stays visible and still
+    reaches the review.
+    """
+
+    selections = [item for item in case.hs_item_selections if item.item_id]
+    by_id = {item.item_id: item for item in selections}
+    by_name = {_normalized_description(item.description): item for item in selections}
+    used: set[str | None] = set()
+    attached: list[CaseHsItemView] = []
+    for item in items:
+        selection = by_id.get(item.item_id) or by_name.get(_normalized_description(item.description))
+        if selection is not None:
+            used.add(selection.item_id)
+        attached.append(item.model_copy(update={"selection": selection}))
+    for selection in selections:
+        if selection.item_id in used:
+            continue
+        attached.append(
+            CaseHsItemView(
+                item_id=str(selection.item_id),
+                description=selection.description or selection.code,
+                candidates=[],
+                selection=selection,
+            )
+        )
+    return attached
+
+
+_HEURISTIC_ITEM_LIMIT = 10
+
+
+def _heuristic_items(scan: _CaseTextScan, candidates: list[HsCandidate]) -> list[CaseHsItemView]:
+    """Split the text heuristics per goods item.
+
+    Every distinct tariff code the documents cite is one item (the same code
+    on the invoice, packing list and certificate is one agreement).  Without
+    cited codes every distinct item-name cell is one item with its own
+    name-match candidates; cells that match nothing in the reference are
+    not items.
+    """
+
+    if scan.code_documents:
+        items: list[CaseHsItemView] = []
+        for candidate in candidates:
+            basis_lines = [basis.raw_value for basis in candidate.basis if basis.raw_value]
+            items.append(
+                CaseHsItemView(
+                    item_id=f"code-{candidate.code}",
+                    description=(candidate.name_ko or (basis_lines[0] if basis_lines else candidate.code))[:300],
+                    document_ids=sorted(scan.code_documents.get(candidate.code, set())),
+                    cited_hs_codes=[candidate.code],
+                    candidates=[candidate],
+                )
+            )
+        return items[:_HEURISTIC_ITEM_LIMIT]
+    groups: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    names: dict[str, str] = {}
+    for document_id, fact in scan.description_facts:
+        value = _fact_value(fact)
+        key = _normalized_description(value)
+        if not key:
+            continue
+        groups.setdefault(key, []).append((document_id, fact))
+        names.setdefault(key, value)
+    items = []
+    for key, facts in groups.items():
+        item_candidates = _description_candidates_from_facts(facts)
+        if not item_candidates:
+            continue
+        items.append(
+            CaseHsItemView(
+                item_id=case_hs_item_id(names[key]),
+                description=names[key][:300],
+                document_ids=sorted({document_id for document_id, _ in facts}),
+                cited_hs_codes=[],
+                candidates=item_candidates,
+            )
+        )
+        if len(items) >= _HEURISTIC_ITEM_LIMIT:
+            break
+    return items
 
 
 def build_case_hs_classification(
@@ -757,18 +885,21 @@ def build_case_hs_classification(
     """Offer HSK candidates from confirmed document text, before any review.
 
     A stored Agent ranking for exactly this document set is returned as is;
-    otherwise the candidates come from the text heuristics.
+    otherwise the candidates come from the text heuristics.  Either way the
+    reading is also split per goods item with the case's per-item
+    confirmations attached.
     """
 
     stored = _stored_agent_ranking(case, documents)
     if stored is not None:
-        candidates, ranked_at = stored
+        candidates, items, ranked_at = stored
         return CaseHsClassificationView(
             case_id=case.case_id,
             basis_kind="agent_ranked",
             reference=_reference_info(),
             candidates=candidates,
             selection=case.hs_selection,
+            items=with_item_selections(items, case),
             agent_ranked_at=ranked_at,
         )
     scan = _scan_case_text(documents)
@@ -784,6 +915,7 @@ def build_case_hs_classification(
         reference=_reference_info(),
         candidates=candidates,
         selection=case.hs_selection,
+        items=with_item_selections(_heuristic_items(scan, candidates), case),
     )
 
 
@@ -804,6 +936,7 @@ class AgentHsItem(BaseModel):
 
     model_config = ConfigDict(extra="ignore", frozen=True)
 
+    item_id: str = Field(min_length=1, max_length=64)
     description: str = Field(min_length=1, max_length=300)
     document_ids: list[str] = Field(default_factory=list)
     cited_hs_codes: list[str] = Field(default_factory=list)
@@ -811,9 +944,14 @@ class AgentHsItem(BaseModel):
 
 
 def agent_hs_items(response: dict[str, Any]) -> list[AgentHsItem]:
-    """The goods the Agent read from the documents; malformed entries are dropped."""
+    """The goods the Agent read from the documents; malformed entries are dropped.
 
-    items: list[AgentHsItem] = []
+    Two readings of the same item name (the invoice line and the packing
+    list row) merge into one item; the id is derived from the name so it is
+    the same on every read.
+    """
+
+    items: dict[str, AgentHsItem] = {}
     raw_items = response.get("items")
     for raw in raw_items if isinstance(raw_items, list) else []:
         if not isinstance(raw, dict):
@@ -821,19 +959,31 @@ def agent_hs_items(response: dict[str, Any]) -> list[AgentHsItem]:
         description = raw.get("description")
         if not isinstance(description, str) or not description.strip():
             continue
-        items.append(
-            AgentHsItem(
-                description=" ".join(description.split())[:300],
-                document_ids=_string_list(raw.get("document_ids"), limit=20, max_length=128),
-                cited_hs_codes=[
-                    code
-                    for code in _string_list(raw.get("cited_hs_codes"), limit=10, max_length=10)
-                    if re.fullmatch(r"[0-9]{6,10}", code)
-                ],
-                search_terms=_string_list(raw.get("search_terms"), limit=10, max_length=80),
-            )
+        text = " ".join(description.split())[:300]
+        item = AgentHsItem(
+            item_id=case_hs_item_id(text),
+            description=text,
+            document_ids=_string_list(raw.get("document_ids"), limit=20, max_length=128),
+            cited_hs_codes=[
+                code
+                for code in _string_list(raw.get("cited_hs_codes"), limit=10, max_length=10)
+                if re.fullmatch(r"[0-9]{6,10}", code)
+            ],
+            search_terms=_string_list(raw.get("search_terms"), limit=10, max_length=80),
         )
-    return items[:20]
+        existing = items.get(item.item_id)
+        if existing is not None:
+            item = existing.model_copy(
+                update={
+                    "document_ids": list(dict.fromkeys([*existing.document_ids, *item.document_ids]))[:20],
+                    "cited_hs_codes": list(dict.fromkeys([*existing.cited_hs_codes, *item.cited_hs_codes]))[:10],
+                    "search_terms": list(dict.fromkeys([*existing.search_terms, *item.search_terms]))[:10],
+                }
+            )
+        items[item.item_id] = item
+        if len(items) >= 20:
+            break
+    return list(items.values())
 
 
 def _string_list(value: object, *, limit: int, max_length: int) -> list[str]:
@@ -970,20 +1120,117 @@ def case_hs_shortlist(
     return shortlist[:_AGENT_SHORTLIST_LIMIT]
 
 
+_AGENT_ITEM_SHORTLIST_LIMIT = 20
+_ITEM_CANDIDATE_LIMIT = 5
+
+
+def _item_shortlist(item: AgentHsItem, index: int) -> list[HsCandidate]:
+    """Reference codes for one item: its cited codes, then its name and term matches."""
+
+    document_ids = item.document_ids or ["agent"]
+    code_documents: dict[str, set[str]] = {}
+    code_basis: dict[str, list[HsCandidateBasis]] = {}
+    documents_with_hs: set[str] = set()
+    for code in item.cited_hs_codes:
+        if len(code) != 10 or not hs_reference_has(code):
+            continue
+        for document_id in document_ids:
+            documents_with_hs.add(document_id)
+            code_documents.setdefault(code, set()).add(document_id)
+            code_basis.setdefault(code, []).append(
+                HsCandidateBasis(
+                    document_id=document_id,
+                    fact_id=f"agent-cited-{index}",
+                    fact_name="cited_hs_code",
+                    raw_value=code,
+                )
+            )
+    facts: list[tuple[str, dict[str, Any]]] = []
+    for term_index, value in enumerate([item.description, *item.search_terms]):
+        suffix = f"-term-{term_index}" if term_index else ""
+        fact = {
+            "fact_id": f"agent-item-{index}{suffix}",
+            "name": "description",
+            "raw_value": item.description[:200],
+            "normalized_value": value[:200],
+        }
+        for document_id in document_ids:
+            facts.append((document_id, fact))
+    shortlist = [
+        candidate
+        for candidate in _code_candidates(
+            code_documents=code_documents,
+            code_basis=code_basis,
+            documents_with_hs=documents_with_hs,
+        )
+        if candidate.in_reference
+    ]
+    seen = {candidate.code for candidate in shortlist}
+    for candidate in [
+        *_agent_search_candidates([item]),
+        *_description_candidates_from_facts(facts, limit=_AGENT_ITEM_SHORTLIST_LIMIT),
+    ]:
+        if candidate.code not in seen:
+            seen.add(candidate.code)
+            shortlist.append(candidate)
+    return shortlist[:_AGENT_ITEM_SHORTLIST_LIMIT]
+
+
+def case_hs_item_shortlists(
+    items: list[AgentHsItem],
+) -> list[tuple[AgentHsItem, list[HsCandidate]]]:
+    """One shortlist per goods item the Agent read, in the Agent's order."""
+
+    return [(item, _item_shortlist(item, index)) for index, item in enumerate(items, start=1)]
+
+
+def case_hs_item_views(
+    item_shortlists: list[tuple[AgentHsItem, list[HsCandidate]]],
+) -> list[CaseHsItemView]:
+    """The per-item view before ranking: each item with its own reference rows."""
+
+    return [
+        CaseHsItemView(
+            item_id=item.item_id,
+            description=item.description,
+            document_ids=item.document_ids,
+            cited_hs_codes=item.cited_hs_codes,
+            candidates=shortlist[:_ITEM_CANDIDATE_LIMIT],
+        )
+        for item, shortlist in item_shortlists
+    ]
+
+
+def _reference_payload(shortlist: list[HsCandidate], limit: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "code": candidate.code,
+            "name_ko": candidate.name_ko,
+            "name_en": candidate.name_en,
+            "ancestors": [item.name_ko for item in candidate.ancestors if item.name_ko][:8],
+        }
+        for candidate in shortlist
+    ][:limit]
+
+
 def agent_hs_request(
     case_id: str,
     documents: list[tuple[DocumentRecord, str]],
     shortlist: list[HsCandidate],
     *,
+    items: list[tuple[AgentHsItem, list[HsCandidate]]] | None = None,
     max_picks: int = 5,
 ) -> dict[str, Any]:
     """The Agent request: confirmed text plus the reference codes it may pick from.
 
-    An empty ``shortlist`` asks for the extraction-only round: the Agent reads
-    the goods and returns no picks because it has nothing to pick from.
+    An empty ``shortlist`` (and no ``items``) asks for the extraction-only
+    round: the Agent reads the goods and returns no picks because it has
+    nothing to pick from.  With ``items`` the Agent ranks each item from its
+    own reference rows; the whole-case list is still sent for an Agent that
+    answers without item ids.
     """
 
-    return {
+    request: dict[str, Any] = {
         "schema_version": "1.0",
         "case_id": case_id,
         "documents": [
@@ -994,35 +1241,28 @@ def agent_hs_request(
             }
             for record, text in documents
         ][:20],
-        "reference_candidates": [
-            {
-                "code": candidate.code,
-                "name_ko": candidate.name_ko,
-                "name_en": candidate.name_en,
-                "ancestors": [item.name_ko for item in candidate.ancestors if item.name_ko][:8],
-            }
-            for candidate in shortlist
-        ][:_AGENT_SHORTLIST_LIMIT],
+        "reference_candidates": _reference_payload(shortlist, _AGENT_SHORTLIST_LIMIT),
         "max_picks": max_picks,
     }
+    if items:
+        request["items"] = [
+            {
+                "item_id": item.item_id,
+                "description": item.description,
+                "document_ids": item.document_ids[:20],
+                "cited_hs_codes": item.cited_hs_codes[:10],
+                "reference_candidates": _reference_payload(
+                    item_shortlist, _AGENT_ITEM_SHORTLIST_LIMIT
+                ),
+            }
+            for item, item_shortlist in items
+        ][:20]
+    return request
 
 
-def apply_agent_hs_picks(
-    view: CaseHsClassificationView,
-    response: dict[str, Any],
-    shortlist: list[HsCandidate],
-) -> CaseHsClassificationView:
-    """Put the Agent's ranked picks first; keep the heuristic candidates behind them.
+def _ranked_from_picks(raw_picks: list[Any], shortlist: list[HsCandidate]) -> list[HsCandidate]:
+    """Picks in the Agent's order as llm_match candidates; codes outside the shortlist are dropped."""
 
-    A pick is honoured only when its code is in the shortlist the Backend sent,
-    so the reference table stays the single source of codes.
-    """
-
-    if response.get("status") != "ok":
-        return view
-    raw_picks = response.get("picks")
-    if not isinstance(raw_picks, list) or not raw_picks:
-        return view
     by_code = {candidate.code: candidate for candidate in shortlist}
     ranked: list[HsCandidate] = []
     for raw in raw_picks:
@@ -1048,6 +1288,108 @@ def apply_agent_hs_picks(
                 }
             )
         )
+    return ranked
+
+
+def apply_agent_hs_item_picks(
+    view: CaseHsClassificationView,
+    response: dict[str, Any],
+    shortlist: list[HsCandidate],
+    item_shortlists: list[tuple[AgentHsItem, list[HsCandidate]]],
+) -> CaseHsClassificationView:
+    """Rank each item's candidates from the Agent's per-item picks.
+
+    A pick naming an item is honoured only against that item's shortlist.
+    Picks without an item (an Agent answering the whole case) rank the
+    whole-case list and reach each item whose shortlist holds the code.
+    The whole-case ``candidates`` carry the ranked picks first.
+    """
+
+    if response.get("status") != "ok":
+        return view
+    raw_picks = response.get("picks")
+    if not isinstance(raw_picks, list) or not raw_picks:
+        return view
+    picks_by_item: dict[str, list[Any]] = {}
+    whole_case_picks: list[Any] = []
+    for raw in raw_picks:
+        if not isinstance(raw, dict):
+            continue
+        item_id = raw.get("item_id")
+        if isinstance(item_id, str) and item_id:
+            picks_by_item.setdefault(item_id, []).append(raw)
+        else:
+            whole_case_picks.append(raw)
+    whole_case_ranked = _ranked_from_picks(whole_case_picks, shortlist)
+
+    any_ranked = bool(whole_case_ranked)
+    items: list[CaseHsItemView] = []
+    flat: list[HsCandidate] = []
+    existing_items = {item.item_id: item for item in view.items}
+    for item, item_shortlist in item_shortlists:
+        ranked = _ranked_from_picks(picks_by_item.get(item.item_id, []), item_shortlist)
+        if not ranked and whole_case_ranked:
+            codes = {candidate.code for candidate in item_shortlist}
+            ranked = [
+                candidate.model_copy(update={"recommended": False})
+                for candidate in whole_case_ranked
+                if candidate.code in codes
+            ]
+            if ranked:
+                ranked[0] = ranked[0].model_copy(update={"recommended": True})
+        if ranked:
+            any_ranked = True
+        picked = {candidate.code for candidate in ranked}
+        rest = [
+            candidate.model_copy(update={"recommended": False})
+            for candidate in item_shortlist
+            if candidate.code not in picked
+        ]
+        base = existing_items.get(item.item_id) or CaseHsItemView(
+            item_id=item.item_id,
+            description=item.description,
+            document_ids=item.document_ids,
+            cited_hs_codes=item.cited_hs_codes,
+        )
+        items.append(base.model_copy(update={"candidates": [*ranked, *rest][:_ITEM_CANDIDATE_LIMIT]}))
+        for candidate in ranked:
+            if candidate.code not in {c.code for c in flat}:
+                flat.append(candidate)
+    if not any_ranked:
+        return view
+    ordered = whole_case_ranked or flat
+    picked = {candidate.code for candidate in ordered}
+    rest = [
+        candidate.model_copy(update={"recommended": False})
+        for candidate in view.candidates
+        if candidate.code not in picked
+    ]
+    # Items the ranking round did not cover (a confirmation whose item is
+    # gone) stay as they were.
+    covered = {item.item_id for item in items}
+    items.extend(item for item in view.items if item.item_id not in covered)
+    return view.model_copy(
+        update={"basis_kind": "agent_ranked", "candidates": [*ordered, *rest][:10], "items": items}
+    )
+
+
+def apply_agent_hs_picks(
+    view: CaseHsClassificationView,
+    response: dict[str, Any],
+    shortlist: list[HsCandidate],
+) -> CaseHsClassificationView:
+    """Put the Agent's ranked picks first; keep the heuristic candidates behind them.
+
+    A pick is honoured only when its code is in the shortlist the Backend sent,
+    so the reference table stays the single source of codes.
+    """
+
+    if response.get("status") != "ok":
+        return view
+    raw_picks = response.get("picks")
+    if not isinstance(raw_picks, list) or not raw_picks:
+        return view
+    ranked = _ranked_from_picks(raw_picks, shortlist)
     if not ranked:
         return view
     picked = {candidate.code for candidate in ranked}

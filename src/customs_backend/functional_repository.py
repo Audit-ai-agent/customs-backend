@@ -561,6 +561,29 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
         self._persist()
         return value
 
+    def record_case_hs_item_selection(
+        self,
+        *,
+        org_id: str,
+        case_id: str,
+        item_id: str,
+        description: str,
+        code: str,
+        reason: str,
+        selected_by: str,
+    ) -> HsSelectionRecord:
+        value = super().record_case_hs_item_selection(
+            org_id=org_id,
+            case_id=case_id,
+            item_id=item_id,
+            description=description,
+            code=code,
+            reason=reason,
+            selected_by=selected_by,
+        )
+        self._persist()
+        return value
+
     def record_case_hs_agent_ranking(
         self,
         *,

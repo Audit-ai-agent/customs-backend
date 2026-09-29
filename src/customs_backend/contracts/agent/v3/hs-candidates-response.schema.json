@@ -2,11 +2,19 @@
   "$id": "https://schemas.customs.local/agent/v3/hs-candidates-response.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
-  "description": "Goods extracted from the documents and the supplied reference codes ranked for them. status=deterministic means no model was used; unavailable means the model call failed and the caller keeps its own heuristic.",
+  "description": "Goods extracted from the documents and the supplied reference codes ranked for them, per item when the request sent items. status=deterministic means no model was used; unavailable means the model call failed and the caller keeps its own heuristic.",
   "$defs": {
     "Item": {
       "additionalProperties": false,
       "properties": {
+        "item_id": {
+          "description": "Echoed from the request item in a ranking round.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 64
+        },
         "description": {
           "type": "string",
           "minLength": 1,
@@ -48,6 +56,14 @@
     "Pick": {
       "additionalProperties": false,
       "properties": {
+        "item_id": {
+          "description": "The request item this pick ranks a code for (multi-item round only).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 64
+        },
         "code": {
           "type": "string",
           "pattern": "^[0-9]{10}$"
@@ -145,7 +161,7 @@
     },
     "picks": {
       "type": "array",
-      "maxItems": 10,
+      "maxItems": 200,
       "items": {
         "$ref": "#/$defs/Pick"
       }
