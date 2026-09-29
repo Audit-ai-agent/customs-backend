@@ -28,6 +28,8 @@ from customs_backend.domain import (
     FindingDecisionReasonCode,
     FindingDecisionStatus,
     GuidanceRegistryVersion,
+    DemoFallbackSetRecord,
+    DemoFallbackSettingsRecord,
     HsSelectionRecord,
     JobRecord,
     KnowledgeConversationRecord,
@@ -217,6 +219,14 @@ class WorkbenchRepository(Protocol):
         reason: str,
         selected_by: str,
     ) -> HsSelectionRecord: ...
+    def demo_fallback_settings(self) -> DemoFallbackSettingsRecord: ...
+    def update_demo_fallback_settings(
+        self, settings: DemoFallbackSettingsRecord
+    ) -> DemoFallbackSettingsRecord: ...
+    def list_demo_fallback_sets(self, org_id: str) -> list[DemoFallbackSetRecord]: ...
+    def add_demo_fallback_set(self, record: DemoFallbackSetRecord) -> DemoFallbackSetRecord: ...
+    def delete_demo_fallback_set(self, *, org_id: str, fallback_id: str) -> None: ...
+    def mark_demo_fallback_used(self, *, org_id: str, fallback_id: str) -> None: ...
     def record_case_hs_agent_ranking(
         self,
         *,

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import re
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -91,6 +93,13 @@ from customs_backend.domain import (
     FindingDecisionRequest,
     GuidanceResolution,
     GuidanceRegistryVersion,
+    CaseHsAgentRankingRecord,
+    DemoFallbackDocument,
+    DemoFallbackRegisterRequest,
+    DemoFallbackSetRecord,
+    DemoFallbackSettingsUpdate,
+    DemoFallbackSetView,
+    DemoFallbackView,
     HsSelectionRecord,
     HsSelectionRequest,
     InputDocumentManifestEntry,
@@ -162,6 +171,7 @@ from customs_backend.trade_features import (
     apply_agent_hs_item_picks,
     build_case_hs_classification,
     case_hs_agent_ranking,
+    case_hs_document_digest,
     case_hs_item_shortlists,
     case_hs_item_views,
     build_hs_classification,
@@ -882,6 +892,43 @@ def _agent_result_snapshot(run: ReviewRunRecord) -> dict[str, Any]:
     if canonical_digest(_agent_result_hash_payload(result)) != run.provider_result_sha256:
         raise ConflictError("persisted Agent result is not hash-consistent for assistant context")
     return result
+
+
+def _replace_identifiers(value: Any, replacements: dict[str, str]) -> Any:
+    """Rewrite every occurrence of the old document/case/run ids inside a JSON value."""
+
+    if not replacements:
+        return value
+    pattern = re.compile("|".join(re.escape(key) for key in sorted(replacements, key=len, reverse=True)))
+
+    def swap(node: Any) -> Any:
+        if isinstance(node, str):
+            return pattern.sub(lambda match: replacements[match.group(0)], node)
+        if isinstance(node, list):
+            return [swap(item) for item in node]
+        if isinstance(node, dict):
+            return {swap(key): swap(item) for key, item in node.items()}
+        return node
+
+    return swap(value)
+
+
+def _demo_fallback_set_view(record: DemoFallbackSetRecord) -> DemoFallbackSetView:
+    findings = record.agent_result.get("findings")
+    return DemoFallbackSetView(
+        fallback_id=record.fallback_id,
+        name=record.name,
+        source_case_id=record.source_case_id,
+        source_case_title=record.source_case_title,
+        source_review_run_id=record.source_review_run_id,
+        documents=record.documents,
+        has_hs_ranking=record.hs_agent_ranking is not None,
+        finding_count=len(findings) if isinstance(findings, list) else 0,
+        created_by=record.created_by,
+        created_at=record.created_at,
+        used_count=record.used_count,
+        last_used_at=record.last_used_at,
+    )
 
 
 def _source_reference_sets(run: ReviewRunRecord) -> dict[str, set[str]]:
@@ -2227,6 +2274,9 @@ class WorkbenchService:
         view = build_case_hs_classification(case, texts)
         if not texts or not use_agent:
             return view
+        replayed = self._demo_fallback_hs_view(principal, case, texts, failed=False)
+        if replayed is not None:
+            return replayed
         # An explicit request always re-reads; the stored ranking (if any)
         # only survives as the fallback when the Agent cannot answer.
         fresh = view.model_copy(
@@ -2244,7 +2294,7 @@ class WorkbenchService:
         try:
             reading = self.agent.hs_candidates(agent_hs_request(case.case_id, texts, []))
             if reading.get("status") != "ok":
-                return view
+                return self._demo_fallback_hs_view(principal, case, texts, failed=True) or view
             items = agent_hs_items(reading)
             shortlist = case_hs_shortlist(texts, agent_items=items)
             if not shortlist:
@@ -2280,7 +2330,7 @@ class WorkbenchService:
             )
             return ranked
         except Exception:  # noqa: BLE001 - any Agent problem keeps the candidates built so far
-            return fallback
+            return self._demo_fallback_hs_view(principal, case, texts, failed=True) or fallback
 
     def record_case_hs_selection(
         self, principal: Principal, case_id: str, request: HsSelectionRequest
@@ -2552,7 +2602,9 @@ class WorkbenchService:
             validate_agent_v3_payload("review_request", wire)
             if len(canonical_json_bytes(wire)) > _MAX_AGENT_REQUEST_BYTES:
                 raise ConflictError("Agent review request exceeds the 2 MiB transport limit")
-            result = self.agent.review(agent_request)
+            result = self._review_with_demo_fallback(
+                principal=principal, job=running, agent_request=agent_request
+            )
             run = self._build_run(
                 principal=principal,
                 job=running,
@@ -2583,6 +2635,227 @@ class WorkbenchService:
                     }
                 )
             )
+
+    # ── demo fallback ────────────────────────────────────────────
+
+    def _demo_fallback_for(
+        self, org_id: str, documents: list[tuple[str, str]]
+    ) -> DemoFallbackSetRecord | None:
+        """The registered set whose confirmed documents are exactly these (by content digest)."""
+
+        digests = sorted(sha for _, sha in documents)
+        if not digests:
+            return None
+        for record in self.repository.list_demo_fallback_sets(org_id):
+            if sorted(item.content_sha256 for item in record.documents) == digests:
+                return record
+        return None
+
+    def _review_with_demo_fallback(
+        self, *, principal: Principal, job: JobRecord, agent_request: AgentReviewRequest
+    ) -> dict[str, Any]:
+        """Call the Agent, or replay a registered result according to the fallback mode.
+
+        A child run (correction re-review) always goes to the Agent: a
+        replayed result could not reflect the approved corrections.
+        """
+
+        settings = self.repository.demo_fallback_settings()
+        fallback: DemoFallbackSetRecord | None = None
+        if settings.mode != "off" and job.request.get("parent_review_run_id") is None:
+            documents = [
+                (str(item["document_id"]), str(item["content_sha256"]))
+                for item in job.request.get("documents", [])
+                if isinstance(item, dict)
+            ]
+            fallback = self._demo_fallback_for(principal.org_id, documents)
+        if fallback is not None and settings.mode == "always":
+            return self._replay_demo_fallback(principal, fallback, job, agent_request, settings)
+        try:
+            return self.agent.review(agent_request)
+        except Exception:
+            if fallback is None or settings.mode != "auto":
+                raise
+            return self._replay_demo_fallback(principal, fallback, job, agent_request, settings)
+
+    def _replay_demo_fallback(
+        self,
+        principal: Principal,
+        fallback: DemoFallbackSetRecord,
+        job: JobRecord,
+        agent_request: AgentReviewRequest,
+        settings: Any,
+    ) -> dict[str, Any]:
+        """The stored Agent result re-bound to this run: ids, dates and the provider hash."""
+
+        documents = [
+            (str(item["document_id"]), str(item["content_sha256"]))
+            for item in job.request.get("documents", [])
+            if isinstance(item, dict)
+        ]
+        by_digest = {sha: document_id for document_id, sha in documents}
+        replacements = {
+            item.document_id: by_digest[item.content_sha256]
+            for item in fallback.documents
+            if item.content_sha256 in by_digest
+        }
+        replacements[fallback.source_case_id] = job.case_id
+        replacements[fallback.source_review_run_id] = job.review_run_id
+        result = _replace_identifiers(copy.deepcopy(fallback.agent_result), replacements)
+        review_as_of = str(job.request["review_as_of"])
+        result["case_id"] = job.case_id
+        result["review_run_id"] = job.review_run_id
+        result["review_as_of"] = review_as_of
+        result["trade_type"] = job.request["trade_type"]
+        result["input_manifest_sha256"] = agent_request.input_manifest_sha256
+        context = result.get("temporal_context")
+        if isinstance(context, dict) and "law_as_of" in context:
+            context["law_as_of"] = review_as_of
+        result["result_sha256"] = canonical_digest(_agent_result_hash_payload(result))
+        if settings.delay_seconds > 0:
+            time.sleep(float(settings.delay_seconds))
+        self.repository.mark_demo_fallback_used(
+            org_id=principal.org_id, fallback_id=fallback.fallback_id
+        )
+        return result
+
+    def _demo_fallback_hs_view(
+        self,
+        principal: Principal,
+        case: CaseRecord,
+        texts: list[tuple[DocumentRecord, str]],
+        *,
+        failed: bool,
+    ) -> CaseHsClassificationView | None:
+        """The registered set's AI HSK ranking, stored on this case when the mode allows it."""
+
+        settings = self.repository.demo_fallback_settings()
+        if settings.mode == "off" or (settings.mode == "auto" and not failed):
+            return None
+        fallback = self._demo_fallback_for(
+            principal.org_id, [(record.document_id, record.content_sha256) for record, _ in texts]
+        )
+        if fallback is None or fallback.hs_agent_ranking is None:
+            return None
+        by_digest = {record.content_sha256: record.document_id for record, _ in texts}
+        replacements = {
+            item.document_id: by_digest[item.content_sha256]
+            for item in fallback.documents
+            if item.content_sha256 in by_digest
+        }
+        stored = _replace_identifiers(copy.deepcopy(fallback.hs_agent_ranking), replacements)
+        ranking = CaseHsAgentRankingRecord(
+            document_digest=case_hs_document_digest(texts),
+            ranked_at=utc_now(),
+            candidates=list(stored.get("candidates", []))[:10],
+            items=list(stored.get("items", []))[:20],
+        )
+        self.repository.record_case_hs_agent_ranking(
+            org_id=principal.org_id, case_id=case.case_id, ranking=ranking
+        )
+        self.repository.mark_demo_fallback_used(
+            org_id=principal.org_id, fallback_id=fallback.fallback_id
+        )
+        refreshed = self.repository.get_case(principal.org_id, case.case_id) or case
+        return build_case_hs_classification(refreshed, texts)
+
+    def demo_fallback(self, principal: Principal) -> DemoFallbackView:
+        self._require_role(principal, Role.approver)
+        return DemoFallbackView(
+            settings=self.repository.demo_fallback_settings(),
+            sets=[
+                _demo_fallback_set_view(item)
+                for item in self.repository.list_demo_fallback_sets(principal.org_id)
+            ],
+        )
+
+    def update_demo_fallback_settings(
+        self, principal: Principal, request: DemoFallbackSettingsUpdate
+    ) -> DemoFallbackView:
+        self._require_role(principal, Role.approver)
+        current = self.repository.demo_fallback_settings()
+        updated = current.model_copy(
+            update={
+                **({"mode": request.mode} if request.mode is not None else {}),
+                **(
+                    {"delay_seconds": request.delay_seconds}
+                    if request.delay_seconds is not None
+                    else {}
+                ),
+                "updated_by": principal.subject,
+                "updated_at": utc_now(),
+            }
+        )
+        self.repository.update_demo_fallback_settings(updated)
+        return self.demo_fallback(principal)
+
+    def register_demo_fallback_set(
+        self, principal: Principal, request: DemoFallbackRegisterRequest
+    ) -> DemoFallbackView:
+        """Keep a completed run (documents + Agent result + AI HSK ranking) as a replayable set."""
+
+        self._require_role(principal, Role.approver)
+        run = self.get_run(principal, request.review_run_id)
+        if run.parent_review_run_id is not None:
+            raise ConflictError("a correction re-review cannot be a fallback set")
+        case = self.get_case(principal, run.case_id)
+        records = {
+            item.document_id: item
+            for item in self.repository.list_documents(principal.org_id, run.case_id)
+        }
+        documents = [
+            DemoFallbackDocument(
+                document_id=entry.document_id,
+                filename=(
+                    records[entry.document_id].filename
+                    if entry.document_id in records
+                    else entry.document_id
+                ),
+                document_type=str(getattr(entry.document_type, "value", entry.document_type)),
+                content_sha256=entry.content_sha256,
+            )
+            for entry in run.input_document_manifest
+        ]
+        digests = sorted(item.content_sha256 for item in documents)
+        for existing in self.repository.list_demo_fallback_sets(principal.org_id):
+            if sorted(item.content_sha256 for item in existing.documents) == digests:
+                raise ConflictError("a fallback set for these documents is already registered")
+        ranking = case.hs_agent_ranking
+        manifest_digest = case_hs_document_digest(
+            [
+                (
+                    DocumentRecord.model_construct(
+                        document_id=entry.document_id, content_sha256=entry.content_sha256
+                    ),
+                    "",
+                )
+                for entry in run.input_document_manifest
+            ]
+        )
+        record = DemoFallbackSetRecord(
+            fallback_id=_id("fallback"),
+            org_id=principal.org_id,
+            name=request.name,
+            source_case_id=case.case_id,
+            source_case_title=case.title[:200],
+            source_review_run_id=run.review_run_id,
+            documents=documents,
+            agent_result=_agent_result_snapshot(run),
+            hs_agent_ranking=(
+                ranking.model_dump(mode="json")
+                if ranking is not None and ranking.document_digest == manifest_digest
+                else None
+            ),
+            created_by=principal.subject,
+            created_at=utc_now(),
+        )
+        self.repository.add_demo_fallback_set(record)
+        return self.demo_fallback(principal)
+
+    def delete_demo_fallback_set(self, principal: Principal, fallback_id: str) -> DemoFallbackView:
+        self._require_role(principal, Role.approver)
+        self.repository.delete_demo_fallback_set(org_id=principal.org_id, fallback_id=fallback_id)
+        return self.demo_fallback(principal)
 
     def get_job(self, principal: Principal, job_id: str) -> JobRecord:
         job = self.repository.get_job(principal.org_id, job_id)

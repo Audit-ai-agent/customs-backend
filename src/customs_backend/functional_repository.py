@@ -22,6 +22,8 @@ from customs_backend.domain import (
     FindingDecisionReasonCode,
     FindingDecisionStatus,
     GuidanceRegistryVersion,
+    DemoFallbackSetRecord,
+    DemoFallbackSettingsRecord,
     HsSelectionRecord,
     JobRecord,
     KnowledgeConversationRecord,
@@ -162,6 +164,13 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
                 key: ReviewRunRecord.model_validate(value)
                 for key, value in dict(state.get("runs", {})).items()
             }
+            self._demo_fallback_sets = {
+                key: DemoFallbackSetRecord.model_validate(value)
+                for key, value in dict(state.get("demo_fallback_sets", {})).items()
+            }
+            self._demo_fallback_settings = DemoFallbackSettingsRecord.model_validate(
+                state.get("demo_fallback_settings") or {}
+            )
             self._conversations = {
                 key: ConversationRecord.model_validate(value)
                 for key, value in dict(state.get("conversations", {})).items()
@@ -236,6 +245,10 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
             "jobs": {key: value.model_dump(mode="json") for key, value in self._jobs.items()},
             "idempotency": [[org, key, job_id] for (org, key), job_id in self._idempotency.items()],
             "runs": {key: value.model_dump(mode="json") for key, value in self._runs.items()},
+            "demo_fallback_sets": {
+                key: value.model_dump(mode="json") for key, value in self._demo_fallback_sets.items()
+            },
+            "demo_fallback_settings": self._demo_fallback_settings.model_dump(mode="json"),
             "conversations": {
                 key: value.model_dump(mode="json") for key, value in self._conversations.items()
             },
@@ -592,6 +605,26 @@ class PostgresWorkbenchRepository(InMemoryWorkbenchRepository):
         ranking: CaseHsAgentRankingRecord | None,
     ) -> None:
         super().record_case_hs_agent_ranking(org_id=org_id, case_id=case_id, ranking=ranking)
+        self._persist()
+
+    def update_demo_fallback_settings(
+        self, settings: DemoFallbackSettingsRecord
+    ) -> DemoFallbackSettingsRecord:
+        value = super().update_demo_fallback_settings(settings)
+        self._persist()
+        return value
+
+    def add_demo_fallback_set(self, record: DemoFallbackSetRecord) -> DemoFallbackSetRecord:
+        value = super().add_demo_fallback_set(record)
+        self._persist()
+        return value
+
+    def delete_demo_fallback_set(self, *, org_id: str, fallback_id: str) -> None:
+        super().delete_demo_fallback_set(org_id=org_id, fallback_id=fallback_id)
+        self._persist()
+
+    def mark_demo_fallback_used(self, *, org_id: str, fallback_id: str) -> None:
+        super().mark_demo_fallback_used(org_id=org_id, fallback_id=fallback_id)
         self._persist()
 
     def record_hs_selection(

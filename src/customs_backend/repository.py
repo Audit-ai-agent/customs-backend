@@ -28,6 +28,8 @@ from customs_backend.domain import (
     FindingDecisionStatus,
     GuidanceRegistryVersion,
     HsSelectionHistoryEntry,
+    DemoFallbackSetRecord,
+    DemoFallbackSettingsRecord,
     HsSelectionRecord,
     JobRecord,
     KnowledgeConversationRecord,
@@ -57,6 +59,8 @@ class InMemoryWorkbenchRepository:
         self._jobs: dict[str, JobRecord] = {}
         self._idempotency: dict[tuple[str, str], str] = {}
         self._runs: dict[str, ReviewRunRecord] = {}
+        self._demo_fallback_sets: dict[str, DemoFallbackSetRecord] = {}
+        self._demo_fallback_settings = DemoFallbackSettingsRecord()
         self._conversations: dict[str, ConversationRecord] = {}
         self._messages: dict[str, ConversationMessageRecord] = {}
         self._chat_idempotency: dict[tuple[str, str, str], tuple[str, str, str]] = {}
@@ -205,6 +209,52 @@ class InMemoryWorkbenchRepository:
             )
             self._cases[case_id] = self._copy(updated)
             return self._copy(selection)
+
+    # ── demo fallback ────────────────────────────────────────────
+
+    def demo_fallback_settings(self) -> DemoFallbackSettingsRecord:
+        with self._lock:
+            return self._copy(self._demo_fallback_settings)
+
+    def update_demo_fallback_settings(
+        self, settings: DemoFallbackSettingsRecord
+    ) -> DemoFallbackSettingsRecord:
+        with self._lock:
+            self._demo_fallback_settings = self._copy(settings)
+            return self._copy(settings)
+
+    def list_demo_fallback_sets(self, org_id: str) -> list[DemoFallbackSetRecord]:
+        with self._lock:
+            return [
+                self._copy(item)
+                for item in sorted(self._demo_fallback_sets.values(), key=lambda x: x.created_at)
+                if item.org_id == org_id
+            ]
+
+    def add_demo_fallback_set(self, record: DemoFallbackSetRecord) -> DemoFallbackSetRecord:
+        with self._lock:
+            if record.fallback_id in self._demo_fallback_sets:
+                raise ConflictError("fallback set already exists")
+            self._demo_fallback_sets[record.fallback_id] = self._copy(record)
+            return self._copy(record)
+
+    def delete_demo_fallback_set(self, *, org_id: str, fallback_id: str) -> None:
+        with self._lock:
+            record = self._demo_fallback_sets.get(fallback_id)
+            if record is None or record.org_id != org_id:
+                raise ConflictError("fallback set does not exist")
+            del self._demo_fallback_sets[fallback_id]
+
+    def mark_demo_fallback_used(self, *, org_id: str, fallback_id: str) -> None:
+        with self._lock:
+            record = self._demo_fallback_sets.get(fallback_id)
+            if record is None or record.org_id != org_id:
+                return
+            self._demo_fallback_sets[fallback_id] = self._copy(
+                record.model_copy(
+                    update={"used_count": record.used_count + 1, "last_used_at": utc_now()}
+                )
+            )
 
     def record_case_hs_agent_ranking(
         self,

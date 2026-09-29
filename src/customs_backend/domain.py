@@ -1259,6 +1259,112 @@ class FindingDecisionRecord(BaseModel):
     history: list[FindingDecisionHistoryEntry] = Field(min_length=1, max_length=100)
 
 
+# ── Demo fallback (2026-09-30) ───────────────────────────────────
+#
+# A live demonstration must not die with the LLM provider.  An approver
+# registers completed review runs (any number of cases) as fallback sets;
+# when the same confirmed documents are reviewed again and the mode allows
+# it, the stored Agent result is replayed instead of calling the model.
+
+DemoFallbackMode = Literal["off", "auto", "always"]
+
+
+class DemoFallbackDocument(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    document_id: str = Field(min_length=1, max_length=128)
+    filename: str = Field(min_length=1, max_length=255)
+    document_type: str = Field(min_length=1, max_length=64)
+    content_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class DemoFallbackSetRecord(BaseModel):
+    """One pre-registered case: its confirmed documents and the Agent result they produced."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    fallback_id: str = Field(min_length=1, max_length=128)
+    org_id: str
+    name: str = Field(min_length=1, max_length=120)
+    source_case_id: str = Field(min_length=1, max_length=128)
+    source_case_title: str = Field(max_length=200)
+    source_review_run_id: str = Field(min_length=1, max_length=128)
+    documents: list[DemoFallbackDocument] = Field(min_length=1, max_length=20)
+    # The immutable Agent result of the source run, exactly as the Agent
+    # returned it (reconstructed and hash-checked at registration).
+    agent_result: dict[str, Any]
+    # The source case's stored AI HSK ranking for the same documents, if any.
+    hs_agent_ranking: dict[str, Any] | None = None
+    created_by: str = Field(min_length=1, max_length=256)
+    created_at: datetime
+    used_count: int = Field(default=0, ge=0)
+    last_used_at: datetime | None = None
+
+
+class DemoFallbackSettingsRecord(BaseModel):
+    """off: never; auto: only when the Agent call fails; always: replay whenever a set matches."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: DemoFallbackMode = "off"
+    # A replayed review answers instantly; a short pause keeps the screen's
+    # progress state believable during a demonstration.
+    delay_seconds: float = Field(default=4.0, ge=0.0, le=60.0)
+    updated_by: str | None = Field(default=None, max_length=256)
+    updated_at: datetime | None = None
+
+
+class DemoFallbackSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: DemoFallbackMode | None = None
+    delay_seconds: float | None = Field(default=None, ge=0.0, le=60.0)
+
+    @model_validator(mode="after")
+    def at_least_one_field(self) -> "DemoFallbackSettingsUpdate":
+        if self.mode is None and self.delay_seconds is None:
+            raise ValueError("at least one setting must be supplied")
+        return self
+
+
+class DemoFallbackRegisterRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=120)
+    review_run_id: str = Field(min_length=1, max_length=128)
+
+    @field_validator("name")
+    @classmethod
+    def non_blank_name(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("a fallback set needs a name")
+        return value.strip()
+
+
+class DemoFallbackSetView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    fallback_id: str
+    name: str
+    source_case_id: str
+    source_case_title: str
+    source_review_run_id: str
+    documents: list[DemoFallbackDocument]
+    has_hs_ranking: bool
+    finding_count: int = Field(ge=0)
+    created_by: str
+    created_at: datetime
+    used_count: int = Field(ge=0)
+    last_used_at: datetime | None = None
+
+
+class DemoFallbackView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    settings: DemoFallbackSettingsRecord
+    sets: list[DemoFallbackSetView]
+
+
 class HsSelectionRequest(BaseModel):
     """A reviewer-owned HS code confirmation which never changes the Agent result.
 

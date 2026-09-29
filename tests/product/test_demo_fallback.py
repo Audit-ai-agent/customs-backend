@@ -1,0 +1,213 @@
+"""Demo fallback: pre-registered review results replayed when the Agent (LLM) is unavailable."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from tests.product.test_trade_features import (
+    _case_with_documents,
+    _review_result_with_facts,
+    _tshirt_agent,
+)
+from tests.product.test_workbench_api import _approver_auth, _auth, _client
+
+_INVOICE = "\n".join(["COMMERCIAL INVOICE", "Description of Goods", "MEN'S COTTON T-SHIRTS", "64,444 PCS"])
+_PACKING = "PACKING LIST\nMEN'S COTTON T-SHIRTS\n64,444 PCS"
+
+
+def _review(client: Any, case_id: str, key: str) -> dict[str, Any]:
+    response = client.post(
+        f"/api/v1/cases/{case_id}/reviews",
+        json={},
+        headers={**_auth(), "Idempotency-Key": key},
+    )
+    assert response.status_code == 202, response.text
+    return dict(response.json())
+
+
+def _run(client: Any, review_run_id: str) -> dict[str, Any]:
+    response = client.get(f"/api/v1/review-runs/{review_run_id}", headers=_auth())
+    assert response.status_code == 200, response.text
+    return dict(response.json())
+
+
+def _register(client: Any, name: str, review_run_id: str) -> dict[str, Any]:
+    response = client.post(
+        "/api/v1/admin/demo-fallback/sets",
+        json={"name": name, "review_run_id": review_run_id},
+        headers=_approver_auth(),
+    )
+    assert response.status_code == 201, response.text
+    return dict(response.json())
+
+
+def _set_mode(client: Any, mode: str, **extra: Any) -> dict[str, Any]:
+    response = client.put(
+        "/api/v1/admin/demo-fallback",
+        json={"mode": mode, **extra},
+        headers=_approver_auth(),
+    )
+    assert response.status_code == 200, response.text
+    return dict(response.json())
+
+
+def test_demo_fallback_is_approver_only_and_starts_off() -> None:
+    with _client(review_handler=_review_result_with_facts) as client:
+        assert client.get("/api/v1/admin/demo-fallback", headers=_auth()).status_code == 403
+        body = client.get("/api/v1/admin/demo-fallback", headers=_approver_auth()).json()
+        assert body["settings"]["mode"] == "off" and body["sets"] == []
+        assert client.put("/api/v1/admin/demo-fallback", json={}, headers=_approver_auth()).status_code == 422
+        assert client.put("/api/v1/admin/demo-fallback", json={"mode": "maybe"}, headers=_approver_auth()).status_code == 422
+
+
+def test_registered_result_is_replayed_for_the_same_documents_in_always_mode() -> None:
+    calls: list[str] = []
+
+    def review(request: Any) -> dict[str, Any]:
+        calls.append(request.review_run_id)
+        return _review_result_with_facts(request)
+
+    with _client(review_handler=review, hs_candidates_handler=_tshirt_agent([])) as client:
+        # 1. A normal review, with the Agent, becomes the registered set.
+        source_case = _case_with_documents(client, [("CI", "ci.txt", _INVOICE), ("PL", "pl.txt", _PACKING)])
+        client.get(f"/api/v1/cases/{source_case}/hs-classification?agent=true", headers=_auth())
+        source = _review(client, source_case, "fallback-source")
+        source_run_id = str(source["job"]["review_run_id"])
+        view = _register(client, "시연 1", source_run_id)
+        assert len(view["sets"]) == 1
+        registered = view["sets"][0]
+        assert registered["source_review_run_id"] == source_run_id
+        assert sorted(item["document_type"] for item in registered["documents"]) == ["CI", "PL"]
+        assert registered["has_hs_ranking"] is True and registered["used_count"] == 0
+        # The same documents cannot be registered twice.
+        assert (
+            client.post(
+                "/api/v1/admin/demo-fallback/sets",
+                json={"name": "dup", "review_run_id": source_run_id},
+                headers=_approver_auth(),
+            ).status_code
+            == 409
+        )
+
+        # 2. Always: a new case with the same documents never reaches the Agent.
+        _set_mode(client, "always", delay_seconds=0)
+        replay_case = _case_with_documents(client, [("PL", "pl.txt", _PACKING), ("CI", "ci.txt", _INVOICE)])
+        before = len(calls)
+        replayed = _review(client, replay_case, "fallback-replay")
+        assert replayed["job"]["status"] == "succeeded"
+        assert len(calls) == before
+        run = _run(client, str(replayed["job"]["review_run_id"]))
+        source_run = _run(client, source_run_id)
+        # The result is re-bound to the new run: ids, documents, hashes.
+        assert run["case_id"] == replay_case and run["review_run_id"] != source_run_id
+        new_documents = {item["document_id"] for item in run["input_document_manifest"]}
+        assert new_documents.isdisjoint({item["document_id"] for item in source_run["input_document_manifest"]})
+        assert {analysis["document_id"] for analysis in run["document_analyses"]} <= new_documents
+        assert len(run["findings"]) == len(source_run["findings"])
+        assert run["report"]["summary"] == source_run["report"]["summary"]
+        assert run["provider_result_sha256"] != source_run["provider_result_sha256"]
+        # The AI HSK ranking is replayed too, without an Agent call.
+        hs = client.get(f"/api/v1/cases/{replay_case}/hs-classification?agent=true", headers=_auth()).json()
+        assert hs["basis_kind"] == "agent_ranked"
+        assert hs["candidates"][0]["code"] == "6109101000"
+        assert all(basis["document_id"] in new_documents for basis in hs["candidates"][0]["basis"])
+        usage = client.get("/api/v1/admin/demo-fallback", headers=_approver_auth()).json()["sets"][0]
+        assert usage["used_count"] == 2 and usage["last_used_at"]
+
+        # 3. Different documents still go to the Agent.
+        other_case = _case_with_documents(client, [("CI", "ci.txt", "COMMERCIAL INVOICE\nHS CODE: 0303540000")])
+        _review(client, other_case, "fallback-other")
+        assert len(calls) == before + 1
+
+        # 4. Delete: the set is gone and the next same-document review calls the Agent.
+        assert (
+            client.delete(
+                f"/api/v1/admin/demo-fallback/sets/{registered['fallback_id']}", headers=_approver_auth()
+            ).status_code
+            == 200
+        )
+        assert client.get("/api/v1/admin/demo-fallback", headers=_approver_auth()).json()["sets"] == []
+        again_case = _case_with_documents(client, [("CI", "ci.txt", _INVOICE), ("PL", "pl.txt", _PACKING)])
+        _review(client, again_case, "fallback-again")
+        assert len(calls) == before + 2
+
+
+def test_auto_mode_replays_only_when_the_agent_fails() -> None:
+    agent_down = {"value": False}
+    calls: list[str] = []
+
+    def review(request: Any) -> dict[str, Any]:
+        calls.append(request.review_run_id)
+        if agent_down["value"]:
+            raise RuntimeError("provider unavailable")
+        return _review_result_with_facts(request)
+
+    def hs_candidates(request: dict[str, Any]) -> dict[str, Any]:
+        if agent_down["value"]:
+            raise RuntimeError("provider unavailable")
+        return _tshirt_agent([])(request)
+
+    with _client(review_handler=review, hs_candidates_handler=hs_candidates) as client:
+        source_case = _case_with_documents(client, [("CI", "ci.txt", _INVOICE)])
+        client.get(f"/api/v1/cases/{source_case}/hs-classification?agent=true", headers=_auth())
+        source_run_id = str(_review(client, source_case, "auto-source")["job"]["review_run_id"])
+        _register(client, "시연 2", source_run_id)
+        _set_mode(client, "auto", delay_seconds=0)
+
+        # Agent healthy: the Agent answers, nothing is replayed.
+        healthy_case = _case_with_documents(client, [("CI", "ci.txt", _INVOICE)])
+        healthy = _review(client, healthy_case, "auto-healthy")
+        assert healthy["job"]["status"] == "succeeded" and calls[-1] == healthy["job"]["review_run_id"]
+        assert client.get("/api/v1/admin/demo-fallback", headers=_approver_auth()).json()["sets"][0]["used_count"] == 0
+
+        # Agent down: the registered result stands in and the job still succeeds.
+        agent_down["value"] = True
+        down_case = _case_with_documents(client, [("CI", "ci.txt", _INVOICE)])
+        down = _review(client, down_case, "auto-down")
+        assert down["job"]["status"] == "succeeded"
+        run = _run(client, str(down["job"]["review_run_id"]))
+        assert run["case_id"] == down_case and run["findings"] is not None
+        hs = client.get(f"/api/v1/cases/{down_case}/hs-classification?agent=true", headers=_auth()).json()
+        assert hs["basis_kind"] == "agent_ranked"
+
+        # Off: an Agent failure fails the job as before.
+        _set_mode(client, "off")
+        off_case = _case_with_documents(client, [("CI", "ci.txt", _INVOICE)])
+        off = _review(client, off_case, "auto-off")
+        assert off["job"]["status"] == "failed"
+
+
+def test_a_correction_re_review_never_uses_the_fallback() -> None:
+    from customs_backend.domain import AgentReviewRequest, JobRecord, Principal, Role
+    from customs_backend.service import WorkbenchService
+
+    principal = Principal(subject="s", org_id="o", roles=frozenset({Role.reviewer}))
+    job = JobRecord.model_construct(
+        request={"parent_review_run_id": "run-parent", "documents": []},
+        case_id="c",
+        review_run_id="r",
+        org_id="o",
+    )
+    calls: list[str] = []
+
+    class _Repository:
+        def demo_fallback_settings(self):  # noqa: ANN202
+            from customs_backend.domain import DemoFallbackSettingsRecord
+
+            return DemoFallbackSettingsRecord(mode="always")
+
+        def list_demo_fallback_sets(self, org_id: str):  # noqa: ANN202
+            raise AssertionError("a child run must not look for a fallback set")
+
+    class _Agent:
+        def review(self, request: Any) -> dict[str, Any]:
+            calls.append("agent")
+            return {"ok": True}
+
+    service = WorkbenchService.__new__(WorkbenchService)
+    service.repository = _Repository()  # type: ignore[assignment]
+    service.agent = _Agent()  # type: ignore[assignment]
+    result = service._review_with_demo_fallback(
+        principal=principal, job=job, agent_request=AgentReviewRequest.model_construct()
+    )
+    assert result == {"ok": True} and calls == ["agent"]

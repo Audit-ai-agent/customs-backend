@@ -1576,6 +1576,253 @@
         "title": "DecisionStatusMetrics",
         "type": "object"
       },
+      "DemoFallbackDocument": {
+        "additionalProperties": false,
+        "properties": {
+          "content_sha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Content Sha256",
+            "type": "string"
+          },
+          "document_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Document Id",
+            "type": "string"
+          },
+          "document_type": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Document Type",
+            "type": "string"
+          },
+          "filename": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Filename",
+            "type": "string"
+          }
+        },
+        "required": [
+          "document_id",
+          "filename",
+          "document_type",
+          "content_sha256"
+        ],
+        "title": "DemoFallbackDocument",
+        "type": "object"
+      },
+      "DemoFallbackRegisterRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "review_run_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Review Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "review_run_id"
+        ],
+        "title": "DemoFallbackRegisterRequest",
+        "type": "object"
+      },
+      "DemoFallbackSetView": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "created_by": {
+            "title": "Created By",
+            "type": "string"
+          },
+          "documents": {
+            "items": {
+              "$ref": "#/components/schemas/DemoFallbackDocument"
+            },
+            "title": "Documents",
+            "type": "array"
+          },
+          "fallback_id": {
+            "title": "Fallback Id",
+            "type": "string"
+          },
+          "finding_count": {
+            "minimum": 0.0,
+            "title": "Finding Count",
+            "type": "integer"
+          },
+          "has_hs_ranking": {
+            "title": "Has Hs Ranking",
+            "type": "boolean"
+          },
+          "last_used_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Used At"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "source_case_id": {
+            "title": "Source Case Id",
+            "type": "string"
+          },
+          "source_case_title": {
+            "title": "Source Case Title",
+            "type": "string"
+          },
+          "source_review_run_id": {
+            "title": "Source Review Run Id",
+            "type": "string"
+          },
+          "used_count": {
+            "minimum": 0.0,
+            "title": "Used Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "fallback_id",
+          "name",
+          "source_case_id",
+          "source_case_title",
+          "source_review_run_id",
+          "documents",
+          "has_hs_ranking",
+          "finding_count",
+          "created_by",
+          "created_at",
+          "used_count"
+        ],
+        "title": "DemoFallbackSetView",
+        "type": "object"
+      },
+      "DemoFallbackSettingsRecord": {
+        "additionalProperties": false,
+        "description": "off: never; auto: only when the Agent call fails; always: replay whenever a set matches.",
+        "properties": {
+          "delay_seconds": {
+            "default": 4.0,
+            "maximum": 60.0,
+            "minimum": 0.0,
+            "title": "Delay Seconds",
+            "type": "number"
+          },
+          "mode": {
+            "default": "off",
+            "enum": [
+              "off",
+              "auto",
+              "always"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "updated_by": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated By"
+          }
+        },
+        "title": "DemoFallbackSettingsRecord",
+        "type": "object"
+      },
+      "DemoFallbackSettingsUpdate": {
+        "additionalProperties": false,
+        "properties": {
+          "delay_seconds": {
+            "anyOf": [
+              {
+                "maximum": 60.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delay Seconds"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "off",
+                  "auto",
+                  "always"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mode"
+          }
+        },
+        "title": "DemoFallbackSettingsUpdate",
+        "type": "object"
+      },
+      "DemoFallbackView": {
+        "additionalProperties": false,
+        "properties": {
+          "sets": {
+            "items": {
+              "$ref": "#/components/schemas/DemoFallbackSetView"
+            },
+            "title": "Sets",
+            "type": "array"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/DemoFallbackSettingsRecord"
+          }
+        },
+        "required": [
+          "settings",
+          "sets"
+        ],
+        "title": "DemoFallbackView",
+        "type": "object"
+      },
       "DevelopmentSessionRequest": {
         "description": "Explicit local identity selection; the endpoint is loopback-only.",
         "properties": {
@@ -5974,6 +6221,450 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/v1/admin/demo-fallback": {
+      "get": {
+        "description": "Demo fallback mode and the registered result sets (approver-only).",
+        "operationId": "get_demo_fallback_endpoint_api_v1_admin_demo_fallback_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DemoFallbackView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Demo Fallback Endpoint"
+      },
+      "put": {
+        "description": "Switch the fallback mode (off / auto on Agent failure / always) or the replay delay.",
+        "operationId": "update_demo_fallback_endpoint_api_v1_admin_demo_fallback_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DemoFallbackSettingsUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DemoFallbackView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Update Demo Fallback Endpoint"
+      }
+    },
+    "/api/v1/admin/demo-fallback/sets": {
+      "post": {
+        "description": "Register a completed review run (its documents and result) as a replayable set.",
+        "operationId": "register_demo_fallback_set_endpoint_api_v1_admin_demo_fallback_sets_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DemoFallbackRegisterRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DemoFallbackView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Register Demo Fallback Set Endpoint"
+      }
+    },
+    "/api/v1/admin/demo-fallback/sets/{fallback_id}": {
+      "delete": {
+        "operationId": "delete_demo_fallback_set_endpoint_api_v1_admin_demo_fallback_sets__fallback_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "fallback_id",
+            "required": true,
+            "schema": {
+              "title": "Fallback Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DemoFallbackView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsV1"
+                }
+              }
+            },
+            "description": "Fail-closed problem response."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Delete Demo Fallback Set Endpoint"
+      }
+    },
     "/api/v1/admin/llm-settings": {
       "delete": {
         "description": "Drop the operator override and return to the Agent's environment configuration.",

@@ -45,6 +45,9 @@ from customs_backend.domain import (
     RasterTextExtractionJobRecord,
     FindingDecisionRecord,
     FindingDecisionRequest,
+    DemoFallbackRegisterRequest,
+    DemoFallbackSettingsUpdate,
+    DemoFallbackView,
     HsSelectionRecord,
     HsSelectionRequest,
     JobStatus,
@@ -1995,6 +1998,60 @@ def create_app(*, container: Container | None = None, settings: Settings | None 
         """One minimal provider request with the active (empty body) or a candidate configuration."""
 
         return service.test_llm_settings(principal, payload)
+
+    @app.get(
+        "/api/v1/admin/demo-fallback",
+        response_model=DemoFallbackView,
+        response_model_exclude_none=False,
+    )
+    def get_demo_fallback_endpoint(
+        principal: Principal = Depends(approvers),
+        service: WorkbenchService = Depends(_service),
+    ) -> DemoFallbackView:
+        """Demo fallback mode and the registered result sets (approver-only)."""
+
+        return service.demo_fallback(principal)
+
+    @app.put(
+        "/api/v1/admin/demo-fallback",
+        response_model=DemoFallbackView,
+        response_model_exclude_none=False,
+    )
+    def update_demo_fallback_endpoint(
+        payload: DemoFallbackSettingsUpdate,
+        principal: Principal = Depends(approvers),
+        service: WorkbenchService = Depends(_service),
+    ) -> DemoFallbackView:
+        """Switch the fallback mode (off / auto on Agent failure / always) or the replay delay."""
+
+        return service.update_demo_fallback_settings(principal, payload)
+
+    @app.post(
+        "/api/v1/admin/demo-fallback/sets",
+        response_model=DemoFallbackView,
+        response_model_exclude_none=False,
+        status_code=201,
+    )
+    def register_demo_fallback_set_endpoint(
+        payload: DemoFallbackRegisterRequest,
+        principal: Principal = Depends(approvers),
+        service: WorkbenchService = Depends(_service),
+    ) -> DemoFallbackView:
+        """Register a completed review run (its documents and result) as a replayable set."""
+
+        return service.register_demo_fallback_set(principal, payload)
+
+    @app.delete(
+        "/api/v1/admin/demo-fallback/sets/{fallback_id}",
+        response_model=DemoFallbackView,
+        response_model_exclude_none=False,
+    )
+    def delete_demo_fallback_set_endpoint(
+        fallback_id: str,
+        principal: Principal = Depends(approvers),
+        service: WorkbenchService = Depends(_service),
+    ) -> DemoFallbackView:
+        return service.delete_demo_fallback_set(principal, fallback_id)
 
     @app.get(
         "/api/v1/hsk-reference",
