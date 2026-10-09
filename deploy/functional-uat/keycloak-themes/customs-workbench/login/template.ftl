@@ -14,6 +14,24 @@
         </#list>
     </#if>
     <title>${msg("loginTitle",(realm.displayName!''))}</title>
+    <#-- customs-workbench: 문서 간 View Transition 사용 설정은 링크된 CSS에 두면 Keycloak 화면이
+         나타나는 시점에 아직 반영되지 않아 전환이 취소됩니다(Chrome "opt-in disabled"). 그래서 head에 인라인으로 둡니다. -->
+    <style>
+/* 앱 로그인 화면 → Keycloak 로그인 창 전환(같은 origin의 문서 간 View Transition).
+   왼쪽 소개 영역은 이름을 붙여 제자리에 두고, 오른쪽만 살짝 떠오르며 바뀝니다.
+   지원하지 않는 브라우저는 그냥 페이지가 바뀝니다. 앱 components.css와 Keycloak 테마 CSS에 같은 블록이 있습니다. */
+@view-transition { navigation: auto; }
+.login-hero { view-transition-name: login-hero; }
+::view-transition-old(root) { animation: .18s ease-in both login-vt-out; }
+::view-transition-new(root) { animation: .32s cubic-bezier(.2, .7, .2, 1) both login-vt-in; }
+::view-transition-group(login-hero) { animation-duration: 0s; }
+@keyframes login-vt-out { to { opacity: 0; } }
+@keyframes login-vt-in { from { opacity: 0; transform: translateY(10px); } }
+@media (prefers-reduced-motion: reduce) {
+  @view-transition { navigation: none; }
+}
+    </style>
+
     <link rel="icon" href="${url.resourcesPath}/img/favicon.ico" />
     <#if properties.stylesCommon?has_content>
         <#list properties.stylesCommon?split(' ') as style>
