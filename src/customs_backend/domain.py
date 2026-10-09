@@ -1278,6 +1278,16 @@ class DemoFallbackDocument(BaseModel):
     content_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
 
 
+class DemoFallbackExtraction(BaseModel):
+    """One source file's extraction preview, replayed when the same bytes are uploaded."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    filename: str = Field(min_length=1, max_length=255)
+    result: dict[str, Any]
+
+
 class DemoFallbackSetRecord(BaseModel):
     """One pre-registered case: its confirmed documents and the Agent result they produced."""
 
@@ -1295,6 +1305,9 @@ class DemoFallbackSetRecord(BaseModel):
     agent_result: dict[str, Any]
     # The source case's stored AI HSK ranking for the same documents, if any.
     hs_agent_ranking: dict[str, Any] | None = None
+    # Extraction previews of the source files whose default text is exactly
+    # the confirmed document, so a demo upload needs no Agent either.
+    extractions: list[DemoFallbackExtraction] = Field(default_factory=list, max_length=20)
     created_by: str = Field(min_length=1, max_length=256)
     created_at: datetime
     used_count: int = Field(default=0, ge=0)

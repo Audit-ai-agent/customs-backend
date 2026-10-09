@@ -448,6 +448,14 @@ class InMemoryWorkbenchRepository:
                 return None
             return self._copy(record)
 
+    def list_extraction_jobs(self, org_id: str, case_id: str) -> list[ExtractionJobRecord]:
+        with self._lock:
+            return [
+                self._copy(item)
+                for item in sorted(self._extraction_jobs.values(), key=lambda x: x.created_at)
+                if item.org_id == org_id and item.case_id == case_id
+            ]
+
     def create_raster_extraction_job(
         self, job: RasterExtractionJobRecord
     ) -> tuple[RasterExtractionJobRecord, bool]:

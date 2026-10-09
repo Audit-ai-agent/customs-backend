@@ -95,6 +95,7 @@ from customs_backend.domain import (
     GuidanceRegistryVersion,
     CaseHsAgentRankingRecord,
     DemoFallbackDocument,
+    DemoFallbackExtraction,
     DemoFallbackRegisterRequest,
     DemoFallbackSetRecord,
     DemoFallbackSettingsUpdate,
@@ -894,6 +895,16 @@ def _agent_result_snapshot(run: ReviewRunRecord) -> dict[str, Any]:
     return result
 
 
+def demo_extraction_preview_text(result: DocumentExtractionResult) -> str:
+    """The text the workbench pre-fills for confirmation (labels.ts extractionPreviewText)."""
+
+    return "\n".join(
+        span.text
+        for page in sorted(result.pages, key=lambda item: item.page_number)
+        for span in sorted(page.spans, key=lambda item: (item.reading_order, item.ordinal))
+    )
+
+
 def _replace_identifiers(value: Any, replacements: dict[str, str]) -> Any:
     """Rewrite every occurrence of the old document/case/run ids inside a JSON value."""
 
@@ -1489,6 +1500,16 @@ class WorkbenchService:
             source_sha256=asset.source_sha256,
             byte_size=asset.byte_size,
         )
+        settings = self.repository.demo_fallback_settings()
+        replay = (
+            self._demo_fallback_extraction(principal.org_id, asset, request)
+            if settings.mode != "off"
+            else None
+        )
+        if replay is not None and settings.mode == "always":
+            return DocumentAssetExtractionView(
+                asset=asset, job=self._replay_demo_fallback_extraction(principal, job, replay)
+            )
         try:
             validate_agent_v3_payload("document_extraction_request", request.to_agent_wire())
             content = self.object_store.get_bytes(
@@ -1511,6 +1532,14 @@ class WorkbenchService:
         except (KeyError, ValueError):
             updated = job.model_copy(
                 update={"status": "failed", "error_code": "document_asset_unavailable", "updated_at": utc_now()}
+            )
+        except Exception:
+            if replay is None:
+                raise
+            updated = job.model_copy(update={"status": "failed"})
+        if replay is not None and updated.status in {"failed", "unavailable"}:
+            return DocumentAssetExtractionView(
+                asset=asset, job=self._replay_demo_fallback_extraction(principal, job, replay)
             )
         persisted = self.repository.update_extraction_job(updated)
         return DocumentAssetExtractionView(asset=asset, job=persisted)
@@ -2651,6 +2680,86 @@ class WorkbenchService:
                 return record
         return None
 
+    def _demo_fallback_extraction(
+        self,
+        org_id: str,
+        asset: DocumentAssetRecord,
+        request: AgentDocumentExtractionRequest,
+    ) -> tuple[str, DocumentExtractionResult] | None:
+        """A registered preview of these exact source bytes, re-bound to this request."""
+
+        for record in self.repository.list_demo_fallback_sets(org_id):
+            for item in record.extractions:
+                if item.source_sha256 != asset.source_sha256:
+                    continue
+                raw = {
+                    **copy.deepcopy(item.result),
+                    "document_asset_id": asset.asset_id,
+                    "extraction_request_id": request.extraction_request_id,
+                }
+                try:
+                    result = self._validate_extraction_result(
+                        asset=asset, request=request, raw=raw
+                    )
+                except AgentResponseRejectedError:
+                    continue
+                return record.fallback_id, result
+        return None
+
+    def _replay_demo_fallback_extraction(
+        self,
+        principal: Principal,
+        job: ExtractionJobRecord,
+        replay: tuple[str, DocumentExtractionResult],
+    ) -> ExtractionJobRecord:
+        fallback_id, result = replay
+        self.repository.mark_demo_fallback_used(org_id=principal.org_id, fallback_id=fallback_id)
+        return self.repository.update_extraction_job(
+            job.model_copy(
+                update={"status": result.status, "result": result, "updated_at": utc_now()}
+            )
+        )
+
+    def _demo_fallback_extractions(
+        self, principal: Principal, case_id: str, manifest: list[InputDocumentManifestEntry]
+    ) -> list[DemoFallbackExtraction]:
+        """Each source file's latest preview whose default text is exactly the confirmed text."""
+
+        documents = {
+            item.document_id: item
+            for item in self.repository.list_documents(principal.org_id, case_id)
+        }
+        jobs = self.repository.list_extraction_jobs(principal.org_id, case_id)
+        extractions: list[DemoFallbackExtraction] = []
+        for entry in manifest:
+            document = documents.get(entry.document_id)
+            if document is None or document.source_asset_id is None:
+                continue
+            asset = self.repository.get_document_asset(
+                principal.org_id, case_id, document.source_asset_id
+            )
+            if asset is None:
+                continue
+            text = self.object_store.get_text(
+                key=document.object_key, expected_sha256=document.content_sha256
+            )
+            for job in reversed(jobs):
+                if (
+                    job.asset_id == asset.asset_id
+                    and job.result is not None
+                    and job.status in {"preview_ready", "needs_review"}
+                    and demo_extraction_preview_text(job.result) == text
+                ):
+                    extractions.append(
+                        DemoFallbackExtraction(
+                            source_sha256=asset.source_sha256,
+                            filename=asset.filename,
+                            result=job.result.model_dump(mode="json"),
+                        )
+                    )
+                    break
+        return extractions
+
     def _review_with_demo_fallback(
         self, *, principal: Principal, job: JobRecord, agent_request: AgentReviewRequest
     ) -> dict[str, Any]:
@@ -2845,6 +2954,9 @@ class WorkbenchService:
                 ranking.model_dump(mode="json")
                 if ranking is not None and ranking.document_digest == manifest_digest
                 else None
+            ),
+            extractions=self._demo_fallback_extractions(
+                principal, case.case_id, run.input_document_manifest
             ),
             created_by=principal.subject,
             created_at=utc_now(),

@@ -9,7 +9,9 @@ from tests.product.test_trade_features import (
     _review_result_with_facts,
     _tshirt_agent,
 )
-from tests.product.test_workbench_api import _approver_auth, _auth, _client
+import hashlib
+
+from tests.product.test_workbench_api import _approver_auth, _auth, _client, _tiny_png
 
 _INVOICE = "\n".join(["COMMERCIAL INVOICE", "Description of Goods", "MEN'S COTTON T-SHIRTS", "64,444 PCS"])
 _PACKING = "PACKING LIST\nMEN'S COTTON T-SHIRTS\n64,444 PCS"
@@ -175,6 +177,93 @@ def test_auto_mode_replays_only_when_the_agent_fails() -> None:
         off_case = _case_with_documents(client, [("CI", "ci.txt", _INVOICE)])
         off = _review(client, off_case, "auto-off")
         assert off["job"]["status"] == "failed"
+
+
+def _uploaded_and_extracted(client: Any, case_id: str) -> dict[str, Any]:
+    asset = client.post(
+        f"/api/v1/cases/{case_id}/document-assets",
+        params={"document_type": "CI", "filename": "invoice.png"},
+        content=_tiny_png(),
+        headers={**_auth(), "Content-Type": "image/png"},
+    ).json()
+    preview = client.post(
+        f"/api/v1/cases/{case_id}/document-assets/{asset['asset_id']}/extractions", headers=_auth()
+    )
+    assert preview.status_code == 202, preview.text
+    return {"asset_id": asset["asset_id"], **preview.json()["job"]}
+
+
+def _confirm_default_text(client: Any, case_id: str, job: dict[str, Any]) -> None:
+    # What the workbench pre-fills: every span in page/reading order, one per line.
+    text = "\n".join(span["text"] for page in job["result"]["pages"] for span in page["spans"])
+    confirmed = client.post(
+        f"/api/v1/cases/{case_id}/document-assets/{job['asset_id']}/confirmed-document",
+        json={"extraction_job_id": job["extraction_job_id"], "filename": "invoice.txt", "content_text": text},
+        headers=_auth(),
+    )
+    assert confirmed.status_code == 201, confirmed.text
+
+
+def test_uploaded_file_extraction_is_replayed_so_the_whole_demo_runs_without_the_agent() -> None:
+    agent_down = {"value": False}
+
+    def extract(request: Any, content: bytes) -> dict[str, Any]:
+        if agent_down["value"]:
+            raise RuntimeError("provider unavailable")
+        lines = _INVOICE.split("\n")
+        return {
+            "schema_version": "1.0",
+            "document_asset_id": request.document_asset_id,
+            "extraction_request_id": request.extraction_request_id,
+            "status": "preview_ready",
+            "media_type": request.media_type,
+            "byte_size": request.byte_size,
+            "source_sha256": request.source_sha256,
+            "canonical_text_sha256": hashlib.sha256(_INVOICE.encode()).hexdigest(),
+            "extractor_revision": "local-preview-test-r1",
+            "pages": [
+                {
+                    "page_number": 1,
+                    "width": 1,
+                    "height": 1,
+                    "coordinate_unit": "pixels",
+                    "spans": [
+                        {
+                            "span_id": f"s{index}",
+                            "ordinal": index,
+                            "text": line,
+                            "bbox": {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0},
+                            "reading_order": index,
+                        }
+                        for index, line in enumerate(lines, start=1)
+                    ],
+                }
+            ],
+            "warnings": [{"code": "human_confirmation_required"}],
+        }
+
+    def review(request: Any) -> dict[str, Any]:
+        if agent_down["value"]:
+            raise RuntimeError("provider unavailable")
+        return _review_result_with_facts(request)
+
+    with _client(review_handler=review, extract_handler=extract) as client:
+        source_case = client.post("/api/v1/cases", json={"title": "prep"}, headers=_auth()).json()["case_id"]
+        _confirm_default_text(client, source_case, _uploaded_and_extracted(client, source_case))
+        source_run_id = str(_review(client, source_case, "upload-source")["job"]["review_run_id"])
+        _register(client, "시연 3", source_run_id)
+        # The source case is only a vehicle: the set survives its deletion.
+        assert client.delete(f"/api/v1/cases/{source_case}", headers=_auth()).status_code == 204
+        _set_mode(client, "auto", delay_seconds=0)
+
+        agent_down["value"] = True
+        demo_case = client.post("/api/v1/cases", json={"title": "demo"}, headers=_auth()).json()["case_id"]
+        job = _uploaded_and_extracted(client, demo_case)
+        assert job["status"] == "preview_ready"
+        _confirm_default_text(client, demo_case, job)
+        assert _review(client, demo_case, "upload-demo")["job"]["status"] == "succeeded"
+        usage = client.get("/api/v1/admin/demo-fallback", headers=_approver_auth()).json()["sets"][0]
+        assert usage["used_count"] == 2
 
 
 def test_a_correction_re_review_never_uses_the_fallback() -> None:
