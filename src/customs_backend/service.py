@@ -2668,17 +2668,43 @@ class WorkbenchService:
     # ── demo fallback ────────────────────────────────────────────
 
     def _demo_fallback_for(
-        self, org_id: str, documents: list[tuple[str, str]]
+        self, org_id: str, documents: list[tuple[str, str, str]]
     ) -> DemoFallbackSetRecord | None:
-        """The registered set whose confirmed documents are exactly these (by content digest)."""
+        """The registered set whose confirmed documents are exactly these.
 
-        digests = sorted(sha for _, sha in documents)
-        if not digests:
+        Content digests decide first; when no set matches by content, the
+        same confirmed file names (case-insensitive) are the second chance.
+        """
+
+        if not documents:
             return None
-        for record in self.repository.list_demo_fallback_sets(org_id):
+        sets = self.repository.list_demo_fallback_sets(org_id)
+        digests = sorted(sha for _, sha, _ in documents)
+        for record in sets:
             if sorted(item.content_sha256 for item in record.documents) == digests:
                 return record
+        names = sorted(name.casefold() for _, _, name in documents)
+        if len(set(names)) != len(names):
+            return None
+        for record in sets:
+            if sorted(item.filename.casefold() for item in record.documents) == names:
+                return record
         return None
+
+    @staticmethod
+    def _demo_fallback_replacements(
+        fallback: DemoFallbackSetRecord, documents: list[tuple[str, str, str]]
+    ) -> dict[str, str]:
+        """Registered document id -> this case's document id, by digest and then by name."""
+
+        by_digest = {sha: document_id for document_id, sha, _ in documents}
+        by_name = {name.casefold(): document_id for document_id, _, name in documents}
+        replacements: dict[str, str] = {}
+        for item in fallback.documents:
+            target = by_digest.get(item.content_sha256) or by_name.get(item.filename.casefold())
+            if target is not None:
+                replacements[item.document_id] = target
+        return replacements
 
     def _demo_fallback_extraction(
         self,
@@ -2686,24 +2712,38 @@ class WorkbenchService:
         asset: DocumentAssetRecord,
         request: AgentDocumentExtractionRequest,
     ) -> tuple[str, DocumentExtractionResult] | None:
-        """A registered preview of these exact source bytes, re-bound to this request."""
+        """A registered preview of these source bytes (or, failing that, this file name),
+        re-bound to this request."""
 
-        for record in self.repository.list_demo_fallback_sets(org_id):
-            for item in record.extractions:
-                if item.source_sha256 != asset.source_sha256:
-                    continue
-                raw = {
-                    **copy.deepcopy(item.result),
-                    "document_asset_id": asset.asset_id,
-                    "extraction_request_id": request.extraction_request_id,
-                }
-                try:
-                    result = self._validate_extraction_result(
-                        asset=asset, request=request, raw=raw
-                    )
-                except AgentResponseRejectedError:
-                    continue
-                return record.fallback_id, result
+        sets = self.repository.list_demo_fallback_sets(org_id)
+        candidates = [
+            (record, item)
+            for record in sets
+            for item in record.extractions
+            if item.source_sha256 == asset.source_sha256
+        ] + [
+            (record, item)
+            for record in sets
+            for item in record.extractions
+            if item.source_sha256 != asset.source_sha256
+            and item.filename.casefold() == asset.filename.casefold()
+        ]
+        for record, item in candidates:
+            raw = {
+                **copy.deepcopy(item.result),
+                "document_asset_id": asset.asset_id,
+                "extraction_request_id": request.extraction_request_id,
+                # A name match is a different file: bind the stored text to it.
+                "source_sha256": asset.source_sha256,
+                "byte_size": asset.byte_size,
+            }
+            try:
+                result = self._validate_extraction_result(
+                    asset=asset, request=request, raw=raw
+                )
+            except AgentResponseRejectedError:
+                continue
+            return record.fallback_id, result
         return None
 
     def _replay_demo_fallback_extraction(
@@ -2773,7 +2813,7 @@ class WorkbenchService:
         fallback: DemoFallbackSetRecord | None = None
         if settings.mode != "off" and job.request.get("parent_review_run_id") is None:
             documents = [
-                (str(item["document_id"]), str(item["content_sha256"]))
+                (str(item["document_id"]), str(item["content_sha256"]), str(item["filename"]))
                 for item in job.request.get("documents", [])
                 if isinstance(item, dict)
             ]
@@ -2798,16 +2838,11 @@ class WorkbenchService:
         """The stored Agent result re-bound to this run: ids, dates and the provider hash."""
 
         documents = [
-            (str(item["document_id"]), str(item["content_sha256"]))
+            (str(item["document_id"]), str(item["content_sha256"]), str(item["filename"]))
             for item in job.request.get("documents", [])
             if isinstance(item, dict)
         ]
-        by_digest = {sha: document_id for document_id, sha in documents}
-        replacements = {
-            item.document_id: by_digest[item.content_sha256]
-            for item in fallback.documents
-            if item.content_sha256 in by_digest
-        }
+        replacements = self._demo_fallback_replacements(fallback, documents)
         replacements[fallback.source_case_id] = job.case_id
         replacements[fallback.source_review_run_id] = job.review_run_id
         result = _replace_identifiers(copy.deepcopy(fallback.agent_result), replacements)
@@ -2841,17 +2876,13 @@ class WorkbenchService:
         settings = self.repository.demo_fallback_settings()
         if settings.mode == "off" or (settings.mode == "auto" and not failed):
             return None
-        fallback = self._demo_fallback_for(
-            principal.org_id, [(record.document_id, record.content_sha256) for record, _ in texts]
-        )
+        documents = [
+            (record.document_id, record.content_sha256, record.filename) for record, _ in texts
+        ]
+        fallback = self._demo_fallback_for(principal.org_id, documents)
         if fallback is None or fallback.hs_agent_ranking is None:
             return None
-        by_digest = {record.content_sha256: record.document_id for record, _ in texts}
-        replacements = {
-            item.document_id: by_digest[item.content_sha256]
-            for item in fallback.documents
-            if item.content_sha256 in by_digest
-        }
+        replacements = self._demo_fallback_replacements(fallback, documents)
         stored = _replace_identifiers(copy.deepcopy(fallback.hs_agent_ranking), replacements)
         ranking = CaseHsAgentRankingRecord(
             document_digest=case_hs_document_digest(texts),

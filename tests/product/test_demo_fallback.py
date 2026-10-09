@@ -10,6 +10,10 @@ from tests.product.test_trade_features import (
     _tshirt_agent,
 )
 import hashlib
+from io import BytesIO
+
+import pytest
+from PIL import Image
 
 from tests.product.test_workbench_api import _approver_auth, _auth, _client, _tiny_png
 
@@ -179,11 +183,13 @@ def test_auto_mode_replays_only_when_the_agent_fails() -> None:
         assert off["job"]["status"] == "failed"
 
 
-def _uploaded_and_extracted(client: Any, case_id: str) -> dict[str, Any]:
+def _uploaded_and_extracted(
+    client: Any, case_id: str, content: bytes | None = None, filename: str = "invoice.png"
+) -> dict[str, Any]:
     asset = client.post(
         f"/api/v1/cases/{case_id}/document-assets",
-        params={"document_type": "CI", "filename": "invoice.png"},
-        content=_tiny_png(),
+        params={"document_type": "CI", "filename": filename},
+        content=content or _tiny_png(),
         headers={**_auth(), "Content-Type": "image/png"},
     ).json()
     preview = client.post(
@@ -264,6 +270,54 @@ def test_uploaded_file_extraction_is_replayed_so_the_whole_demo_runs_without_the
         assert _review(client, demo_case, "upload-demo")["job"]["status"] == "succeeded"
         usage = client.get("/api/v1/admin/demo-fallback", headers=_approver_auth()).json()["sets"][0]
         assert usage["used_count"] == 2
+
+        # Second chance: a different file under the same name (case-insensitive)
+        # still gets the stored text, so the review replays as well.
+        other_bytes = BytesIO()
+        Image.new("RGB", (2, 2), color=(255, 255, 255)).save(other_bytes, format="PNG")
+        renamed_case = client.post("/api/v1/cases", json={"title": "demo 2"}, headers=_auth()).json()["case_id"]
+        job = _uploaded_and_extracted(client, renamed_case, other_bytes.getvalue(), "INVOICE.PNG")
+        assert job["status"] == "preview_ready"
+        _confirm_default_text(client, renamed_case, job)
+        assert _review(client, renamed_case, "upload-renamed")["job"]["status"] == "succeeded"
+        # An unknown name with unknown bytes is not replayed.
+        stranger = client.post("/api/v1/cases", json={"title": "demo 3"}, headers=_auth()).json()["case_id"]
+        with pytest.raises(RuntimeError):
+            _uploaded_and_extracted(client, stranger, other_bytes.getvalue(), "other.png")
+
+
+def test_same_confirmed_file_names_replay_when_the_text_differs() -> None:
+    calls: list[str] = []
+
+    def review(request: Any) -> dict[str, Any]:
+        calls.append(request.review_run_id)
+        return _review_result_with_facts(request)
+
+    with _client(review_handler=review, hs_candidates_handler=_tshirt_agent([])) as client:
+        source_case = _case_with_documents(client, [("CI", "ci.txt", _INVOICE), ("PL", "pl.txt", _PACKING)])
+        client.get(f"/api/v1/cases/{source_case}/hs-classification?agent=true", headers=_auth())
+        source_run_id = str(_review(client, source_case, "name-source")["job"]["review_run_id"])
+        _register(client, "시연 4", source_run_id)
+        _set_mode(client, "always", delay_seconds=0)
+
+        # Edited text, same names: replayed and re-bound to the new documents.
+        edited = _case_with_documents(
+            client, [("CI", "CI.txt", _INVOICE + "\nedited"), ("PL", "pl.txt", _PACKING + " ")]
+        )
+        before = len(calls)
+        replayed = _review(client, edited, "name-replay")
+        assert replayed["job"]["status"] == "succeeded" and len(calls) == before
+        run = _run(client, str(replayed["job"]["review_run_id"]))
+        new_documents = {item["document_id"] for item in run["input_document_manifest"]}
+        assert {analysis["document_id"] for analysis in run["document_analyses"]} <= new_documents
+        hs = client.get(f"/api/v1/cases/{edited}/hs-classification?agent=true", headers=_auth()).json()
+        assert hs["basis_kind"] == "agent_ranked"
+        assert all(basis["document_id"] in new_documents for basis in hs["candidates"][0]["basis"])
+
+        # A different set of names still goes to the Agent.
+        partial = _case_with_documents(client, [("CI", "ci.txt", _INVOICE + "\nedited")])
+        _review(client, partial, "name-partial")
+        assert len(calls) == before + 1
 
 
 def test_a_correction_re_review_never_uses_the_fallback() -> None:
