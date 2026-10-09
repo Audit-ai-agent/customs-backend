@@ -1,17 +1,29 @@
 /*
- * KRDS skin for the Keycloak login screen, mirroring the workbench FRAME 00
- * login card (customs-frontend src/krds.css + components.css). Token values are
- * copied verbatim from those files; keep the two in sync when tokens change.
+ * KRDS skin for the Keycloak login screen. Layout mirrors the workbench login
+ * screen (customs-frontend src/login.ts + components.css "로그인 화면" block):
+ * left product introduction, right sign-in form. The hero rules below are copied
+ * from components.css; keep the two in sync when either changes.
  */
 :root {
   --krds-primary: #256ef4;
   --krds-primary-strong: #0b50d0;
+  --krds-primary-active: #083891;
+  --krds-primary-bg: #ecf2fe;
+  --krds-primary-line: #cfe0fb;
   --krds-ink: #1e2124;
   --krds-text: #464c53;
   --krds-muted: #6d7882;
+  --krds-muted-2: #8a949e;
+  --krds-line: #e8ebee;
   --krds-line-2: #dde1e5;
   --krds-line-3: #d3d8dd;
+  --krds-bg: #f7f8fa;
   --krds-surface: #ffffff;
+  --krds-surface-2: #f7f9fb;
+  --krds-success: #228738;
+  --krds-success-bg: #eef8f0;
+  --krds-warning: #9e6a00;
+  --krds-warning-bg: #fff3db;
   --krds-danger: #de3412;
   --krds-danger-strong: #c8290b;
   --krds-danger-bg: #fdf1ee;
@@ -20,7 +32,6 @@
   --ui: 'Pretendard GOV', Pretendard, 'Noto Sans KR', 'Malgun Gothic', system-ui, -apple-system, sans-serif;
 }
 
-/* ── 페이지: 앱 로그인 화면과 동일한 밝은 그라데이션 ─────────────── */
 /* 부모 테마는 html.login-pf 아래 `.login-pf body`로 어두운 배경 이미지를
    깔기 때문에 같은 특이도 이상으로 다시 선언합니다. */
 html,
@@ -30,71 +41,192 @@ html.login-pf {
 
 body,
 .login-pf body {
-  background: linear-gradient(180deg, #e9f1fe 0%, #f7f8fa 60%) fixed;
+  margin: 0;
+  background: var(--krds-bg);
   font-family: var(--ui);
   color: var(--krds-text);
 }
 
-.login-pf-page {
-  display: grid;
-  place-items: center;
-  min-height: 100vh;
-  margin: 0;
-  padding: 2rem 1rem;
+/* ── 로그인 화면 (FRAME 00) — 왼쪽 제품 소개, 오른쪽 로그인 ──────── */
+.login-screen {
+  min-height: 100vh; display: grid; grid-template-columns: 1.25fr 1fr; background: var(--krds-bg);
+}
+.login-hero {
+  position: relative; overflow: hidden; display: flex; flex-direction: column; gap: 1.9rem;
+  padding: 2.25rem 3.5rem; color: #fff;
+  background:
+    radial-gradient(1200px 600px at 10% 0%, #3b82f6 0%, transparent 60%),
+    linear-gradient(160deg, var(--krds-primary-strong) 0%, var(--krds-primary-active) 70%, #062a6e 100%);
+}
+.login-hero::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none; opacity: .12;
+  background-image: linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px);
+  background-size: 40px 40px; mask-image: linear-gradient(180deg, #000, transparent 75%);
+}
+.login-hero > * { position: relative; z-index: 1; }
+.login-hero__brand { display: flex; align-items: center; gap: .75rem; }
+.login-hero__mark {
+  width: 40px; height: 40px; flex: none; border-radius: .625rem;
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M11 19.5H5V4.5h9l3 3V10'/%3E%3Ccircle cx='15' cy='15' r='3.3'/%3E%3Cpath d='M17.4 17.4L20 20' stroke-width='2.2'/%3E%3Cpath d='M8 9h4M8 12h2.5' stroke-opacity='.7'/%3E%3C/svg%3E") center / 24px no-repeat, rgb(255 255 255 / 16%);
+  border: 1px solid rgb(255 255 255 / 28%);
+}
+.login-hero__brand strong { display: block; font-size: 1.06rem; font-weight: 700; letter-spacing: -.01em; }
+.login-hero__brand small { display: block; margin-top: 1px; color: rgb(255 255 255 / 75%); font-size: .75rem; }
+.login-hero__copy { max-width: 32rem; }
+.login-hero__headline { margin: 0; font-size: 2.1rem; line-height: 1.3; font-weight: 800; letter-spacing: -.03em; }
+.login-hero__copy p:not(.login-hero__headline) { margin: .9rem 0 0; font-size: .97rem; line-height: 1.7; opacity: .86; }
+
+.login-preview {
+  max-width: 35rem; overflow: hidden; color: var(--krds-ink); background: var(--krds-surface);
+  border-radius: .875rem; box-shadow: 0 30px 60px rgb(3 20 60 / 45%);
+}
+.login-preview__top {
+  display: flex; align-items: center; gap: .6rem; padding: .75rem 1rem;
+  background: var(--krds-surface-2); border-bottom: 1px solid var(--krds-line); font-size: .8rem;
+}
+.login-preview__top > span:last-child { margin-left: auto; color: var(--krds-muted); font-size: .72rem; }
+.login-preview__dots { display: flex; gap: 5px; }
+.login-preview__dots i { width: 9px; height: 9px; border-radius: 50%; background: var(--krds-line-2); }
+.login-preview__body { display: grid; gap: .85rem; padding: 1rem; }
+.login-preview__docs { display: grid; grid-template-columns: repeat(4, 1fr); gap: .5rem; }
+.login-preview__docs > div { padding: .55rem .6rem; border: 1px solid var(--krds-line); border-radius: .5rem; font-size: .75rem; }
+.login-preview__docs b { display: block; margin-bottom: .2rem; font-size: .8rem; }
+.login-preview__docs span { color: var(--krds-success); font-weight: 600; }
+.login-preview__row {
+  display: flex; align-items: center; gap: .6rem; padding: .6rem .75rem;
+  background: var(--krds-bg); border-radius: .5rem; font-size: .8rem;
+}
+.login-preview__row > span { width: 4.75rem; flex: none; color: var(--krds-muted); }
+.login-preview__row em { margin-left: auto; padding: 3px 8px; border-radius: 999px; font-size: .72rem; font-style: normal; font-weight: 700; }
+.login-preview__row .is-ok { color: var(--krds-success); background: var(--krds-success-bg); }
+.login-preview__row .is-warn { color: var(--krds-warning); background: var(--krds-warning-bg); }
+.login-preview__row .is-bad { color: var(--krds-danger); background: var(--krds-danger-bg); }
+.login-preview__verdict {
+  display: flex; align-items: center; gap: .75rem; padding: .75rem .9rem;
+  background: var(--krds-primary-bg); border: 1px solid var(--krds-primary-line); border-radius: .625rem;
+}
+.login-preview__verdict b { font-size: .87rem; }
+.login-preview__verdict small { display: block; margin-top: 2px; color: var(--krds-text); font-size: .75rem; }
+.login-preview__verdict > span {
+  margin-left: auto; padding: .45rem .75rem; color: #fff; background: var(--krds-primary);
+  border-radius: .5rem; font-size: .78rem; font-weight: 700; white-space: nowrap;
+}
+.login-hero__feats {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.1rem; max-width: 37.5rem;
+  margin: auto 0 0; padding: 0; list-style: none;
+}
+.login-hero__feats li::before { content: ""; display: block; width: 24px; height: 3px; margin-bottom: .6rem; border-radius: 2px; background: #7fb0ff; }
+.login-hero__feats b { display: block; margin-bottom: .25rem; font-size: .87rem; }
+.login-hero__feats span { font-size: .78rem; line-height: 1.6; opacity: .78; }
+
+.login-side { display: flex; flex-direction: column; gap: 1.5rem; padding: 2.25rem 3.5rem; }
+.login-side__top { display: flex; justify-content: flex-end; gap: 1rem; font-size: .82rem; }
+.login-side a { color: var(--krds-muted); text-decoration: none; }
+.login-side a:hover { color: var(--krds-primary-strong); text-decoration: underline; }
+.login-side__foot { display: flex; justify-content: space-between; color: var(--krds-muted-2); font-size: .75rem; }
+.login-side__foot a { color: inherit; }
+.login-notes {
+  display: grid; gap: .6rem; margin: .75rem 0 0; padding: 1.5rem 0 0; list-style: none;
+  border-top: 1px solid var(--krds-line); color: var(--krds-text); font-size: .82rem; line-height: 1.55;
+}
+.login-notes li { position: relative; padding-left: 1.5rem; }
+.login-notes li::before {
+  content: ""; position: absolute; left: 0; top: .2rem; width: 1rem; height: 1rem;
+  background: var(--krds-primary); -webkit-mask: var(--icon) center / contain no-repeat; mask: var(--icon) center / contain no-repeat;
+}
+.login-notes__ai { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6z'/%3E%3C/svg%3E"); }
+.login-notes__help { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 8v5M12 16h.01'/%3E%3C/svg%3E"); }
+
+@media (min-width: 961px) {
+  .login-screen { height: 100vh; min-height: 0; }
+  .login-hero, .login-side { min-height: 0; }
+}
+/* 노트북 높이(약 650~880px): 문구·카드를 줄이고 기능 3개를 숨겨 한 화면에 맞춥니다. */
+@media (min-width: 961px) and (max-height: 880px) {
+  .login-hero { gap: 1.25rem; padding-block: 1.75rem; }
+  .login-hero__headline { font-size: 1.75rem; }
+  .login-hero__copy p:not(.login-hero__headline) { margin-top: .6rem; font-size: .9rem; }
+  .login-hero__feats { display: none; }
+  .login-preview__body { gap: .55rem; padding: .75rem 1rem; }
+  .login-preview__row { padding: .45rem .75rem; }
+  .login-preview__verdict { padding: .55rem .9rem; }
+  .login-side { padding-block: 1.75rem; }
+}
+@media (min-width: 961px) and (max-height: 660px) {
+  .login-preview { display: none; }
 }
 
-/* 카드 위 흰색 대제목은 카드 내부 브랜드로 대체합니다. */
+@media (max-width: 960px) {
+  .login-screen { grid-template-columns: 1fr; }
+  .login-hero { gap: 1.5rem; padding: 1.75rem 1rem; }
+  .login-hero__headline { font-size: 1.6rem; }
+  .login-preview, .login-hero__feats { display: none; }
+  .login-side { padding: 1.25rem 1rem 1.5rem; }
+}
+
+/* 앱 로그인 화면 → Keycloak 로그인 창 전환(같은 origin의 문서 간 View Transition).
+   왼쪽 소개 영역은 이름을 붙여 제자리에 두고, 오른쪽만 살짝 떠오르며 바뀝니다.
+   지원하지 않는 브라우저는 그냥 페이지가 바뀝니다. 앱 components.css와 Keycloak 테마 CSS에 같은 블록이 있습니다. */
+@view-transition { navigation: auto; }
+.login-hero { view-transition-name: login-hero; }
+::view-transition-old(root) { animation: .18s ease-in both login-vt-out; }
+::view-transition-new(root) { animation: .32s cubic-bezier(.2, .7, .2, 1) both login-vt-in; }
+::view-transition-group(login-hero) { animation-duration: 0s; }
+@keyframes login-vt-out { to { opacity: 0; } }
+@keyframes login-vt-in { from { opacity: 0; transform: translateY(10px); } }
+@media (prefers-reduced-motion: reduce) {
+  @view-transition { navigation: none; }
+}
+
+/* ── 오른쪽: Keycloak 기본 폼을 카드 없이 놓습니다 ─────────────── */
+.login-pf-page {
+  width: 100%;
+  max-width: 24rem;
+  margin: auto;
+  padding: 0;
+}
+
 #kc-header {
   display: none;
 }
 
-/* ── 카드: .login-card 문법 그대로 ───────────────────────────── */
-.card-pf {
-  width: min(30rem, 100%);
+/* 부모 테마의 `.login-pf-page .card-pf` 여백(20px 40px)을 이기도록 같은 특이도로 씁니다. */
+.login-pf-page .card-pf {
+  width: 100%;
+  max-width: none;
   margin: 0;
-  padding: 2.2rem 2rem;
-  background: var(--krds-surface);
-  border: 1px solid var(--krds-line-2);
-  border-top: 1px solid var(--krds-line-2);
-  border-radius: 1rem;
-  box-shadow: 0 14px 44px rgb(30 33 36 / 10%);
+  padding: 0;
+  background: none;
+  border: 0;
+  box-shadow: none;
 }
 
 .login-pf-page .login-pf-header {
-  margin-bottom: 1.15rem;
-  text-align: center;
+  margin-bottom: 1.5rem;
+  text-align: left;
 }
 
-/* 작업대 로고(.seal-mark 상당): 서류 위 돋보기 SVG */
-.login-pf-page .login-pf-header::before {
-  content: "";
-  display: grid;
-  place-items: center;
-  width: 60px;
-  height: 60px;
-  margin: 0 auto 14px;
-  border-radius: var(--r);
-  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M11 19.5H5V4.5h9l3 3V10'/%3E%3Ccircle cx='15' cy='15' r='3.3'/%3E%3Cpath d='M17.4 17.4L20 20' stroke-width='2.2'/%3E%3Cpath d='M8 9h4M8 12h2.5' stroke-opacity='.7'/%3E%3C/svg%3E") center / 34px no-repeat,
-    linear-gradient(135deg, #4a8af6, var(--krds-primary-strong));
-  box-shadow: 0 3px 8px rgb(37 110 244 / 28%);
-}
-
-h1#kc-page-title {
+.login-pf-page h1#kc-page-title {
   margin: 0;
+  text-align: left;
   color: var(--krds-ink);
   font-family: var(--ui);
-  font-size: 20px;
-  font-weight: 700;
+  font-size: 1.65rem;
+  font-weight: 800;
   letter-spacing: -0.02em;
 }
 
-/* 제목 아래 안내문(.login-hint 상당) */
+/* 제목 아래 안내문(앱 .login-copy 상당) */
+.login-pf-page #kc-content-wrapper {
+  margin-top: 0;
+}
+
 .login-pf-page .login-pf-header::after {
-  content: "기관 통합 인증(OIDC)으로 본인 계정을 확인합니다.";
+  content: "기관 계정으로 로그인해 배정된 Case를 확인하세요.";
   display: block;
-  margin-top: 9px;
-  color: var(--krds-muted);
-  font-size: 12.5px;
+  margin-top: 0.6rem;
+  color: var(--krds-text);
+  font-size: 0.92rem;
   font-weight: 400;
   line-height: 1.6;
 }
@@ -245,10 +377,4 @@ input#kc-login.pf-c-button.pf-m-primary:focus-visible {
 
 .login-pf-page .login-pf-settings {
   margin: 0;
-}
-
-@media (max-width: 480px) {
-  .card-pf {
-    padding: 1.6rem 1.15rem;
-  }
 }
