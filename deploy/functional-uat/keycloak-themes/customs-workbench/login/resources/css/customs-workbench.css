@@ -65,21 +65,18 @@ body,
   text-align: center;
 }
 
-/* 통 인장 마크(.seal-mark.lg 상당) — CSS content로 재현 */
+/* 작업대 로고(.seal-mark 상당): 서류 위 돋보기 SVG */
 .login-pf-page .login-pf-header::before {
-  content: "通";
+  content: "";
   display: grid;
   place-items: center;
   width: 60px;
   height: 60px;
   margin: 0 auto 14px;
   border-radius: var(--r);
-  background: linear-gradient(135deg, #4a8af6, var(--krds-primary-strong));
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M11 19.5H5V4.5h9l3 3V10'/%3E%3Ccircle cx='15' cy='15' r='3.3'/%3E%3Cpath d='M17.4 17.4L20 20' stroke-width='2.2'/%3E%3Cpath d='M8 9h4M8 12h2.5' stroke-opacity='.7'/%3E%3C/svg%3E") center / 34px no-repeat,
+    linear-gradient(135deg, #4a8af6, var(--krds-primary-strong));
   box-shadow: 0 3px 8px rgb(37 110 244 / 28%);
-  color: #fff;
-  font-size: 23px;
-  font-weight: 800;
-  letter-spacing: 0.02em;
 }
 
 h1#kc-page-title {
